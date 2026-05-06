@@ -265,3 +265,30 @@ test("findCookiesFile with explicit non-existent profileDir returns null", () =>
   const fakeDir = "C:\\definitely\\does\\not\\exist\\BraveProfile";
   assert.strictEqual(pool.findCookiesFile(fakeDir), null);
 });
+
+// ───── W3 V2: braveDetectError exposed when auto-detect fails ─────
+
+test("loadConfig() exposes a braveDetectError property (null when detection succeeds, Error when it fails)", () => {
+  // Run with a deliberately bogus PROGRAMFILES + LOCALAPPDATA so detect fails
+  // on Win, and a deliberately bogus 'which' shim on POSIX. We only need to
+  // assert that braveDetectError is EITHER null OR an Error instance — both
+  // are valid outcomes depending on whether the host has Brave installed.
+  const cfg = pool.loadConfig({
+    env: {
+      PROGRAMFILES: "Z:\\nonsense",
+      "PROGRAMFILES(X86)": "Z:\\nonsense",
+      LOCALAPPDATA: "Z:\\nonsense",
+      // Force POSIX paths to also fail.
+      PATH: "/nonexistent",
+    },
+    repoRoot: "C:\\fake\\repo",
+  });
+  // Field must exist on the returned object (V2 follow-up wired it in).
+  assert.ok("braveDetectError" in cfg, "loadConfig must expose braveDetectError key");
+  // Either null (Brave was found via wrapper or default scan slipped through)
+  // or an actual Error. Never undefined.
+  if (cfg.braveDetectError !== null) {
+    assert.ok(cfg.braveDetectError instanceof Error);
+    assert.match(cfg.braveDetectError.message, /Brave/);
+  }
+});

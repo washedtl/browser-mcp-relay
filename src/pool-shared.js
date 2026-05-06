@@ -24,6 +24,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { detectBravePath, detectBraveProfileDir } = require("./detect-browser.js");
 const processShim = require("./process-shim.js");
+const { applyLocalConfigToEnv } = require("./local-config.js");
 
 // ───────────────────────────── Constants ─────────────────────────────
 
@@ -78,11 +79,19 @@ try {
 function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, "..") } = {}) {
   const wrapperConfig = upstreamWrapper && upstreamWrapper.CONFIG ? upstreamWrapper.CONFIG : null;
 
+  // Layer local-config.json under env vars. Real env values win; otherwise
+  // the file's value (if any) is used. Auto-detection still runs underneath.
+  env = applyLocalConfigToEnv(env);
+
   // Brave path: env override wins; otherwise auto-detect; otherwise wrapper hint.
+  // braveDetectError captures any auto-detect failure so launch-time error
+  // messages can include the original detection context (V2 follow-up from W1).
   let bravePath = null;
+  let braveDetectError = null;
   try {
     bravePath = detectBravePath({ env });
   } catch (detectErr) {
+    braveDetectError = detectErr;
     if (wrapperConfig && wrapperConfig.bravePath) {
       bravePath = wrapperConfig.bravePath;
     } else {
@@ -91,6 +100,8 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
       // Actually: defer. Many tests just want CONFIG.poolDirs and shouldn't
       // crash because Brave isn't installed in CI. Store null and surface
       // the error via getBravePath() when the launch path actually needs it.
+      // The captured braveDetectError is exposed on the returned config so
+      // launch-path code can fold its message into a richer error.
       bravePath = null;
     }
   }
@@ -123,6 +134,7 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
 
   return {
     bravePath,
+    braveDetectError,
     poolDirs,
     slotRoles,
     cookieSourceProfile,

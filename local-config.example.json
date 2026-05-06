@@ -6,6 +6,9 @@
   "BROWSER_RELAY_BRAVE_PATH": "",
   "_BROWSER_RELAY_BRAVE_PATH_doc": "Absolute path to the Brave executable. Leave empty to auto-detect (Win/Mac/Linux standard install locations + Windows registry probe). Examples: 'C:\\\\Program Files\\\\BraveSoftware\\\\Brave-Browser\\\\Application\\\\brave.exe', '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', '/usr/bin/brave-browser'.",
 
+  "BROWSER_RELAY_BRAVE_PROFILE_DIR": "",
+  "_BROWSER_RELAY_BRAVE_PROFILE_DIR_doc": "Absolute path to the Brave User Data directory (parent of the per-profile 'Default/' folder). Leave empty to auto-detect from the OS standard location. Used by cookies_export to find the SQLite cookies file. Examples: 'C:\\\\Users\\\\<user>\\\\AppData\\\\Local\\\\BraveSoftware\\\\Brave-Browser\\\\User Data', '/Users/<user>/Library/Application Support/BraveSoftware/Brave-Browser', '/home/<user>/.config/BraveSoftware/Brave-Browser'.",
+
   "BROWSER_RELAY_UPSTREAM_PATH": "",
   "_BROWSER_RELAY_UPSTREAM_PATH_doc": "Absolute path to browser-devtools-mcp/dist/index.js. Leave empty to use the version installed via npm (resolved by require.resolve). Only set this if you want to point at a custom build or a different install location.",
 
@@ -13,7 +16,7 @@
   "_BROWSER_RELAY_POOL_DIR_doc": "Opt-in pool mode: absolute path to a single Brave user-data-dir to claim. Leave empty for the default standalone mode (relay creates and uses '<repo>/.browser-data'). Set this if you want to share a profile dir across runs or coordinate with another tool managing a pool of profiles.",
 
   "BROWSER_RELAY_POOL_SLOT": "",
-  "_BROWSER_RELAY_POOL_SLOT_doc": "Slot identifier (1, 2, ...) used in the slot=N/M banner when pool mode is active. Mostly cosmetic — the lock dir from BROWSER_RELAY_POOL_DIR is what actually arbitrates ownership.",
+  "_BROWSER_RELAY_POOL_SLOT_doc": "Slot identifier (1, 2, ...) used in the slot=N/M banner AND in the CDP port calculation (port = 9333 + slot - 1). Set when running multiple relays in pool mode so each picks a deterministic port. Cosmetic when only one relay is running.",
 
   "BROWSER_HEADLESS_ENABLE": "false",
   "_BROWSER_HEADLESS_ENABLE_doc": "Set to 'true' to launch Brave headless. Default: visible window (helpful for debugging, required for CDP-driven login flows).",

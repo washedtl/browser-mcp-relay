@@ -3,6 +3,41 @@
 Custom MCP server that wraps `browser-devtools-mcp` (upstream) with a relay
 shim, allowing us to add tools beyond what upstream exposes.
 
+## Quick start
+
+```
+git clone <this repo>
+cd browser-mcp-relay
+npm install
+npm run setup
+```
+
+The interactive setup wizard auto-detects your Brave install + Brave profile
+dir, writes a `local-config.json` (gitignored), prints a paste-ready MCP
+registration snippet for your Claude Code or Cursor config, and runs a
+smoke test to confirm the relay can launch. The whole thing takes <2 minutes
+on a clean machine. The wizard never modifies any files outside this repo.
+
+After setup, paste the printed snippet into the `mcpServers` section of
+`~/.claude.json` (or your equivalent) and restart your editor. To re-verify
+the relay anytime: `npm run smoke`.
+
+## Troubleshooting
+
+- **`npm run setup` says "Brave was not found"** — install Brave from
+  https://brave.com/download/ , or enter the absolute path to your `brave`
+  / `brave.exe` binary when prompted. Setup also accepts
+  `BROWSER_RELAY_BRAVE_PATH` as an env var.
+- **`npm run setup` says "Could not resolve `browser-devtools-mcp`"** — you
+  forgot `npm install`. Run it, then re-run setup. If you have a custom
+  build of upstream, set `BROWSER_RELAY_UPSTREAM_PATH` in
+  `local-config.json` (or as an env var).
+- **`npm run smoke` exits non-zero with "timeout" or "exited prematurely"** —
+  inspect the stderr tail in the failure message. Most common causes:
+  Brave is already running with the same user-data-dir (close it), the
+  upstream `browser-devtools-mcp` package is corrupt (re-run `npm install`),
+  or a leftover `.mcp-wrapper-lock` file in `.browser-data/` (delete it).
+
 ## What it does
 1. Reuses the pool/lock/cookie/role layer from `wrap-browser-devtools-mcp.js`
    to claim a profile dir and snapshot cookies.

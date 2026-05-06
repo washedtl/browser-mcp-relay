@@ -5,7 +5,9 @@
   "type": "commonjs",
   "scripts": {
     "test": "node --test test/*.test.js test/**/*.test.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "setup": "node scripts/setup.js",
+    "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",

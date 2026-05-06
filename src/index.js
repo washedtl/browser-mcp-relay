@@ -33,6 +33,11 @@ const { UpstreamClient } = require("./upstream-client.js");
 const { RelayServer } = require("./relay-server.js");
 const { launchBrave, closeBrave } = require("./cdp-bridge.js");
 const { tools: ownTools } = require("./own-tools/index.js");
+const { applyLocalConfigToEnv } = require("./local-config.js");
+
+// Layer local-config.json under env so resolveBdmcpEntry / launch flags see
+// it transparently. pool-shared.js applies the same overlay independently.
+const RELAY_ENV = applyLocalConfigToEnv(process.env);
 
 // Path to upstream `browser-devtools-mcp`. Resolution order:
 //   1. BROWSER_RELAY_UPSTREAM_PATH env var (explicit override).
@@ -44,7 +49,7 @@ const { tools: ownTools } = require("./own-tools/index.js");
 // We resolve once at module load; if all three fail we throw with an
 // actionable message before any side effects fire.
 function resolveBdmcpEntry() {
-  const override = process.env.BROWSER_RELAY_UPSTREAM_PATH;
+  const override = RELAY_ENV.BROWSER_RELAY_UPSTREAM_PATH;
   if (override && override.length > 0) {
     if (fs.existsSync(override)) return override;
     throw new Error(
@@ -66,7 +71,18 @@ function resolveBdmcpEntry() {
 async function main() {
   // 1. Claim slot.
   const { dir, lock, role, release: releasePool } = pool.claimSlot();
-  const slotIdx = pool.CONFIG.poolDirs.indexOf(dir) + 1;
+  // Slot index for the launch banner (and for the CDP port calc below).
+  // Order of preference: explicit BROWSER_RELAY_POOL_SLOT env override
+  // (parsed as a positive integer), otherwise the position of the claimed
+  // dir in CONFIG.poolDirs (1-based). The override exists so users running
+  // in pool mode can pin a specific port even if their dir-list ordering
+  // changes between runs.
+  const computedSlotIdx = pool.CONFIG.poolDirs.indexOf(dir) + 1;
+  const slotOverrideRaw = RELAY_ENV.BROWSER_RELAY_POOL_SLOT;
+  const slotOverride = slotOverrideRaw ? parseInt(slotOverrideRaw, 10) : NaN;
+  const slotIdx = (Number.isFinite(slotOverride) && slotOverride > 0)
+    ? slotOverride
+    : computedSlotIdx;
   const totalSlots = pool.CONFIG.poolDirs.length;
   const src = pool.CONFIG.cookieSourceProfile;
   const cookiesPath = src ? pool.findCookiesFile(src) : null;
@@ -114,7 +130,7 @@ async function main() {
     // CDP env points at the port we'll launch Brave on. Upstream is lazy
     // about its CDP attach (only runs in newBrowserContext on first tool
     // execution), so it's safe to set this before Brave is up.
-    const upstreamEnv = { ...process.env };
+    const upstreamEnv = { ...RELAY_ENV };
     delete upstreamEnv.BROWSER_PERSISTENT_USER_DATA_DIR;
     delete upstreamEnv.BROWSER_PERSISTENT_ENABLE;
     upstreamEnv.BROWSER_CDP_CONNECT_URL = `http://127.0.0.1:${port}`;
@@ -156,13 +172,25 @@ async function main() {
       braveLaunchPromise = (async () => {
         // Resolve bravePath now, not at module load — auto-detect, env override,
         // or wrapper hint. Throws a clear error if Brave isn't installed.
-        const bravePath = pool.CONFIG.bravePath || require("./detect-browser.js").detectBravePath();
+        let bravePath = pool.CONFIG.bravePath;
+        if (!bravePath) {
+          try {
+            bravePath = require("./detect-browser.js").detectBravePath({ env: RELAY_ENV });
+          } catch (e) {
+            // Fold the original detection failure context into the launch error.
+            const original = pool.CONFIG.braveDetectError;
+            if (original && original !== e) {
+              e.message += `\n\nOriginal detection error at config-load time:\n${original.message}`;
+            }
+            throw e;
+          }
+        }
         process.stderr.write(`[mcp-relay] launching Brave (port=${port}, exe=${bravePath})...\n`);
-        const extensionPath = process.env.BROWSER_LOAD_EXTENSIONS || null;
+        const extensionPath = RELAY_ENV.BROWSER_LOAD_EXTENSIONS || null;
         const launched = await launchBrave({
           userDataDir: dir,
           port,
-          headless: process.env.BROWSER_HEADLESS_ENABLE === "true",
+          headless: RELAY_ENV.BROWSER_HEADLESS_ENABLE === "true",
           extensionPath,
           executablePath: bravePath,
         });
