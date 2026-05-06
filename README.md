@@ -90,22 +90,26 @@ npm run smoke
 
 ## 🛠️ Tool catalog
 
-The 16 first-party tools, grouped by category:
+**67 tools total = 16 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).**
 
-### 🔬 Performance & diagnostics
+Both layers are merged into a single `tools/list` response, so to your MCP client they all just look like "tools the relay provides."
+
+### 🌟 First-party tools (16)
+
+##### 🔬 Performance & diagnostics
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `lighthouse_audit` | Lighthouse audit against a URL | `formFactor: "desktop"\|"mobile"` | Performance regression check on a deploy |
 | `memory_take-heap-snapshot` | V8 heap snapshot via CDP | `outputPath` | Memory-leak hunt on a long-running SPA |
 
-### 📱 Device emulation
+#### 📱 Device emulation
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `emulate_device` | UA / viewport / network throttling | `network.downloadKbps` | Verify a layout on Slow 3G |
 
-### 📑 Multi-tab control
+#### 📑 Multi-tab control
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
@@ -114,7 +118,7 @@ The 16 first-party tools, grouped by category:
 | `tabs_select` | Bring a tab to front | `index` | Switch to a specific tab before interacting |
 | `tabs_close` | Close a tab by index | `index` | Tear down workflow tabs |
 
-### 📤 Forms, dialogs, files
+#### 📤 Forms, dialogs, files
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
@@ -122,13 +126,13 @@ The 16 first-party tools, grouped by category:
 | `file_upload` | Set files on a file input | `files: [absPath]` | Upload a file without an OS picker |
 | `form_fill` | Fill many fields in one round-trip | `fields: [{selector, value}]` | Bulk-fill a long signup form |
 
-### 🌐 Network capture
+#### 🌐 Network capture
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `capture_xhr` | Record XHR/fetch responses | `urlFilter` (regex) | Reverse-engineer a site API while logged in |
 
-### 🍪 Session & cookies
+#### 🍪 Session & cookies
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
@@ -136,19 +140,126 @@ The 16 first-party tools, grouped by category:
 | `cookies_import` | Import cookies into the context | `cookies` | Restore an authed session |
 | `stealth_apply` | Anti-detection patches | `languages` | Defeat trivial bot checks |
 
-### 💾 Downloads
+#### 💾 Downloads
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `download_capture` | Wait for a download, save to disk | `clickSelector` | Trigger + save a CSV export |
 
-### 🔍 Data extraction
+#### 🔍 Data extraction
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `extract_structured` | CSS-selector-based extraction | `schema` | Scrape an authed page that firecrawl can't reach |
 
-> Source for each tool lives at [`src/own-tools/<tool-name>.js`](./src/own-tools/). All 41 upstream tools are forwarded verbatim — see [serkan-ozal/browser-devtools-mcp](https://github.com/serkan-ozal/browser-devtools-mcp) for that catalog.
+> Source for each first-party tool lives at [`src/own-tools/<tool-name>.js`](./src/own-tools/).
+
+---
+
+### 🔁 Forwarded upstream tools (51)
+
+Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) — the relay forwards `tools/call` requests for these to the upstream child process verbatim. Brief summaries below; full schemas come straight from upstream and are visible to your MCP client via `tools/list`.
+
+#### ♿ Accessibility (2)
+
+| Tool | Purpose |
+|---|---|
+| `a11y_take-aria-snapshot` | ARIA tree snapshot with refs (`e1`, `e2`, …) for downstream targeting |
+| `a11y_take-ax-tree-snapshot` | Chromium AX tree + bounding boxes / visibility / viewport diagnostics |
+
+#### 📄 Content extraction & capture (6)
+
+| Tool | Purpose |
+|---|---|
+| `content_get-as-html` | Get the page's HTML |
+| `content_get-as-text` | Get the page's visible text |
+| `content_save-as-pdf` | Save current page as a PDF |
+| `content_take-screenshot` | Screenshot the page or a specific element |
+| `content_start-recording` | Start video recording |
+| `content_stop-recording` | Stop recording and save the video file |
+
+#### 🐛 Live debugging probes (11)
+
+| Tool | Purpose |
+|---|---|
+| `debug_status` | Status of the debug subsystem |
+| `debug_resolve-source-location` | Resolve a source-map location |
+| `debug_put-tracepoint` | Install a tracepoint at a source location |
+| `debug_put-logpoint` | Install a logpoint (non-pausing console-style log) |
+| `debug_put-exceptionpoint` | Install an exception breakpoint |
+| `debug_add-watch` | Add a watch expression evaluated on each probe hit |
+| `debug_list-probes` | List installed tracepoints / logpoints / watches |
+| `debug_remove-probe` | Remove a probe by ID |
+| `debug_clear-probes` | Bulk-remove probes by type |
+| `debug_get-probe-snapshots` | Get captured snapshots from probes |
+| `debug_clear-probe-snapshots` | Clear captured snapshots |
+
+#### 🖱️ Page interaction (9)
+
+| Tool | Purpose |
+|---|---|
+| `interaction_click` | Click an element (selector or ARIA ref) |
+| `interaction_fill` | Fill an input |
+| `interaction_select` | Select a dropdown option |
+| `interaction_hover` | Hover an element |
+| `interaction_drag` | Drag an element to a target |
+| `interaction_press-key` | Press a keyboard key (with optional hold + repeat) |
+| `interaction_scroll` | Scroll the viewport or a scrollable element |
+| `interaction_resize-viewport` | Resize the page viewport (Playwright emulation) |
+| `interaction_resize-window` | Resize the OS-level browser window via CDP |
+
+#### 🧭 Navigation (3)
+
+| Tool | Purpose |
+|---|---|
+| `navigation_go-to` | Navigate to a URL |
+| `navigation_reload` | Reload the current page |
+| `navigation_go-back-or-forward` | Move through history |
+
+#### 📈 Observability (6)
+
+| Tool | Purpose |
+|---|---|
+| `o11y_get-console-messages` | Console messages / logs with filtering |
+| `o11y_get-http-requests` | HTTP requests with filtering |
+| `o11y_get-web-vitals` | LCP / INP / CLS / TTFB / FCP with Google thresholds |
+| `o11y_get-trace-context` | Get the OpenTelemetry trace context |
+| `o11y_set-trace-context` | Set or clear the OTel trace context |
+| `o11y_new-trace-id` | Generate + set a new OTel trace ID |
+
+#### ⚛️ React introspection (2)
+
+| Tool | Purpose |
+|---|---|
+| `react_get-component-for-element` | Find React component(s) for a DOM element via Fiber |
+| `react_get-element-for-component` | Map a React component instance to its DOM footprint |
+
+#### 🔌 HTTP stubbing (4)
+
+| Tool | Purpose |
+|---|---|
+| `stub_intercept-http-request` | Modify outgoing requests before they're sent |
+| `stub_mock-http-response` | Mock responses for matching requests (picomatch glob) |
+| `stub_list` | List currently installed stubs |
+| `stub_clear` | Clear all stubs |
+
+#### 🎬 Scenarios (6)
+
+| Tool | Purpose |
+|---|---|
+| `scenario-add` | Save a reusable JS script that orchestrates other tools |
+| `scenario-update` | Update a scenario's description / script |
+| `scenario-delete` | Delete a scenario by name |
+| `scenario-run` | Run a saved scenario by name |
+| `scenario-list` | List all scenarios (project + global scope) |
+| `scenario-search` | Search scenarios by query |
+
+#### ⚡ Other (2)
+
+| Tool | Purpose |
+|---|---|
+| `execute` | Batch-execute multiple tool calls in one request via custom JS — reduces round-trips |
+| `sync_wait-for-network-idle` | Wait until in-flight requests ≤ N for `idleMs` |
 
 ---
 
