@@ -1,66 +1,307 @@
-// pool-shared.js — bridge to the existing v2 wrapper's pool/lock/cookie/role
-// layer. Initial implementation: re-export from the wrapper module. Future:
-// lift those helpers into this module for full ownership.
+// pool-shared.js — slot/lock/cookie helpers for the relay.
+//
+// Two modes:
+//
+//   1. STANDALONE (default) — the relay manages a single user-data-dir at
+//      `<repo>/.browser-data` (gitignored). Atomic wrapper-lock on that dir
+//      prevents two relay processes from corrupting one Brave profile.
+//      Cookie snapshot is skipped (no source profile to snapshot from).
+//
+//   2. POOL (opt-in) — set both BROWSER_RELAY_POOL_DIR and BROWSER_RELAY_POOL_SLOT.
+//      The relay claims that one specific dir. If the host also has the
+//      private wrap-browser-devtools-mcp.js wrapper sitting next to this repo,
+//      its richer config (slotRoles, cookieSourceProfile, multiple poolDirs)
+//      is used. Otherwise pool mode degrades to "use this single dir as
+//      if it were standalone".
+//
+// All helpers here are pure JS — no required dependencies on the parent
+// wrapper file. The wrapper require is wrapped in try/catch so a clean
+// clone of the relay repo works without it.
 
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
-const upstreamWrapper = require(path.join(
-  __dirname, "..", "..", "wrap-browser-devtools-mcp.js"
-));
+const { execSync, spawnSync } = require("node:child_process");
+const { detectBravePath } = require("./detect-browser.js");
 
-// Re-export the pure helpers we already trust (Tasks 1-7 of the v2 plan
-// shipped these with full test coverage).
-module.exports.loadConfig = upstreamWrapper.loadConfig;
-module.exports.CONFIG = upstreamWrapper.CONFIG;
-module.exports.findBraveProcessesForDir = upstreamWrapper.findBraveProcessesForDir;
-module.exports.listBraveProcessesRaw = upstreamWrapper.listBraveProcessesRaw;
-module.exports.reapOrphansFor = upstreamWrapper.reapOrphansFor;
-module.exports.isPidAlive = upstreamWrapper.isPidAlive;
-module.exports.checkCookieAgeDays = upstreamWrapper.checkCookieAgeDays;
-module.exports.findCookiesFile = upstreamWrapper.findCookiesFile;
-module.exports.pickDirCandidates = upstreamWrapper.pickDirCandidates;
+// ───────────────────────────── Constants ─────────────────────────────
+
+const WRAPPER_LOCK = ".mcp-wrapper-lock";
+
+const COOKIE_FILES = [
+  "Local State",
+  "Default/Network/Cookies",
+  "Default/Network/Cookies-journal",
+  "Default/Cookies",
+  "Default/Cookies-journal",
+];
+
+// ───────────────────────── Optional wrapper bridge ───────────────────
+//
+// If the user has the private pool wrapper installed (Washed's setup), we
+// reuse its richer config. Otherwise we operate standalone. The require is
+// best-effort — failure here is the normal published-repo path.
+
+let upstreamWrapper = null;
+try {
+  // Resolve from the user's ~/.claude/scripts/ if present. The wrapper file
+  // is a sibling-of-sibling of this module ONLY in Washed's local layout
+  // (.claude/scripts/browser-mcp-relay/src/pool-shared.js). Try that first;
+  // if missing, leave wrapper null.
+  const wrapperPath = path.resolve(__dirname, "..", "..", "wrap-browser-devtools-mcp.js");
+  if (fs.existsSync(wrapperPath)) {
+    upstreamWrapper = require(wrapperPath);
+  }
+} catch (e) {
+  // Defensive: any require failure (syntax, transitive) is silently treated
+  // as "wrapper unavailable". Standalone mode keeps working.
+  upstreamWrapper = null;
+}
+
+// ───────────────────────────── Config ────────────────────────────────
 
 /**
- * Claim a pool slot for the relay. Mirrors the v2 wrapper's main() flow:
- * pickDir → return { dir, lock, role, release }. The v2 wrapper's takeWrapperLock
- * isn't exported, so we replicate the minimal claim sequence here using the
- * exported atomics. Long-term, the v2 wrapper should export takeWrapperLock
- * and we replace this with a single call.
+ * Build the relay's runtime config. Resolution order:
+ *
+ *   - bravePath: BROWSER_RELAY_BRAVE_PATH > detectBravePath() > wrapper config
+ *   - poolDirs:  BROWSER_RELAY_POOL_DIR (single-element array, opt-in)
+ *                > wrapper.CONFIG.poolDirs (Washed's pool)
+ *                > [<repo>/.browser-data] (standalone default)
+ *   - cookieSourceProfile: wrapper.CONFIG.cookieSourceProfile if present, else null
+ *   - cookieFreshnessWarnDays: wrapper.CONFIG or 7
+ *   - slotRoles: wrapper.CONFIG or {}
+ *
+ * Mutating the returned object is safe — each call returns a fresh
+ * object; nothing else in the module reads from it.
+ */
+function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, "..") } = {}) {
+  const wrapperConfig = upstreamWrapper && upstreamWrapper.CONFIG ? upstreamWrapper.CONFIG : null;
+
+  // Brave path: env override wins; otherwise auto-detect; otherwise wrapper hint.
+  let bravePath = null;
+  try {
+    bravePath = detectBravePath({ env });
+  } catch (detectErr) {
+    if (wrapperConfig && wrapperConfig.bravePath) {
+      bravePath = wrapperConfig.bravePath;
+    } else {
+      // Re-throw the detect error — we'll only need bravePath at launch time
+      // anyway, but tests / CONFIG inspection should see the failure.
+      // Actually: defer. Many tests just want CONFIG.poolDirs and shouldn't
+      // crash because Brave isn't installed in CI. Store null and surface
+      // the error via getBravePath() when the launch path actually needs it.
+      bravePath = null;
+    }
+  }
+
+  // Pool dirs: env > wrapper > standalone default
+  let poolDirs;
+  let slotRoles = {};
+  let cookieSourceProfile = null;
+  let cookieFreshnessWarnDays = 7;
+  let staleAfterMs = 5 * 60 * 1000;
+
+  if (env.BROWSER_RELAY_POOL_DIR) {
+    poolDirs = [env.BROWSER_RELAY_POOL_DIR];
+    if (wrapperConfig) {
+      // Inherit cookie source + freshness if wrapper exists.
+      cookieSourceProfile = wrapperConfig.cookieSourceProfile || null;
+      cookieFreshnessWarnDays = wrapperConfig.cookieFreshnessWarnDays || 7;
+      staleAfterMs = wrapperConfig.staleAfterMs || staleAfterMs;
+    }
+  } else if (wrapperConfig && Array.isArray(wrapperConfig.poolDirs) && wrapperConfig.poolDirs.length > 0) {
+    poolDirs = wrapperConfig.poolDirs.slice();
+    slotRoles = wrapperConfig.slotRoles || {};
+    cookieSourceProfile = wrapperConfig.cookieSourceProfile || null;
+    cookieFreshnessWarnDays = wrapperConfig.cookieFreshnessWarnDays || 7;
+    staleAfterMs = wrapperConfig.staleAfterMs || staleAfterMs;
+  } else {
+    // Standalone default: one dir under the repo, gitignored.
+    poolDirs = [path.join(repoRoot, ".browser-data")];
+  }
+
+  return {
+    bravePath,
+    poolDirs,
+    slotRoles,
+    cookieSourceProfile,
+    cookieFreshnessWarnDays,
+    staleAfterMs,
+    standalone: !env.BROWSER_RELAY_POOL_DIR && !wrapperConfig,
+  };
+}
+
+const CONFIG = loadConfig();
+
+// ───────────────────────── Process introspection ─────────────────────
+// Windows-only helpers (lifted from wrap-browser-devtools-mcp.js so the
+// relay no longer requires that file at runtime). On non-Windows hosts
+// these become safe no-ops that return empty / "alive=false" — Brave
+// reaping isn't supported on Mac/Linux yet (W2's job).
+
+/** Pure parser. Given the stdout of the PowerShell brave-process probe
+ *  (one `<PID>|<command-line>` line per process) and a profile dir,
+ *  return the PIDs of brave processes whose command line includes
+ *  `--user-data-dir=<dir>` either unquoted or with `"..."` around dir. */
+function findBraveProcessesForDir(stdoutText, dir) {
+  const needleBare = `--user-data-dir=${dir}`;
+  const needleQuoted = `--user-data-dir="${dir}"`;
+  const pids = [];
+  for (const line of (stdoutText || "").split(/\r?\n/)) {
+    const sep = line.indexOf("|");
+    if (sep < 0) continue;
+    const cmd = line.slice(sep + 1);
+    if (!cmd.includes(needleBare) && !cmd.includes(needleQuoted)) continue;
+    const pid = parseInt(line.slice(0, sep), 10);
+    if (Number.isFinite(pid)) pids.push(pid);
+  }
+  return pids;
+}
+
+/** Snapshot all brave.exe processes via PowerShell on Windows. Returns
+ *  one `PID|CommandLine` line per process, joined by \r\n. Returns "" on
+ *  any failure or non-Windows platform (caller treats as "no brave running"). */
+function listBraveProcessesRaw() {
+  if (process.platform !== "win32") return "";
+  const result = spawnSync(
+    "powershell",
+    [
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_Process -Filter \"name='brave.exe'\" | ForEach-Object { ''+$_.ProcessId+'|'+$_.CommandLine }",
+    ],
+    { encoding: "utf8", windowsHide: true },
+  );
+  if (result.status !== 0) {
+    process.stderr.write(
+      `[mcp-relay] PowerShell brave-process probe failed (exit ${result.status}): ${result.stderr || ""}\n`,
+    );
+    return "";
+  }
+  return result.stdout || "";
+}
+
+/** Find orphan brave.exe PIDs holding `dir` as their user-data-dir
+ *  (parent + all child helpers) and kill each with `taskkill /F /T`.
+ *  Best-effort; logs failures to stderr; returns the count of processes
+ *  successfully killed. Caller must already hold the wrapper lock for
+ *  `dir`. No-op on non-Windows (W2 will add Mac/Linux paths). */
+function reapOrphansFor(dir) {
+  if (process.platform !== "win32") return 0;
+  const stdout = listBraveProcessesRaw();
+  const pids = findBraveProcessesForDir(stdout, dir);
+  let killed = 0;
+  for (const pid of pids) {
+    try {
+      execSync(`taskkill /F /PID ${pid} /T`, { windowsHide: true, stdio: "ignore" });
+      killed++;
+      process.stderr.write(`[mcp-relay] reaped orphan brave.exe pid=${pid} holding ${dir}\n`);
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] taskkill pid=${pid} failed: ${e.message}\n`);
+    }
+  }
+  return killed;
+}
+
+/** PID liveness check. Windows uses `tasklist`; non-Windows hosts return
+ *  false until W2 adds the POSIX `kill -0` path. Returns false for invalid
+ *  input (NaN, undefined, ≤ 0) without spawning a child. */
+function isPidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  if (process.platform !== "win32") {
+    // POSIX: kill -0 returns 0 if the process exists and we have permission.
+    // Best-effort; W2 hardens this.
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    const out = execSync(`tasklist /fi "PID eq ${pid}" /fo csv /nh`, {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    return out.includes(`,"${pid}",`);
+  } catch {
+    return false;
+  }
+}
+
+// ───────────────────────── Cookie helpers ────────────────────────────
+
+/** Return days since `absPath` was last modified (fractional). Returns
+ *  null on any stat failure (missing file, permission denied, etc.).
+ *  Caller treats null as "unknown" — NOT as "recent". */
+function checkCookieAgeDays(absPath) {
+  try {
+    const stat = fs.statSync(absPath);
+    return (Date.now() - stat.mtimeMs) / (24 * 60 * 60 * 1000);
+  } catch {
+    return null;
+  }
+}
+
+/** Return the path to the canonical cookie SQLite store inside a
+ *  Chromium profile dir, preferring the modern Brave/Chrome 92+
+ *  path (Default/Network/Cookies) and falling back to the legacy
+ *  path (Default/Cookies). Returns null if neither exists. */
+function findCookiesFile(profileDir) {
+  if (!profileDir) return null;
+  const modern = path.join(profileDir, "Default", "Network", "Cookies");
+  if (fs.existsSync(modern)) return modern;
+  const legacy = path.join(profileDir, "Default", "Cookies");
+  if (fs.existsSync(legacy)) return legacy;
+  return null;
+}
+
+/** Pure helper. When `requestedRole` is falsy returns a fresh copy of
+ *  all pool dirs (role-less mode). Otherwise returns only dirs whose
+ *  entry in `cfg.slotRoles` matches the requested role. Returns []
+ *  when role is requested but no slot is configured for it. */
+function pickDirCandidates(cfg, requestedRole) {
+  if (!requestedRole) return cfg.poolDirs.slice();
+  return cfg.poolDirs.filter((d) => (cfg.slotRoles || {})[d] === requestedRole);
+}
+
+// ───────────────────────── Slot claim ────────────────────────────────
+
+/**
+ * Claim a pool slot for the relay. Atomic O_CREAT|O_EXCL lock on
+ * `<dir>/.mcp-wrapper-lock`; clears stale locks where the recorded PID is
+ * dead. After the lock is acquired, reaps orphan brave processes still
+ * holding that dir (Windows-only; non-Windows skips reap).
  *
  * @returns {{ dir: string, lock: { fd: number, path: string }, role: string, release: () => void }}
  */
 function claimSlot() {
-  const fs = require("node:fs");
-  const os = require("node:os");
-  const cfg = upstreamWrapper.CONFIG;
   const requestedRole = process.env.BROWSER_MCP_ROLE || undefined;
-  const candidates = upstreamWrapper.pickDirCandidates(cfg, requestedRole);
+  const candidates = pickDirCandidates(CONFIG, requestedRole);
   if (candidates.length === 0) {
     throw new Error(
-      `[mcp-relay] no pool dirs configured for role="${requestedRole}". Check slotRoles in browser-mcp-config.json.`,
+      `[mcp-relay] no pool dirs configured for role="${requestedRole}". ` +
+      `In standalone mode, this should never happen — check pool-shared.js.`,
     );
   }
-
-  const WRAPPER_LOCK = ".mcp-wrapper-lock";
 
   for (const dir of candidates) {
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
     const lockPath = path.join(dir, WRAPPER_LOCK);
 
-    // Stale-clean: dead-PID-only (matching v2 post-fix semantics).
+    // Stale-clean: dead-PID-only.
     try {
       if (fs.existsSync(lockPath)) {
         let pidAlive;
         try {
           const meta = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-          pidAlive = upstreamWrapper.isPidAlive(meta.pid);
+          pidAlive = isPidAlive(meta.pid);
         } catch {
           pidAlive = false;
         }
         if (!pidAlive) {
           fs.unlinkSync(lockPath);
-          process.stderr.write(
-            `[mcp-relay] cleared stale lock at ${lockPath} (pidAlive=false)\n`,
-          );
+          process.stderr.write(`[mcp-relay] cleared stale lock at ${lockPath} (pidAlive=false)\n`);
         }
       }
     } catch { /* race: file vanished */ }
@@ -69,7 +310,7 @@ function claimSlot() {
     try {
       fd = fs.openSync(lockPath, "wx");
     } catch (e) {
-      if (e.code === "EEXIST") continue; // someone else owns it
+      if (e.code === "EEXIST") continue;
       throw e;
     }
     fs.writeSync(
@@ -82,10 +323,10 @@ function claimSlot() {
       }),
     );
 
-    // Reap orphan brave AFTER lock acquired — same ordering as v2's pickDir.
-    upstreamWrapper.reapOrphansFor(dir);
+    // Reap orphan brave AFTER lock acquired.
+    reapOrphansFor(dir);
 
-    const role = (cfg.slotRoles || {})[dir] || "default";
+    const role = (CONFIG.slotRoles || {})[dir] || "default";
 
     function release() {
       try { fs.closeSync(fd); } catch { /* already closed */ }
@@ -96,8 +337,50 @@ function claimSlot() {
   }
 
   throw new Error(
-    `[mcp-relay] pool exhausted for role="${requestedRole || "any"}" — all of ${candidates.join(", ")} are in use.`,
+    `[mcp-relay] pool exhausted for role="${requestedRole || "any"}" — ` +
+    `all of ${candidates.join(", ")} are in use.`,
   );
 }
 
-module.exports.claimSlot = claimSlot;
+// ───────────────────────── Cookie snapshot ────────────────────────────
+
+/**
+ * Snapshot cookies from cookieSourceProfile (if configured & present) into
+ * the slot dir. No-op in standalone mode (sourceProfile is null). Returns
+ * the count of files copied — caller can log it.
+ */
+function snapshotCookiesFrom(srcProfile, dstProfile) {
+  if (!srcProfile || !fs.existsSync(srcProfile)) return 0;
+  let copied = 0;
+  for (const rel of COOKIE_FILES) {
+    const s = path.join(srcProfile, rel);
+    const d = path.join(dstProfile, rel);
+    try {
+      if (fs.existsSync(s)) {
+        fs.mkdirSync(path.dirname(d), { recursive: true });
+        fs.copyFileSync(s, d);
+        copied++;
+      }
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] cookie copy ${rel} failed: ${e.code || e.message}\n`);
+    }
+  }
+  return copied;
+}
+
+module.exports = {
+  CONFIG,
+  COOKIE_FILES,
+  loadConfig,
+  claimSlot,
+  findBraveProcessesForDir,
+  listBraveProcessesRaw,
+  reapOrphansFor,
+  isPidAlive,
+  checkCookieAgeDays,
+  findCookiesFile,
+  pickDirCandidates,
+  snapshotCookiesFrom,
+  /** Test seam: whether the optional pool wrapper was found at require time. */
+  hasPoolWrapper: upstreamWrapper !== null,
+};

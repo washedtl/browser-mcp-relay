@@ -7,11 +7,16 @@ const os = require("node:os");
 const { launchBrave, closeBrave, waitForCdpReady } = require("../src/cdp-bridge.js");
 
 // playwright-core has no bundled chromium — use the system Brave install
-// (same path production reads from CONFIG.bravePath).
-const wrapper = require("../../wrap-browser-devtools-mcp.js");
-const SYSTEM_BRAVE = wrapper.CONFIG.bravePath;
+// resolved via the same auto-detect logic the relay uses at launch time.
+const { detectBravePath } = require("../src/detect-browser.js");
+let SYSTEM_BRAVE;
+try {
+  SYSTEM_BRAVE = detectBravePath();
+} catch {
+  SYSTEM_BRAVE = null; // tests that need it will skip
+}
 
-test("launchBrave + connectOverCDP roundtrip on a throwaway profile", async () => {
+test("launchBrave + connectOverCDP roundtrip on a throwaway profile", { skip: !SYSTEM_BRAVE }, async () => {
   const tmp = path.join(os.tmpdir(), `cdp-bridge-test-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
   const handle = await launchBrave({

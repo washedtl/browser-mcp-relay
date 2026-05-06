@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",
+    "browser-devtools-mcp": "^0.6.4",
     "lighthouse": "^11.0.0",
     "playwright-core": "^1.58.0"
   },

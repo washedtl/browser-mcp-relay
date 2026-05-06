@@ -34,55 +34,62 @@ const { RelayServer } = require("./relay-server.js");
 const { launchBrave, closeBrave } = require("./cdp-bridge.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 
-// Path to upstream — same constant as the v2 wrapper.
-const BDMCP_ENTRY =
-  "C:\\Users\\tlip9\\.cursor\\extensions\\serkan-ozal.browser-devtools-mcp-vscode-0.6.3-universal\\node_modules\\browser-devtools-mcp\\dist\\index.js";
-
-const COOKIE_FILES = [
-  "Local State",
-  "Default/Network/Cookies",
-  "Default/Network/Cookies-journal",
-  "Default/Cookies",
-  "Default/Cookies-journal",
-];
+// Path to upstream `browser-devtools-mcp`. Resolution order:
+//   1. BROWSER_RELAY_UPSTREAM_PATH env var (explicit override).
+//   2. require.resolve("browser-devtools-mcp/dist/index.js") — works once the
+//      package is installed as an npm dependency (the published-repo path).
+//   3. The user's Cursor-extension install (kept as a last-resort fallback so
+//      Washed's local install keeps working through the migration).
+//
+// We resolve once at module load; if all three fail we throw with an
+// actionable message before any side effects fire.
+function resolveBdmcpEntry() {
+  const override = process.env.BROWSER_RELAY_UPSTREAM_PATH;
+  if (override && override.length > 0) {
+    if (fs.existsSync(override)) return override;
+    throw new Error(
+      `[mcp-relay] BROWSER_RELAY_UPSTREAM_PATH="${override}" but no file at that path. Fix or unset.`,
+    );
+  }
+  try {
+    return require.resolve("browser-devtools-mcp/dist/index.js");
+  } catch { /* fall through to legacy path */ }
+  const legacy = "C:\\Users\\tlip9\\.cursor\\extensions\\serkan-ozal.browser-devtools-mcp-vscode-0.6.3-universal\\node_modules\\browser-devtools-mcp\\dist\\index.js";
+  if (fs.existsSync(legacy)) return legacy;
+  throw new Error(
+    `[mcp-relay] Could not locate browser-devtools-mcp upstream entry. ` +
+    `Run \`npm install\` (so require.resolve finds it) or set ` +
+    `BROWSER_RELAY_UPSTREAM_PATH=/abs/path/to/browser-devtools-mcp/dist/index.js.`,
+  );
+}
 
 async function main() {
   // 1. Claim slot.
   const { dir, lock, role, release: releasePool } = pool.claimSlot();
   const slotIdx = pool.CONFIG.poolDirs.indexOf(dir) + 1;
-  const cookiesPath = pool.findCookiesFile(pool.CONFIG.cookieSourceProfile);
+  const totalSlots = pool.CONFIG.poolDirs.length;
+  const src = pool.CONFIG.cookieSourceProfile;
+  const cookiesPath = src ? pool.findCookiesFile(src) : null;
   const ageDays = cookiesPath ? pool.checkCookieAgeDays(cookiesPath) : null;
   const ageStr = ageDays === null ? "?" : `${ageDays.toFixed(1)}d`;
   process.stderr.write(
-    `[mcp-relay] slot=${slotIdx}/${pool.CONFIG.poolDirs.length} role=${role} pid=${process.pid} cookieAge=${ageStr} dir=${dir}\n`,
+    `[mcp-relay] slot=${slotIdx}/${totalSlots} role=${role} pid=${process.pid} cookieAge=${ageStr} dir=${dir} mode=${pool.CONFIG.standalone ? "standalone" : "pool"}\n`,
   );
 
-  // 2. Cookie snapshot from source. Mirrors v2 wrapper's snapshotCookiesFrom semantics.
-  const src = pool.CONFIG.cookieSourceProfile;
-  if (fs.existsSync(src)) {
+  // 2. Cookie snapshot from source (skipped in standalone mode — sourceProfile is null).
+  if (src && fs.existsSync(src)) {
     if (ageDays !== null && ageDays > pool.CONFIG.cookieFreshnessWarnDays) {
       process.stderr.write(
-        `[mcp-relay] WARNING: cookie source ${path.basename(src)} is ${ageDays.toFixed(1)} days old (threshold ${pool.CONFIG.cookieFreshnessWarnDays}d). Refresh by launching the 'browser-devtools-mcp-2' MCP and logging into the sites you need.\n`,
+        `[mcp-relay] WARNING: cookie source ${path.basename(src)} is ${ageDays.toFixed(1)} days old (threshold ${pool.CONFIG.cookieFreshnessWarnDays}d). Refresh by launching the dedicated cookie-source MCP and logging into the sites you need.\n`,
       );
     }
-    let copied = 0;
-    for (const rel of COOKIE_FILES) {
-      const s = path.join(src, rel);
-      const d = path.join(dir, rel);
-      try {
-        if (fs.existsSync(s)) {
-          fs.mkdirSync(path.dirname(d), { recursive: true });
-          fs.copyFileSync(s, d);
-          copied++;
-        }
-      } catch (e) {
-        process.stderr.write(`[mcp-relay] cookie copy ${rel} failed: ${e.code || e.message}\n`);
-      }
-    }
-    process.stderr.write(`[mcp-relay] snapshotted ${copied}/${COOKIE_FILES.length} cookie files from ${path.basename(src)}\n`);
-  } else {
+    const copied = pool.snapshotCookiesFrom(src, dir);
+    process.stderr.write(`[mcp-relay] snapshotted ${copied}/${pool.COOKIE_FILES.length} cookie files from ${path.basename(src)}\n`);
+  } else if (src) {
     process.stderr.write(`[mcp-relay] cookie source ${src} missing — fresh login wall expected\n`);
   }
+  // (In standalone mode, no cookie source is configured. The relay's
+  // .browser-data dir is its own session — first-run will hit login walls.)
 
   // 3. SPLIT lazy init: upstream and Brave init separately.
   //    - tools/list (Cursor calls this immediately at MCP connect) only needs
@@ -102,7 +109,8 @@ async function main() {
   let upstreamSpawnPromise = null;
 
   async function spawnUpstream() {
-    process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet)...\n`);
+    const bdmcpEntry = resolveBdmcpEntry();
+    process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet, entry=${bdmcpEntry})...\n`);
     // CDP env points at the port we'll launch Brave on. Upstream is lazy
     // about its CDP attach (only runs in newBrowserContext on first tool
     // execution), so it's safe to set this before Brave is up.
@@ -112,7 +120,7 @@ async function main() {
     upstreamEnv.BROWSER_CDP_CONNECT_URL = `http://127.0.0.1:${port}`;
     upstreamEnv.BROWSER_CDP_ENDPOINT_EXPLICIT = "true";
 
-    upstreamChild = spawn(process.execPath, [BDMCP_ENTRY, "--cursor-mcp-server"], {
+    upstreamChild = spawn(process.execPath, [bdmcpEntry, "--cursor-mcp-server"], {
       stdio: ["pipe", "pipe", "inherit"],
       env: upstreamEnv,
     });
@@ -146,14 +154,17 @@ async function main() {
     if (bridge) return bridge;
     if (!braveLaunchPromise) {
       braveLaunchPromise = (async () => {
-        process.stderr.write(`[mcp-relay] launching Brave (port=${port})...\n`);
+        // Resolve bravePath now, not at module load — auto-detect, env override,
+        // or wrapper hint. Throws a clear error if Brave isn't installed.
+        const bravePath = pool.CONFIG.bravePath || require("./detect-browser.js").detectBravePath();
+        process.stderr.write(`[mcp-relay] launching Brave (port=${port}, exe=${bravePath})...\n`);
         const extensionPath = process.env.BROWSER_LOAD_EXTENSIONS || null;
         const launched = await launchBrave({
           userDataDir: dir,
           port,
           headless: process.env.BROWSER_HEADLESS_ENABLE === "true",
           extensionPath,
-          executablePath: pool.CONFIG.bravePath,
+          executablePath: bravePath,
         });
         process.stderr.write(`[mcp-relay] Brave ready (cdpConnectUrl=${launched.cdpConnectUrl})\n`);
         // Make the bridge available to own-tool handlers via globalThis.

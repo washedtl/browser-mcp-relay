@@ -1,0 +1,23 @@
+{
+  "_comment_1": "Copy this file to local-config.json and fill in any overrides you need. local-config.json is gitignored. ALL keys are optional — if you don't set them, the relay auto-detects sane defaults.",
+
+  "_comment_2": "These keys map 1:1 to environment variables. If both are set, the env var wins. The example below shows the env-var name next to each key.",
+
+  "BROWSER_RELAY_BRAVE_PATH": "",
+  "_BROWSER_RELAY_BRAVE_PATH_doc": "Absolute path to the Brave executable. Leave empty to auto-detect (Win/Mac/Linux standard install locations + Windows registry probe). Examples: 'C:\\\\Program Files\\\\BraveSoftware\\\\Brave-Browser\\\\Application\\\\brave.exe', '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', '/usr/bin/brave-browser'.",
+
+  "BROWSER_RELAY_UPSTREAM_PATH": "",
+  "_BROWSER_RELAY_UPSTREAM_PATH_doc": "Absolute path to browser-devtools-mcp/dist/index.js. Leave empty to use the version installed via npm (resolved by require.resolve). Only set this if you want to point at a custom build or a different install location.",
+
+  "BROWSER_RELAY_POOL_DIR": "",
+  "_BROWSER_RELAY_POOL_DIR_doc": "Opt-in pool mode: absolute path to a single Brave user-data-dir to claim. Leave empty for the default standalone mode (relay creates and uses '<repo>/.browser-data'). Set this if you want to share a profile dir across runs or coordinate with another tool managing a pool of profiles.",
+
+  "BROWSER_RELAY_POOL_SLOT": "",
+  "_BROWSER_RELAY_POOL_SLOT_doc": "Slot identifier (1, 2, ...) used in the slot=N/M banner when pool mode is active. Mostly cosmetic — the lock dir from BROWSER_RELAY_POOL_DIR is what actually arbitrates ownership.",
+
+  "BROWSER_HEADLESS_ENABLE": "false",
+  "_BROWSER_HEADLESS_ENABLE_doc": "Set to 'true' to launch Brave headless. Default: visible window (helpful for debugging, required for CDP-driven login flows).",
+
+  "BROWSER_LOAD_EXTENSIONS": "",
+  "_BROWSER_LOAD_EXTENSIONS_doc": "Path to an unpacked Chrome extension to load via --load-extension. Leave empty for no extension."
+}
