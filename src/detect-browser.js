@@ -14,6 +14,10 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
+// Brave profile/user-data directory (parent of the per-profile subfolders
+// like `Default/`). The cookie file lives at `<profileDir>/Default/Network/Cookies`
+// (modern Chromium 92+) with a fallback to `<profileDir>/Default/Cookies`.
+
 /**
  * Resolve the Brave executable path for the current platform.
  *
@@ -140,7 +144,50 @@ function braveNotFoundError(candidates, platform, extra = {}) {
   );
 }
 
+/**
+ * Resolve the Brave user-data-dir (parent of profile subfolders like `Default/`).
+ *
+ * Returned path is the directory; the cookie SQLite store lives at
+ * `<profileDir>/Default/Network/Cookies` (modern) or `<profileDir>/Default/Cookies`
+ * (legacy, pre-Chromium-92). Use {@link findCookiesFile} from `pool-shared.js`
+ * to resolve to the actual file with fallback.
+ *
+ * Lookup order:
+ *   1. BROWSER_RELAY_BRAVE_PROFILE_DIR env var (used as-is, even if missing —
+ *      caller decides whether to verify existence).
+ *   2. Per-platform default location.
+ *
+ * Returns null on unknown platforms.
+ *
+ * @param {object} [opts]
+ * @param {NodeJS.ProcessEnv} [opts.env=process.env]
+ * @param {NodeJS.Platform} [opts.platform=process.platform]
+ * @param {string} [opts.homedir=os.homedir()] — test seam
+ * @returns {string | null}
+ */
+function detectBraveProfileDir(opts = {}) {
+  const env = opts.env || process.env;
+  const platform = opts.platform || process.platform;
+  const homedir = opts.homedir || os.homedir();
+
+  const override = env.BROWSER_RELAY_BRAVE_PROFILE_DIR;
+  if (override && override.length > 0) return override;
+
+  if (platform === "win32") {
+    const localAppData = env.LOCALAPPDATA || path.join(homedir, "AppData", "Local");
+    return path.join(localAppData, "BraveSoftware", "Brave-Browser", "User Data");
+  }
+  if (platform === "darwin") {
+    return path.join(homedir, "Library", "Application Support", "BraveSoftware", "Brave-Browser");
+  }
+  if (platform === "linux") {
+    return path.join(homedir, ".config", "BraveSoftware", "Brave-Browser");
+  }
+  return null;
+}
+
 module.exports = {
   detectBravePath,
+  detectBraveProfileDir,
   standardLocations,
 };

@@ -49,3 +49,7 @@ the relay reads env vars at runtime, the example file is documentation).
 
 - **Standalone (default)** — One Brave per relay process, profile stored at `<repo>/.browser-data`. No cookie snapshot. Suitable for a fresh clone.
 - **Pool (opt-in)** — Set `BROWSER_RELAY_POOL_DIR` to a profile dir managed elsewhere. If a `wrap-browser-devtools-mcp.js` file is present two directories above this repo, its richer config (multi-slot pool, cookie snapshot from a dedicated source profile, slot roles) is reused. Otherwise pool mode behaves like standalone with a custom dir.
+
+### Platform support
+
+Tested on Windows. macOS and Linux are supported by the cross-platform process / browser / cookie-path layers (`src/process-shim.js`, `src/detect-browser.js`) but have not yet been exercised end-to-end by the maintainers — please report any issues.

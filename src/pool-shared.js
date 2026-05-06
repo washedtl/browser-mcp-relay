@@ -21,8 +21,9 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { execSync, spawnSync } = require("node:child_process");
-const { detectBravePath } = require("./detect-browser.js");
+const { spawnSync } = require("node:child_process");
+const { detectBravePath, detectBraveProfileDir } = require("./detect-browser.js");
+const processShim = require("./process-shim.js");
 
 // ───────────────────────────── Constants ─────────────────────────────
 
@@ -134,15 +135,18 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
 const CONFIG = loadConfig();
 
 // ───────────────────────── Process introspection ─────────────────────
-// Windows-only helpers (lifted from wrap-browser-devtools-mcp.js so the
-// relay no longer requires that file at runtime). On non-Windows hosts
-// these become safe no-ops that return empty / "alive=false" — Brave
-// reaping isn't supported on Mac/Linux yet (W2's job).
+// Cross-platform via `./process-shim.js`. Win uses PowerShell; Mac/Linux use
+// plain `ps`. The brave-process needle differs by platform: Windows command
+// lines contain `brave.exe` literally, Mac/Linux contain `brave` (no .exe).
 
-/** Pure parser. Given the stdout of the PowerShell brave-process probe
- *  (one `<PID>|<command-line>` line per process) and a profile dir,
- *  return the PIDs of brave processes whose command line includes
- *  `--user-data-dir=<dir>` either unquoted or with `"..."` around dir. */
+/** Pure parser. Given the stdout of the brave-process probe (one
+ *  `<PID>|<command-line>` line per process) and a profile dir, return the
+ *  PIDs of brave processes whose command line includes `--user-data-dir=<dir>`
+ *  either unquoted or with `"..."` around dir.
+ *
+ *  Kept as the canonical Windows-shape parser for backwards compat with
+ *  external callers and for unit tests. Internally we use the structured
+ *  output of `processShim.listProcessesByCommand`. */
 function findBraveProcessesForDir(stdoutText, dir) {
   const needleBare = `--user-data-dir=${dir}`;
   const needleQuoted = `--user-data-dir="${dir}"`;
@@ -158,75 +162,86 @@ function findBraveProcessesForDir(stdoutText, dir) {
   return pids;
 }
 
-/** Snapshot all brave.exe processes via PowerShell on Windows. Returns
- *  one `PID|CommandLine` line per process, joined by \r\n. Returns "" on
- *  any failure or non-Windows platform (caller treats as "no brave running"). */
-function listBraveProcessesRaw() {
-  if (process.platform !== "win32") return "";
-  const result = spawnSync(
-    "powershell",
-    [
-      "-NoProfile",
-      "-Command",
-      "Get-CimInstance Win32_Process -Filter \"name='brave.exe'\" | ForEach-Object { ''+$_.ProcessId+'|'+$_.CommandLine }",
-    ],
-    { encoding: "utf8", windowsHide: true },
-  );
-  if (result.status !== 0) {
-    process.stderr.write(
-      `[mcp-relay] PowerShell brave-process probe failed (exit ${result.status}): ${result.stderr || ""}\n`,
-    );
-    return "";
-  }
-  return result.stdout || "";
+/** Brave-needle for the current platform — needs to differ because Win
+ *  command lines include `brave.exe` literally while Mac/Linux just say
+ *  `brave`. Exposed for testing. */
+function braveNeedle(platform) {
+  return platform === "win32" ? "brave.exe" : "brave";
 }
 
-/** Find orphan brave.exe PIDs holding `dir` as their user-data-dir
- *  (parent + all child helpers) and kill each with `taskkill /F /T`.
+/** Snapshot all Brave processes. Returns one `PID|CommandLine` line per
+ *  process, joined by `\r\n`. Empty string on failure or no matches.
+ *
+ *  Cross-platform via processShim. Backwards compat: still returns the
+ *  pipe-formatted text shape so existing callers and tests work unchanged. */
+function listBraveProcessesRaw(opts = {}) {
+  const platform = opts._platform || process.platform;
+  const procs = processShim.listProcessesByCommand(braveNeedle(platform), opts);
+  return procs.map((p) => `${p.pid}|${p.command}`).join("\r\n");
+}
+
+/** Find orphan Brave PIDs holding `dir` as their user-data-dir (parent +
+ *  any child helpers Brave spawned) and kill them. On Windows we use
+ *  `taskkill /F /T` to take the whole tree; on POSIX we send SIGTERM, then
+ *  SIGKILL after a brief grace period.
+ *
  *  Best-effort; logs failures to stderr; returns the count of processes
- *  successfully killed. Caller must already hold the wrapper lock for
- *  `dir`. No-op on non-Windows (W2 will add Mac/Linux paths). */
-function reapOrphansFor(dir) {
-  if (process.platform !== "win32") return 0;
-  const stdout = listBraveProcessesRaw();
-  const pids = findBraveProcessesForDir(stdout, dir);
+ *  we successfully signaled. Caller must already hold the wrapper lock
+ *  for `dir`. */
+function reapOrphansFor(dir, opts = {}) {
+  const platform = opts._platform || process.platform;
+  const spawn = opts._spawnSync || spawnSync;
+  const procs = processShim.listProcessesByCommand(braveNeedle(platform), opts);
+  const needleBare = `--user-data-dir=${dir}`;
+  const needleQuoted = `--user-data-dir="${dir}"`;
+  const matched = procs.filter(
+    (p) => p.command.includes(needleBare) || p.command.includes(needleQuoted),
+  );
+
   let killed = 0;
-  for (const pid of pids) {
-    try {
-      execSync(`taskkill /F /PID ${pid} /T`, { windowsHide: true, stdio: "ignore" });
-      killed++;
-      process.stderr.write(`[mcp-relay] reaped orphan brave.exe pid=${pid} holding ${dir}\n`);
-    } catch (e) {
-      process.stderr.write(`[mcp-relay] taskkill pid=${pid} failed: ${e.message}\n`);
+  for (const { pid } of matched) {
+    if (platform === "win32") {
+      const result = spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+        windowsHide: true,
+      });
+      if (result && result.status === 0) {
+        killed++;
+        process.stderr.write(`[mcp-relay] reaped orphan brave.exe pid=${pid} holding ${dir}\n`);
+      } else {
+        const err = (result && (result.stderr || result.error)) || "non-zero exit";
+        process.stderr.write(`[mcp-relay] taskkill pid=${pid} failed: ${err}\n`);
+      }
+    } else {
+      // POSIX: SIGTERM, then SIGKILL after a short grace period if still alive.
+      const kill = opts._processKill || ((p, s) => process.kill(p, s));
+      try {
+        kill(pid, "SIGTERM");
+        killed++;
+        process.stderr.write(`[mcp-relay] reaped orphan brave pid=${pid} holding ${dir} (SIGTERM)\n`);
+      } catch (e) {
+        process.stderr.write(`[mcp-relay] kill SIGTERM pid=${pid} failed: ${e.message}\n`);
+        continue;
+      }
+      // Best-effort SIGKILL escalation. We don't actually sleep here (we're
+      // synchronous + opts can override kill for tests); the entrypoint's
+      // claimSlot call is on a hot path we don't want to block on.
+      // Tests inject _processKill if they need to verify the SIGKILL path.
+      try {
+        if (processShim.isPidAlive(pid, opts)) {
+          kill(pid, "SIGKILL");
+        }
+      } catch {
+        // Best-effort: if the process is already gone, that's fine.
+      }
     }
   }
   return killed;
 }
 
-/** PID liveness check. Windows uses `tasklist`; non-Windows hosts return
- *  false until W2 adds the POSIX `kill -0` path. Returns false for invalid
- *  input (NaN, undefined, ≤ 0) without spawning a child. */
-function isPidAlive(pid) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  if (process.platform !== "win32") {
-    // POSIX: kill -0 returns 0 if the process exists and we have permission.
-    // Best-effort; W2 hardens this.
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  try {
-    const out = execSync(`tasklist /fi "PID eq ${pid}" /fo csv /nh`, {
-      encoding: "utf8",
-      windowsHide: true,
-    });
-    return out.includes(`,"${pid}",`);
-  } catch {
-    return false;
-  }
+/** PID liveness check. Delegates to processShim for cross-platform handling
+ *  (Win uses `tasklist`; Mac/Linux use POSIX `process.kill(pid, 0)`). */
+function isPidAlive(pid, opts) {
+  return processShim.isPidAlive(pid, opts);
 }
 
 // ───────────────────────── Cookie helpers ────────────────────────────
@@ -246,12 +261,21 @@ function checkCookieAgeDays(absPath) {
 /** Return the path to the canonical cookie SQLite store inside a
  *  Chromium profile dir, preferring the modern Brave/Chrome 92+
  *  path (Default/Network/Cookies) and falling back to the legacy
- *  path (Default/Cookies). Returns null if neither exists. */
+ *  path (Default/Cookies). Returns null if neither exists.
+ *
+ *  When called with no `profileDir`, falls back to {@link detectBraveProfileDir}
+ *  for the host's default Brave install. This makes `findCookiesFile()` a
+ *  one-call helper for cookie-export tools that just want "give me the user's
+ *  Brave cookies on whatever OS they're on". */
 function findCookiesFile(profileDir) {
-  if (!profileDir) return null;
-  const modern = path.join(profileDir, "Default", "Network", "Cookies");
+  let dir = profileDir;
+  if (!dir) {
+    dir = detectBraveProfileDir();
+  }
+  if (!dir) return null;
+  const modern = path.join(dir, "Default", "Network", "Cookies");
   if (fs.existsSync(modern)) return modern;
-  const legacy = path.join(profileDir, "Default", "Cookies");
+  const legacy = path.join(dir, "Default", "Cookies");
   if (fs.existsSync(legacy)) return legacy;
   return null;
 }
@@ -377,6 +401,7 @@ module.exports = {
   listBraveProcessesRaw,
   reapOrphansFor,
   isPidAlive,
+  braveNeedle,
   checkCookieAgeDays,
   findCookiesFile,
   pickDirCandidates,

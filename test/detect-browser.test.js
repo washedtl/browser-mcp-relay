@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const path = require("node:path");
 
-const { detectBravePath, standardLocations } = require("../src/detect-browser.js");
+const { detectBravePath, detectBraveProfileDir, standardLocations } = require("../src/detect-browser.js");
 
 // Test seam helpers ─ keep the actual fs/spawn isolated from these unit tests
 // so they don't depend on whether the host has Brave installed.
@@ -185,4 +185,67 @@ test("standardLocations returns at least one entry on darwin and linux", () => {
 
 test("standardLocations returns [] for unknown platforms", () => {
   assert.deepStrictEqual(standardLocations("freebsd", {}), []);
+});
+
+// ───── detectBraveProfileDir ─────
+
+test("detectBraveProfileDir returns the env override when set", () => {
+  const result = detectBraveProfileDir({
+    env: { BROWSER_RELAY_BRAVE_PROFILE_DIR: "/custom/profile" },
+    platform: "linux",
+    homedir: "/home/u",
+  });
+  assert.strictEqual(result, "/custom/profile");
+});
+
+test("detectBraveProfileDir on Win uses LOCALAPPDATA\\BraveSoftware\\Brave-Browser\\User Data", () => {
+  const result = detectBraveProfileDir({
+    env: { LOCALAPPDATA: "C:\\Users\\u\\AppData\\Local" },
+    platform: "win32",
+    homedir: "C:\\Users\\u",
+  });
+  assert.strictEqual(
+    result,
+    path.join("C:\\Users\\u\\AppData\\Local", "BraveSoftware", "Brave-Browser", "User Data"),
+  );
+});
+
+test("detectBraveProfileDir on Win falls back to homedir\\AppData\\Local when LOCALAPPDATA is unset", () => {
+  const result = detectBraveProfileDir({
+    env: {},
+    platform: "win32",
+    homedir: "C:\\Users\\fallback",
+  });
+  assert.match(result, /AppData[\\/]Local[\\/]BraveSoftware[\\/]Brave-Browser[\\/]User Data$/);
+});
+
+test("detectBraveProfileDir on darwin uses ~/Library/Application Support/BraveSoftware/Brave-Browser", () => {
+  const result = detectBraveProfileDir({
+    env: {},
+    platform: "darwin",
+    homedir: "/Users/u",
+  });
+  assert.strictEqual(
+    result,
+    path.join("/Users/u", "Library", "Application Support", "BraveSoftware", "Brave-Browser"),
+  );
+});
+
+test("detectBraveProfileDir on linux uses ~/.config/BraveSoftware/Brave-Browser", () => {
+  const result = detectBraveProfileDir({
+    env: {},
+    platform: "linux",
+    homedir: "/home/u",
+  });
+  assert.strictEqual(
+    result,
+    path.join("/home/u", ".config", "BraveSoftware", "Brave-Browser"),
+  );
+});
+
+test("detectBraveProfileDir returns null on unknown platforms", () => {
+  assert.strictEqual(
+    detectBraveProfileDir({ env: {}, platform: "freebsd", homedir: "/home/u" }),
+    null,
+  );
 });
