@@ -212,7 +212,7 @@ function reapOrphansFor(dir, opts = {}) {
         process.stderr.write(`[mcp-relay] taskkill pid=${pid} failed: ${err}\n`);
       }
     } else {
-      // POSIX: SIGTERM, then SIGKILL after a short grace period if still alive.
+      // POSIX: SIGTERM, then immediate SIGKILL if still alive.
       const kill = opts._processKill || ((p, s) => process.kill(p, s));
       try {
         kill(pid, "SIGTERM");
@@ -222,10 +222,10 @@ function reapOrphansFor(dir, opts = {}) {
         process.stderr.write(`[mcp-relay] kill SIGTERM pid=${pid} failed: ${e.message}\n`);
         continue;
       }
-      // Best-effort SIGKILL escalation. We don't actually sleep here (we're
-      // synchronous + opts can override kill for tests); the entrypoint's
-      // claimSlot call is on a hot path we don't want to block on.
-      // Tests inject _processKill if they need to verify the SIGKILL path.
+      // Synchronous SIGKILL escalation with no sleep — claimSlot is on the hot
+      // path and we can't block. SIGTERM is async at the kernel level, so this
+      // check usually still sees the process alive and double-signals. Fine for
+      // orphan reaping (we want them dead either way); not a graceful shutdown.
       try {
         if (processShim.isPidAlive(pid, opts)) {
           kill(pid, "SIGKILL");

@@ -59,7 +59,13 @@ function listProcessesWin(needle, spawn) {
     ["-NoProfile", "-Command", psScript],
     { encoding: "utf8", windowsHide: true },
   );
-  if (!result || result.status !== 0) return [];
+  if (!result || result.status !== 0) {
+    const stderr = result && result.stderr ? String(result.stderr).trim() : "";
+    if (stderr) {
+      process.stderr.write(`[mcp-relay] PowerShell process probe failed: ${stderr}\n`);
+    }
+    return [];
+  }
   return parsePidPipeOutput(result.stdout || "");
 }
 
@@ -69,7 +75,13 @@ function listProcessesWin(needle, spawn) {
  *  capital B but callers may pass lowercase "brave"). */
 function listProcessesPosix(needle, spawn) {
   const result = spawn("ps", ["-eo", "pid,command"], { encoding: "utf8" });
-  if (!result || result.status !== 0) return [];
+  if (!result || result.status !== 0) {
+    const stderr = result && result.stderr ? String(result.stderr).trim() : "";
+    if (stderr) {
+      process.stderr.write(`[mcp-relay] ps process probe failed: ${stderr}\n`);
+    }
+    return [];
+  }
   const out = [];
   const needleLower = needle.toLowerCase();
   // ps output:  "  PID COMMAND" header, then "  1234 /path/to/cmd args..."

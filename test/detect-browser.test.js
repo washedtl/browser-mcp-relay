@@ -243,6 +243,30 @@ test("detectBraveProfileDir on linux uses ~/.config/BraveSoftware/Brave-Browser"
   );
 });
 
+test("detectBraveProfileDir on linux honors XDG_CONFIG_HOME when set", () => {
+  const result = detectBraveProfileDir({
+    env: { XDG_CONFIG_HOME: "/custom/config" },
+    platform: "linux",
+    homedir: "/home/u",
+  });
+  assert.strictEqual(
+    result,
+    path.join("/custom/config", "BraveSoftware", "Brave-Browser"),
+  );
+});
+
+test("detectBraveProfileDir on linux ignores empty XDG_CONFIG_HOME", () => {
+  const result = detectBraveProfileDir({
+    env: { XDG_CONFIG_HOME: "" },
+    platform: "linux",
+    homedir: "/home/u",
+  });
+  assert.strictEqual(
+    result,
+    path.join("/home/u", ".config", "BraveSoftware", "Brave-Browser"),
+  );
+});
+
 test("detectBraveProfileDir returns null on unknown platforms", () => {
   assert.strictEqual(
     detectBraveProfileDir({ env: {}, platform: "freebsd", homedir: "/home/u" }),

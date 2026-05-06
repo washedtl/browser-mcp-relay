@@ -181,7 +181,11 @@ function detectBraveProfileDir(opts = {}) {
     return path.join(homedir, "Library", "Application Support", "BraveSoftware", "Brave-Browser");
   }
   if (platform === "linux") {
-    return path.join(homedir, ".config", "BraveSoftware", "Brave-Browser");
+    // Brave on Linux honors XDG_CONFIG_HOME, fall back to ~/.config per spec.
+    const xdgConfigHome = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0
+      ? env.XDG_CONFIG_HOME
+      : path.join(homedir, ".config");
+    return path.join(xdgConfigHome, "BraveSoftware", "Brave-Browser");
   }
   return null;
 }

@@ -143,12 +143,15 @@ test("listProcessesByCommand on macOS uses `ps` (same POSIX path as Linux)", () 
         " 4444 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser\n",
     };
   };
-  const result = listProcessesByCommand("Brave Browser", {
+  // Lowercase needle vs capital-B command — exercises case-insensitive match.
+  // On macOS the binary path is "Brave Browser" with capital B but the
+  // braveNeedle("darwin") helper returns lowercase "brave".
+  const result = listProcessesByCommand("brave", {
     _platform: "darwin",
     _spawnSync: fakeSpawn,
   });
   assert.strictEqual(cmdSeen, "ps");
-  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result.length, 1, "lowercase 'brave' must match 'Brave Browser' command");
   assert.strictEqual(result[0].pid, 4444);
 });
 
