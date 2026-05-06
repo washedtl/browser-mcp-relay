@@ -30,7 +30,7 @@ module.exports = {
     const bridge = globalThis.__relayBridge;
     if (!bridge) {
       return {
-        content: [{ type: "text", text: "lighthouse_audit unavailable: relay bridge not initialized (Phase B not active)" }],
+        content: [{ type: "text", text: "lighthouse_audit unavailable: relay bridge not initialized" }],
         isError: true,
       };
     }

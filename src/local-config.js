@@ -92,12 +92,8 @@ function applyLocalConfigToEnv(env, opts = {}) {
 /** Path to the canonical local-config.json — exposed for tests / setup script. */
 function getLocalConfigPath() { return LOCAL_CONFIG_PATH; }
 
-/** Path to the repo root the relay is running from. */
-function getRepoRoot() { return REPO_ROOT; }
-
 module.exports = {
   loadLocalConfig,
   applyLocalConfigToEnv,
   getLocalConfigPath,
-  getRepoRoot,
 };

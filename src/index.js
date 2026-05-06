@@ -43,11 +43,9 @@ const RELAY_ENV = applyLocalConfigToEnv(process.env);
 //   1. BROWSER_RELAY_UPSTREAM_PATH env var (explicit override).
 //   2. require.resolve("browser-devtools-mcp/dist/index.js") — works once the
 //      package is installed as an npm dependency (the published-repo path).
-//   3. The user's Cursor-extension install (kept as a last-resort fallback so
-//      Washed's local install keeps working through the migration).
 //
-// We resolve once at module load; if all three fail we throw with an
-// actionable message before any side effects fire.
+// We resolve once at module load; if both fail we throw with an actionable
+// message before any side effects fire.
 function resolveBdmcpEntry() {
   const override = RELAY_ENV.BROWSER_RELAY_UPSTREAM_PATH;
   if (override && override.length > 0) {
@@ -58,14 +56,13 @@ function resolveBdmcpEntry() {
   }
   try {
     return require.resolve("browser-devtools-mcp/dist/index.js");
-  } catch { /* fall through to legacy path */ }
-  const legacy = "C:\\Users\\tlip9\\.cursor\\extensions\\serkan-ozal.browser-devtools-mcp-vscode-0.6.3-universal\\node_modules\\browser-devtools-mcp\\dist\\index.js";
-  if (fs.existsSync(legacy)) return legacy;
-  throw new Error(
-    `[mcp-relay] Could not locate browser-devtools-mcp upstream entry. ` +
-    `Run \`npm install\` (so require.resolve finds it) or set ` +
-    `BROWSER_RELAY_UPSTREAM_PATH=/abs/path/to/browser-devtools-mcp/dist/index.js.`,
-  );
+  } catch {
+    throw new Error(
+      `[mcp-relay] Could not locate browser-devtools-mcp upstream entry. ` +
+      `Run \`npm install\` (so require.resolve finds it) or set ` +
+      `BROWSER_RELAY_UPSTREAM_PATH=/abs/path/to/browser-devtools-mcp/dist/index.js.`,
+    );
+  }
 }
 
 async function main() {

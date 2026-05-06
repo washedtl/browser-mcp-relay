@@ -8,7 +8,7 @@
 
 ## Upstream Architecture (browser-devtools-mcp 0.6.4)
 
-**Location on disk:** `C:\Users\tlip9\.cursor\extensions\serkan-ozal.browser-devtools-mcp-vscode-0.6.3-universal\node_modules\browser-devtools-mcp\`
+**Location on disk:** at the time of this research, the upstream was loaded from a Cursor-extension install of `serkan-ozal.browser-devtools-mcp-vscode` (`browser-devtools-mcp 0.6.3`); since W1 the relay resolves it via `require.resolve("browser-devtools-mcp/dist/index.js")` from the npm dependency.
 
 **Key files:**
 - `dist/index.js` (4-line entry, parses `--transport` flag, calls `startStdioServer()` or `startStreamableHTTPServer()`)

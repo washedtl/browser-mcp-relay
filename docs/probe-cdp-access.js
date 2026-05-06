@@ -5,19 +5,17 @@
 //   4. Confirm we can do this against the SAME Brave that upstream
 //      browser-devtools-mcp could attach to via BROWSER_CDP_CONNECT_URL.
 //
-// Run: node ~/.claude/scripts/browser-mcp-relay/docs/probe-cdp-access.js
-//
-// Uses upstream's bundled playwright (no need to install our own yet).
+// Archival: this probe pre-dates the relay's first-class `playwright-core`
+// dep. It originally resolved playwright from the upstream's bundled
+// node_modules at a Cursor-extension install path. To re-run today, install
+// from the repo root (`npm install`) and replace the require below with
+// `require("playwright-core")`.
 
-const path = require("node:path");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 
-const UPSTREAM_NODE_MODULES =
-  "C:\\Users\\tlip9\\.cursor\\extensions\\serkan-ozal.browser-devtools-mcp-vscode-0.6.3-universal\\node_modules";
-
-// Resolve playwright from upstream's node_modules so we don't need our own install.
-const playwright = require(path.join(UPSTREAM_NODE_MODULES, "playwright"));
+// To re-run, change this to `require("playwright-core")` after `npm install`.
+const playwright = require("playwright-core");
 
 // Use Playwright's bundled chromium (the one upstream uses) so we know the
 // binary is the same Brave/Chromium build the rest of the system targets.

@@ -23,7 +23,6 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const os = require("node:os");
 const readline = require("node:readline");
 const { spawn } = require("node:child_process");
 
@@ -127,10 +126,20 @@ async function step3_detectBrave(prompter) {
   }
 
   if (detected) {
-    process.stdout.write(`Detected Brave: ${detected}\n`);
-    const useIt = await askYesNo(prompter, "Use this Brave install?", true);
-    if (useIt) return detected;
-  } else {
+    // Re-validate: detection caches its result, but a path that resolved at
+    // module-load time may have been uninstalled / moved since. If the file
+    // is gone, fall through to the manual-entry prompt below rather than
+    // silently writing a dead path into local-config.json.
+    if (!fs.existsSync(detected)) {
+      process.stdout.write(`Detected Brave path no longer exists on disk: ${detected}\n`);
+      detected = null;
+    } else {
+      process.stdout.write(`Detected Brave: ${detected}\n`);
+      const useIt = await askYesNo(prompter, "Use this Brave install?", true);
+      if (useIt) return detected;
+    }
+  }
+  if (!detected) {
     const checked = detectBrowser.standardLocations(process.platform, process.env);
     process.stdout.write("Brave was not found at any standard location:\n");
     for (const loc of checked) process.stdout.write(`  - ${loc}\n`);
