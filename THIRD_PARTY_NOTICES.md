@@ -76,7 +76,7 @@ The audit below records what was checked at the time these notices were written.
 | `@modelcontextprotocol/sdk` | Anthropic — corporate sponsor, active releases, broad LLM-tooling adoption. | Low |
 | `lighthouse` | Google Chrome team — long-running, multi-maintainer, OSS process well-established. | Low |
 | `playwright-core` | Microsoft — first-party browser-automation team, near-weekly releases. | Low |
-| `browser-devtools-mcp` | Single maintainer (`serkan-ozal`). Active release cadence (0.6.4 → 0.6.12 in two months). Permissive but non-OSI license. **Single-maintainer risk** — if this package is abandoned, the relay's forwarded toolset breaks; the relay can be unblocked by pinning the last working version or by replacing the upstream resolution path with a fork. | Medium |
+| `browser-devtools-mcp` | Single maintainer (`serkan-ozal`). Active release cadence as of this writing. Permissive but non-OSI license. **Single-maintainer risk** — if this package is abandoned, the relay's forwarded toolset breaks; the relay can be unblocked by pinning the last working version or by replacing the upstream resolution path with a fork. | Medium |
 
 Transitive deps were not enumerated in this document; run `npm ls` for the full tree, or
 `npm audit --omit=dev` for vulnerability signals.
