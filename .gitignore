@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.cache/
+.browser-data*/
+local-config.json
+coverage/
+.DS_Store

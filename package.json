@@ -1,0 +1,18 @@
+{
+  "name": "browser-mcp-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.js test/**/*.test.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.23.0",
+    "lighthouse": "^11.0.0",
+    "playwright-core": "^1.58.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
