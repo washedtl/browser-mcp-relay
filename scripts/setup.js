@@ -281,7 +281,7 @@ function step8_printMcpSnippet() {
 
 /**
  * Spawn `node src/index.js`, send a single tools/list JSON-RPC request over
- * stdin, and wait for a reply. Verify ≥50 tools (41 forwarded + 16 own = 57).
+ * stdin, and wait for a reply. Verify ≥50 tools (51 forwarded + 16 own = 67).
  * Kill the relay regardless of outcome. Returns { ok, count, reason }.
  *
  * Self-contained — does NOT require any of the relay's modules itself, so

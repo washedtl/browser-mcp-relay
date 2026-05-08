@@ -515,13 +515,13 @@
   }
 
   // Standard MCP-registration snippet for ~/.claude.json. Path placeholders
-  // are obvious — we don't read the user's .claude.json.
+  // are obvious — we don't read the user's .claude.json. Kept in sync with
+  // what scripts/setup.js prints (same key, same entry point).
   function buildMcpSnippet() {
     return JSON.stringify({
-      "browser-devtools-mcp-relay": {
+      "browser-mcp-relay": {
         command: "node",
-        args: ["<absolute-path-to-repo>/scripts/wrap-browser-devtools-mcp.js"],
-        env: {},
+        args: ["<absolute-path-to-repo>/src/index.js"],
       },
     }, null, 2);
   }

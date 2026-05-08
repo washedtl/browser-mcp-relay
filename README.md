@@ -98,7 +98,7 @@ Your AI sees **67 tools** total and doesn't know or care where each one comes fr
 
 ## 🌐 Overview
 
-`browser-mcp-relay` spawns [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) as a child process, forwards its **41 upstream tools** verbatim over JSON-RPC, and adds **16 first-party tools** of its own. Both layers attach to the *same* Brave browser instance over CDP, so the merged `tools/list` looks (to the MCP client) like one bigger MCP — **67 tools total**.
+`browser-mcp-relay` spawns [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) as a child process, forwards its **51 upstream tools** verbatim over JSON-RPC, and adds **16 first-party tools** of its own. Both layers attach to the *same* Brave browser instance over CDP, so the merged `tools/list` looks (to the MCP client) like one bigger MCP — **67 tools total**.
 
 You add a tool by dropping a file in `src/own-tools/`. No upstream fork, no patch maintenance, no contribution-back blocker.
 
@@ -460,7 +460,7 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
 
 - 📥 The relay receives MCP messages on stdin from your client.
 - 📋 `tools/list` → merges the upstream's catalog with the 16 own-tool definitions and returns one combined list.
-- ⚙️ `tools/call` → either forwards to the upstream child (for the 41 forwarded tools) or runs an own-tool handler directly.
+- ⚙️ `tools/call` → either forwards to the upstream child (for the 51 forwarded tools) or runs an own-tool handler directly.
 - 🔌 Both paths attach to the same Brave instance: the upstream uses `BROWSER_CDP_CONNECT_URL`, own-tools use Playwright's `chromium.connectOverCDP` against the same port.
 - 🪶 One Brave per relay process. Brave is launched **lazily on the first `tools/call`**, not at startup.
 
@@ -547,9 +547,9 @@ Set `BROWSER_RELAY_INSPECTOR_PORT` in your MCP-client config (e.g. `~/.claude.js
 // ~/.claude.json (excerpt)
 {
   "mcpServers": {
-    "browser-devtools-mcp-relay": {
+    "browser-mcp-relay": {
       "command": "node",
-      "args": ["<absolute-path-to-repo>/scripts/wrap-browser-devtools-mcp.js"],
+      "args": ["<absolute-path-to-repo>/src/index.js"],
       "env": {
         "BROWSER_RELAY_INSPECTOR_PORT": "9091"
       }
@@ -651,7 +651,7 @@ Direct-dependency licenses, including the Elastic-2.0 callout for the upstream `
 
 ## 🙏 Credits
 
-Built on top of [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) by **Serkan Ozal**. The upstream provides the 41 forwarded tools that make this relay useful out of the box.
+Built on top of [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) by **Serkan Ozal**. The upstream provides the 51 forwarded tools that make this relay useful out of the box.
 
 The MCP protocol itself is defined by Anthropic — see [modelcontextprotocol.io](https://modelcontextprotocol.io/).
 

@@ -1,7 +1,7 @@
 // cdp-bridge.js — launches Brave for a slot via Playwright launchPersistentContext
 // with a remote-debugging-port that BOTH our relay AND upstream attach to via
-// chromium.connectOverCDP. Verified architecture from Phase 0
-// (see docs/phase-0-research.md and docs/probe-cdp-access.js).
+// chromium.connectOverCDP. See docs/probe-cdp-access.js for the standalone
+// probe used to verify this architecture.
 
 const { chromium } = require("playwright-core");
 

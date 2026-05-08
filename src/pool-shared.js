@@ -8,8 +8,8 @@
 //      Cookie snapshot is skipped (no source profile to snapshot from).
 //
 //   2. POOL (opt-in) — set both BROWSER_RELAY_POOL_DIR and BROWSER_RELAY_POOL_SLOT.
-//      The relay claims that one specific dir. If the host also has the
-//      private wrap-browser-devtools-mcp.js wrapper sitting next to this repo,
+//      The relay claims that one specific dir. If the host also has an
+//      optional wrap-browser-devtools-mcp.js wrapper sitting next to this repo,
 //      its richer config (slotRoles, cookieSourceProfile, multiple poolDirs)
 //      is used. Otherwise pool mode degrades to "use this single dir as
 //      if it were standalone".
@@ -74,16 +74,17 @@ const COOKIE_FILES = SNAPSHOT_FILES;
 
 // ───────────────────────── Optional wrapper bridge ───────────────────
 //
-// If the user has the private pool wrapper installed (Washed's setup), we
-// reuse its richer config. Otherwise we operate standalone. The require is
-// best-effort — failure here is the normal published-repo path.
+// If a sibling-of-sibling pool wrapper exists, we reuse its richer config.
+// This is the maintainer's local-development layout
+// (`<parent>/wrap-browser-devtools-mcp.js`); most public users won't have
+// this file, which is fine — pool mode is opt-in via BROWSER_RELAY_POOL_DIR
+// and standalone mode is the default.
 
 let upstreamWrapper = null;
 try {
-  // Resolve from the user's ~/.claude/scripts/ if present. The wrapper file
-  // is a sibling-of-sibling of this module ONLY in Washed's local layout
-  // (.claude/scripts/browser-mcp-relay/src/pool-shared.js). Try that first;
-  // if missing, leave wrapper null.
+  // The wrapper file is a sibling-of-sibling of this module
+  // (`<parent>/wrap-browser-devtools-mcp.js`). Try to load it; if missing,
+  // leave wrapper null and operate standalone.
   const wrapperPath = path.resolve(__dirname, "..", "..", "wrap-browser-devtools-mcp.js");
   if (fs.existsSync(wrapperPath)) {
     upstreamWrapper = require(wrapperPath);
@@ -101,7 +102,7 @@ try {
  *
  *   - bravePath: BROWSER_RELAY_BRAVE_PATH > detectBravePath() > wrapper config
  *   - poolDirs:  BROWSER_RELAY_POOL_DIR (single-element array, opt-in)
- *                > wrapper.CONFIG.poolDirs (Washed's pool)
+ *                > wrapper.CONFIG.poolDirs (when the optional wrapper is present)
  *                > [<repo>/.browser-data] (standalone default)
  *   - cookieSourceProfile: wrapper.CONFIG.cookieSourceProfile if present, else null
  *   - cookieFreshnessWarnDays: wrapper.CONFIG or 7

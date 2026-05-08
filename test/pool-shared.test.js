@@ -39,8 +39,8 @@ test("loadConfig() returns a fresh object with standalone defaults when no env /
   const cfg = pool.loadConfig({ env: {}, repoRoot: "C:\\fake\\repo" });
   assert.ok(Array.isArray(cfg.poolDirs));
   // Without BROWSER_RELAY_POOL_DIR and without the wrapper, poolDirs is the
-  // standalone default ([<repo>/.browser-data]). With wrapper present (Washed's
-  // setup) poolDirs is the wrapper's pool. Both shapes are valid.
+  // standalone default ([<repo>/.browser-data]). With the optional wrapper
+  // present, poolDirs is the wrapper's pool. Both shapes are valid.
   assert.ok(cfg.poolDirs.length >= 1);
   assert.strictEqual(typeof cfg.standalone, "boolean");
 });
@@ -254,8 +254,9 @@ test("findCookiesFile with no profileDir falls through to detectBraveProfileDir 
   // the contract is "null if neither modern nor legacy file exists". This
   // exercises that fallback path without mocking.
   const result = pool.findCookiesFile();
-  // We can't assert null universally (Washed's host has Brave installed), but we
-  // can assert: it's either a string ending in "Cookies", or null.
+  // We can't assert null universally (the maintainer's dev host has Brave
+  // installed), but we can assert: it's either a string ending in "Cookies",
+  // or null.
   if (result !== null) {
     assert.match(result, /Cookies$/);
   }

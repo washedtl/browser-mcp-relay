@@ -127,7 +127,7 @@ function fetch(port, path, method = "GET") {
 // ─── Pure-helper tests ──────────────────────────────────────────────────
 
 test("redactPath: returns basename, hides absolute parents", () => {
-  assert.strictEqual(redactPath("C:/Users/tlip9/foo/.browser-data-1"), ".browser-data-1");
+  assert.strictEqual(redactPath("C:/Users/fakeuser/foo/.browser-data-1"), ".browser-data-1");
   assert.strictEqual(redactPath("/home/x/.cache/y"), "y");
   assert.strictEqual(redactPath(null), null);
 });
