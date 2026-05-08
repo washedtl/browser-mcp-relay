@@ -245,6 +245,16 @@ async function main() {
     return await braveLaunchPromise;
   }
 
+  // Expose getUpstream to own-tool handlers via globalThis. The tabs_new /
+  // tabs_select handlers use this to call upstream's `navigation_go-to` so
+  // upstream's tracked `_page` follows our intended active tab. Upstream's
+  // session captures one specific Playwright Page reference at CDP-attach
+  // time and never re-evaluates it from CDP `Target.*` events; calls like
+  // `bringToFront` or creating new Playwright pages do NOT update that
+  // reference. The only externally observable lever is to navigate
+  // upstream's existing page via its own forwarded tools.
+  globalThis.__relayUpstream = getUpstream;
+
   // 4. Run MCP server (NO Brave, NO upstream yet — both spawn lazily).
   const relay = new RelayServer({ getUpstream, ensureBrave });
   // Register Phase C own-tools. Each entry in ownTools is
