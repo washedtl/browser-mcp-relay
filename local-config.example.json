@@ -22,5 +22,14 @@
   "_BROWSER_HEADLESS_ENABLE_doc": "Set to 'true' to launch Brave headless. Default: visible window (helpful for debugging, required for CDP-driven login flows).",
 
   "BROWSER_LOAD_EXTENSIONS": "",
-  "_BROWSER_LOAD_EXTENSIONS_doc": "Path to an unpacked Chrome extension to load via --load-extension. Leave empty for no extension."
+  "_BROWSER_LOAD_EXTENSIONS_doc": "Path to an unpacked Chrome extension to load via --load-extension. Leave empty for no extension.",
+
+  "BROWSER_RELAY_PROXY_URL": "",
+  "_BROWSER_RELAY_PROXY_URL_doc": "Optional: route Brave traffic through an HTTP proxy you control (e.g. http://127.0.0.1:8888 for a local debug proxy like Charles, mitmproxy, or powhttp). Combined with the relay's per-context ignoreHTTPSErrors, this lets you inspect the relay's HTTP traffic without affecting your main browser. Default: no proxy.",
+
+  "BROWSER_RELAY_VAULT_FILES": "",
+  "_BROWSER_RELAY_VAULT_FILES_doc": "Optional: semicolon-separated absolute paths to Brave/Chrome password CSV exports (header: name,url,username,password,note). Enables autofill on login forms. Loaded into memory only — never logged or re-written. Only point this at CSVs you trust. Default: empty (autofill disabled).",
+
+  "BROWSER_RELAY_SNAPSHOT_INDEXEDDB": "false",
+  "_BROWSER_RELAY_SNAPSHOT_INDEXEDDB_doc": "Optional: include IndexedDB in the cookie-source snapshot (pool mode only). Default false because IndexedDB is typically 100+ MB across 1000+ files."
 }

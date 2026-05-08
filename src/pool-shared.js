@@ -30,13 +30,47 @@ const { applyLocalConfigToEnv } = require("./local-config.js");
 
 const WRAPPER_LOCK = ".mcp-wrapper-lock";
 
-const COOKIE_FILES = [
+// SNAPSHOT_FILES: profile files snapshotted from the cookie source into the
+// claimed pool slot. Local State carries the DPAPI-wrapped os_crypt key
+// (without it nothing else decrypts). Cookies live at Default/Network/ on
+// Brave 92+ (Default/ is the legacy fallback). Login Data + Login Data For
+// Account are SQLite password stores using the same os_crypt key. WAL/SHM
+// files copy alongside main DBs because Brave 92+ runs SQLite in WAL mode,
+// so recent writes in the source profile live in -wal until checkpoint;
+// copying main DB without -wal can produce a stale snapshot. -journal is
+// the legacy rollback path. copyOne silently skips missing entries.
+const SNAPSHOT_FILES = [
   "Local State",
   "Default/Network/Cookies",
+  "Default/Network/Cookies-wal",
+  "Default/Network/Cookies-shm",
   "Default/Network/Cookies-journal",
   "Default/Cookies",
+  "Default/Cookies-wal",
+  "Default/Cookies-shm",
   "Default/Cookies-journal",
+  "Default/Login Data",
+  "Default/Login Data-wal",
+  "Default/Login Data-shm",
+  "Default/Login Data-journal",
+  "Default/Login Data For Account",
+  "Default/Login Data For Account-journal",
 ];
+
+// SNAPSHOT_DIRS: localStorage / sessionStorage. Many SPAs (Discord, Slack,
+// Linear, Notion, Mercury) store auth tokens in localStorage rather than
+// cookies — without these you can have all the cookies in the world and
+// still hit a login wall. fs.cpSync recursive copy handles LevelDB sub-files
+// (CURRENT, MANIFEST-NNNNNN, NNNNNN.ldb, NNNNNN.log, LOCK). IndexedDB is
+// opt-in only — typically 100+ MB across 1000+ files. Set
+// BROWSER_RELAY_SNAPSHOT_INDEXEDDB=true to include it.
+const SNAPSHOT_DIRS = [
+  "Default/Local Storage/leveldb",
+  "Default/Session Storage",
+];
+
+// Backwards-compat alias — older code referenced COOKIE_FILES.
+const COOKIE_FILES = SNAPSHOT_FILES;
 
 // ───────────────────────── Optional wrapper bridge ───────────────────
 //
@@ -378,17 +412,18 @@ function claimSlot() {
   );
 }
 
-// ───────────────────────── Cookie snapshot ────────────────────────────
+// ───────────────────────── Profile snapshot ──────────────────────────
 
 /**
- * Snapshot cookies from cookieSourceProfile (if configured & present) into
- * the slot dir. No-op in standalone mode (sourceProfile is null). Returns
- * the count of files copied — caller can log it.
+ * Snapshot profile files (cookies + Local State + password DBs) from
+ * cookieSourceProfile (if configured & present) into the slot dir. No-op in
+ * standalone mode (sourceProfile is null). Returns the count of files copied
+ * — caller can log it.
  */
 function snapshotCookiesFrom(srcProfile, dstProfile) {
   if (!srcProfile || !fs.existsSync(srcProfile)) return 0;
   let copied = 0;
-  for (const rel of COOKIE_FILES) {
+  for (const rel of SNAPSHOT_FILES) {
     const s = path.join(srcProfile, rel);
     const d = path.join(dstProfile, rel);
     try {
@@ -398,15 +433,65 @@ function snapshotCookiesFrom(srcProfile, dstProfile) {
         copied++;
       }
     } catch (e) {
-      process.stderr.write(`[mcp-relay] cookie copy ${rel} failed: ${e.code || e.message}\n`);
+      process.stderr.write(`[mcp-relay] snapshot copy ${rel} failed: ${e.code || e.message}\n`);
     }
   }
   return copied;
 }
 
+/**
+ * Snapshot profile directories (localStorage / sessionStorage / optional
+ * IndexedDB) from cookieSourceProfile into the slot dir. fs.cpSync handles
+ * LevelDB sub-files including LOCK; force:true overwrites any prior snapshot.
+ *
+ * @param {string} srcProfile
+ * @param {string} dstProfile
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeIndexedDB] — when true, also snapshot
+ *   Default/IndexedDB. Off by default (typically 100+ MB).
+ * @returns {{ copied: number, total: number, bytes: number, elapsedMs: number }}
+ */
+function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false } = {}) {
+  if (!srcProfile || !fs.existsSync(srcProfile)) {
+    return { copied: 0, total: 0, bytes: 0, elapsedMs: 0 };
+  }
+  const dirs = SNAPSHOT_DIRS.slice();
+  if (includeIndexedDB) dirs.push("Default/IndexedDB");
+  let copied = 0;
+  let bytes = 0;
+  const t0 = Date.now();
+  for (const rel of dirs) {
+    const s = path.join(srcProfile, rel);
+    const d = path.join(dstProfile, rel);
+    try {
+      if (fs.existsSync(s)) {
+        fs.mkdirSync(path.dirname(d), { recursive: true });
+        fs.cpSync(s, d, { recursive: true, force: true });
+        copied++;
+        // Best-effort byte counter for the launch banner. Walks dest after copy.
+        try {
+          const stack = [d];
+          while (stack.length) {
+            const p = stack.pop();
+            const stat = fs.statSync(p);
+            if (stat.isDirectory()) {
+              for (const e of fs.readdirSync(p)) stack.push(path.join(p, e));
+            } else bytes += stat.size;
+          }
+        } catch {}
+      }
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] snapshot dir ${rel} failed: ${e.code || e.message}\n`);
+    }
+  }
+  return { copied, total: dirs.length, bytes, elapsedMs: Date.now() - t0 };
+}
+
 module.exports = {
   CONFIG,
   COOKIE_FILES,
+  SNAPSHOT_FILES,
+  SNAPSHOT_DIRS,
   loadConfig,
   claimSlot,
   findBraveProcessesForDir,
@@ -418,6 +503,7 @@ module.exports = {
   findCookiesFile,
   pickDirCandidates,
   snapshotCookiesFrom,
+  snapshotDirsFrom,
   /** Test seam: whether the optional pool wrapper was found at require time. */
   hasPoolWrapper: upstreamWrapper !== null,
 };

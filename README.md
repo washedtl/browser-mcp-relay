@@ -29,6 +29,7 @@ MCP client (Claude Code, Cursor) ── stdio ──▶ relay ──▶ upstream
 - [Architecture](#%EF%B8%8F-architecture)
 - [Configuration](#%EF%B8%8F-configuration)
 - [Modes](#-modes)
+- [Optional features](#-optional-features)
 - [Platform support](#%EF%B8%8F-platform-support)
 - [Troubleshooting](#-troubleshooting)
 - [Limitations](#%EF%B8%8F-limitations)
@@ -422,6 +423,9 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_HEADLESS_ENABLE` | `false` | Set `true` to launch Brave headless. |
 | `BROWSER_LOAD_EXTENSIONS` | unset | Path to an unpacked Chrome extension to load. |
 | `BROWSER_MCP_ROLE` | unset | Role-based slot filter (only meaningful with the optional pool wrapper). |
+| `BROWSER_RELAY_PROXY_URL` | unset | Optional HTTP proxy for Brave's outbound traffic. Useful with debug proxies (Charles, mitmproxy, powhttp). See [Optional features](#-optional-features). |
+| `BROWSER_RELAY_VAULT_FILES` | unset (autofill disabled) | Semicolon-separated paths to Brave/Chrome password CSV exports. Enables form-autofill on navigation. See [Optional features](#-optional-features). |
+| `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` | `false` | Include IndexedDB in pool-mode profile snapshot (100+ MB typical). |
 
 **Precedence:** environment variable ▸ `local-config.json` ▸ auto-detect ▸ reasonable hard-coded defaults.
 
@@ -436,6 +440,26 @@ One Brave per relay process, profile stored at `<repo>/.browser-data`. No cookie
 ### 🔵 Pool (opt-in)
 
 Set `BROWSER_RELAY_POOL_DIR` to a profile dir managed elsewhere. If a `wrap-browser-devtools-mcp.js` file is present two directories above this repo, its richer config (multi-slot pool, cookie snapshot from a dedicated source profile, slot roles) is reused. Otherwise pool mode behaves like standalone with a custom dir. **Useful when running multiple relay processes against pre-warmed Brave profiles.**
+
+---
+
+## 🔓 Optional features
+
+### 🌐 Proxy whitelist
+
+Set `BROWSER_RELAY_PROXY_URL=http://127.0.0.1:8888` (or wherever your debug proxy listens) to route the relay's Brave traffic through an HTTP proxy you control. Combined with the relay's per-context `ignoreHTTPSErrors`, this lets you inspect the relay's HTTP traffic via Charles, mitmproxy, powhttp, etc. without affecting your main browser. Your system proxy stays untouched — only this launched Brave opts in.
+
+### 🔐 Credential vault + autofill
+
+The relay can auto-fill login forms when a saved credential matches the current page's hostname. **Off by default.** To enable:
+
+1. Export passwords from Brave (or Chrome): `brave://settings/passwords` → "Export passwords" → save as CSV
+2. Set `BROWSER_RELAY_VAULT_FILES=/absolute/path/to/passwords.csv` (semicolon-separate multiple paths)
+3. Restart the relay
+
+The vault loads CSVs at startup, indexes by hostname + registrable domain, and fills the first empty username + password fields on each `framenavigated`. **It does not auto-submit** — you click submit yourself.
+
+> ⚠️ **Security:** Passwords stay in memory only — never logged, never re-written. But anyone with read access to your relay process's memory could read them. Only point this at CSVs you trust. The vault is most useful when scraping authed sites that block Playwright's password manager (e.g. Brave 127+'s App-Bound Encryption).
 
 ---
 

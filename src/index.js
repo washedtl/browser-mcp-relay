@@ -34,6 +34,8 @@ const { RelayServer } = require("./relay-server.js");
 const { launchBrave, closeBrave } = require("./cdp-bridge.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
+const { loadVaultFromEnv } = require("./vault.js");
+const { attachAutofill } = require("./autofill-injector.js");
 
 // Layer local-config.json under env so resolveBdmcpEntry / launch flags see
 // it transparently. pool-shared.js applies the same overlay independently.
@@ -89,7 +91,7 @@ async function main() {
     `[mcp-relay] slot=${slotIdx}/${totalSlots} role=${role} pid=${process.pid} cookieAge=${ageStr} dir=${dir} mode=${pool.CONFIG.standalone ? "standalone" : "pool"}\n`,
   );
 
-  // 2. Cookie snapshot from source (skipped in standalone mode — sourceProfile is null).
+  // 2. Profile snapshot from source (skipped in standalone mode — sourceProfile is null).
   if (src && fs.existsSync(src)) {
     if (ageDays !== null && ageDays > pool.CONFIG.cookieFreshnessWarnDays) {
       process.stderr.write(
@@ -97,12 +99,37 @@ async function main() {
       );
     }
     const copied = pool.snapshotCookiesFrom(src, dir);
-    process.stderr.write(`[mcp-relay] snapshotted ${copied}/${pool.COOKIE_FILES.length} cookie files from ${path.basename(src)}\n`);
+    process.stderr.write(`[mcp-relay] snapshotted ${copied}/${pool.SNAPSHOT_FILES.length} profile files from ${path.basename(src)}\n`);
+
+    // Directory snapshots (Local Storage, Session Storage, optional IndexedDB).
+    // Many SPAs store auth tokens in localStorage rather than cookies, so this
+    // is what makes Discord/Slack/Linear/Notion/Mercury sessions work.
+    const includeIndexedDB = RELAY_ENV.BROWSER_RELAY_SNAPSHOT_INDEXEDDB === "true";
+    const dirRes = pool.snapshotDirsFrom(src, dir, { includeIndexedDB });
+    if (dirRes.total > 0) {
+      process.stderr.write(
+        `[mcp-relay] snapshotted ${dirRes.copied}/${dirRes.total} storage dirs ` +
+        `(${(dirRes.bytes / 1024 / 1024).toFixed(1)}MB) in ${dirRes.elapsedMs}ms from ${path.basename(src)}\n`,
+      );
+    }
   } else if (src) {
     process.stderr.write(`[mcp-relay] cookie source ${src} missing — fresh login wall expected\n`);
   }
   // (In standalone mode, no cookie source is configured. The relay's
   // .browser-data dir is its own session — first-run will hit login walls.)
+
+  // 2c. Load credential vault. OFF by default; opt in via BROWSER_RELAY_VAULT_FILES.
+  // Empty vault → autofill is a no-op. Logged with counts only, never values.
+  // Only emits a stderr line when at least one entry loaded, to keep startup
+  // quiet for the common (vault-disabled) case.
+  const vault = loadVaultFromEnv();
+  const vsum = vault.summary();
+  if (vsum.totalEntries > 0) {
+    process.stderr.write(
+      `[mcp-relay] vault: ${vsum.totalEntries} entries across ${vsum.uniqueHosts} hosts; ` +
+      `files=[${vsum.filesLoaded.map((f) => `${path.basename(f.path)}:${f.entries}`).join(", ")}]\n`,
+    );
+  }
 
   // 3. SPLIT lazy init: upstream and Brave init separately.
   //    - tools/list (Cursor calls this immediately at MCP connect) only needs
@@ -130,8 +157,14 @@ async function main() {
     const upstreamEnv = { ...RELAY_ENV };
     delete upstreamEnv.BROWSER_PERSISTENT_USER_DATA_DIR;
     delete upstreamEnv.BROWSER_PERSISTENT_ENABLE;
-    upstreamEnv.BROWSER_CDP_CONNECT_URL = `http://127.0.0.1:${port}`;
-    upstreamEnv.BROWSER_CDP_ENDPOINT_EXPLICIT = "true";
+    // BDMCP reads `BROWSER_CDP_ENDPOINT_URL` from process.env and assigns it
+    // internally to its exported constant `BROWSER_CDP_CONNECT_URL`. The
+    // env var must use the *_ENDPOINT_URL name; the *_CONNECT_URL constant
+    // is never read from env, so setting it would silently send BDMCP into
+    // its standalone-launch path (spawning a fresh temp-profile Brave next
+    // to the relay's launched Brave). Don't set ENDPOINT_EXPLICIT — BDMCP
+    // derives it internally from `!!_BROWSER_CDP_ENDPOINT`.
+    upstreamEnv.BROWSER_CDP_ENDPOINT_URL = `http://127.0.0.1:${port}`;
 
     upstreamChild = spawn(process.execPath, [bdmcpEntry, "--cursor-mcp-server"], {
       stdio: ["pipe", "pipe", "inherit"],
@@ -190,8 +223,14 @@ async function main() {
           headless: RELAY_ENV.BROWSER_HEADLESS_ENABLE === "true",
           extensionPath,
           executablePath: bravePath,
+          proxyUrl: RELAY_ENV.BROWSER_RELAY_PROXY_URL || null,
         });
         process.stderr.write(`[mcp-relay] Brave ready (cdpConnectUrl=${launched.cdpConnectUrl})\n`);
+        // Attach autofill listeners to the launched context. Pages BDMCP
+        // creates via CDP attach share this context, so the framenavigated
+        // event fires for them too — autofill works for both relay-driven
+        // and BDMCP-driven navigations. No-op when the vault is empty.
+        attachAutofill(launched.context, vault, (msg) => process.stderr.write(msg + "\n"));
         // Make the bridge available to own-tool handlers via globalThis.
         // Shape: { context, cdpConnectUrl, port } — Phase C tool handlers
         // read globalThis.__relayBridge to drive CDP operations.
