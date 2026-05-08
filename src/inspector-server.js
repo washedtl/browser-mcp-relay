@@ -633,8 +633,31 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail }) {
  *  The buffer accessor is { getRecent(): array } so the WS server pulls a
  *  snapshot at connect-time, not at construct-time.
  */
-function attachWebsocket(httpServer, { trafficEmitter, getRecent } = {}) {
-  const wss = new WebSocketServer({ noServer: true });
+function attachWebsocket(httpServer, { trafficEmitter, getRecent, allowedOrigins } = {}) {
+  // Defense-in-depth: clients should never send anything beyond pong frames,
+  // so cap incoming payloads small. Stops a malicious or buggy client from
+  // tying up memory with arbitrarily large frames.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+
+  // Cross-origin WS protection. Browsers do NOT enforce SOP for WebSockets,
+  // so a tab on evil.com could open ws://127.0.0.1:9090/ws/traffic and
+  // receive every captured tool call — even though our HTTP bind is
+  // localhost-only. We accept connections only when the Origin header is
+  // absent (curl, native MCP client, our own UI fetched from same origin)
+  // or when it matches an allowlist. Default allowlist = localhost / 127.0.0.1.
+  const DEFAULT_ALLOWED = ["http://localhost", "http://127.0.0.1"];
+  const allowList = (allowedOrigins && allowedOrigins.length) ? allowedOrigins : DEFAULT_ALLOWED;
+  function isOriginAllowed(originHeader) {
+    if (!originHeader) return true; // non-browser client (curl, native ws)
+    // Match by URL prefix (allows any port). normalize: strip trailing slash.
+    const probe = String(originHeader).replace(/\/$/, "");
+    return allowList.some((prefix) => probe === prefix || probe.startsWith(prefix + ":"));
+  }
+
+  // Back-pressure cap: if a slow/paused client lets the send buffer grow
+  // past this, drop the connection rather than OOM the relay during a
+  // capture_xhr burst or a parallel scrape.
+  const MAX_BUFFERED_BYTES = 1_000_000;
 
   // Per-client liveness: send ping every 25s; if no pong by 10s after the
   // ping, terminate. Tracked via `isAlive` flag flipped on `pong`.
@@ -679,6 +702,21 @@ function attachWebsocket(httpServer, { trafficEmitter, getRecent } = {}) {
       socket.destroy();
       return;
     }
+    // Origin allowlist check — prevents cross-origin WS hijack from a
+    // hostile webpage. Browsers ALWAYS send Origin on WS upgrade, so a
+    // missing Origin = non-browser client (curl, ws-client) which is fine.
+    const origin = req.headers && req.headers.origin;
+    if (!isOriginAllowed(origin)) {
+      try {
+        socket.write(
+          "HTTP/1.1 403 Forbidden\r\n" +
+          "Connection: close\r\n" +
+          "Content-Length: 0\r\n\r\n",
+        );
+      } catch { /* noop */ }
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       setupClient(ws);
 
@@ -703,13 +741,24 @@ function attachWebsocket(httpServer, { trafficEmitter, getRecent } = {}) {
         ws.send(JSON.stringify({ type: "backfill", events: events || [] }));
       } catch { /* noop — client will see the live stream regardless */ }
 
-      const onRequest = (evt) => {
+      // Back-pressure guard: drop the client if its send buffer balloons.
+      // A paused/slow tab during a capture_xhr burst would otherwise let
+      // `ws` queue frames in memory unboundedly. Better to lose one viewer
+      // than OOM the relay process.
+      const sendOrTerminate = (payload) => {
         if (ws.readyState !== ws.OPEN) return;
-        try { ws.send(JSON.stringify({ type: "request", ...evt })); } catch { /* noop */ }
+        if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+          try { ws.terminate(); } catch { /* noop */ }
+          return;
+        }
+        try { ws.send(payload); } catch { /* noop */ }
+      };
+
+      const onRequest = (evt) => {
+        sendOrTerminate(JSON.stringify({ type: "request", ...evt }));
       };
       const onResponse = (evt) => {
-        if (ws.readyState !== ws.OPEN) return;
-        try { ws.send(JSON.stringify({ type: "response", ...evt })); } catch { /* noop */ }
+        sendOrTerminate(JSON.stringify({ type: "response", ...evt }));
       };
 
       trafficEmitter.on("request", onRequest);
@@ -759,6 +808,7 @@ function startInspector(opts = {}) {
   const wss = attachWebsocket(server, {
     trafficEmitter: opts.trafficEmitter || null,
     getRecent,
+    allowedOrigins: opts.allowedOrigins,
   });
 
   return new Promise((resolve) => {

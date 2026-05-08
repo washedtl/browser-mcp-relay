@@ -937,3 +937,117 @@ test("WS /ws/traffic non-/ws/traffic upgrade is rejected", async () => {
     await handle.close();
   }
 });
+
+// ─── W10 V1 fixes: Origin allowlist + back-pressure ─────────────────
+
+test("WS upgrade rejects hostile Origin (cross-origin protection)", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    // ws lib lets us set arbitrary Origin via options.
+    const ws = new WebSocket(
+      "ws://127.0.0.1:" + handle.port + "/ws/traffic",
+      { origin: "http://evil.example.com" },
+    );
+    const result = await new Promise((resolve) => {
+      ws.on("error", () => resolve("error"));
+      ws.on("close", () => resolve("close"));
+      ws.on("open", () => resolve("open"));
+      setTimeout(() => resolve("timeout"), 1500);
+    });
+    assert.notStrictEqual(result, "open", "evil-origin must NOT open");
+    assert.notStrictEqual(ws.readyState, ws.OPEN);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("WS upgrade allows http://localhost Origin", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const ws = new WebSocket(
+      "ws://127.0.0.1:" + handle.port + "/ws/traffic",
+      { origin: "http://localhost:9090" },
+    );
+    const result = await new Promise((resolve) => {
+      ws.on("open", () => resolve("open"));
+      ws.on("error", () => resolve("error"));
+      setTimeout(() => resolve("timeout"), 1500);
+    });
+    assert.strictEqual(result, "open", "localhost origin must connect");
+    ws.close();
+  } finally {
+    await handle.close();
+  }
+});
+
+test("WS upgrade allows http://127.0.0.1 Origin", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const ws = new WebSocket(
+      "ws://127.0.0.1:" + handle.port + "/ws/traffic",
+      { origin: "http://127.0.0.1:9090" },
+    );
+    const result = await new Promise((resolve) => {
+      ws.on("open", () => resolve("open"));
+      ws.on("error", () => resolve("error"));
+      setTimeout(() => resolve("timeout"), 1500);
+    });
+    assert.strictEqual(result, "open", "127.0.0.1 origin must connect");
+    ws.close();
+  } finally {
+    await handle.close();
+  }
+});
+
+test("WS upgrade allows missing Origin (non-browser client)", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    // Don't set origin option → ws lib omits the header for native clients.
+    const ws = new WebSocket("ws://127.0.0.1:" + handle.port + "/ws/traffic");
+    const result = await new Promise((resolve) => {
+      ws.on("open", () => resolve("open"));
+      ws.on("error", () => resolve("error"));
+      setTimeout(() => resolve("timeout"), 1500);
+    });
+    assert.strictEqual(result, "open", "missing Origin must connect");
+    ws.close();
+  } finally {
+    await handle.close();
+  }
+});
+
+test("WS upgrade allowedOrigins option overrides default allowlist", async () => {
+  const handle = await startInspector({
+    port: 0,
+    bind: "127.0.0.1",
+    seams: makeSeams(),
+    allowedOrigins: ["http://my-custom-host"],
+  });
+  try {
+    const wsAllowed = new WebSocket(
+      "ws://127.0.0.1:" + handle.port + "/ws/traffic",
+      { origin: "http://my-custom-host:8080" },
+    );
+    const wsRejected = new WebSocket(
+      "ws://127.0.0.1:" + handle.port + "/ws/traffic",
+      { origin: "http://localhost:9090" },
+    );
+    const allowedResult = await new Promise((resolve) => {
+      wsAllowed.on("open", () => resolve("open"));
+      wsAllowed.on("error", () => resolve("error"));
+      setTimeout(() => resolve("timeout"), 1500);
+    });
+    const rejectedResult = await new Promise((resolve) => {
+      wsRejected.on("open", () => resolve("open"));
+      wsRejected.on("error", () => resolve("error"));
+      wsRejected.on("close", () => resolve("close"));
+      setTimeout(() => resolve("timeout"), 1500);
+    });
+    assert.strictEqual(allowedResult, "open", "custom-host origin allowed");
+    assert.notStrictEqual(rejectedResult, "open", "default localhost rejected when custom allowlist set");
+    try { wsAllowed.close(); } catch { /* noop */ }
+    try { wsRejected.close(); } catch { /* noop */ }
+  } finally {
+    await handle.close();
+  }
+});
