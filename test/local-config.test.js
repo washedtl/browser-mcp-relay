@@ -70,3 +70,25 @@ test("getLocalConfigPath points at <repo>/local-config.json", () => {
   const p = localConfig.getLocalConfigPath();
   assert.ok(p.endsWith("local-config.json"), `expected to end with local-config.json, got ${p}`);
 });
+
+test("loadLocalConfig: malformed JSON returns {} without crashing (warns to stderr)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const os = require("node:os");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lc-bad-json-"));
+  const badPath = path.join(tmp, "local-config.json");
+  fs.writeFileSync(badPath, "{ this is not json", "utf8");
+
+  // Capture stderr to verify the warning fires (and is keep-going behavior).
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let stderrCaptured = "";
+  process.stderr.write = (chunk) => { stderrCaptured += chunk; return true; };
+  try {
+    const result = localConfig.loadLocalConfig({ path: badPath, refresh: true });
+    assert.deepStrictEqual(result, {}, "malformed JSON must yield {} (graceful)");
+    assert.match(stderrCaptured, /WARN.*failed to parse/i, "should warn to stderr");
+  } finally {
+    process.stderr.write = origWrite;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

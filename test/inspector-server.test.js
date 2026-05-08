@@ -1482,3 +1482,28 @@ test("buildActivity: returns events from _trafficBuffer seam", () => {
   assert.strictEqual(out.events.length, 2);
   assert.strictEqual(out.totalCaptured, 2);
 });
+
+test("forwardedCount matches the actual hardcoded catalog length (drift guard)", () => {
+  const forwarded = require("../scripts/inspector-forwarded-tools.js");
+  const catalogLen = (forwarded.tools || []).length;
+  // The status response hardcodes forwardedCount: 51. If upstream gets a tool added
+  // and the catalog list is updated but not the constant, this test catches it.
+  // If both stay in sync, this passes.
+  const status = buildStatus({
+    _loadConfig: () => ({ poolDirs: [], slotRoles: {}, cookieFreshnessWarnDays: 7, mode: "standalone" }),
+    _findCookiesFile: () => null,
+    _checkCookieAgeDays: () => null,
+    _existsFile: () => false,
+    _now: () => Date.now(),
+    _startedAt: Date.now(),
+    _ownTools: [],
+    _listProcesses: () => "",
+    _findProcessesFor: () => [],
+    _isPidAlive: () => false,
+  });
+  assert.strictEqual(
+    status.tools.forwardedCount,
+    catalogLen,
+    "buildStatus.tools.forwardedCount must equal the catalog length — update the constant when adding a forwarded tool",
+  );
+});
