@@ -526,6 +526,8 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 
 A small web dashboard for peeking at the relay's runtime state — pool slot status (claimed / idle / orphan), specialty MCP cookie freshness, vault entry counts, tool counts, uptime, plus a per-slot **Inspector page** with live MCP-traffic streaming. **Off by default**, no auth, read-only.
 
+![Inspector — Pool overview](./docs/screenshots/01-pool-overview.png)
+
 Two modes:
 
 #### Standalone (no live traffic)
@@ -562,12 +564,14 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 
 The Inspector has six surfaces:
 
-- **Pool overview** (`/`) — slot grid (claimed / idle / orphan), specialty MCPs, vault summary. Orphan slots get a **Reap** button that clears the stale lock + kills any leftover Brave processes holding that user-data-dir.
-- **Tools catalog** (`/tools`) — all 67 tools (16 first-party + 51 forwarded), filter + per-tool detail
-- **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode.
-- **Specialty MCPs** (`/specialty`) — auxiliary MCP servers + cookie source freshness. The `browser-devtools-mcp-2` card has a **Refresh cookies…** button that surfaces the next-step instructions for picking up new logins (the inspector can't trigger interactive Brave logins on its own).
-- **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet
-- **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode.
+| | |
+|---|---|
+| **Pool overview** (`/`) — slot grid (claimed / idle / orphan), specialty MCPs, vault summary. Orphan slots get a **Reap** button that clears the stale lock + kills any leftover Brave processes holding that user-data-dir. | ![Pool overview](./docs/screenshots/01-pool-overview.png) |
+| **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode. | ![Slot detail](./docs/screenshots/02-slot-detail.png) |
+| **Tools catalog** (`/tools`) — all 67 tools (16 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./docs/screenshots/03-tools-catalog.png) |
+| **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode. | ![Activity history](./docs/screenshots/04-activity-history.png) |
+| **Specialty MCPs** (`/specialty`) — auxiliary MCP servers + cookie source freshness. The `browser-devtools-mcp-2` card has a **Refresh cookies…** button that surfaces the next-step instructions for picking up new logins (the inspector can't trigger interactive Brave logins on its own). | ![Specialty MCPs](./docs/screenshots/05-specialty-mcps.png) |
+| **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet | ![Settings](./docs/screenshots/06-settings.png) |
 
 Mutating endpoints (`POST /api/slots/N/reap`, `POST /api/specialty/mcp-2/refresh-hint`) require a same-origin Origin header (or no Origin — the curl path); cross-origin POSTs are rejected with 403.
 
