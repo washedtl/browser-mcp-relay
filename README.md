@@ -21,6 +21,7 @@ MCP client (Claude Code, Cursor) ── stdio ──▶ relay ──▶ upstream
 
 ## 📑 Contents
 
+- [In plain English](#-in-plain-english)
 - [Overview](#-overview)
 - [Highlights](#-highlights)
 - [Quick start](#-quick-start)
@@ -36,6 +37,62 @@ MCP client (Claude Code, Cursor) ── stdio ──▶ relay ──▶ upstream
 - [Contributing](#-contributing)
 - [License](#-license)
 - [Credits](#-credits)
+
+---
+
+## 🤔 In plain English
+
+**This gives your AI assistant a real browser.**
+
+When you ask Claude Code or Cursor to *"check what's on this page,"* *"fill out this form,"* *"run Lighthouse on production,"* or *"scrape my logged-in dashboard"* — the AI doesn't actually have a browser. It needs a tool that drives one for it.
+
+`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the **Model Context Protocol** (MCP), and turns them into actual browser actions. Your AI gets ~67 commands ("tools") it can call; the relay does the work behind the scenes.
+
+### What it lets your AI do
+
+| | |
+|---|---|
+| 📸 **See pages** | Screenshots, full HTML, visible text, PDF export, ARIA tree, accessibility snapshots |
+| 🖱️ **Click around** | Buttons, links, dropdowns, drag-and-drop, hover, scroll, keyboard input |
+| 📝 **Fill forms** | Single fields or 20 at once via `form_fill`. File uploads without an OS picker. |
+| 🔬 **Diagnose performance** | Lighthouse audits, Web Vitals (LCP/INP/CLS/TTFB/FCP), V8 heap snapshots |
+| 📊 **Capture telemetry** | Console messages, HTTP requests, OpenTelemetry trace context, XHR/fetch responses |
+| 🍪 **Reuse your sessions** | Saved cookies + (optionally) autofill credentials work, so logged-in pages just work |
+| 🥷 **Stay stealthy** | Anti-bot patches that fool naive detection (`stealth_apply`) |
+| 🔁 **Stub network calls** | Mock HTTP responses or intercept outgoing requests (`stub_*`) |
+| ⚛️ **Inspect React** | Map React components ↔ DOM elements via Fiber |
+| 💾 **Save outputs** | Capture downloads to disk, record video of the session, save heap snapshots |
+| 🐛 **Live-debug** | Tracepoints, logpoints, exceptionpoints — non-pausing instrumentation |
+| 🔍 **Extract structured data** | CSS-selector schema → JSON, even from authed pages |
+
+### Why "relay"?
+
+Because it bundles **two layers in one MCP server:**
+
+- 🔁 **51 tools** from the open-source [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) project — forwarded verbatim
+- 🌟 **16 tools** of our own — the things upstream doesn't ship (Lighthouse, cookies, device emulation, multi-tab, autofill, structured extraction, …)
+
+Your AI sees **67 tools** total and doesn't know or care where each one comes from. To it, it's just one MCP.
+
+### ✅ When to use it
+
+- 🧪 End-to-end testing a site flow with real auth, real cookies, real JavaScript
+- 🚦 Performance debugging after a deploy (Lighthouse, Web Vitals, HTTP traffic)
+- 🔐 Scraping pages behind login — your saved Brave session works without re-authenticating
+- 🕵️ Reverse-engineering a site's API — `capture_xhr` records every request while you click around
+- 🧬 React component introspection during development
+- 📡 API mocking — `stub_mock-http-response` lets you swap out a flaky upstream during testing
+
+### ❌ When to use something else
+
+- 🚫 **Headless mass scraping** → use [Firecrawl](https://firecrawl.dev/) or [Bright Data](https://brightdata.com/) — those are built for scale
+- 🚫 **Plain unauthenticated HTTP fetches** → just use `curl` or your client's `WebFetch`
+- 🚫 **Mobile / Safari / Firefox testing** → this is Brave/Chromium-only by design
+- 🚫 **CI without a display** → works headlessly via `BROWSER_HEADLESS_ENABLE=true`, but you'll need a real X server or xvfb on Linux
+
+### TL;DR
+
+**Remote control for a real browser, with a vocabulary your AI already speaks.** Plug it into Claude Code, Cursor, or any MCP client; the AI gets 67 new things it can do.
 
 ---
 
