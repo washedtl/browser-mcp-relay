@@ -66,6 +66,17 @@ this is a non-issue.
   as a child process and proxies most tool calls to it; the relay's own-tools live
   alongside the forwarded ones in the merged tools/list response.
 
+### `ws@^8.20.0`
+
+- **License:** MIT
+- **Author:** Einar Otto Stangvik (`einaros`)
+- **Repository:** https://github.com/websockets/ws
+- **Used for:** the Inspector's `/ws/traffic` WebSocket endpoint. When the relay is
+  launched with `BROWSER_RELAY_INSPECTOR_PORT` set, the in-process Inspector streams
+  every `tools/call` request/response pair to connected Inspector pages over this
+  WebSocket. Standalone Inspector (no traffic emitter) closes incoming WS connections
+  with a `no-emitter` message — no live data is exposed in that mode.
+
 ## Supply-chain audit notes
 
 The audit below records what was checked at the time these notices were written. Re-run

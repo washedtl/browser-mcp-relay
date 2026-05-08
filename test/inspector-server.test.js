@@ -676,3 +676,264 @@ test("POST /api/tools → 405 method not allowed (read-only in W9)", async () =>
     server.close();
   }
 });
+
+// ─── W10: startInspector + slot detail + WebSocket tests ───────────────
+
+const { EventEmitter } = require("node:events");
+const WebSocket = require("ws");
+const { startInspector, buildSlotDetail } = require("../src/inspector-server.js");
+
+// Helper: small TrafficEmitter clone for tests, matching the API the
+// Inspector reads (on/off + getRecent).
+function makeTestEmitter() {
+  const ee = new EventEmitter();
+  ee.setMaxListeners(50);
+  ee._ring = [];
+  ee.push = (evt) => { ee._ring.push(evt); if (ee._ring.length > 200) ee._ring.shift(); };
+  ee.getRecent = () => ee._ring.slice();
+  return ee;
+}
+
+test("startInspector: boots on port 0 + can close", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1" });
+  try {
+    assert.ok(handle.server);
+    assert.ok(handle.port > 0);
+    assert.strictEqual(handle.bind, "127.0.0.1");
+    assert.strictEqual(typeof handle.close, "function");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("startInspector: standalone mode → /api/slot/:n has empty recentTraffic", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const r = await fetch(handle.port, "/api/slot/1");
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.deepStrictEqual(body.recentTraffic, []);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("startInspector: in-process mode → /api/slot/:n surfaces buffered traffic", async () => {
+  const ee = makeTestEmitter();
+  ee.push({ id: 1, time: new Date().toISOString(), method: "tools/call", name: "capture_xhr", args: { foo: 1 }, source: "own" });
+  ee.push({ id: 1, time: new Date().toISOString(), status: "ok", durationMs: 42, response: { content: [] } });
+
+  const handle = await startInspector({
+    port: 0, bind: "127.0.0.1",
+    seams: makeSeams(),
+    trafficEmitter: ee,
+    getRecent: () => ee.getRecent(),
+  });
+  try {
+    const r = await fetch(handle.port, "/api/slot/1");
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.strictEqual(body.recentTraffic.length, 2);
+    assert.strictEqual(body.recentTraffic[0].name, "capture_xhr");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("buildSlotDetail: returns null for out-of-range index", () => {
+  const detail = buildSlotDetail(99, makeSeams());
+  assert.strictEqual(detail, null);
+});
+
+test("buildSlotDetail: returns slot + totalSlots for valid n", () => {
+  const detail = buildSlotDetail(2, makeSeams());
+  assert.ok(detail.slot);
+  assert.strictEqual(detail.slot.index, 2);
+  assert.strictEqual(detail.totalSlots, 2);
+  assert.ok(Array.isArray(detail.recentTraffic));
+});
+
+test("GET /api/slot/3 → 404 (out of range with 2-slot pool)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/slot/3");
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/slot/0 → 404 (slots are 1-indexed)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/slot/0");
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/slot/abc → 404 (not an integer)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/slot/abc");
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/slot/1 → 200 with slot + recentTraffic shape", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/slot/1");
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.ok(body.slot);
+    assert.strictEqual(body.slot.index, 1);
+    assert.ok(Array.isArray(body.recentTraffic));
+    assert.strictEqual(typeof body.totalSlots, "number");
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /slot/3 → 200 (SPA — frontend handles invalid n)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/slot/3");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /text\/html/);
+    assert.ok(r.body.includes("Inspector"));
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /slot/1 → 200 (SPA, normal slot)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/slot/1");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /text\/html/);
+  } finally {
+    server.close();
+  }
+});
+
+// ─── WebSocket /ws/traffic tests ───────────────────────────────────────
+
+function awaitMessage(ws, predicate, timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout waiting for message")), timeoutMs);
+    const onMsg = (data) => {
+      try {
+        const obj = JSON.parse(data.toString("utf8"));
+        if (!predicate || predicate(obj)) {
+          clearTimeout(t);
+          ws.off("message", onMsg);
+          resolve(obj);
+        }
+      } catch (e) { /* ignore */ }
+    };
+    ws.on("message", onMsg);
+  });
+}
+
+function awaitClose(ws, timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout waiting for close")), timeoutMs);
+    ws.once("close", () => { clearTimeout(t); resolve(); });
+  });
+}
+
+test("WS /ws/traffic standalone mode → no-emitter then close", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const ws = new WebSocket("ws://127.0.0.1:" + handle.port + "/ws/traffic");
+    const msg = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("no message")), 2000);
+      ws.on("message", (data) => { clearTimeout(t); resolve(JSON.parse(data.toString("utf8"))); });
+      ws.on("error", (e) => { clearTimeout(t); reject(e); });
+    });
+    assert.strictEqual(msg.type, "no-emitter");
+    assert.match(msg.message, /BROWSER_RELAY_INSPECTOR_PORT/);
+    await awaitClose(ws);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("WS /ws/traffic in-process mode → backfill then live request/response", async () => {
+  const ee = makeTestEmitter();
+  // Pre-seed one event for backfill verification.
+  ee.push({ id: 7, time: new Date().toISOString(), method: "tools/call", name: "tabs_list", args: {}, source: "own" });
+
+  const handle = await startInspector({
+    port: 0, bind: "127.0.0.1", seams: makeSeams(),
+    trafficEmitter: ee,
+    getRecent: () => ee.getRecent(),
+  });
+  try {
+    // Collect every message into a queue so we don't race the server's
+    // immediate backfill-on-open send against our listener registration.
+    const ws = new WebSocket("ws://127.0.0.1:" + handle.port + "/ws/traffic");
+    const queue = [];
+    let resolveNext = null;
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data.toString("utf8"));
+      queue.push(msg);
+      if (resolveNext) { const r = resolveNext; resolveNext = null; r(); }
+    });
+    function nextMatching(predicate, timeoutMs = 2000) {
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+        const tryNow = () => {
+          const idx = queue.findIndex(predicate);
+          if (idx >= 0) {
+            clearTimeout(t);
+            const found = queue.splice(idx, 1)[0];
+            resolve(found);
+            return true;
+          }
+          return false;
+        };
+        if (tryNow()) return;
+        const onArrive = () => { if (!tryNow()) resolveNext = onArrive; };
+        resolveNext = onArrive;
+      });
+    }
+
+    const backfill = await nextMatching((m) => m.type === "backfill");
+    assert.ok(Array.isArray(backfill.events));
+    assert.strictEqual(backfill.events.length, 1);
+    assert.strictEqual(backfill.events[0].name, "tabs_list");
+
+    const liveRequest = { id: 8, time: new Date().toISOString(), method: "tools/call", name: "lighthouse_audit", args: { url: "https://example.com" }, source: "own" };
+    const liveP = nextMatching((m) => m.type === "request" && m.id === 8);
+    ee.emit("request", liveRequest);
+    const live = await liveP;
+    assert.strictEqual(live.name, "lighthouse_audit");
+
+    ws.close();
+    await awaitClose(ws);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("WS /ws/traffic non-/ws/traffic upgrade is rejected", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const ws = new WebSocket("ws://127.0.0.1:" + handle.port + "/ws/wrong-path");
+    await new Promise((resolve) => {
+      // Either error or close fires — both prove the server didn't accept us.
+      ws.on("error", () => resolve());
+      ws.on("close", () => resolve());
+      setTimeout(resolve, 1500);
+    });
+    assert.notStrictEqual(ws.readyState, ws.OPEN);
+  } finally {
+    await handle.close();
+  }
+});

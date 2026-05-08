@@ -16,9 +16,61 @@
 // Splitting these means tools/list (Cursor's first call at MCP connect)
 // does NOT trigger Brave launch. Brave only spins up when something
 // actually needs to drive a browser.
+//
+// W10: trafficEmitter — every handleToolsCall fires `request` and `response`
+// events. The in-process Inspector subscribes to these for live traffic
+// streaming. Standalone Inspector ignores it (no subscriber). The emitter
+// also keeps a 200-event ring buffer so new WS subscribers can backfill
+// without missing context.
+
+const { EventEmitter } = require("node:events");
+
+// Cap each emitted event's response body at this size (in JSON-stringified
+// chars). capture_xhr / lighthouse_audit can return MB-scale responses;
+// streaming those over WS to N subscribers + holding them in the 200-event
+// ring buffer would balloon memory. The full body is still returned to the
+// MCP client — this cap only affects what the Inspector sees.
+const MAX_TRAFFIC_BODY_CHARS = 10_000;
+// Ring-buffer capacity. 200 events ~= 2-3 minutes of normal use.
+const TRAFFIC_RING_CAPACITY = 200;
+const TRUNCATED_MARKER = "[truncated]";
+
+/** Truncate a JSON-serializable value's stringified form to MAX chars. We
+ *  serialize, slice, then return either the original (if short) or a string
+ *  with the truncation marker. The Inspector renders this verbatim — no
+ *  re-parse. */
+function truncateForEmit(value, max = MAX_TRAFFIC_BODY_CHARS) {
+  if (value == null) return value;
+  let s;
+  try { s = JSON.stringify(value); }
+  catch { return { error: "[unserializable]" }; }
+  if (s.length <= max) return value;
+  return s.slice(0, max - TRUNCATED_MARKER.length) + TRUNCATED_MARKER;
+}
+
+class TrafficEmitter extends EventEmitter {
+  constructor({ capacity = TRAFFIC_RING_CAPACITY } = {}) {
+    super();
+    // Lift the default listener cap so multiple WS subscribers don't trip
+    // Node's "MaxListenersExceededWarning". 50 is plenty for an inspector
+    // that only ever has one or two browser tabs open.
+    this.setMaxListeners(50);
+    this.capacity = capacity;
+    this._ring = []; // ordered oldest → newest
+    this._nextId = 1;
+  }
+  nextId() { return this._nextId++; }
+  push(evt) {
+    this._ring.push(evt);
+    if (this._ring.length > this.capacity) {
+      this._ring.splice(0, this._ring.length - this.capacity);
+    }
+  }
+  getRecent() { return this._ring.slice(); }
+}
 
 class RelayServer {
-  constructor({ getUpstream, ensureBrave } = {}) {
+  constructor({ getUpstream, ensureBrave, trafficEmitter } = {}) {
     if (typeof getUpstream !== "function") {
       throw new Error("RelayServer: constructor expects { getUpstream } async function");
     }
@@ -28,6 +80,10 @@ class RelayServer {
     this.getUpstream = getUpstream;
     this.ensureBrave = ensureBrave || null;
     this.ownTools = new Map(); // name → { name, description, inputSchema, handler }
+    // Traffic emitter is always present so call sites don't need null-guards.
+    // If the caller doesn't pass one, we make our own (no subscribers = no
+    // visible behavior change).
+    this.trafficEmitter = trafficEmitter || new TrafficEmitter();
   }
 
   registerOwnTool({ name, description, inputSchema, handler }) {
@@ -62,25 +118,77 @@ class RelayServer {
 
   async handleToolsCall({ name, arguments: args }) {
     const own = this.ownTools.get(name);
-    if (own) {
-      // Own-tool handlers read globalThis.__relayBridge. ensureBrave populates
-      // that. Always call it before invoking the own-tool handler.
-      if (this.ensureBrave) await this.ensureBrave();
-      try {
-        return await own.handler(args || {});
-      } catch (e) {
-        return {
-          content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
-          isError: true,
-        };
+    const isOwn = !!own;
+    const id = this.trafficEmitter.nextId();
+    const startTime = Date.now();
+    const startHr = process.hrtime.bigint();
+
+    // Emit `request` BEFORE forwarding/handling. Inspector buffers this so
+    // the activity feed can show "in-flight" until the response lands.
+    const requestEvent = {
+      id,
+      time: new Date(startTime).toISOString(),
+      method: "tools/call",
+      name,
+      args: truncateForEmit(args || {}),
+      source: isOwn ? "own" : "upstream",
+    };
+    this.trafficEmitter.push(requestEvent);
+    // emit() throws back to the caller if a listener throws — wrap in
+    // try/catch so a busted Inspector subscriber can't take out a tool call.
+    try { this.trafficEmitter.emit("request", requestEvent); } catch { /* noop */ }
+
+    let status = "ok";
+    let response;
+    try {
+      if (isOwn) {
+        // Own-tool handlers read globalThis.__relayBridge. ensureBrave
+        // populates that. Always call it before invoking the handler.
+        if (this.ensureBrave) await this.ensureBrave();
+        try {
+          response = await own.handler(args || {});
+        } catch (e) {
+          response = {
+            content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
+            isError: true,
+          };
+        }
+      } else {
+        // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
+        if (this.ensureBrave) await this.ensureBrave();
+        const upstream = await this.getUpstream();
+        response = await upstream.request("tools/call", { name, arguments: args });
       }
+      if (response && response.isError) status = "error";
+    } catch (e) {
+      // Forwarded-path failures bubble up as caller errors. Record + rethrow.
+      status = "error";
+      const durationMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;
+      const responseEvent = {
+        id,
+        time: new Date().toISOString(),
+        status,
+        durationMs,
+        response: truncateForEmit({ error: e.message }),
+      };
+      this.trafficEmitter.push(responseEvent);
+      try { this.trafficEmitter.emit("response", responseEvent); } catch { /* noop */ }
+      throw e;
     }
-    // Forwarded tool — upstream's tool handler will lazily try to attach to
-    // our Brave via CDP. Brave must be running first.
-    if (this.ensureBrave) await this.ensureBrave();
-    const upstream = await this.getUpstream();
-    return await upstream.request("tools/call", { name, arguments: args });
+
+    const durationMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;
+    const responseEvent = {
+      id,
+      time: new Date().toISOString(),
+      status,
+      durationMs,
+      response: truncateForEmit(response),
+    };
+    this.trafficEmitter.push(responseEvent);
+    try { this.trafficEmitter.emit("response", responseEvent); } catch { /* noop */ }
+
+    return response;
   }
 }
 
-module.exports = { RelayServer };
+module.exports = { RelayServer, TrafficEmitter, truncateForEmit, MAX_TRAFFIC_BODY_CHARS, TRAFFIC_RING_CAPACITY };

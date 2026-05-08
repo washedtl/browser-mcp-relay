@@ -483,6 +483,8 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_RELAY_PROXY_URL` | unset | Optional HTTP proxy for Brave's outbound traffic. Useful with debug proxies (Charles, mitmproxy, powhttp). See [Optional features](#-optional-features). |
 | `BROWSER_RELAY_VAULT_FILES` | unset (autofill disabled) | Semicolon-separated paths to Brave/Chrome password CSV exports. Enables form-autofill on navigation. See [Optional features](#-optional-features). |
 | `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` | `false` | Include IndexedDB in pool-mode profile snapshot (100+ MB typical). |
+| `BROWSER_RELAY_INSPECTOR_PORT` | unset | When set, the relay boots the Inspector dashboard inline on this port and pipes its live MCP-traffic stream into the `/slot/N` Inspector pages. Without this, run the Inspector separately via `npm run inspector` (no live traffic). See [Live inspector](#-live-inspector). |
+| `BROWSER_RELAY_INSPECTOR_BIND` | `127.0.0.1` | Bind address for the Inspector. Override only with care — the Inspector has no auth. |
 
 **Precedence:** environment variable ▸ `local-config.json` ▸ auto-detect ▸ reasonable hard-coded defaults.
 
@@ -522,20 +524,53 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 
 ### 🔍 Live inspector
 
-A small web dashboard for peeking at the relay's runtime state — pool slot status (claimed / idle / orphan), specialty MCP cookie freshness, vault entry counts, tool counts, uptime. **Off by default**, no auth, read-only.
+A small web dashboard for peeking at the relay's runtime state — pool slot status (claimed / idle / orphan), specialty MCP cookie freshness, vault entry counts, tool counts, uptime, plus a per-slot **Inspector page** with live MCP-traffic streaming. **Off by default**, no auth, read-only.
 
-Start it:
+Two modes:
+
+#### Standalone (no live traffic)
+
+Start the Inspector separately. It still serves Pool / Tools / Specialty / Settings / per-slot pages, but the **Activity feed on `/slot/N` will be empty** — there's no relay process to subscribe to.
 
 ```bash
 npm run inspector
 # Inspector running at http://127.0.0.1:9090
 ```
 
-Open `http://localhost:9090` in any browser. Auto-refreshes every 5 s; click Pause to stop polling. Override the port with `BROWSER_RELAY_INSPECTOR_PORT=9091`.
+#### In-process (full live traffic)
 
-The inspector now has four pages — **Pool overview** (`/`), **Tools catalog** (`/tools`), **Specialty MCPs** (`/specialty`), and **Settings** (`/settings`) — all read-only for safety. The Tools catalog browses all 67 tools (16 first-party + 51 forwarded from `browser-devtools-mcp`) with a left-pane filter and right-pane detail, including source-file references for the first-party tools and category groupings on both sides. Settings shows resolved config, which `BROWSER_RELAY_*` env vars are set (booleans only — values are never displayed), and a paste-ready `local-config.json` snippet you can copy with one click. Mutating actions (refresh cookies, save settings, invoke tools) come in a later release once we add proper CORS gating.
+Set `BROWSER_RELAY_INSPECTOR_PORT` in your MCP-client config (e.g. `~/.claude.json`) so the relay boots the Inspector inline. The Inspector then subscribes to the relay's traffic emitter and streams every `tools/call` request + response over a WebSocket to connected Inspector tabs.
 
-> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). It's read-only in this version (no mutating endpoints), so the worst case is information disclosure — but that's still worth taking seriously.
+```jsonc
+// ~/.claude.json (excerpt)
+{
+  "mcpServers": {
+    "browser-devtools-mcp-relay": {
+      "command": "node",
+      "args": ["<absolute-path-to-repo>/scripts/wrap-browser-devtools-mcp.js"],
+      "env": {
+        "BROWSER_RELAY_INSPECTOR_PORT": "9091"
+      }
+    }
+  }
+}
+```
+
+After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-slot Inspector page. The Activity feed populates in real time as your AI client makes tool calls.
+
+#### Pages
+
+The Inspector has five surfaces — all read-only:
+
+- **Pool overview** (`/`) — slot grid (claimed / idle / orphan), specialty MCPs, vault summary
+- **Tools catalog** (`/tools`) — all 67 tools (16 first-party + 51 forwarded), filter + per-tool detail
+- **Specialty MCPs** (`/specialty`) — auxiliary MCP servers + cookie source freshness
+- **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet
+- **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode.
+
+Mutating actions (refresh cookies, save settings, invoke tools) come in a later release once we add proper CORS gating.
+
+> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). It's read-only in this version (no mutating endpoints), so the worst case is information disclosure — but that's still worth taking seriously.
 
 ---
 

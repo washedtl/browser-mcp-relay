@@ -129,12 +129,15 @@
     const specialtyCount = Object.keys(status.specialty || {}).length;
     document.getElementById("nav-specialty-count").textContent = specialtyCount;
 
+    const slotPathMatch = location.pathname.match(/^\/slot\/(\d+)$/);
+    const activeSlot = slotPathMatch ? parseInt(slotPathMatch[1], 10) : null;
     const renderList = (target, list, statusClass) => {
       const node = document.getElementById(target);
       clearChildren(node);
       for (const slot of list) {
+        const isActive = activeSlot === slot.index;
         node.appendChild(
-          el("div", { class: "nav-item" }, [
+          el("a", { href: "/slot/" + slot.index, class: "nav-item" + (isActive ? " active" : "") }, [
             el("span", { class: "nav-status " + statusClass }),
             el("span", { class: "name mono" }, "Slot " + slot.index),
             statusClass === "warn" ? el("span", { class: "nav-meta" }, "orphan") : null,
@@ -991,6 +994,410 @@
     renderToolDetail();
   }
 
+  // ─── SLOT DETAIL (per-slot Inspector page) ───────────────────────────
+  //
+  // Layout: top breadcrumb, "Recent activity" feed (WS-driven), "Detail"
+  // section that shows the selected event's request + response. Standalone
+  // mode receives no live events; we show the standalone empty state.
+
+  // Module-level state for the live feed. Reset on each renderSlotDetail.
+  let slotState = {
+    n: null,
+    feed: [],          // array of merged request/response events (newest first)
+    selectedId: null,  // event id whose request/response we're showing
+    eventMap: new Map(), // id → { request: {...}, response: {...} }
+    ws: null,
+    wsAttempts: 0,
+    wsLive: false,
+    wsStandalone: false,
+    wsReconnectTimer: null,
+    sigToken: 0,        // bumps on each renderSlotDetail; stale handlers no-op
+  };
+
+  const FEED_CAP = 100;
+
+  function formatHHMMSS(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    const pad = (n) => String(n).padStart(2, "0");
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+
+  function formatMs(ms) {
+    if (ms == null || !Number.isFinite(ms)) return "—";
+    if (ms >= 1000) return (ms / 1000).toFixed(1) + "s";
+    return Math.round(ms) + "ms";
+  }
+
+  function summariseArgs(args) {
+    if (args == null) return "";
+    if (typeof args === "string") return args;
+    try {
+      const json = JSON.stringify(args);
+      if (json.length > 110) return json.slice(0, 109) + "…";
+      return json;
+    } catch {
+      return String(args);
+    }
+  }
+
+  function renderActivityCard(merged) {
+    const { request, response, id } = merged;
+    const isInFlight = !response;
+    const status = response ? response.status : "pending";
+    const iconClass = isInFlight ? "pending" : (status === "error" ? "err" : "ok");
+    const sourceClass = request && request.source === "own" ? "first-party" : "";
+    const sourceLabel = request && request.source === "own" ? "First-party" : "Forwarded";
+    const card = el("div", { class: "activity-card" + (slotState.selectedId === id ? " active" : ""), "data-id": String(id) }, [
+      el("span", { class: "activity-icon " + iconClass }),
+      el("div", { class: "activity-body" }, [
+        el("div", { class: "activity-title" }, [
+          el("span", { class: "activity-tool" }, request ? request.name : "(unknown)"),
+          el("span", { class: "activity-source " + sourceClass }, sourceLabel),
+        ]),
+        el("div", { class: "activity-args mono" }, request ? summariseArgs(request.args) : ""),
+      ]),
+      el("div", { class: "activity-meta" }, [
+        el("span", { class: "activity-duration mono" + (response && response.durationMs > 1000 ? " slow" : "") },
+          response ? formatMs(response.durationMs) : "in flight"),
+        el("span", { class: "activity-time mono" }, request ? formatHHMMSS(request.time) : "—"),
+      ]),
+    ]);
+    card.addEventListener("click", () => {
+      slotState.selectedId = id;
+      renderActivityFeed();
+      renderSlotDetailSelected();
+    });
+    return card;
+  }
+
+  function renderActivityFeed() {
+    const node = document.getElementById("slot-activity-feed");
+    if (!node) return;
+    clearChildren(node);
+
+    if (slotState.wsStandalone) {
+      node.appendChild(
+        el("div", { class: "activity-empty" },
+          "Inspector running standalone — live traffic requires launching the relay with BROWSER_RELAY_INSPECTOR_PORT set."),
+      );
+      updateActivityMeta(0, 0, 0);
+      return;
+    }
+
+    if (slotState.feed.length === 0) {
+      node.appendChild(
+        el("div", { class: "activity-empty" },
+          "Listening for activity. Make a request via your MCP client to see it here."),
+      );
+      updateActivityMeta(0, 0, 0);
+      return;
+    }
+
+    let ok = 0, err = 0, pending = 0;
+    for (const m of slotState.feed) {
+      node.appendChild(renderActivityCard(m));
+      if (!m.response) pending++;
+      else if (m.response.status === "error") err++;
+      else ok++;
+    }
+    updateActivityMeta(ok, err, pending);
+  }
+
+  function updateActivityMeta(ok, err, pending) {
+    const meta = document.getElementById("slot-activity-meta");
+    if (!meta) return;
+    clearChildren(meta);
+    meta.appendChild(el("span", { class: "ok" }, ok + " ok"));
+    meta.appendChild(document.createTextNode(" · "));
+    meta.appendChild(el("span", { class: "err" }, err + " error"));
+    if (pending > 0) {
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(el("span", null, pending + " in flight"));
+    }
+  }
+
+  function renderSlotDetailSelected() {
+    const pane = document.getElementById("slot-detail-pane");
+    const title = document.getElementById("slot-detail-title");
+    if (!pane) return;
+    clearChildren(pane);
+
+    const merged = slotState.feed.find((m) => m.id === slotState.selectedId);
+    if (!merged) {
+      if (title) title.textContent = "Detail";
+      pane.appendChild(el("div", { class: "slot-detail-empty" }, "Select an event from the feed to view its request/response."));
+      return;
+    }
+
+    const { request, response } = merged;
+    if (title) title.textContent = "Detail · " + (request ? request.name : "");
+
+    const head = el("div", { class: "detail-head" }, [
+      el("div", { class: "detail-tool" }, request ? request.name : ""),
+      el("div", { class: "detail-badges" }, [
+        el("span", { class: "badge " + (request && request.source === "own" ? "first-party" : "") },
+          request && request.source === "own" ? "First-party" : "Forwarded"),
+        response
+          ? el("span", { class: "badge " + (response.status === "error" ? "err" : "ok") },
+              response.status === "error" ? "Error" : "OK")
+          : el("span", { class: "badge" }, "In flight"),
+        el("span", { class: "badge mono" }, formatHHMMSS(request ? request.time : null)),
+        response ? el("span", { class: "badge mono" }, formatMs(response.durationMs)) : null,
+      ]),
+    ]);
+    pane.appendChild(head);
+
+    pane.appendChild(detailSection("Request", JSON.stringify({
+      method: request ? request.method : "tools/call",
+      params: { name: request ? request.name : "", arguments: request ? request.args : {} },
+    }, null, 2)));
+
+    if (response) {
+      // response.response is the actual MCP response payload (may be a
+      // string from the relay's truncate path).
+      const rendered = typeof response.response === "string"
+        ? response.response
+        : JSON.stringify(response.response, null, 2);
+      pane.appendChild(detailSection("Response", rendered));
+    }
+  }
+
+  function detailSection(label, body) {
+    return el("div", { class: "detail-section" }, [
+      el("div", { class: "detail-section-label" }, label),
+      el("pre", { class: "json-block mono" }, body || ""),
+    ]);
+  }
+
+  function ingestEvent(evt) {
+    if (!evt || !evt.type || evt.id == null) return;
+
+    if (evt.type === "request") {
+      const merged = { id: evt.id, request: evt, response: null };
+      slotState.eventMap.set(evt.id, merged);
+      slotState.feed.unshift(merged);
+      if (slotState.feed.length > FEED_CAP) {
+        const dropped = slotState.feed.splice(FEED_CAP);
+        for (const m of dropped) slotState.eventMap.delete(m.id);
+      }
+      // Default-select first event if user hasn't picked one yet.
+      if (slotState.selectedId == null) slotState.selectedId = evt.id;
+      return;
+    }
+
+    if (evt.type === "response") {
+      const m = slotState.eventMap.get(evt.id);
+      if (m) m.response = evt;
+      return;
+    }
+  }
+
+  function applyBackfill(events) {
+    if (!Array.isArray(events)) return;
+    // Backfill events arrive oldest → newest. Process in order to fold
+    // request+response pairs.
+    for (const e of events) ingestEvent(e);
+  }
+
+  function teardownWs() {
+    if (slotState.ws) {
+      try { slotState.ws.onopen = null; slotState.ws.onclose = null; slotState.ws.onerror = null; slotState.ws.onmessage = null; } catch {}
+      try { slotState.ws.close(); } catch {}
+      slotState.ws = null;
+    }
+    if (slotState.wsReconnectTimer) {
+      clearTimeout(slotState.wsReconnectTimer);
+      slotState.wsReconnectTimer = null;
+    }
+  }
+
+  function connectWs(token) {
+    teardownWs();
+    if (token !== slotState.sigToken) return;
+
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    let ws;
+    try {
+      ws = new WebSocket(proto + "//" + location.host + "/ws/traffic");
+    } catch (e) {
+      // Browser refused (e.g. invalid URL) — no live updates available.
+      slotState.wsLive = false;
+      updateLivePill();
+      return;
+    }
+    slotState.ws = ws;
+
+    ws.onopen = () => {
+      if (token !== slotState.sigToken) { try { ws.close(); } catch {}; return; }
+      slotState.wsAttempts = 0;
+      slotState.wsLive = true;
+      slotState.wsStandalone = false;
+      updateLivePill();
+    };
+    ws.onmessage = (msgEvt) => {
+      if (token !== slotState.sigToken) return;
+      let data;
+      try { data = JSON.parse(msgEvt.data); }
+      catch { return; }
+      if (data.type === "no-emitter") {
+        slotState.wsStandalone = true;
+        slotState.wsLive = false;
+        updateLivePill();
+        renderActivityFeed();
+        return;
+      }
+      if (data.type === "backfill") {
+        applyBackfill(data.events);
+        renderActivityFeed();
+        renderSlotDetailSelected();
+        return;
+      }
+      if (data.type === "request" || data.type === "response") {
+        ingestEvent(data);
+        renderActivityFeed();
+        if (data.id === slotState.selectedId) renderSlotDetailSelected();
+        return;
+      }
+    };
+    ws.onclose = () => {
+      if (token !== slotState.sigToken) return;
+      slotState.wsLive = false;
+      updateLivePill();
+      // Only reconnect if we never got a definitive "no-emitter" from the
+      // server. Standalone mode closes intentionally; reconnecting would
+      // just bounce off the same wall.
+      if (slotState.wsStandalone) return;
+      slotState.wsAttempts++;
+      const delay = Math.min(30_000, 500 * Math.pow(2, slotState.wsAttempts - 1));
+      slotState.wsReconnectTimer = setTimeout(() => connectWs(token), delay);
+    };
+    ws.onerror = () => {
+      // Browser fires onclose right after onerror; let onclose handle backoff.
+      slotState.wsLive = false;
+      updateLivePill();
+    };
+  }
+
+  function updateLivePill() {
+    const pill = document.getElementById("slot-live-pill");
+    if (!pill) return;
+    if (slotState.wsStandalone) {
+      pill.className = "live-pill warn";
+      pill.textContent = "Standalone";
+      return;
+    }
+    if (slotState.wsLive) {
+      pill.className = "live-pill ok";
+      pill.textContent = "Live";
+      return;
+    }
+    pill.className = "live-pill";
+    pill.textContent = "Reconnecting…";
+  }
+
+  function buildSlotDetailShell(main, n, total) {
+    clearChildren(main);
+
+    const breadcrumb = el("div", { class: "slot-breadcrumb" }, [
+      el("a", { href: "/" }, "Pool"),
+      el("span", { class: "slot-breadcrumb-sep" }, "·"),
+      el("span", null, "Slot " + n),
+      el("span", { id: "slot-live-pill", class: "live-pill" }, "Connecting…"),
+    ]);
+    main.appendChild(breadcrumb);
+
+    main.appendChild(el("div", { id: "slot-summary-card", class: "slot-summary-card" }, [
+      el("div", { class: "empty-msg" }, "Loading slot…"),
+    ]));
+
+    main.appendChild(
+      el("div", { class: "section-title" }, [
+        el("h2", null, "Recent activity"),
+        el("span", { class: "meta", id: "slot-activity-meta" }),
+      ]),
+    );
+    main.appendChild(el("div", { class: "activity-feed", id: "slot-activity-feed" }, [
+      el("div", { class: "activity-empty" }, "Connecting…"),
+    ]));
+
+    main.appendChild(
+      el("div", { class: "section-title" }, [
+        el("h2", { id: "slot-detail-title" }, "Detail"),
+        el("span", { class: "meta" }, total ? "slot " + n + " of " + total : ""),
+      ]),
+    );
+    main.appendChild(el("div", { class: "detail-block", id: "slot-detail-pane" }, [
+      el("div", { class: "slot-detail-empty" }, "Select an event from the feed to view its request/response."),
+    ]));
+  }
+
+  function renderSlotSummaryCard(slot) {
+    const node = document.getElementById("slot-summary-card");
+    if (!node) return;
+    clearChildren(node);
+    const stateLabel = slot.state === "claimed" ? "Active" :
+                       slot.state === "orphan" ? "Orphan" : "Idle";
+    const stateClass = slot.state === "claimed" ? "ok" :
+                       slot.state === "orphan" ? "err" : "idle";
+    const headLeft = el("div", null, [
+      el("div", { class: "slot-summary-name" }, "Slot " + slot.index),
+      el("div", { class: "slot-summary-dir mono" }, slot.dir || "—"),
+    ]);
+    const headRight = el("div", { class: "slot-summary-stats mono" }, [
+      el("span", null, [el("span", { class: "k" }, "STATE"), el("span", { class: "v " + stateClass }, stateLabel)]),
+      el("span", null, [el("span", { class: "k" }, "PID"), el("span", { class: "v" }, slot.pid != null ? String(slot.pid) : "—")]),
+      el("span", null, [el("span", { class: "k" }, "ROLE"), el("span", { class: "v" }, slot.role || "default")]),
+      el("span", null, [el("span", { class: "k" }, "UP"), el("span", { class: "v" }, slot.lockHeldMs != null ? formatDuration(slot.lockHeldMs / 1000) : "—")]),
+      el("span", null, [el("span", { class: "k" }, "COOKIE"), el("span", { class: "v" }, formatCookieAge(slot.cookieAgeDays))]),
+    ]);
+    node.appendChild(el("div", { class: "slot-summary-head" }, [headLeft, headRight]));
+  }
+
+  async function renderSlotDetail(main, n) {
+    // Reset state for this view.
+    teardownWs();
+    slotState = {
+      n,
+      feed: [],
+      selectedId: null,
+      eventMap: new Map(),
+      ws: null,
+      wsAttempts: 0,
+      wsLive: false,
+      wsStandalone: false,
+      wsReconnectTimer: null,
+      sigToken: slotState.sigToken + 1,
+    };
+    const token = slotState.sigToken;
+
+    let detail;
+    try {
+      detail = await fetchJson("/api/slot/" + n);
+    } catch (e) {
+      // Most likely 404 (slot out of range) — bounce home.
+      location.replace("/");
+      return;
+    }
+    if (token !== slotState.sigToken) return;
+
+    buildSlotDetailShell(main, n, detail.totalSlots);
+    renderSlotSummaryCard(detail.slot);
+
+    // Backfill from the GET first (HTTP-fast); WS will then provide a more
+    // recent backfill on connect + live updates.
+    if (Array.isArray(detail.recentTraffic) && detail.recentTraffic.length > 0) {
+      applyBackfill(detail.recentTraffic);
+      renderActivityFeed();
+      renderSlotDetailSelected();
+    } else {
+      renderActivityFeed();
+    }
+
+    connectWs(token);
+  }
+
   // ─── Header / sidebar wiring (chrome shared across views) ─────────────
 
   // Header buttons. Refresh + Pause only matter on Home.
@@ -1049,11 +1456,38 @@
     }
   }
 
+  // Route a slot detail page. Refresh sidebar (so slot links highlight)
+  // before mounting the detail view.
+  async function refreshSlotSidebar() {
+    try {
+      const status = await fetchJson("/api/status");
+      renderSidebar(status);
+    } catch {
+      // Sidebar can stay empty if status fails — page still renders.
+    }
+  }
+
   function route() {
     const main = document.getElementById("main");
     if (!main) return;
     const pathname = location.pathname;
     applyActiveNav(pathname);
+
+    // Per-slot detail page. /slot/:n where :n is a positive integer.
+    const slotMatch = pathname.match(/^\/slot\/(.+)$/);
+    if (slotMatch) {
+      const n = parseInt(slotMatch[1], 10);
+      if (!Number.isInteger(n) || n < 1 || String(n) !== slotMatch[1]) {
+        location.replace("/");
+        return;
+      }
+      blankStatStrip();
+      // Sidebar still shows pool slots — refresh it so this slot is highlighted.
+      refreshSlotSidebar();
+      renderSlotDetail(main, n);
+      return;
+    }
+
     if (pathname === "/settings") {
       blankStatStrip();
       blankSidebarLists();

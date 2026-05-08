@@ -266,6 +266,42 @@ async function main() {
     process.stderr.write(`[mcp-relay] registered ${ownTools.length} own-tools: ${ownTools.map(t => t.name).join(", ")}\n`);
   }
 
+  // 4b. Optional in-process Inspector. When BROWSER_RELAY_INSPECTOR_PORT is
+  // set on the relay process, we boot the Inspector in this same Node
+  // process and wire its WebSocket to the relay's trafficEmitter — so the
+  // /slot/N Inspector page sees real MCP traffic as it happens. Standalone
+  // `npm run inspector` runs separately and never gets here.
+  let inspectorHandle = null;
+  const inspectorPortRaw = RELAY_ENV.BROWSER_RELAY_INSPECTOR_PORT;
+  if (inspectorPortRaw) {
+    const parsed = parseInt(inspectorPortRaw, 10);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 65535) {
+      process.stderr.write(`[mcp-relay] WARNING: BROWSER_RELAY_INSPECTOR_PORT="${inspectorPortRaw}" is not a valid port; skipping in-process inspector\n`);
+    } else {
+      try {
+        const { startInspector } = require("./inspector-server.js");
+        const inspectorBind = RELAY_ENV.BROWSER_RELAY_INSPECTOR_BIND || "127.0.0.1";
+        if (inspectorBind !== "127.0.0.1" && inspectorBind !== "localhost") {
+          process.stderr.write(
+            `[mcp-relay] WARNING: inspector binding to ${inspectorBind} (not 127.0.0.1). ` +
+            `No auth — anyone reaching this address can read pool state.\n`,
+          );
+        }
+        inspectorHandle = await startInspector({
+          port: parsed,
+          bind: inspectorBind,
+          uiRoot: path.resolve(__dirname, "..", "scripts", "inspector-ui"),
+          trafficEmitter: relay.trafficEmitter,
+        });
+        process.stderr.write(
+          `[mcp-relay] inspector running at http://${inspectorBind}:${inspectorHandle.port}\n`,
+        );
+      } catch (e) {
+        process.stderr.write(`[mcp-relay] inspector failed to start: ${e.stack || e.message}\n`);
+      }
+    }
+  }
+
   const server = new Server(
     { name: "browser-mcp-relay", version: "0.1.0" },
     { capabilities: { tools: {} } },
@@ -293,6 +329,7 @@ async function main() {
     if (upstreamClient) { try { upstreamClient.close(); } catch {} }
     if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
     if (bridge) { closeBrave(bridge).catch(() => {}); }
+    if (inspectorHandle) { inspectorHandle.close().catch(() => {}); }
     try { releasePool(); } catch {}
   }
 
@@ -302,6 +339,7 @@ async function main() {
     if (upstreamClient) { try { upstreamClient.close(); } catch {} }
     if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
     if (bridge) { try { await closeBrave(bridge); } catch {} }
+    if (inspectorHandle) { try { await inspectorHandle.close(); } catch {} }
     try { releasePool(); } catch {}
   }
 

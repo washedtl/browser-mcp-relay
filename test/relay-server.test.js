@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert");
-const { RelayServer } = require("../src/relay-server.js");
+const { RelayServer, TrafficEmitter, truncateForEmit, MAX_TRAFFIC_BODY_CHARS, TRAFFIC_RING_CAPACITY } = require("../src/relay-server.js");
 
 class FakeUpstream {
   async request(method, params) {
@@ -223,4 +223,144 @@ test("RelayServer.handleToolsCall calls ensureBrave BEFORE forwarding to upstrea
   });
   await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
   assert.deepStrictEqual(order, ["ensureBrave", "upstream.tools/call"], "ensureBrave must complete before forwarding");
+});
+
+// ─── W10: trafficEmitter tests ─────────────────────────────────────────
+
+test("RelayServer exposes a trafficEmitter by default", () => {
+  const relay = makeRelay();
+  assert.ok(relay.trafficEmitter, "trafficEmitter must always exist");
+  assert.strictEqual(typeof relay.trafficEmitter.on, "function");
+  assert.strictEqual(typeof relay.trafficEmitter.getRecent, "function");
+});
+
+test("RelayServer.handleToolsCall emits request + response events for forwarded tool", async () => {
+  const relay = makeRelay();
+  const events = [];
+  relay.trafficEmitter.on("request", (e) => events.push({ kind: "request", ...e }));
+  relay.trafficEmitter.on("response", (e) => events.push({ kind: "response", ...e }));
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: { url: "about:blank" } });
+  assert.strictEqual(events.length, 2);
+  assert.strictEqual(events[0].kind, "request");
+  assert.strictEqual(events[0].name, "navigation_go-to");
+  assert.strictEqual(events[0].source, "upstream");
+  assert.strictEqual(events[1].kind, "response");
+  assert.strictEqual(events[1].id, events[0].id, "request and response share id");
+  assert.strictEqual(events[1].status, "ok");
+  assert.strictEqual(typeof events[1].durationMs, "number");
+});
+
+test("RelayServer.handleToolsCall emits source=own for own-tool", async () => {
+  const relay = makeRelay();
+  const events = [];
+  relay.trafficEmitter.on("request", (e) => events.push(e));
+  relay.registerOwnTool({
+    name: "ours",
+    description: "",
+    inputSchema: {},
+    handler: async () => ({ content: [{ type: "text", text: "ok" }] }),
+  });
+  await relay.handleToolsCall({ name: "ours", arguments: { x: 1 } });
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].source, "own");
+});
+
+test("RelayServer.handleToolsCall emits status=error when own-tool returns isError", async () => {
+  const relay = makeRelay();
+  const events = [];
+  relay.trafficEmitter.on("response", (e) => events.push(e));
+  relay.registerOwnTool({
+    name: "broken",
+    description: "",
+    inputSchema: {},
+    handler: async () => { throw new Error("kaboom"); },
+  });
+  await relay.handleToolsCall({ name: "broken", arguments: {} });
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].status, "error");
+});
+
+test("RelayServer.handleToolsCall pushes events into the ring buffer", async () => {
+  const relay = makeRelay();
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
+  const recent = relay.trafficEmitter.getRecent();
+  assert.strictEqual(recent.length, 2);
+  assert.strictEqual(recent[0].name, "navigation_go-to");
+  assert.strictEqual(recent[1].status, "ok");
+  assert.strictEqual(recent[1].id, recent[0].id);
+});
+
+test("RelayServer trafficEmitter ring buffer caps at TRAFFIC_RING_CAPACITY", async () => {
+  const ee = new TrafficEmitter();
+  // Push 250 fake events directly. Ring should hold only the last 200.
+  for (let i = 0; i < 250; i++) ee.push({ id: i, foo: "bar" });
+  const recent = ee.getRecent();
+  assert.strictEqual(recent.length, TRAFFIC_RING_CAPACITY);
+  assert.strictEqual(recent[0].id, 50, "oldest event should be id=50 after 250 pushes with cap 200");
+  assert.strictEqual(recent[recent.length - 1].id, 249);
+});
+
+test("truncateForEmit: returns value unchanged when under cap", () => {
+  const small = { name: "x", payload: "hello" };
+  assert.deepStrictEqual(truncateForEmit(small), small);
+});
+
+test("truncateForEmit: returns truncated string with marker for oversize values", () => {
+  const big = { huge: "x".repeat(MAX_TRAFFIC_BODY_CHARS + 1000) };
+  const out = truncateForEmit(big);
+  assert.strictEqual(typeof out, "string");
+  assert.ok(out.endsWith("[truncated]"));
+  assert.ok(out.length <= MAX_TRAFFIC_BODY_CHARS, "truncated output must be ≤ MAX_TRAFFIC_BODY_CHARS");
+});
+
+test("RelayServer.handleToolsCall truncates oversized response in emit", async () => {
+  // Upstream returns a huge response; relay should still return it intact to
+  // the caller, but the emitted event payload must be truncated.
+  const huge = "z".repeat(MAX_TRAFFIC_BODY_CHARS + 5000);
+  const upstream = {
+    async request(method) {
+      if (method === "tools/list") return { tools: [{ name: "big_tool", description: "", inputSchema: {} }] };
+      return { content: [{ type: "text", text: huge }] };
+    },
+    close() {},
+  };
+  const relay = new RelayServer({ getUpstream: async () => upstream });
+  const events = [];
+  relay.trafficEmitter.on("response", (e) => events.push(e));
+  const callerSawResponse = await relay.handleToolsCall({ name: "big_tool", arguments: {} });
+  // Caller still gets the full response.
+  assert.strictEqual(callerSawResponse.content[0].text.length, huge.length);
+  // Inspector sees the truncated marker.
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(typeof events[0].response, "string");
+  assert.ok(events[0].response.endsWith("[truncated]"));
+});
+
+test("RelayServer accepts an injected trafficEmitter", async () => {
+  const ee = new TrafficEmitter();
+  const relay = new RelayServer({
+    getUpstream: async () => ({
+      async request(method) {
+        if (method === "tools/list") return { tools: [{ name: "t", description: "", inputSchema: {} }] };
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+      close() {},
+    }),
+    trafficEmitter: ee,
+  });
+  assert.strictEqual(relay.trafficEmitter, ee);
+  await relay.handleToolsCall({ name: "t", arguments: {} });
+  assert.strictEqual(ee.getRecent().length, 2);
+});
+
+test("RelayServer.handleToolsCall ids increment across calls", async () => {
+  const relay = makeRelay();
+  const ids = [];
+  relay.trafficEmitter.on("request", (e) => ids.push(e.id));
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
+  assert.strictEqual(ids.length, 3);
+  assert.ok(ids[1] > ids[0]);
+  assert.ok(ids[2] > ids[1]);
 });
