@@ -679,6 +679,318 @@
     main.appendChild(list);
   }
 
+  // ─── TOOLS (catalog) ──────────────────────────────────────────────────
+
+  // Stable display order for the left-pane subgroups. Both first-party and
+  // forwarded categories are union'd here; we filter to whatever's actually
+  // present at render time.
+  const TOOLS_CATEGORY_ORDER = [
+    "performance", "device", "tabs", "forms", "network", "session", "downloads", "data",
+    "accessibility", "content", "debug", "interaction", "navigation", "observability",
+    "react", "stub", "scenario", "execute", "sync",
+  ];
+  const TOOLS_CATEGORY_LABELS = {
+    performance: "Performance & diagnostics",
+    device: "Device emulation",
+    tabs: "Multi-tab control",
+    forms: "Forms, dialogs, files",
+    network: "Network capture",
+    session: "Session & cookies",
+    downloads: "Downloads",
+    data: "Data extraction",
+    accessibility: "Accessibility",
+    content: "Content extraction",
+    debug: "Debug probes",
+    interaction: "Page interaction",
+    navigation: "Navigation",
+    observability: "Observability",
+    react: "React introspection",
+    stub: "HTTP stubbing",
+    scenario: "Scenarios",
+    execute: "Other",
+    sync: "Sync",
+  };
+
+  // Module-level tools state — fetched once, then driven by user input. We
+  // don't poll /api/tools (it's static for the lifetime of the inspector).
+  let toolsState = {
+    catalog: null,        // raw /api/tools payload
+    selected: null,       // tool name
+    filter: "",           // search string
+    sourceFilter: "all",  // "all" | "first-party" | "forwarded"
+  };
+
+  function matchesFilter(tool, filterText) {
+    if (!filterText) return true;
+    const q = filterText.toLowerCase();
+    return (
+      tool.name.toLowerCase().includes(q) ||
+      (tool.description || "").toLowerCase().includes(q)
+    );
+  }
+
+  function renderToolRow(tool, isOwn) {
+    const row = el("div", {
+      class: "tool-row" + (toolsState.selected === tool.name ? " active" : ""),
+      "data-name": tool.name,
+    }, [
+      el("span", { class: "tool-name" }, tool.name),
+      el("span", { class: "tool-desc" }, tool.description || ""),
+    ]);
+    row.addEventListener("click", () => {
+      toolsState.selected = tool.name;
+      renderToolsList();
+      renderToolDetail();
+    });
+    row._isOwn = isOwn;
+    return row;
+  }
+
+  function groupByCategory(tools) {
+    const map = new Map();
+    for (const t of tools) {
+      const cat = t.category || "data";
+      if (!map.has(cat)) map.set(cat, []);
+      map.get(cat).push(t);
+    }
+    return map;
+  }
+
+  function renderToolsList() {
+    const scroll = document.getElementById("tools-list-scroll");
+    if (!scroll) return;
+    clearChildren(scroll);
+
+    const cat = toolsState.catalog;
+    if (!cat) {
+      scroll.appendChild(el("div", { class: "tools-empty" }, "Loading…"));
+      return;
+    }
+
+    const showOwn = toolsState.sourceFilter !== "forwarded";
+    const showFwd = toolsState.sourceFilter !== "first-party";
+
+    const ownFiltered = (cat.own || []).filter((t) => matchesFilter(t, toolsState.filter));
+    const fwdFiltered = (cat.forwarded || []).filter((t) => matchesFilter(t, toolsState.filter));
+
+    let totalShown = 0;
+
+    if (showOwn && ownFiltered.length) {
+      scroll.appendChild(
+        el("div", { class: "tools-group-label" }, [
+          el("span", null, "First-party"),
+          el("span", { class: "group-count" }, String(ownFiltered.length)),
+        ]),
+      );
+      const groups = groupByCategory(ownFiltered);
+      for (const cat of TOOLS_CATEGORY_ORDER) {
+        const list = groups.get(cat);
+        if (!list || !list.length) continue;
+        scroll.appendChild(el("div", { class: "tools-subgroup-label" }, TOOLS_CATEGORY_LABELS[cat] || cat));
+        for (const t of list) scroll.appendChild(renderToolRow(t, true));
+        totalShown += list.length;
+      }
+    }
+
+    if (showFwd && fwdFiltered.length) {
+      scroll.appendChild(
+        el("div", { class: "tools-group-label" }, [
+          el("span", null, "Forwarded"),
+          el("span", { class: "group-count" }, String(fwdFiltered.length)),
+        ]),
+      );
+      const groups = groupByCategory(fwdFiltered);
+      for (const cat of TOOLS_CATEGORY_ORDER) {
+        const list = groups.get(cat);
+        if (!list || !list.length) continue;
+        scroll.appendChild(el("div", { class: "tools-subgroup-label" }, TOOLS_CATEGORY_LABELS[cat] || cat));
+        for (const t of list) scroll.appendChild(renderToolRow(t, false));
+        totalShown += list.length;
+      }
+    }
+
+    if (!totalShown) {
+      scroll.appendChild(el("div", { class: "tools-empty" }, "No tools match."));
+    }
+  }
+
+  function lookupSelected() {
+    const cat = toolsState.catalog;
+    if (!cat || !toolsState.selected) return null;
+    for (const t of cat.own || []) {
+      if (t.name === toolsState.selected) return { tool: t, isOwn: true };
+    }
+    for (const t of cat.forwarded || []) {
+      if (t.name === toolsState.selected) return { tool: t, isOwn: false };
+    }
+    return null;
+  }
+
+  function renderToolDetail() {
+    const pane = document.getElementById("tools-detail-pane");
+    if (!pane) return;
+    clearChildren(pane);
+
+    const sel = lookupSelected();
+    if (!sel) {
+      pane.appendChild(el("div", { class: "tools-empty" }, "Select a tool from the list."));
+      return;
+    }
+    const { tool, isOwn } = sel;
+
+    pane.appendChild(el("div", { class: "tool-detail-name" }, tool.name));
+    pane.appendChild(
+      el("div", { class: "tool-detail-badges" }, [
+        el("span", { class: "tool-source-pill " + (isOwn ? "first-party" : "forwarded") }, isOwn ? "First-party" : "Forwarded"),
+        tool.category ? el("span", { class: "tool-cat-chip" }, TOOLS_CATEGORY_LABELS[tool.category] || tool.category) : null,
+      ]),
+    );
+    pane.appendChild(el("div", { class: "tool-detail-desc" }, tool.description || "(no description)"));
+
+    if (isOwn) {
+      if (tool.sourceFile) {
+        pane.appendChild(
+          el("div", { class: "tool-detail-section" }, [
+            el("span", { class: "section-key" }, "Source"),
+            el("span", { class: "section-value" }, "src/own-tools/" + tool.sourceFile),
+          ]),
+        );
+      }
+      if (tool.inputSchemaPreview) {
+        pane.appendChild(
+          el("div", { class: "tool-detail-section" }, [
+            el("span", { class: "section-key" }, "Input schema (top-level fields)"),
+            el("span", { class: "section-value" }, tool.inputSchemaPreview),
+          ]),
+        );
+      } else {
+        pane.appendChild(
+          el("div", { class: "tool-detail-section" }, [
+            el("span", { class: "section-key" }, "Input schema"),
+            el("span", { class: "section-value muted" }, "(no input fields)"),
+          ]),
+        );
+      }
+    } else {
+      const upstream = tool.upstreamSource || "browser-devtools-mcp";
+      pane.appendChild(
+        el("div", { class: "tool-detail-section" }, [
+          el("span", { class: "section-key" }, "Upstream"),
+          el("a", {
+            href: "https://github.com/serkan-ozal/browser-devtools-mcp",
+            target: "_blank",
+            rel: "noopener noreferrer",
+          }, "From " + upstream),
+        ]),
+      );
+    }
+
+    const tryBtn = el("button", {
+      class: "tool-try-btn",
+      type: "button",
+      disabled: "",
+      title: "Requires running relay (W10)",
+    }, "Try it");
+    pane.appendChild(tryBtn);
+  }
+
+  function buildToolsShell(main) {
+    clearChildren(main);
+
+    const filterInput = el("input", {
+      type: "text",
+      placeholder: "Filter tools…",
+      id: "tools-filter-input",
+      autocomplete: "off",
+      spellcheck: "false",
+    });
+    filterInput.addEventListener("input", () => {
+      toolsState.filter = filterInput.value || "";
+      renderToolsList();
+    });
+
+    const filterWrap = el("div", { class: "tools-filter" }, [
+      svgIcon("0 0 24 24", [
+        { tag: "circle", attrs: { cx: "11", cy: "11", r: "8" } },
+        { tag: "line", attrs: { x1: "21", y1: "21", x2: "16.65", y2: "16.65" } },
+      ], { width: "13", height: "13", strokeWidth: "1.8" }),
+      filterInput,
+      el("kbd", null, "⌘F"),
+    ]);
+
+    const pillAll = el("button", { class: "tools-pill" + (toolsState.sourceFilter === "all" ? " active" : ""), type: "button" }, "All");
+    const pillOwn = el("button", { class: "tools-pill" + (toolsState.sourceFilter === "first-party" ? " active" : ""), type: "button" }, "First-party");
+    const pillFwd = el("button", { class: "tools-pill" + (toolsState.sourceFilter === "forwarded" ? " active" : ""), type: "button" }, "Forwarded");
+    const setSource = (val) => () => {
+      toolsState.sourceFilter = val;
+      pillAll.classList.toggle("active", val === "all");
+      pillOwn.classList.toggle("active", val === "first-party");
+      pillFwd.classList.toggle("active", val === "forwarded");
+      renderToolsList();
+    };
+    pillAll.addEventListener("click", setSource("all"));
+    pillOwn.addEventListener("click", setSource("first-party"));
+    pillFwd.addEventListener("click", setSource("forwarded"));
+
+    const titleRow = el("div", { class: "tools-list-titlerow" }, [
+      el("h2", null, "Tools"),
+      el("span", { class: "count", id: "tools-count" }, "—"),
+    ]);
+
+    const header = el("div", { class: "tools-list-header" }, [
+      titleRow,
+      filterWrap,
+      el("div", { class: "tools-pills" }, [pillAll, pillOwn, pillFwd]),
+    ]);
+
+    const scroll = el("div", { class: "tools-list-scroll", id: "tools-list-scroll" }, [
+      el("div", { class: "tools-empty" }, "Loading…"),
+    ]);
+
+    const listPane = el("div", { class: "tools-list-pane" }, [header, scroll]);
+    const detailPane = el("div", { class: "tools-detail-pane", id: "tools-detail-pane" }, [
+      el("div", { class: "tools-empty" }, "Loading…"),
+    ]);
+
+    main.appendChild(el("div", { class: "tools-layout" }, [listPane, detailPane]));
+
+    // Focus filter on ⌘/Ctrl+F. Page-local — doesn't intercept the browser's
+    // built-in find when typing in inputs/textareas elsewhere on the page.
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && document.querySelector(".tools-layout")) {
+        e.preventDefault();
+        filterInput.focus();
+        filterInput.select();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+  }
+
+  async function renderTools(main) {
+    buildToolsShell(main);
+    let data;
+    try {
+      data = await fetchJson("/api/tools");
+    } catch (e) {
+      const scroll = document.getElementById("tools-list-scroll");
+      if (scroll) {
+        clearChildren(scroll);
+        scroll.appendChild(el("div", { class: "tools-empty" }, "Failed to load /api/tools: " + e.message));
+      }
+      return;
+    }
+    toolsState.catalog = data;
+    // Default selection: lighthouse_audit if present, else the first own tool.
+    if (!toolsState.selected) {
+      const def = (data.own || []).find((t) => t.name === "lighthouse_audit");
+      toolsState.selected = def ? def.name : (data.own && data.own[0] ? data.own[0].name : null);
+    }
+    const counter = document.getElementById("tools-count");
+    if (counter) counter.textContent = String(data.total);
+    renderToolsList();
+    renderToolDetail();
+  }
+
   // ─── Header / sidebar wiring (chrome shared across views) ─────────────
 
   // Header buttons. Refresh + Pause only matter on Home.
@@ -705,7 +1017,7 @@
 
   // Highlight the active sidebar link for the current pathname.
   function applyActiveNav(pathname) {
-    const map = { "/": "home", "/index.html": "home", "/specialty": "specialty", "/settings": "settings" };
+    const map = { "/": "home", "/index.html": "home", "/tools": "tools", "/specialty": "specialty", "/settings": "settings" };
     const want = map[pathname] || "home";
     const items = document.querySelectorAll(".nav-item[data-nav]");
     items.forEach((n) => {
@@ -750,6 +1062,10 @@
       blankStatStrip();
       blankSidebarLists();
       renderSpecialty(main);
+    } else if (pathname === "/tools") {
+      blankStatStrip();
+      blankSidebarLists();
+      renderTools(main);
     } else {
       renderHome(main);
     }

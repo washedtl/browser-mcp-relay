@@ -15,10 +15,13 @@ const {
   buildStatus,
   buildSettings,
   buildSpecialty,
+  buildToolsCatalog,
   defaultPort,
   defaultBind,
   redactPath,
   formatDuration,
+  truncate,
+  inputSchemaPreview,
   TRACKED_ENV_VARS,
 } = require("../scripts/inspector.js");
 
@@ -517,6 +520,158 @@ test("/api/settings response never contains absolute paths", async () => {
     assert.ok(!/C:\\/.test(r.body), "Win backslash path leaked: " + r.body);
     assert.ok(!/C:\/fake/.test(r.body), "Win forward path leaked: " + r.body);
     assert.ok(!r.body.includes("Program Files"), "Program Files leaked: " + r.body);
+  } finally {
+    server.close();
+  }
+});
+
+// ─── W9: Tools catalog tests ───────────────────────────────────────────
+
+test("truncate: returns short text unchanged, long text gets ellipsis", () => {
+  assert.strictEqual(truncate("hi", 10), "hi");
+  assert.strictEqual(truncate("", 10), "");
+  const long = "x".repeat(220);
+  const out = truncate(long, 200);
+  assert.strictEqual(out.length, 200);
+  assert.ok(out.endsWith("…"));
+});
+
+test("inputSchemaPreview: returns empty for missing/empty schemas", () => {
+  assert.strictEqual(inputSchemaPreview(undefined), "");
+  assert.strictEqual(inputSchemaPreview({}), "");
+  assert.strictEqual(inputSchemaPreview({ type: "object", properties: {} }), "");
+});
+
+test("inputSchemaPreview: returns comma-separated top-level field names", () => {
+  const s = inputSchemaPreview({
+    type: "object",
+    properties: { url: {}, formFactor: {}, onlyCategories: {} },
+  });
+  assert.strictEqual(s, "url, formFactor, onlyCategories");
+});
+
+test("buildToolsCatalog: total = own + forwarded = 67 (16 + 51)", () => {
+  const c = buildToolsCatalog();
+  assert.strictEqual(c.total, 67);
+  assert.strictEqual(c.ownCount, 16);
+  assert.strictEqual(c.forwardedCount, 51);
+  assert.ok(Array.isArray(c.own));
+  assert.ok(Array.isArray(c.forwarded));
+  assert.strictEqual(c.own.length, 16);
+  assert.strictEqual(c.forwarded.length, 51);
+});
+
+test("buildToolsCatalog: each own-tool entry has required fields + valid category", () => {
+  const c = buildToolsCatalog();
+  const ownCategories = new Set([
+    "performance", "device", "tabs", "forms",
+    "network", "session", "downloads", "data",
+  ]);
+  for (const t of c.own) {
+    assert.strictEqual(typeof t.name, "string");
+    assert.ok(t.name.length > 0);
+    assert.strictEqual(typeof t.description, "string");
+    assert.ok(t.description.length <= 200, t.name + " description > 200 chars");
+    assert.strictEqual(typeof t.sourceFile, "string");
+    assert.ok(t.sourceFile.endsWith(".js"), t.name + " sourceFile not .js");
+    assert.ok(ownCategories.has(t.category), t.name + " has bad category " + t.category);
+    assert.strictEqual(typeof t.inputSchemaPreview, "string");
+  }
+});
+
+test("buildToolsCatalog: each forwarded entry has name + description + category + upstreamSource", () => {
+  const c = buildToolsCatalog();
+  const fwdCategories = new Set([
+    "accessibility", "content", "debug", "interaction", "navigation",
+    "observability", "react", "stub", "scenario", "execute", "sync",
+  ]);
+  for (const t of c.forwarded) {
+    assert.strictEqual(typeof t.name, "string");
+    assert.ok(t.name.length > 0);
+    assert.strictEqual(typeof t.description, "string");
+    assert.ok(t.description.length > 0);
+    assert.strictEqual(t.upstreamSource, "browser-devtools-mcp");
+    assert.ok(fwdCategories.has(t.category), t.name + " has bad category " + t.category);
+  }
+});
+
+test("buildToolsCatalog: seam test — mocked own-tools registry produces matching shape", () => {
+  const fakeRegistry = [
+    {
+      name: "tabs_list",
+      description: "Stub description",
+      inputSchema: { type: "object", properties: { idx: {} } },
+    },
+    {
+      name: "made_up_tool",
+      description: "Not in OWN_TOOL_META",
+      inputSchema: { type: "object", properties: {} },
+    },
+  ];
+  const c = buildToolsCatalog({ _ownTools: fakeRegistry });
+  assert.strictEqual(c.ownCount, 2);
+  assert.strictEqual(c.forwardedCount, 51);
+  assert.strictEqual(c.total, 53);
+  // Known entry: pulls sourceFile + category from OWN_TOOL_META.
+  const known = c.own.find((t) => t.name === "tabs_list");
+  assert.strictEqual(known.sourceFile, "tabs-list.js");
+  assert.strictEqual(known.category, "tabs");
+  assert.strictEqual(known.inputSchemaPreview, "idx");
+  // Unknown entry: falls back to <name>.js + "data" category.
+  const unknown = c.own.find((t) => t.name === "made_up_tool");
+  assert.strictEqual(unknown.sourceFile, "made_up_tool.js");
+  assert.strictEqual(unknown.category, "data");
+  assert.strictEqual(unknown.inputSchemaPreview, "");
+});
+
+test("GET /api/tools → 200 with valid shape", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/tools");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /application\/json/);
+    const body = JSON.parse(r.body);
+    assert.strictEqual(body.total, 67);
+    assert.strictEqual(body.ownCount, 16);
+    assert.strictEqual(body.forwardedCount, 51);
+    assert.strictEqual(body.own.length, 16);
+    assert.strictEqual(body.forwarded.length, 51);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /tools → 200 serves index.html", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/tools");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /text\/html/);
+    assert.ok(r.body.includes("Inspector"));
+  } finally {
+    server.close();
+  }
+});
+
+test("/api/tools response never leaks absolute paths (sourceFile basename only)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/tools");
+    assert.strictEqual(r.status, 200);
+    assert.ok(!/C:\\/.test(r.body), "Win backslash path leaked: " + r.body);
+    assert.ok(!/[A-Z]:\//.test(r.body), "Win forward absolute path leaked: " + r.body);
+    // POSIX absolute under common roots — should also not appear.
+    assert.ok(!/"sourceFile":"\//.test(r.body), "POSIX absolute sourceFile leaked: " + r.body);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/tools → 405 method not allowed (read-only in W9)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/tools", "POST");
+    assert.strictEqual(r.status, 405);
   } finally {
     server.close();
   }

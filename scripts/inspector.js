@@ -30,6 +30,7 @@ const processShim = require("../src/process-shim.js");
 const { loadVaultFromEnv } = require("../src/vault.js");
 const { tools: ownTools } = require("../src/own-tools/index.js");
 const { detectBraveProfileDir } = require("../src/detect-browser.js");
+const forwardedCatalog = require("./inspector-forwarded-tools.js");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const UI_DIR = path.join(__dirname, "inspector-ui");
@@ -411,6 +412,83 @@ function buildSettings(seams = {}) {
   };
 }
 
+// Map own-tool name → { sourceFile, category }. Mirrors the "First-party
+// tools" section of the README. Used by buildToolsCatalog() to enrich each
+// own-tool registry entry with display metadata. Source-file path is the
+// basename only; the absolute path lives in src/own-tools/ but the inspector
+// must never leak Windows-absolute paths onto the rendered page.
+const OWN_TOOL_META = {
+  lighthouse_audit: { sourceFile: "lighthouse-audit.js", category: "performance" },
+  "memory_take-heap-snapshot": { sourceFile: "memory-take-heap-snapshot.js", category: "performance" },
+  emulate_device: { sourceFile: "emulate-device.js", category: "device" },
+  tabs_list: { sourceFile: "tabs-list.js", category: "tabs" },
+  tabs_new: { sourceFile: "tabs-new.js", category: "tabs" },
+  tabs_select: { sourceFile: "tabs-select.js", category: "tabs" },
+  tabs_close: { sourceFile: "tabs-close.js", category: "tabs" },
+  dialog_handle: { sourceFile: "dialog-handle.js", category: "forms" },
+  file_upload: { sourceFile: "file-upload.js", category: "forms" },
+  form_fill: { sourceFile: "form-fill.js", category: "forms" },
+  capture_xhr: { sourceFile: "capture-xhr.js", category: "network" },
+  cookies_export: { sourceFile: "cookies-export.js", category: "session" },
+  cookies_import: { sourceFile: "cookies-import.js", category: "session" },
+  stealth_apply: { sourceFile: "stealth-apply.js", category: "session" },
+  download_capture: { sourceFile: "download-capture.js", category: "downloads" },
+  extract_structured: { sourceFile: "extract-structured.js", category: "data" },
+};
+
+/** Truncate text to a max length with ellipsis. Used for the API's
+ *  short-form descriptions; the frontend can request full descriptions
+ *  via the per-tool detail (which is just the registry's full string). */
+function truncate(text, max) {
+  if (!text) return "";
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1).trimEnd() + "…";
+}
+
+/** Compact comma-separated preview of an inputSchema's top-level fields.
+ *  Just field names — types live in the source. Empty objects render as "—". */
+function inputSchemaPreview(inputSchema) {
+  if (!inputSchema || !inputSchema.properties) return "";
+  const keys = Object.keys(inputSchema.properties);
+  if (!keys.length) return "";
+  return keys.join(", ");
+}
+
+/** Build the /api/tools payload. Own-tools come from the live registry
+ *  (so dropping a new file in src/own-tools/ + index.js auto-surfaces here);
+ *  forwarded tools come from the hardcoded scripts/inspector-forwarded-tools.js
+ *  catalog because the inspector can't introspect the upstream MCP from out
+ *  here. Tools is read-only — there's no /api/tools/call counterpart. */
+function buildToolsCatalog(seams = {}) {
+  const _ownTools = seams._ownTools || ownTools;
+
+  const own = _ownTools.map((t) => {
+    const meta = OWN_TOOL_META[t.name] || {};
+    return {
+      name: t.name,
+      description: truncate(t.description || "", 200),
+      sourceFile: meta.sourceFile || `${t.name}.js`,
+      category: meta.category || "data",
+      inputSchemaPreview: inputSchemaPreview(t.inputSchema),
+    };
+  });
+
+  const forwarded = forwardedCatalog.tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    upstreamSource: forwardedCatalog.upstreamSource,
+    category: t.category,
+  }));
+
+  return {
+    total: own.length + forwarded.length,
+    ownCount: own.length,
+    forwardedCount: forwarded.length,
+    own,
+    forwarded,
+  };
+}
+
 /** Build the /api/specialty payload — 4 cards (mcp-2 + 3 static). mcp-2's
  *  status is derived from cookieSourceProfile freshness; everything else is
  *  unknown because the inspector can't probe other MCP server processes. */
@@ -498,6 +576,7 @@ function makeHandler(seams = {}) {
       "/api/status": buildStatus,
       "/api/settings": buildSettings,
       "/api/specialty": buildSpecialty,
+      "/api/tools": buildToolsCatalog,
     };
     const apiBuilder = apiBuilders[pathname];
     if (apiBuilder) {
@@ -530,6 +609,7 @@ function makeHandler(seams = {}) {
       "/index.html": "index.html",
       "/settings": "index.html",
       "/specialty": "index.html",
+      "/tools": "index.html",
       "/styles.css": "styles.css",
       "/app.js": "app.js",
     };
@@ -610,10 +690,14 @@ module.exports = {
   buildStatus,
   buildSettings,
   buildSpecialty,
+  buildToolsCatalog,
   makeHandler,
   defaultPort,
   defaultBind,
   redactPath,
   formatDuration,
+  truncate,
+  inputSchemaPreview,
   TRACKED_ENV_VARS,
+  OWN_TOOL_META,
 };
