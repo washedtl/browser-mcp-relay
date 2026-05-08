@@ -5,6 +5,7 @@
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
+const { getActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "download_capture",
@@ -34,9 +35,10 @@ module.exports = {
   handler: async ({ clickSelector, savePath, timeoutMs = 30000 }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    const pages = bridge.context.pages();
-    if (pages.length === 0) return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    const page = pages[0];
+    // Use the tracked active page (set by tabs_new / tabs_select) — not
+    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) return { content: [{ type: "text", text: "no pages open" }], isError: true };
 
     // Promise-race pattern: setup the download wait BEFORE triggering, to avoid
     // missing fast downloads.

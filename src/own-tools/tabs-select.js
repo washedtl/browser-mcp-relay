@@ -10,6 +10,7 @@
 // _propagate-active-page.js for the full investigation.
 
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
+const { setActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "tabs_select",
@@ -33,6 +34,9 @@ module.exports = {
       };
     }
     await pages[index].bringToFront();
+    // Track this as the active page so own-tools (capture_xhr, dialog_handle
+    // etc.) target it instead of pages[0]. See _active-page.js.
+    setActivePage(pages[index]);
     const url = pages[index].url();
     // Propagate to upstream so content_take-screenshot etc. target this
     // tab's URL. Best-effort; about:blank is skipped to avoid churn.

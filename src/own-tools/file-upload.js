@@ -1,6 +1,8 @@
 // file_upload — sets file input via Playwright's setInputFiles.
 // Bypasses the OS file picker dialog entirely.
 
+const { getActivePage } = require("./_active-page.js");
+
 module.exports = {
   name: "file_upload",
   description:
@@ -21,9 +23,10 @@ module.exports = {
   handler: async ({ selector, files }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    const pages = bridge.context.pages();
-    if (pages.length === 0) return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    const page = pages[0];
+    // Use the tracked active page (set by tabs_new / tabs_select) — not
+    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) return { content: [{ type: "text", text: "no pages open" }], isError: true };
     const locator = page.locator(selector);
     await locator.setInputFiles(files);
     return { content: [{ type: "text", text: JSON.stringify({ selector, uploaded: files }, null, 2) }] };

@@ -9,6 +9,7 @@
 // upstream targeting its original page.
 
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
+const { setActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "tabs_new",
@@ -22,6 +23,10 @@ module.exports = {
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const page = await bridge.context.newPage();
     if (url) await page.goto(url);
+    // Track this as the active page so own-tools (capture_xhr, dialog_handle
+    // etc.) target it instead of pages[0] (which is Brave's auto-opened
+    // about:blank). See _active-page.js for the why.
+    setActivePage(page);
     // Propagate to upstream so content_take-screenshot etc. target the
     // URL the caller asked for. No-op when url is empty/about:blank or
     // when upstream is unavailable (best-effort; never throws).

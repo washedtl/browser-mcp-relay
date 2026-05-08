@@ -2,6 +2,8 @@
 // Each field calls page.fill(selector, value) sequentially. Stops on first failure
 // (returning the partial-fill state for diagnosis).
 
+const { getActivePage } = require("./_active-page.js");
+
 module.exports = {
   name: "form_fill",
   description:
@@ -28,9 +30,10 @@ module.exports = {
   handler: async ({ fields }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    const pages = bridge.context.pages();
-    if (pages.length === 0) return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    const page = pages[0];
+    // Use the tracked active page (set by tabs_new / tabs_select) — not
+    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) return { content: [{ type: "text", text: "no pages open" }], isError: true };
     const filled = [];
     for (const f of fields) {
       try {

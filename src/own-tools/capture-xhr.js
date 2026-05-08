@@ -2,6 +2,8 @@
 // For API reverse-engineering: see what calls a page makes, capture response
 // bodies, filter by URL pattern.
 
+const { getActivePage } = require("./_active-page.js");
+
 module.exports = {
   name: "capture_xhr",
   description:
@@ -42,9 +44,11 @@ module.exports = {
   handler: async ({ navigateToUrl, durationMs = 5000, urlFilter, includeBody = true, maxBodyBytes = 100000 }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "capture_xhr unavailable: bridge missing" }], isError: true };
-    const pages = bridge.context.pages();
-    if (pages.length === 0) return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    const page = pages[0];
+    // Use the tracked active page (set by tabs_new / tabs_select) instead of
+    // pages[0] — which is Brave's auto-opened about:blank, not what the user
+    // is actually looking at. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) return { content: [{ type: "text", text: "no pages open" }], isError: true };
 
     let filter = null;
     if (urlFilter) {

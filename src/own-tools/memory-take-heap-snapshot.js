@@ -12,6 +12,7 @@ const path = require("node:path");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
+const { getActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "memory_take-heap-snapshot",
@@ -36,14 +37,15 @@ module.exports = {
         isError: true,
       };
     }
-    const pages = bridge.context.pages();
-    if (pages.length === 0) {
+    // Use the tracked active page (set by tabs_new / tabs_select) — not
+    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) {
       return {
         content: [{ type: "text", text: "no pages open in browser context" }],
         isError: true,
       };
     }
-    const page = pages[0]; // active page
     // V1-1: per-page CDP cache — session is auto-detached on page close.
     // Detach is no longer manual, so a takeHeapSnapshot throw cannot leak
     // the session.

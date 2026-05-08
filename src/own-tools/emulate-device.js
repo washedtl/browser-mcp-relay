@@ -10,6 +10,7 @@
 // Auto-cleanup on page close.
 
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
+const { getActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "emulate_device",
@@ -49,11 +50,12 @@ module.exports = {
     if (!bridge) {
       return { content: [{ type: "text", text: "emulate_device unavailable: bridge missing" }], isError: true };
     }
-    const pages = bridge.context.pages();
-    if (pages.length === 0) {
+    // Use the tracked active page (set by tabs_new / tabs_select) — not
+    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) {
       return { content: [{ type: "text", text: "no pages open" }], isError: true };
     }
-    const page = pages[0];
     // V0-3: do NOT detach after applying — Emulation overrides revert on
     // detach. The session stays alive for the page's lifetime.
     const cdp = await getOrCreatePageCdp(page, bridge.context);

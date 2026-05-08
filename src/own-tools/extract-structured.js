@@ -2,6 +2,8 @@
 // Schema is { fieldName: { selector, attribute?, multiple? }, ... }.
 // Uses the authed session — sees logged-in content unlike unauthenticated scrapers.
 
+const { getActivePage } = require("./_active-page.js");
+
 module.exports = {
   name: "extract_structured",
   description:
@@ -39,9 +41,10 @@ module.exports = {
   handler: async ({ navigateToUrl, waitForSelector, schema }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    const pages = bridge.context.pages();
-    if (pages.length === 0) return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    const page = pages[0];
+    // Use the tracked active page (set by tabs_new / tabs_select) — not
+    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
+    const page = getActivePage(bridge.context);
+    if (!page) return { content: [{ type: "text", text: "no pages open" }], isError: true };
 
     if (navigateToUrl) {
       try { await page.goto(navigateToUrl, { waitUntil: "domcontentloaded" }); }
