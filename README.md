@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-293%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-294%20passing-brightgreen.svg)](#)
 [![Tools](https://img.shields.io/badge/tools-67%20%2851%20forwarded%20%2B%2016%20own%29-blue.svg)](#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](#platform-support)
 [![MCP](https://img.shields.io/badge/MCP-stdio-orange.svg)](https://modelcontextprotocol.io/)
@@ -627,6 +627,7 @@ Each relay process needs its own user-data-dir. Use pool mode (`BROWSER_RELAY_PO
 - 🦁 Requires **Brave** installed locally. Other Chromium browsers may work via `BROWSER_RELAY_BRAVE_PATH` but are untested.
 - 🍪 **Standalone mode does not snapshot cookies** from another profile — first run hits login walls. Cookie snapshot is a pool-mode feature.
 - 🧍 **One Brave per relay process.** To run multiple Brave sessions in parallel, run multiple relays (each on its own slot / profile dir).
+- 🔐 **3 low-severity transitive `cookie<0.7.0` advisories** via `lighthouse → @sentry/node`. Fix requires `lighthouse@13`, which is a breaking dep upgrade for our `^11.0.0` pin. Tracked; not exploitable in practice for a localhost-bound dev tool. Run `npm audit` to see them; `npm audit fix --force` would resolve at the cost of a major-version upgrade. The 2 prior moderate `ip-address` advisories are fixed in v0.2.3.
 
 ---
 

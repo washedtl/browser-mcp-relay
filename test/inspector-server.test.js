@@ -402,6 +402,32 @@ test("inspector-ui directory exists with all 3 expected files", () => {
   assert.ok(fs.existsSync(path.join(ui, "app.js")));
 });
 
+// ─── v0.2.3 regression: Settings page MCP snippet must point to src/index.js ──
+// (The original W11 ship pointed at scripts/wrap-browser-devtools-mcp.js which
+// doesn't exist in the public repo — friend following the snippet hit
+// "Cannot find module". Fix in v0.2.2; this test prevents silent regression.)
+
+test("Settings page MCP snippet points to src/index.js (not wrap-browser-devtools-mcp.js)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const appJsPath = path.join(__dirname, "..", "scripts", "inspector-ui", "app.js");
+  const src = fs.readFileSync(appJsPath, "utf8");
+  // Find the buildMcpSnippet function body and the args line within it.
+  const idx = src.indexOf("buildMcpSnippet");
+  assert.ok(idx >= 0, "buildMcpSnippet function must exist in app.js");
+  const slice = src.slice(idx, idx + 600);
+  assert.match(
+    slice,
+    /args:\s*\[\s*"<absolute-path-to-repo>\/src\/index\.js"\s*\]/,
+    "MCP snippet args must point to src/index.js",
+  );
+  assert.doesNotMatch(
+    slice,
+    /wrap-browser-devtools-mcp\.js/,
+    "MCP snippet must NOT reference wrap-browser-devtools-mcp.js (file not in public repo)",
+  );
+});
+
 // ─── W8: buildSettings shape + redaction tests ──────────────────────────
 
 function makeSettingsSeams(overrides = {}) {
