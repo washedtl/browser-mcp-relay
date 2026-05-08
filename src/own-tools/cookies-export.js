@@ -20,6 +20,15 @@ module.exports = {
   handler: async ({ urls }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
+    // V1-4: Playwright's `context.cookies([])` returns ALL cookies (empty
+    // array = no filter). A caller passing `urls: []` likely expects "no
+    // cookies for empty filter" — instead they'd get the full vault. Treat
+    // empty array as "no matching URLs → empty result".
+    if (Array.isArray(urls) && urls.length === 0) {
+      return {
+        content: [{ type: "text", text: JSON.stringify({ count: 0, cookies: [] }, null, 2) }],
+      };
+    }
     const cookies = await bridge.context.cookies(urls);
     return {
       content: [{

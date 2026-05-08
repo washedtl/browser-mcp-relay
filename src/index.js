@@ -41,6 +41,23 @@ const { attachAutofill } = require("./autofill-injector.js");
 // it transparently. pool-shared.js applies the same overlay independently.
 const RELAY_ENV = applyLocalConfigToEnv(process.env);
 
+/**
+ * V0-1/V0-2: ensure that if any post-launch step throws, the live Brave
+ * context is closed before the error propagates. `launchBrave()` resolves
+ * with a live BrowserContext that holds the user-data-dir lock; a throw
+ * after that point (attachAutofill error, etc.) would leak the context
+ * forever. Used by ensureBrave() in main(). Module-level + exported so
+ * unit tests can drive the contract directly.
+ */
+async function attachWithCleanupOnError(launched, fn) {
+  try {
+    return await fn(launched);
+  } catch (e) {
+    try { await launched.context.close(); } catch { /* best-effort */ }
+    throw e;
+  }
+}
+
 // Path to upstream `browser-devtools-mcp`. Resolution order:
 //   1. BROWSER_RELAY_UPSTREAM_PATH env var (explicit override).
 //   2. require.resolve("browser-devtools-mcp/dist/index.js") — works once the
@@ -217,6 +234,12 @@ async function main() {
         }
         process.stderr.write(`[mcp-relay] launching Brave (port=${port}, exe=${bravePath})...\n`);
         const extensionPath = RELAY_ENV.BROWSER_LOAD_EXTENSIONS || null;
+        // V0-1/V0-2: launchBrave resolves with a live Brave subprocess +
+        // open BrowserContext. If anything between here and the bridge
+        // assignment throws (attachAutofill exception, an exception in the
+        // logging code itself), the live context would leak with its
+        // user-data-dir lock held forever. attachWithCleanupOnError closes
+        // the context on any throw before rethrowing.
         const launched = await launchBrave({
           userDataDir: dir,
           port,
@@ -225,18 +248,20 @@ async function main() {
           executablePath: bravePath,
           proxyUrl: RELAY_ENV.BROWSER_RELAY_PROXY_URL || null,
         });
-        process.stderr.write(`[mcp-relay] Brave ready (cdpConnectUrl=${launched.cdpConnectUrl})\n`);
-        // Attach autofill listeners to the launched context. Pages BDMCP
-        // creates via CDP attach share this context, so the framenavigated
-        // event fires for them too — autofill works for both relay-driven
-        // and BDMCP-driven navigations. No-op when the vault is empty.
-        attachAutofill(launched.context, vault, (msg) => process.stderr.write(msg + "\n"));
-        // Make the bridge available to own-tool handlers via globalThis.
-        // Shape: { context, cdpConnectUrl, port } — Phase C tool handlers
-        // read globalThis.__relayBridge to drive CDP operations.
-        globalThis.__relayBridge = { ...launched, port };
-        bridge = launched;
-        return bridge;
+        return await attachWithCleanupOnError(launched, async (l) => {
+          process.stderr.write(`[mcp-relay] Brave ready (cdpConnectUrl=${l.cdpConnectUrl})\n`);
+          // Attach autofill listeners to the launched context. Pages BDMCP
+          // creates via CDP attach share this context, so the framenavigated
+          // event fires for them too — autofill works for both relay-driven
+          // and BDMCP-driven navigations. No-op when the vault is empty.
+          attachAutofill(l.context, vault, (msg) => process.stderr.write(msg + "\n"));
+          // Make the bridge available to own-tool handlers via globalThis.
+          // Shape: { context, cdpConnectUrl, port } — Phase C tool handlers
+          // read globalThis.__relayBridge to drive CDP operations.
+          globalThis.__relayBridge = { ...l, port };
+          bridge = l;
+          return bridge;
+        });
       })().catch((e) => {
         braveLaunchPromise = null; // allow retry on next call
         throw e;
@@ -355,4 +380,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, attachWithCleanupOnError };

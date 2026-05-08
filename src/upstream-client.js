@@ -70,12 +70,20 @@ class UpstreamClient {
 
   /**
    * Send a JSON-RPC 2.0 request and await the matching response.
+   *
+   * V0-4: default timeout bumped from 30s → 180s. Forwarded calls like
+   * `lighthouse_audit` and `content_save-as-pdf` regularly exceed 30s; the
+   * old default surfaced as an upstream timeout error while the upstream
+   * was still working — its eventual response was orphaned and dropped.
+   * Callers that need a tighter ceiling can still pass an explicit
+   * `timeoutMs`.
+   *
    * @param {string} method
    * @param {object} [params]
    * @param {number} [timeoutMs]
    * @returns {Promise<any>} the response's `result` field
    */
-  request(method, params = {}, timeoutMs = 30000) {
+  request(method, params = {}, timeoutMs = 180000) {
     if (this.closed) return Promise.reject(new Error("upstream closed"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {

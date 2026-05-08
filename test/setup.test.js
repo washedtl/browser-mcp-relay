@@ -117,6 +117,81 @@ test("package.json: setup + smoke scripts are wired", () => {
   assert.strictEqual(pkg.scripts.start, "node src/index.js");
 });
 
+// ─────────────────── V0-5: killTree process-tree cleanup ───────────────────
+//
+// Reproduces: on Windows, `child.kill()` orphans the relay's spawned upstream
+// + Brave subprocess. `taskkill /F /T /PID` takes the full tree.
+
+test("V0-5: smoke.js exports killTree", () => {
+  const { killTree } = require("../scripts/smoke.js");
+  assert.strictEqual(typeof killTree, "function");
+});
+
+test("V0-5: setup.js exports killTree", () => {
+  const { killTree } = require("../scripts/setup.js");
+  assert.strictEqual(typeof killTree, "function");
+});
+
+test("V0-5: killTree no-ops on null / pid-less child", () => {
+  const { killTree } = require("../scripts/smoke.js");
+  // Must not throw.
+  killTree(null);
+  killTree(undefined);
+  killTree({});
+  killTree({ pid: 0 });
+});
+
+test("V0-5: smoke.js source uses taskkill /F /T on win32", () => {
+  // The bug: `child.kill()` on Windows is TerminateProcess — no signal
+  // cascade — so the spawned upstream BDMCP + Brave subprocess get orphaned.
+  // Fix: `taskkill /F /T /PID <pid>` takes the whole process tree at once.
+  const src = fs.readFileSync(SMOKE_PATH, "utf8");
+  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID/.test(src),
+    "smoke.js must call taskkill /F /T /PID on win32");
+  assert.ok(/process\.platform\s*===\s*['"]win32['"]/.test(src),
+    "smoke.js must branch on process.platform === 'win32'");
+});
+
+test("V0-5: setup.js source uses taskkill /F /T on win32", () => {
+  const src = fs.readFileSync(SETUP_PATH, "utf8");
+  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID/.test(src),
+    "setup.js must call taskkill /F /T /PID on win32");
+  assert.ok(/process\.platform\s*===\s*['"]win32['"]/.test(src),
+    "setup.js must branch on process.platform === 'win32'");
+});
+
+test("V0-5: killTree on win32 invokes taskkill (mocked execSync)", () => {
+  // Inject a mock execSync via require cache. We require fresh copies so
+  // we don't pollute other tests.
+  const realChildProcess = require("node:child_process");
+  const captured = { calls: [] };
+  // Monkey-patch execSync; restore in finally.
+  const originalExecSync = realChildProcess.execSync;
+  realChildProcess.execSync = (cmd, opts) => {
+    captured.calls.push({ cmd, opts });
+    return Buffer.from("");
+  };
+  try {
+    // Bust the require cache so smoke.js picks up the patched execSync.
+    const smokePath = require.resolve("../scripts/smoke.js");
+    delete require.cache[smokePath];
+    const { killTree } = require("../scripts/smoke.js");
+    killTree({ pid: 99999 });
+    if (process.platform === "win32") {
+      assert.strictEqual(captured.calls.length, 1, "expected one taskkill invocation on win32");
+      assert.match(captured.calls[0].cmd, /taskkill\s+\/F\s+\/T\s+\/PID\s+99999/);
+    } else {
+      // POSIX path uses child.kill, no execSync call expected.
+      assert.strictEqual(captured.calls.length, 0, "POSIX path should NOT invoke execSync");
+    }
+  } finally {
+    realChildProcess.execSync = originalExecSync;
+    // Bust again so subsequent tests get a clean module.
+    const smokePath = require.resolve("../scripts/smoke.js");
+    delete require.cache[smokePath];
+  }
+});
+
 test("local-config.example.json contains all keys the setup wizard writes", () => {
   const example = JSON.parse(
     fs.readFileSync(path.join(REPO_ROOT, "local-config.example.json"), "utf8"),

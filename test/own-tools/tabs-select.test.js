@@ -45,6 +45,48 @@ test("tabs_select: out-of-range index returns isError", async () => {
   }
 });
 
+// V1-5: JSON-Schema `minimum: 0` is not enforced by the MCP SDK at handler
+// entry. Negative / non-integer / huge index must all produce isError, not
+// an undefined-property TypeError.
+test("V1-5: tabs_select with negative index returns isError (not crash)", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
+  try {
+    const result = await tool.handler({ index: -1 });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.content[0].text, /out of range/i);
+    // bringToFront must NOT have been called on any page.
+    for (const page of globalThis.__relayBridge._pages) {
+      assert.strictEqual(page._bringCalled, 0);
+    }
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+  }
+});
+
+test("V1-5: tabs_select with non-integer index returns isError", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  globalThis.__relayBridge = makeFakeBridge(["about:blank"]);
+  try {
+    const result = await tool.handler({ index: "abc" });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.content[0].text, /out of range/i);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+  }
+});
+
+test("V1-5: tabs_select error message includes pages-count for actionability", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
+  try {
+    const result = await tool.handler({ index: 999 });
+    assert.match(result.content[0].text, /have 2 pages/);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+  }
+});
+
 test("tabs_select: about:blank target skips upstream propagation", async () => {
   const prevBridge = globalThis.__relayBridge;
   const prevUpstream = globalThis.__relayUpstream;

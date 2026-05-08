@@ -23,8 +23,14 @@ module.exports = {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const pages = bridge.context.pages();
-    if (index >= pages.length) {
-      return { content: [{ type: "text", text: `index ${index} out of range (${pages.length} pages)` }], isError: true };
+    // V1-5: JSON-Schema `minimum: 0` is not enforced by the MCP SDK at
+    // handler entry. Validate explicitly so bad inputs (-1, "abc", 999)
+    // produce an actionable error instead of an undefined-property crash.
+    if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
+      return {
+        content: [{ type: "text", text: `index out of range: ${index} (have ${pages.length} pages)` }],
+        isError: true,
+      };
     }
     await pages[index].bringToFront();
     const url = pages[index].url();

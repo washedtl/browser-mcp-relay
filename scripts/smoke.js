@@ -10,12 +10,40 @@
 // otherwise — same precedence as a real run.
 
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, execSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_ENTRY = path.join(REPO_ROOT, "src", "index.js");
 const MIN_TOOLS = 50; // expectation: 41 forwarded + 16 own = 57; threshold 50 allows minor upstream churn
 const DEFAULT_TIMEOUT_MS = 60000;
+
+/**
+ * V0-5: cross-platform process-tree kill.
+ *
+ * On Windows, `child.kill()` calls TerminateProcess on the relay node
+ * process — which sends NO signal cascade. The relay's spawned upstream
+ * BDMCP child + Brave subprocess + (transitively) any browser windows
+ * are orphaned. Each `npm run smoke` adds a phantom Brave; eventually
+ * "user-data-dir is locked" on the next launch.
+ *
+ * Fix: on win32, `taskkill /F /T /PID <pid>` takes the whole process
+ * tree at once. Fall back to child.kill() if taskkill fails (e.g. PID
+ * already exited). On POSIX, SIGTERM gives a chance to clean up, then
+ * SIGKILL after 2s.
+ */
+function killTree(child) {
+  if (!child || !child.pid) return;
+  if (process.platform === "win32") {
+    try {
+      execSync(`taskkill /F /T /PID ${child.pid}`, { stdio: "ignore" });
+    } catch {
+      try { child.kill(); } catch { /* already gone */ }
+    }
+  } else {
+    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
+  }
+}
 
 function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
@@ -31,7 +59,7 @@ function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     function settle(result) {
       if (resolved) return;
       resolved = true;
-      try { child.kill(); } catch { /* ignore */ }
+      killTree(child);
       resolve(result);
     }
 
@@ -60,6 +88,13 @@ function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     });
 
     child.stderr.on("data", (chunk) => { stderrBuf += chunk.toString(); });
+
+    // Swallow async stdin errors. With killTree (V0-5), the child can die
+    // synchronously before deferred stdin.write fires; the resulting EPIPE
+    // surfaces async on the stream's `error` event and would otherwise
+    // bubble as an uncaughtException. We've already settled the test
+    // outcome — the write was just trying to drive the handshake.
+    child.stdin.on("error", () => { /* settled or pre-settle race */ });
 
     child.stdout.on("data", (chunk) => {
       stdoutBuf += chunk.toString();
@@ -128,4 +163,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { smokeTest };
+module.exports = { smokeTest, killTree };

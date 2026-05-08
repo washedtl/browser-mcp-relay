@@ -28,29 +28,38 @@ module.exports = {
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
 
     // BrowserContext-wide init script — applied to every page in the context.
+    //
+    // V1-6: addInitScript is additive — calling stealth_apply twice means
+    // both copies run on the next page load. On a second run, redefining
+    // the already-non-configurable `navigator.webdriver` etc. throws and
+    // takes the entire init script down. Guard each defineProperty with
+    // try/catch so a second-run redefinition is a no-op rather than a crash.
     const stealthScript = `
       // Hide webdriver flag.
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      try { Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => undefined }); } catch (e) {}
       // Fake plugins (not empty — common bot tells expect non-empty).
-      Object.defineProperty(navigator, 'plugins', {
+      try { Object.defineProperty(navigator, 'plugins', {
+        configurable: true,
         get: () => [
           { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
           { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
           { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
         ],
-      });
+      }); } catch (e) {}
       // Override languages.
-      Object.defineProperty(navigator, 'languages', { get: () => ${JSON.stringify(languages)} });
+      try { Object.defineProperty(navigator, 'languages', { configurable: true, get: () => ${JSON.stringify(languages)} }); } catch (e) {}
       // Permissions: notifications check is a common bot tell.
-      const origQuery = navigator.permissions.query;
-      navigator.permissions.query = (params) => {
-        if (params && params.name === 'notifications') {
-          return Promise.resolve({ state: typeof Notification !== 'undefined' ? Notification.permission : 'prompt' });
-        }
-        return origQuery(params);
-      };
+      try {
+        const origQuery = navigator.permissions.query;
+        navigator.permissions.query = (params) => {
+          if (params && params.name === 'notifications') {
+            return Promise.resolve({ state: typeof Notification !== 'undefined' ? Notification.permission : 'prompt' });
+          }
+          return origQuery(params);
+        };
+      } catch (e) {}
       // Chrome runtime fakery.
-      if (!window.chrome) window.chrome = { runtime: {} };
+      try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
     `;
 
     await bridge.context.addInitScript(stealthScript);

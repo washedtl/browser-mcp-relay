@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-294%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-324%20passing-brightgreen.svg)](#)
 [![Tools](https://img.shields.io/badge/tools-67%20%2851%20forwarded%20%2B%2016%20own%29-blue.svg)](#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](#platform-support)
 [![MCP](https://img.shields.io/badge/MCP-stdio-orange.svg)](https://modelcontextprotocol.io/)

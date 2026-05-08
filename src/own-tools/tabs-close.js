@@ -12,8 +12,14 @@ module.exports = {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const pages = bridge.context.pages();
-    if (index >= pages.length) {
-      return { content: [{ type: "text", text: `index ${index} out of range (${pages.length} pages)` }], isError: true };
+    // V1-5: validate index explicitly — JSON-Schema `minimum: 0` is not
+    // enforced by the MCP SDK at handler entry, so -1 / "abc" / 999 would
+    // crash with an unhelpful undefined-property TypeError otherwise.
+    if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
+      return {
+        content: [{ type: "text", text: `index out of range: ${index} (have ${pages.length} pages)` }],
+        isError: true,
+      };
     }
     if (pages.length === 1) {
       return { content: [{ type: "text", text: "refusing to close the last remaining page" }], isError: true };

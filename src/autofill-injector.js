@@ -93,6 +93,12 @@ function attachAutofill(context, vault, log = () => {}) {
     return;
   }
 
+  // V1-2: per-frame fill-in-progress tracking. `framenavigated` fires for
+  // every redirect step in OAuth chains; without this guard, multiple
+  // 3-second fill loops spin up concurrently and clobber any user input
+  // already typed. WeakMap keyed by frame so it's GC'd when the frame is.
+  const ACTIVE_FILLS = new WeakMap();
+
   function attachToPage(page) {
     page.on("framenavigated", async (frame) => {
       if (frame !== page.mainFrame()) return;
@@ -100,23 +106,29 @@ function attachAutofill(context, vault, log = () => {}) {
       if (!url || url === "about:blank" || url.startsWith("chrome://") || url.startsWith("chrome-error://")) return;
       const creds = vault.lookup(url);
       if (creds.length === 0) return;
+      // Skip if a fill is already in progress for this frame.
+      if (ACTIVE_FILLS.has(frame)) return;
       // Use the first saved cred (most recent or only one — we don't have a
       // way to disambiguate multi-account here without a UI).
       const c = creds[0];
       const userPeek = c.username.length > 3 ? c.username.slice(0, 3) + "***" : "***";
       log(`[autofill] ${new URL(url).hostname}: found ${creds.length} cred(s), trying user=${userPeek}`);
-      try {
-        const result = await frame.evaluate(fillScript, {
-          username: c.username,
-          password: c.password,
-          usernameSelectors: USERNAME_FIELD_SELECTORS,
-          passwordSelectors: PASSWORD_FIELD_SELECTORS,
-        });
-        log(`[autofill] ${new URL(url).hostname}: filled user=${result.user} pass=${result.pass}`);
-      } catch (e) {
-        // Page navigated away or closed mid-fill — best-effort.
-        log(`[autofill] ${new URL(url).hostname}: fill error (ignored): ${e.message.split("\n")[0]}`);
-      }
+      const fillPromise = (async () => {
+        try {
+          const result = await frame.evaluate(fillScript, {
+            username: c.username,
+            password: c.password,
+            usernameSelectors: USERNAME_FIELD_SELECTORS,
+            passwordSelectors: PASSWORD_FIELD_SELECTORS,
+          });
+          log(`[autofill] ${new URL(url).hostname}: filled user=${result.user} pass=${result.pass}`);
+        } catch (e) {
+          // Page navigated away or closed mid-fill — best-effort.
+          log(`[autofill] ${new URL(url).hostname}: fill error (ignored): ${e.message.split("\n")[0]}`);
+        }
+      })();
+      ACTIVE_FILLS.set(frame, fillPromise);
+      fillPromise.finally(() => ACTIVE_FILLS.delete(frame));
     });
   }
 

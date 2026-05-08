@@ -24,7 +24,26 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
-const { spawn } = require("node:child_process");
+const { spawn, execSync } = require("node:child_process");
+
+/**
+ * V0-5: cross-platform process-tree kill (mirrors smoke.js's killTree).
+ * On Windows, `child.kill()` orphans the relay's spawned upstream BDMCP
+ * + Brave subprocess. `taskkill /F /T /PID <pid>` takes the whole tree.
+ */
+function killTree(child) {
+  if (!child || !child.pid) return;
+  if (process.platform === "win32") {
+    try {
+      execSync(`taskkill /F /T /PID ${child.pid}`, { stdio: "ignore" });
+    } catch {
+      try { child.kill(); } catch { /* already gone */ }
+    }
+  } else {
+    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
+  }
+}
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const LOCAL_CONFIG_PATH = path.join(REPO_ROOT, "local-config.json");
@@ -302,7 +321,7 @@ function step9_smokeTest({ timeoutMs = 30000 } = {}) {
     function settle(result) {
       if (resolved) return;
       resolved = true;
-      try { child.kill(); } catch { /* ignore */ }
+      killTree(child);
       resolve(result);
     }
 
@@ -438,4 +457,5 @@ if (require.main === module) {
 module.exports = {
   // Exported for tests.
   step9_smokeTest,
+  killTree,
 };

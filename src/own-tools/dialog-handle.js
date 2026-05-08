@@ -25,11 +25,21 @@ module.exports = {
     }
     const page = pages[0];
     return await new Promise((resolve) => {
+      // V1-3: if the timeout fires AND the dialog arrives in the same tick,
+      // both branches would resolve the promise (only the first take effect)
+      // and the dialog would still be auto-accepted by Playwright after the
+      // caller already saw a timeout. The `settled` guard prevents the
+      // second branch from firing at all — exactly one outcome.
+      let settled = false;
       const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
         page.off("dialog", onDialog);
         resolve({ content: [{ type: "text", text: `timeout: no dialog appeared within ${timeoutMs}ms` }], isError: true });
       }, timeoutMs);
       const onDialog = async (dialog) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         const info = { type: dialog.type(), message: dialog.message(), defaultValue: dialog.defaultValue?.() };
         try {

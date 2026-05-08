@@ -51,3 +51,44 @@ test("attachAutofill: hooks existing pages (calls page.on framenavigated)", () =
   assert.strictEqual(pageEvents.length, 1);
   assert.strictEqual(pageEvents[0].event, "framenavigated");
 });
+
+// V1-2: framenavigated fires for every redirect step in OAuth chains.
+// Without debouncing, multiple concurrent 3-second fill loops spin up
+// against the same frame.
+test("V1-2: rapid framenavigated events do NOT spawn concurrent fills", async () => {
+  // Capture the framenavigated handler so we can fire it ourselves.
+  let frameNavHandler = null;
+  const fakeMainFrame = { url: () => "https://example.com/oauth/step1" };
+  const evaluateCalls = [];
+  // The handler awaits frame.evaluate — we fake one that resolves after
+  // a microtask so the test can fire 5 events before any fill completes.
+  fakeMainFrame.evaluate = async () => {
+    evaluateCalls.push(Date.now());
+    await new Promise((r) => setTimeout(r, 50));
+    return { user: true, pass: true };
+  };
+  const fakePage = {
+    on: (event, fn) => { if (event === "framenavigated") frameNavHandler = fn; },
+    mainFrame: () => fakeMainFrame,
+  };
+  const ctx = makeMockContext();
+  ctx.calls.pages.push(fakePage);
+  // Vault returns a real cred each time — without debounce, every nav fires.
+  const vault = {
+    totalEntries: 1,
+    lookup: () => [{ username: "alice", password: "p1" }],
+  };
+  attachAutofill(ctx, vault, () => {});
+
+  assert.ok(frameNavHandler, "framenavigated handler must be registered");
+  // Fire 5 framenavigated events back-to-back synchronously — simulates
+  // OAuth redirect chain.
+  for (let i = 0; i < 5; i++) {
+    frameNavHandler(fakeMainFrame);
+  }
+  // Wait for all microtasks + the 50ms fill to drain.
+  await new Promise((r) => setTimeout(r, 150));
+  // Critical assertion: only ONE evaluate fired, even though 5 events landed.
+  assert.strictEqual(evaluateCalls.length, 1,
+    `expected exactly 1 fill on rapid framenavigated, got ${evaluateCalls.length}`);
+});
