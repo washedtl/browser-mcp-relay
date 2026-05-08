@@ -449,6 +449,8 @@ Set `BROWSER_RELAY_POOL_DIR` to a profile dir managed elsewhere. If a `wrap-brow
 
 Set `BROWSER_RELAY_PROXY_URL=http://127.0.0.1:8888` (or wherever your debug proxy listens) to route the relay's Brave traffic through an HTTP proxy you control. Combined with the relay's per-context `ignoreHTTPSErrors`, this lets you inspect the relay's HTTP traffic via Charles, mitmproxy, powhttp, etc. without affecting your main browser. Your system proxy stays untouched — only this launched Brave opts in.
 
+> ⚠️ **Security:** Only point this at HTTP proxies you control on **localhost**. The relay accepts any TLS cert when a proxy is set (so MITM debug proxies "just work"), which means a hostile or compromised remote proxy can transparently MITM all of the relay's traffic — including pages you're authenticated to. If you don't fully control the proxy, leave this unset.
+
 ### 🔐 Credential vault + autofill
 
 The relay can auto-fill login forms when a saved credential matches the current page's hostname. **Off by default.** To enable:
