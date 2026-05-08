@@ -520,6 +520,21 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 
 > ⚠️ **Security:** Passwords stay in memory only — never logged, never re-written. But anyone with read access to your relay process's memory could read them. Only point this at CSVs you trust. The vault is most useful when scraping authed sites that block Playwright's password manager (e.g. Brave 127+'s App-Bound Encryption).
 
+### 🔍 Live inspector
+
+A small web dashboard for peeking at the relay's runtime state — pool slot status (claimed / idle / orphan), specialty MCP cookie freshness, vault entry counts, tool counts, uptime. **Off by default**, no auth, read-only.
+
+Start it:
+
+```bash
+npm run inspector
+# Inspector running at http://127.0.0.1:9090
+```
+
+Open `http://localhost:9090` in any browser. Auto-refreshes every 5 s; click Pause to stop polling. Override the port with `BROWSER_RELAY_INSPECTOR_PORT=9091`.
+
+> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). It's read-only in this version (no mutating endpoints), so the worst case is information disclosure — but that's still worth taking seriously.
+
 ---
 
 ## 🖥️ Platform support

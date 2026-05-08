@@ -7,7 +7,8 @@
     "test": "node --test test/*.test.js test/**/*.test.js",
     "start": "node src/index.js",
     "setup": "node scripts/setup.js",
-    "smoke": "node scripts/smoke.js"
+    "smoke": "node scripts/smoke.js",
+    "inspector": "node scripts/inspector.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inspector — browser-mcp-relay</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+  <header class="top-header">
+    <div>
+      <div class="header-title-row">
+        <h1 class="page-title">Inspector</h1>
+        <span class="page-subtitle mono">browser-mcp-relay</span>
+      </div>
+      <div class="stat-strip mono" id="stat-strip">
+        <span class="stat"><span class="label">Tools</span><span class="value" data-stat="tools">—</span></span>
+        <span class="stat"><span class="label">Pool</span><span class="value" data-stat="pool">—</span></span>
+        <span class="stat"><span class="label">Mode</span><span class="value" data-stat="mode">—</span></span>
+        <span class="stat"><span class="label">Vault</span><span class="value" data-stat="vault">—</span></span>
+        <span class="stat"><span class="label">Uptime</span><span class="value" data-stat="uptime">—</span></span>
+      </div>
+    </div>
+    <div class="header-right">
+      <span class="health-pill" id="health-pill">
+        <span class="health-dot"></span><span id="health-label">Loading…</span>
+      </span>
+      <button class="icon-btn" type="button" id="btn-refresh" title="Refresh">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      </button>
+      <button class="icon-btn" type="button" id="btn-pause" title="Pause auto-refresh">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+      </button>
+      <button class="icon-btn" type="button" id="btn-settings" title="Settings (W9)">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <aside class="sidebar">
+      <div class="sidebar-scroll" id="sidebar-scroll">
+        <div class="nav-section">
+          <div class="nav-item active" data-nav="home">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+            <span class="name">Home</span>
+          </div>
+        </div>
+
+        <div class="nav-divider"></div>
+
+        <div class="nav-section">
+          <div class="nav-section-label">
+            <span>Active sessions</span><span class="count" id="nav-active-count">—</span>
+          </div>
+          <div id="nav-active-list"></div>
+        </div>
+
+        <div class="nav-section">
+          <div class="nav-section-label">
+            <span>Idle</span><span class="count" id="nav-idle-count">—</span>
+          </div>
+          <div id="nav-idle-list"></div>
+        </div>
+
+        <div class="nav-section">
+          <div class="nav-section-label">
+            <span>Attention</span><span class="count" id="nav-attention-count">—</span>
+          </div>
+          <div id="nav-attention-list"></div>
+        </div>
+
+        <div class="nav-divider"></div>
+
+        <div class="nav-section">
+          <div class="nav-item" data-nav="specialty">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            <span class="name">Specialty MCPs</span>
+            <span class="nav-meta" id="nav-specialty-count">—</span>
+          </div>
+          <div class="nav-item" data-nav="settings">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span class="name">Settings</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+
+      <div class="section-title">
+        <h2>Pool</h2>
+        <span class="meta" id="pool-meta">
+          <span class="ok" data-pool="active">— active</span>
+          ·
+          <span class="idle" data-pool="idle">— idle</span>
+          ·
+          <span class="err" data-pool="attention">— attention</span>
+        </span>
+      </div>
+
+      <div class="slot-grid" id="slot-grid">
+        <div class="empty-msg">Loading pool slots…</div>
+      </div>
+
+      <div class="section-title">
+        <h2>Specialty MCPs</h2>
+        <span class="meta" id="specialty-meta"></span>
+      </div>
+
+      <div class="specialty-grid" id="specialty-grid">
+        <div class="empty-msg">Loading specialty MCPs…</div>
+      </div>
+
+      <div class="section-title">
+        <h2>Vault</h2>
+        <span class="meta" id="vault-meta"></span>
+      </div>
+
+      <div class="vault-card" id="vault-card">
+        <div class="empty-msg">Loading vault…</div>
+      </div>
+
+    </main>
+
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
