@@ -32,9 +32,9 @@
       <button class="icon-btn" type="button" id="btn-pause" title="Pause auto-refresh">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
       </button>
-      <button class="icon-btn" type="button" id="btn-settings" title="Settings (W9)">
+      <a class="icon-btn" href="/settings" id="btn-settings" title="Settings">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      </button>
+      </a>
     </div>
   </header>
 
@@ -43,10 +43,10 @@
     <aside class="sidebar">
       <div class="sidebar-scroll" id="sidebar-scroll">
         <div class="nav-section">
-          <div class="nav-item active" data-nav="home">
+          <a class="nav-item" href="/" data-nav="home">
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
             <span class="name">Home</span>
-          </div>
+          </a>
         </div>
 
         <div class="nav-divider"></div>
@@ -75,54 +75,21 @@
         <div class="nav-divider"></div>
 
         <div class="nav-section">
-          <div class="nav-item" data-nav="specialty">
+          <a class="nav-item" href="/specialty" data-nav="specialty">
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
             <span class="name">Specialty MCPs</span>
             <span class="nav-meta" id="nav-specialty-count">—</span>
-          </div>
-          <div class="nav-item" data-nav="settings">
+          </a>
+          <a class="nav-item" href="/settings" data-nav="settings">
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span class="name">Settings</span>
-          </div>
+          </a>
         </div>
       </div>
     </aside>
 
-    <main class="main">
-
-      <div class="section-title">
-        <h2>Pool</h2>
-        <span class="meta" id="pool-meta">
-          <span class="ok" data-pool="active">— active</span>
-          ·
-          <span class="idle" data-pool="idle">— idle</span>
-          ·
-          <span class="err" data-pool="attention">— attention</span>
-        </span>
-      </div>
-
-      <div class="slot-grid" id="slot-grid">
-        <div class="empty-msg">Loading pool slots…</div>
-      </div>
-
-      <div class="section-title">
-        <h2>Specialty MCPs</h2>
-        <span class="meta" id="specialty-meta"></span>
-      </div>
-
-      <div class="specialty-grid" id="specialty-grid">
-        <div class="empty-msg">Loading specialty MCPs…</div>
-      </div>
-
-      <div class="section-title">
-        <h2>Vault</h2>
-        <span class="meta" id="vault-meta"></span>
-      </div>
-
-      <div class="vault-card" id="vault-card">
-        <div class="empty-msg">Loading vault…</div>
-      </div>
-
+    <main class="main" id="main">
+      <div class="empty-msg">Loading…</div>
     </main>
 
   </div>

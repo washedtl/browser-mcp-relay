@@ -13,10 +13,13 @@ const fs = require("node:fs");
 const {
   createInspector,
   buildStatus,
+  buildSettings,
+  buildSpecialty,
   defaultPort,
   defaultBind,
   redactPath,
   formatDuration,
+  TRACKED_ENV_VARS,
 } = require("../scripts/inspector.js");
 
 // ─── Test seams: a fully stubbed config + lock state ────────────────────
@@ -330,4 +333,191 @@ test("inspector-ui directory exists with all 3 expected files", () => {
   assert.ok(fs.existsSync(path.join(ui, "index.html")));
   assert.ok(fs.existsSync(path.join(ui, "styles.css")));
   assert.ok(fs.existsSync(path.join(ui, "app.js")));
+});
+
+// ─── W8: buildSettings shape + redaction tests ──────────────────────────
+
+function makeSettingsSeams(overrides = {}) {
+  const base = makeSeams();
+  return {
+    ...base,
+    _detectBraveProfileDir: ({ env } = {}) =>
+      "C:/Users/fakeuser/AppData/Local/BraveSoftware/Brave-Browser/User Data",
+    _existsFile: () => false, // local-config absent by default
+    _env: {},
+    ...overrides,
+  };
+}
+
+test("buildSettings: returns expected top-level shape", () => {
+  const s = buildSettings(makeSettingsSeams());
+  assert.ok(s.config);
+  assert.ok(s.env);
+  assert.strictEqual(typeof s.localConfigExists, "boolean");
+  assert.strictEqual(typeof s.localConfigSnippet, "string");
+  assert.strictEqual(typeof s.localConfigExamplePath, "string");
+});
+
+test("buildSettings: paths are redacted to basenames (no C:/ leak)", () => {
+  const s = buildSettings(makeSettingsSeams());
+  // Walk the entire response body — no full Windows path may appear.
+  const blob = JSON.stringify(s);
+  assert.ok(!/C:\\/.test(blob), "absolute Win path leaked: " + blob);
+  assert.ok(!/C:\//.test(blob), "absolute forward Win path leaked: " + blob);
+  assert.ok(!blob.includes("/Users/fakeuser/"), "POSIX absolute leaked: " + blob);
+  assert.ok(!blob.includes("/fake/"), "POSIX absolute leaked: " + blob);
+});
+
+test("buildSettings: env unset → all booleans false", () => {
+  const s = buildSettings(makeSettingsSeams({ _env: {} }));
+  for (const k of TRACKED_ENV_VARS) {
+    assert.strictEqual(s.env[k], false, k + " should be false when unset");
+  }
+});
+
+test("buildSettings: env set → matching boolean is true (value not leaked)", () => {
+  const s = buildSettings(
+    makeSettingsSeams({
+      _env: {
+        BROWSER_RELAY_BRAVE_PATH: "C:/secret/path/brave.exe",
+        BROWSER_RELAY_VAULT_FILES: "C:/secret/passwords.csv",
+      },
+    }),
+  );
+  assert.strictEqual(s.env.BROWSER_RELAY_BRAVE_PATH, true);
+  assert.strictEqual(s.env.BROWSER_RELAY_VAULT_FILES, true);
+  assert.strictEqual(s.env.BROWSER_RELAY_POOL_DIR, false);
+  // Crucially: the value strings must not appear anywhere in the response.
+  const blob = JSON.stringify(s);
+  assert.ok(!blob.includes("secret"), "env value leaked into response: " + blob);
+});
+
+test("buildSettings: localConfigExists reflects _existsFile result", () => {
+  const present = buildSettings(makeSettingsSeams({ _existsFile: () => true }));
+  const absent = buildSettings(makeSettingsSeams({ _existsFile: () => false }));
+  assert.strictEqual(present.localConfigExists, true);
+  assert.strictEqual(absent.localConfigExists, false);
+});
+
+test("buildSettings: localConfigSnippet is valid JSON", () => {
+  const s = buildSettings(makeSettingsSeams());
+  // Should round-trip through JSON.parse without throwing.
+  const parsed = JSON.parse(s.localConfigSnippet);
+  assert.ok(parsed && typeof parsed === "object");
+  assert.ok(Object.prototype.hasOwnProperty.call(parsed, "BROWSER_RELAY_BRAVE_PATH"));
+});
+
+// ─── W8: buildSpecialty shape tests ─────────────────────────────────────
+
+test("buildSpecialty: returns 4 items (mcp-2 + 3 static)", () => {
+  const s = buildSpecialty(makeSeams());
+  assert.ok(Array.isArray(s.items));
+  assert.strictEqual(s.items.length, 4);
+  const ids = s.items.map((i) => i.id);
+  assert.ok(ids.includes("browser-devtools-mcp-2"));
+  assert.ok(ids.includes("puppeteer-real-browser"));
+  assert.ok(ids.includes("amz-aff-firefox-mcp"));
+  assert.ok(ids.includes("claude-in-chrome"));
+});
+
+test("buildSpecialty: each item has required fields", () => {
+  const s = buildSpecialty(makeSeams());
+  for (const item of s.items) {
+    assert.strictEqual(typeof item.id, "string");
+    assert.strictEqual(typeof item.displayName, "string");
+    assert.strictEqual(typeof item.role, "string");
+    assert.strictEqual(typeof item.description, "string");
+    assert.ok(["fresh", "stale", "ready", "unknown"].includes(item.status));
+    assert.ok(Object.prototype.hasOwnProperty.call(item, "cookieSourceProfile"));
+    assert.ok(Object.prototype.hasOwnProperty.call(item, "cookieAgeDays"));
+    assert.ok(Object.prototype.hasOwnProperty.call(item, "thresholdDays"));
+  }
+});
+
+test("buildSpecialty: non-mcp-2 items have status=unknown", () => {
+  const s = buildSpecialty(makeSeams());
+  for (const item of s.items) {
+    if (item.id !== "browser-devtools-mcp-2") {
+      assert.strictEqual(item.status, "unknown");
+    }
+  }
+});
+
+// ─── W8: HTTP routing tests ─────────────────────────────────────────────
+
+test("GET /api/settings → 200 with valid shape", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/settings");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /application\/json/);
+    const body = JSON.parse(r.body);
+    assert.ok(body.config);
+    assert.ok(body.env);
+    assert.strictEqual(typeof body.localConfigExists, "boolean");
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/specialty → 200 with 4 items", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/specialty");
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.ok(Array.isArray(body.items));
+    assert.strictEqual(body.items.length, 4);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /settings → 200 serves index.html", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/settings");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /text\/html/);
+    assert.ok(r.body.includes("Inspector"));
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /specialty → 200 serves index.html", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/specialty");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /text\/html/);
+    assert.ok(r.body.includes("Inspector"));
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/settings → 405 method not allowed (no mutating endpoints in W8)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/settings", "POST");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+test("/api/settings response never contains absolute paths", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/settings");
+    assert.strictEqual(r.status, 200);
+    // Default seam uses C:/fake/... and C:/Program Files/... — neither
+    // should leak into the wire payload after redaction.
+    assert.ok(!/C:\\/.test(r.body), "Win backslash path leaked: " + r.body);
+    assert.ok(!/C:\/fake/.test(r.body), "Win forward path leaked: " + r.body);
+    assert.ok(!r.body.includes("Program Files"), "Program Files leaked: " + r.body);
+  } finally {
+    server.close();
+  }
 });

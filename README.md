@@ -533,6 +533,8 @@ npm run inspector
 
 Open `http://localhost:9090` in any browser. Auto-refreshes every 5 s; click Pause to stop polling. Override the port with `BROWSER_RELAY_INSPECTOR_PORT=9091`.
 
+The inspector now has three pages — **Pool overview** (`/`), **Specialty MCPs** (`/specialty`), and **Settings** (`/settings`) — all read-only for safety. Settings shows resolved config, which `BROWSER_RELAY_*` env vars are set (booleans only — values are never displayed), and a paste-ready `local-config.json` snippet you can copy with one click. Mutating actions (refresh cookies, save settings) come in a later release once we add proper CORS gating.
+
 > ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). It's read-only in this version (no mutating endpoints), so the worst case is information disclosure — but that's still worth taking seriously.
 
 ---

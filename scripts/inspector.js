@@ -29,10 +29,28 @@ const pool = require("../src/pool-shared.js");
 const processShim = require("../src/process-shim.js");
 const { loadVaultFromEnv } = require("../src/vault.js");
 const { tools: ownTools } = require("../src/own-tools/index.js");
+const { detectBraveProfileDir } = require("../src/detect-browser.js");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const UI_DIR = path.join(__dirname, "inspector-ui");
 const PKG = require(path.join(REPO_ROOT, "package.json"));
+const LOCAL_CONFIG_PATH = path.join(REPO_ROOT, "local-config.json");
+const LOCAL_CONFIG_EXAMPLE = "local-config.example.json";
+
+// Env vars whose set/unset state we surface on the Settings page. We only
+// expose booleans — never the values themselves — so this list also acts as
+// the allowlist for `/api/settings`.env.
+const TRACKED_ENV_VARS = [
+  "BROWSER_RELAY_BRAVE_PATH",
+  "BROWSER_RELAY_UPSTREAM_PATH",
+  "BROWSER_RELAY_BRAVE_PROFILE_DIR",
+  "BROWSER_RELAY_POOL_DIR",
+  "BROWSER_RELAY_POOL_SLOT",
+  "BROWSER_RELAY_PROXY_URL",
+  "BROWSER_RELAY_VAULT_FILES",
+  "BROWSER_RELAY_SNAPSHOT_INDEXEDDB",
+  "BROWSER_HEADLESS_ENABLE",
+];
 
 // Specialty MCPs we *can name* but *can't probe* directly (they're separate
 // MCP server processes the user's IDE talks to, not this relay). The inspector
@@ -42,20 +60,47 @@ const PKG = require(path.join(REPO_ROOT, "package.json"));
 const STATIC_SPECIALTY = [
   {
     name: "puppeteer-real-browser",
-    description: "Fingerprint-aware Chrome. Use when standard scrape hits PX/Akamai walls.",
+    displayName: "puppeteer-real-browser",
+    role: "scrape-fallback",
+    description:
+      "Fingerprint-aware Chrome. Use when standard scrape hits PX/Akamai/Cloudflare walls. Standalone MCP — runs in its own process.",
     note: "Standalone — separate MCP process, not introspectable from here.",
+    docsUrl: "https://www.npmjs.com/package/puppeteer-real-browser",
+    sourceRepoUrl: "https://github.com/zfcsoftware/puppeteer-real-browser",
   },
   {
     name: "amz-aff-firefox-mcp",
-    description: "Walmart B2B authed via Firefox profile. Single-session.",
+    displayName: "amz-aff-firefox-mcp",
+    role: "walmart-b2b",
+    description:
+      "Walmart B2B authed via Firefox profile. Single-session. Used when the relay's Brave can't get past Walmart B2B's bot detection.",
     note: "Standalone — separate MCP process, not introspectable from here.",
+    docsUrl: null,
+    sourceRepoUrl: null,
   },
   {
     name: "claude-in-chrome",
-    description: "Live page debugging via the Chrome extension.",
+    displayName: "claude-in-chrome",
+    role: "live-debug",
+    description:
+      "Live page debugging via the official Anthropic Chrome extension. Use to inspect a page already open in your daily-driver Chrome profile.",
     note: "Extension — not introspectable from here.",
+    docsUrl: "https://chromewebstore.google.com/",
+    sourceRepoUrl: null,
   },
 ];
+
+// Description for browser-devtools-mcp-2 — surfaced on the Specialty page.
+// Stored separate from STATIC_SPECIALTY because mcp-2 is the one specialty
+// we *can* introspect (it's the cookie-source profile).
+const BDMCP2_META = {
+  displayName: "browser-devtools-mcp-2",
+  role: "cookie-source",
+  description:
+    "Cookie source profile. Feeds saved-login cookies into every pool slot at launch — log in once via this MCP, every subsequent pool launch inherits the session. Refresh by opening a new mcp-2 session and logging back in.",
+  docsUrl: "https://www.npmjs.com/package/browser-devtools-mcp",
+  sourceRepoUrl: "https://github.com/iansatish/browser-devtools-mcp",
+};
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -295,6 +340,139 @@ function buildStatus(seams = {}) {
   };
 }
 
+/** Build the /api/settings payload. Surfaces resolved config + which env
+ *  vars are SET (booleans only — never values) + a paste-ready
+ *  local-config.json snippet for friends who'd rather configure once on disk
+ *  than maintain env vars. Read-only by design — W8 has no /api/settings POST
+ *  counterpart. Mutating endpoints land in W10 with proper CORS gating. */
+function buildSettings(seams = {}) {
+  const _loadConfig = seams._loadConfig || pool.loadConfig;
+  const _detectBraveProfileDir = seams._detectBraveProfileDir || detectBraveProfileDir;
+  const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
+  const _env = seams._env || process.env;
+
+  const cfg = _loadConfig();
+
+  // detectBraveProfileDir() reads BROWSER_RELAY_BRAVE_PROFILE_DIR if set.
+  // We pass the same env so tests / overrides are honored.
+  let braveProfileDir = null;
+  try {
+    braveProfileDir = _detectBraveProfileDir({ env: _env });
+  } catch { /* leave null */ }
+
+  // Booleans only — never values. The loop is the allowlist; any env var not
+  // in TRACKED_ENV_VARS is invisible to this endpoint.
+  const envBooleans = {};
+  for (const k of TRACKED_ENV_VARS) {
+    envBooleans[k] = !!(_env[k] && _env[k].length > 0);
+  }
+
+  const localConfigExists = !!_existsFile(LOCAL_CONFIG_PATH);
+
+  // Build a paste-ready snippet using the values currently being used. We
+  // redact paths in the *displayed* snippet too — friends see basenames and
+  // know where to fill in their own absolute paths. Better than leaking
+  // C:\Users\<them>\... back into the page.
+  const localConfigSnippet = JSON.stringify(
+    {
+      BROWSER_RELAY_BRAVE_PATH: cfg.bravePath ? redactPath(cfg.bravePath) : "",
+      BROWSER_RELAY_BRAVE_PROFILE_DIR: braveProfileDir
+        ? redactPath(braveProfileDir)
+        : "",
+      BROWSER_RELAY_POOL_DIR: "",
+      BROWSER_RELAY_POOL_SLOT: "",
+      BROWSER_HEADLESS_ENABLE: "false",
+      BROWSER_RELAY_PROXY_URL: "",
+      BROWSER_RELAY_VAULT_FILES: "",
+      BROWSER_RELAY_SNAPSHOT_INDEXEDDB: "false",
+    },
+    null,
+    2,
+  );
+
+  return {
+    config: {
+      bravePath: cfg.bravePath ? redactPath(cfg.bravePath) : null,
+      braveProfileDir: braveProfileDir ? redactPath(braveProfileDir) : null,
+      poolDirs: (cfg.poolDirs || []).map(redactPath),
+      slotRoles: Object.fromEntries(
+        Object.entries(cfg.slotRoles || {}).map(([k, v]) => [redactPath(k), v]),
+      ),
+      cookieSourceProfile: cfg.cookieSourceProfile
+        ? redactPath(cfg.cookieSourceProfile)
+        : null,
+      cookieFreshnessWarnDays: cfg.cookieFreshnessWarnDays,
+      mode: cfg.standalone ? "standalone" : "pool",
+    },
+    env: envBooleans,
+    localConfigExists,
+    localConfigSnippet,
+    localConfigExamplePath: LOCAL_CONFIG_EXAMPLE,
+  };
+}
+
+/** Build the /api/specialty payload — 4 cards (mcp-2 + 3 static). mcp-2's
+ *  status is derived from cookieSourceProfile freshness; everything else is
+ *  unknown because the inspector can't probe other MCP server processes. */
+function buildSpecialty(seams = {}) {
+  const _loadConfig = seams._loadConfig || pool.loadConfig;
+  const _findCookiesFile = seams._findCookiesFile || pool.findCookiesFile;
+  const _checkCookieAgeDays =
+    seams._checkCookieAgeDays || pool.checkCookieAgeDays;
+
+  const cfg = _loadConfig();
+  const items = [];
+
+  // browser-devtools-mcp-2 — cookie source. Same derivation as buildStatus
+  // so the two pages can't disagree on freshness.
+  let mcp2CookieAge = null;
+  let mcp2Status = "unknown";
+  try {
+    if (cfg.cookieSourceProfile) {
+      const cookiesPath = _findCookiesFile(cfg.cookieSourceProfile);
+      if (cookiesPath) {
+        mcp2CookieAge = _checkCookieAgeDays(cookiesPath);
+        if (mcp2CookieAge != null) {
+          mcp2Status =
+            mcp2CookieAge <= cfg.cookieFreshnessWarnDays ? "fresh" : "stale";
+        }
+      }
+    }
+  } catch { /* leave unknown */ }
+
+  items.push({
+    id: "browser-devtools-mcp-2",
+    displayName: BDMCP2_META.displayName,
+    role: BDMCP2_META.role,
+    description: BDMCP2_META.description,
+    status: mcp2Status,
+    cookieSourceProfile: cfg.cookieSourceProfile
+      ? redactPath(cfg.cookieSourceProfile)
+      : null,
+    cookieAgeDays: mcp2CookieAge,
+    thresholdDays: cfg.cookieFreshnessWarnDays,
+    docsUrl: BDMCP2_META.docsUrl,
+    sourceRepoUrl: BDMCP2_META.sourceRepoUrl,
+  });
+
+  for (const s of STATIC_SPECIALTY) {
+    items.push({
+      id: s.name,
+      displayName: s.displayName,
+      role: s.role,
+      description: s.description,
+      status: "unknown",
+      cookieSourceProfile: null,
+      cookieAgeDays: null,
+      thresholdDays: cfg.cookieFreshnessWarnDays,
+      docsUrl: s.docsUrl,
+      sourceRepoUrl: s.sourceRepoUrl,
+    });
+  }
+
+  return { items };
+}
+
 // Module-level start time so /api/status uptime stays stable across reqs.
 let serverStartedAt = Date.now();
 
@@ -314,17 +492,25 @@ function makeHandler(seams = {}) {
     const parsed = url.parse(req.url || "/");
     const pathname = parsed.pathname || "/";
 
-    if (pathname === "/api/status") {
+    // JSON API endpoints. Each wraps its build* in try/catch so a single
+    // bad seam can't kill the whole inspector.
+    const apiBuilders = {
+      "/api/status": buildStatus,
+      "/api/settings": buildSettings,
+      "/api/specialty": buildSpecialty,
+    };
+    const apiBuilder = apiBuilders[pathname];
+    if (apiBuilder) {
       try {
-        const status = buildStatus(seams);
+        const payload = apiBuilder(seams);
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify(status, null, 2));
+        res.end(JSON.stringify(payload, null, 2));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ error: "status build failed", detail: e.message }));
+        res.end(JSON.stringify({ error: "build failed", detail: e.message }));
       }
       return;
     }
@@ -336,10 +522,14 @@ function makeHandler(seams = {}) {
     }
 
     // Whitelist of static UI files. Never let the URL drive a path join into
-    // arbitrary disk — pin to the three files we serve.
+    // arbitrary disk — pin to the named files we serve. SPA routes /settings
+    // and /specialty also resolve to index.html so the frontend can route on
+    // location.pathname (no pushState yet — full nav per W8 brief).
     const staticMap = {
       "/": "index.html",
       "/index.html": "index.html",
+      "/settings": "index.html",
+      "/specialty": "index.html",
       "/styles.css": "styles.css",
       "/app.js": "app.js",
     };
@@ -418,9 +608,12 @@ if (require.main === module) {
 module.exports = {
   createInspector,
   buildStatus,
+  buildSettings,
+  buildSpecialty,
   makeHandler,
   defaultPort,
   defaultBind,
   redactPath,
   formatDuration,
+  TRACKED_ENV_VARS,
 };
