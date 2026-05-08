@@ -14,7 +14,6 @@ const {
   createInspector,
   buildStatus,
   buildSettings,
-  buildSpecialty,
   buildToolsCatalog,
   defaultPort,
   defaultBind,
@@ -162,7 +161,7 @@ test("buildStatus: returns expected top-level keys", () => {
   const status = buildStatus(makeSeams());
   assert.ok(status.config);
   assert.ok(Array.isArray(status.slots));
-  assert.ok(status.specialty);
+  assert.ok(status.cookieSource);
   assert.ok(status.vault);
   assert.ok(status.tools);
   assert.ok(status.server);
@@ -217,12 +216,77 @@ test("buildStatus: tools.ownCount comes from ownTools length", () => {
   assert.strictEqual(status.tools.total, 16 + 51);
 });
 
-test("buildStatus: specialty includes browser-devtools-mcp-2 + 3 static MCPs", () => {
+// ─── v0.2.1: cookieSource block on buildStatus ──────────────────────────
+
+test("buildStatus: cookieSource block exposes profile, ageDays, thresholdDays, status", () => {
   const status = buildStatus(makeSeams());
-  assert.ok(status.specialty["browser-devtools-mcp-2"]);
-  assert.ok(status.specialty["puppeteer-real-browser"]);
-  assert.ok(status.specialty["amz-aff-firefox-mcp"]);
-  assert.ok(status.specialty["claude-in-chrome"]);
+  const cs = status.cookieSource;
+  assert.ok(cs);
+  assert.ok(Object.prototype.hasOwnProperty.call(cs, "profile"));
+  assert.ok(Object.prototype.hasOwnProperty.call(cs, "ageDays"));
+  assert.ok(Object.prototype.hasOwnProperty.call(cs, "thresholdDays"));
+  assert.ok(Object.prototype.hasOwnProperty.call(cs, "status"));
+  assert.strictEqual(cs.thresholdDays, 7);
+});
+
+test("buildStatus: cookieSource.profile is path-redacted to basename", () => {
+  const seams = makeSeams({
+    extra: {
+      _findCookiesFile: (dir) => dir + "/Default/Network/Cookies",
+      _checkCookieAgeDays: () => 2,
+    },
+  });
+  const status = buildStatus(seams);
+  // Default seams use absolute path "C:/fake/.browser-data-mcp-2"
+  assert.strictEqual(status.cookieSource.profile, ".browser-data-mcp-2");
+  assert.ok(!status.cookieSource.profile.includes("C:"), "absolute path leaked");
+  assert.ok(!status.cookieSource.profile.includes("/"), "path separator leaked");
+});
+
+test("buildStatus: cookieSource.status = 'fresh' when age <= threshold", () => {
+  const seams = makeSeams({
+    extra: {
+      _findCookiesFile: () => "/fake/cookies",
+      _checkCookieAgeDays: () => 2, // < 7-day threshold
+    },
+  });
+  const status = buildStatus(seams);
+  assert.strictEqual(status.cookieSource.status, "fresh");
+  assert.strictEqual(status.cookieSource.ageDays, 2);
+});
+
+test("buildStatus: cookieSource.status = 'stale' when age > threshold", () => {
+  const seams = makeSeams({
+    extra: {
+      _findCookiesFile: () => "/fake/cookies",
+      _checkCookieAgeDays: () => 14, // > 7-day threshold
+    },
+  });
+  const status = buildStatus(seams);
+  assert.strictEqual(status.cookieSource.status, "stale");
+  assert.strictEqual(status.cookieSource.ageDays, 14);
+});
+
+test("buildStatus: cookieSource.status = 'unknown' when profile is null", () => {
+  const seams = makeSeams({
+    config: {
+      poolDirs: ["C:/fake/.browser-data-mcp-pool-1"],
+      slotRoles: {},
+      cookieFreshnessWarnDays: 7,
+      cookieSourceProfile: null,
+      bravePath: null,
+      standalone: false,
+    },
+  });
+  const status = buildStatus(seams);
+  assert.strictEqual(status.cookieSource.profile, null);
+  assert.strictEqual(status.cookieSource.ageDays, null);
+  assert.strictEqual(status.cookieSource.status, "unknown");
+});
+
+test("buildStatus: no `specialty` block on status response (removed v0.2.1)", () => {
+  const status = buildStatus(makeSeams());
+  assert.strictEqual(status.specialty, undefined);
 });
 
 // ─── HTTP routing tests ─────────────────────────────────────────────────
@@ -410,42 +474,6 @@ test("buildSettings: localConfigSnippet is valid JSON", () => {
   assert.ok(Object.prototype.hasOwnProperty.call(parsed, "BROWSER_RELAY_BRAVE_PATH"));
 });
 
-// ─── W8: buildSpecialty shape tests ─────────────────────────────────────
-
-test("buildSpecialty: returns 4 items (mcp-2 + 3 static)", () => {
-  const s = buildSpecialty(makeSeams());
-  assert.ok(Array.isArray(s.items));
-  assert.strictEqual(s.items.length, 4);
-  const ids = s.items.map((i) => i.id);
-  assert.ok(ids.includes("browser-devtools-mcp-2"));
-  assert.ok(ids.includes("puppeteer-real-browser"));
-  assert.ok(ids.includes("amz-aff-firefox-mcp"));
-  assert.ok(ids.includes("claude-in-chrome"));
-});
-
-test("buildSpecialty: each item has required fields", () => {
-  const s = buildSpecialty(makeSeams());
-  for (const item of s.items) {
-    assert.strictEqual(typeof item.id, "string");
-    assert.strictEqual(typeof item.displayName, "string");
-    assert.strictEqual(typeof item.role, "string");
-    assert.strictEqual(typeof item.description, "string");
-    assert.ok(["fresh", "stale", "ready", "unknown"].includes(item.status));
-    assert.ok(Object.prototype.hasOwnProperty.call(item, "cookieSourceProfile"));
-    assert.ok(Object.prototype.hasOwnProperty.call(item, "cookieAgeDays"));
-    assert.ok(Object.prototype.hasOwnProperty.call(item, "thresholdDays"));
-  }
-});
-
-test("buildSpecialty: non-mcp-2 items have status=unknown", () => {
-  const s = buildSpecialty(makeSeams());
-  for (const item of s.items) {
-    if (item.id !== "browser-devtools-mcp-2") {
-      assert.strictEqual(item.status, "unknown");
-    }
-  }
-});
-
 // ─── W8: HTTP routing tests ─────────────────────────────────────────────
 
 test("GET /api/settings → 200 with valid shape", async () => {
@@ -463,14 +491,11 @@ test("GET /api/settings → 200 with valid shape", async () => {
   }
 });
 
-test("GET /api/specialty → 200 with 4 items", async () => {
+test("GET /api/specialty → 404 (endpoint removed v0.2.1)", async () => {
   const { server, port } = await startServer();
   try {
     const r = await fetch(port, "/api/specialty");
-    assert.strictEqual(r.status, 200);
-    const body = JSON.parse(r.body);
-    assert.ok(Array.isArray(body.items));
-    assert.strictEqual(body.items.length, 4);
+    assert.strictEqual(r.status, 404);
   } finally {
     server.close();
   }
@@ -488,13 +513,11 @@ test("GET /settings → 200 serves index.html", async () => {
   }
 });
 
-test("GET /specialty → 200 serves index.html", async () => {
+test("GET /specialty → 404 (page removed v0.2.1)", async () => {
   const { server, port } = await startServer();
   try {
     const r = await fetch(port, "/specialty");
-    assert.strictEqual(r.status, 200);
-    assert.match(r.headers["content-type"], /text\/html/);
-    assert.ok(r.body.includes("Inspector"));
+    assert.strictEqual(r.status, 404);
   } finally {
     server.close();
   }
@@ -1140,7 +1163,7 @@ test("All responses include X-Frame-Options: DENY (clickjacking gate)", async ()
 test("Cache-Control: no-store on /api/* responses", async () => {
   const { server, port } = await startServer();
   try {
-    for (const p of ["/api/status", "/api/settings", "/api/specialty", "/api/tools", "/api/slot/1"]) {
+    for (const p of ["/api/status", "/api/settings", "/api/tools", "/api/slot/1"]) {
       const r = await fetch(port, p);
       assert.match(r.headers["cache-control"] || "", /no-store/, p + " missing no-store");
     }
@@ -1377,27 +1400,23 @@ test("GET /api/slots/1/reap → 405 (POST only)", async () => {
   }
 });
 
-test("POST /api/specialty/mcp-2/refresh-hint with bad Origin → 403", async () => {
+test("GET /api/specialty/mcp-2/refresh-hint → 404 (endpoint removed v0.2.1)", async () => {
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", {
-      Origin: "http://evil.example.com",
-    });
-    assert.strictEqual(r.status, 403);
+    const r = await fetch(port, "/api/specialty/mcp-2/refresh-hint");
+    assert.strictEqual(r.status, 404);
   } finally {
     server.close();
   }
 });
 
-test("POST /api/specialty/mcp-2/refresh-hint with no Origin → 200 with message", async () => {
+test("POST /api/specialty/mcp-2/refresh-hint → 405 (no longer a mutating route)", async () => {
+  // Falls through to the post-mutating-route gate, which 405s any non-GET
+  // for unrecognized paths. Confirms the route was removed (formerly 200).
   const { server, port } = await startServer();
   try {
     const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", {});
-    assert.strictEqual(r.status, 200);
-    const body = JSON.parse(r.body);
-    assert.strictEqual(body.ok, true);
-    assert.match(body.message, /MCP entry/);
-    assert.match(body.message, /pool-mode launch/);
+    assert.strictEqual(r.status, 405);
   } finally {
     server.close();
   }

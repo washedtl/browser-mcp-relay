@@ -53,50 +53,6 @@ const TRACKED_ENV_VARS = [
   "BROWSER_HEADLESS_ENABLE",
 ];
 
-// Specialty MCPs we *can name* but *can't probe*. browser-devtools-mcp-2 is
-// the one exception — we surface its mtime via pool-shared helpers.
-const STATIC_SPECIALTY = [
-  {
-    name: "puppeteer-real-browser",
-    displayName: "puppeteer-real-browser",
-    role: "scrape-fallback",
-    description:
-      "Fingerprint-aware Chrome. Use when standard scrape hits PX/Akamai/Cloudflare walls. Standalone MCP — runs in its own process.",
-    note: "Standalone — separate MCP process, not introspectable from here.",
-    docsUrl: "https://www.npmjs.com/package/puppeteer-real-browser",
-    sourceRepoUrl: "https://github.com/zfcsoftware/puppeteer-real-browser",
-  },
-  {
-    name: "amz-aff-firefox-mcp",
-    displayName: "amz-aff-firefox-mcp",
-    role: "walmart-b2b",
-    description:
-      "Walmart B2B authed via Firefox profile. Single-session. Used when the relay's Brave can't get past Walmart B2B's bot detection.",
-    note: "Standalone — separate MCP process, not introspectable from here.",
-    docsUrl: null,
-    sourceRepoUrl: null,
-  },
-  {
-    name: "claude-in-chrome",
-    displayName: "claude-in-chrome",
-    role: "live-debug",
-    description:
-      "Live page debugging via the official Anthropic Chrome extension. Use to inspect a page already open in your daily-driver Chrome profile.",
-    note: "Extension — not introspectable from here.",
-    docsUrl: "https://chromewebstore.google.com/",
-    sourceRepoUrl: null,
-  },
-];
-
-const BDMCP2_META = {
-  displayName: "browser-devtools-mcp-2",
-  role: "cookie-source",
-  description:
-    "Cookie source profile. Feeds saved-login cookies into every pool slot at launch — log in once via this MCP, every subsequent pool launch inherits the session. Refresh by opening a new mcp-2 session and logging back in.",
-  docsUrl: "https://www.npmjs.com/package/browser-devtools-mcp",
-  sourceRepoUrl: "https://github.com/iansatish/browser-devtools-mcp",
-};
-
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -239,42 +195,34 @@ function buildStatus(seams = {}) {
     };
   });
 
-  const specialty = {};
-  let bdmcp2CookieAge = null;
-  let bdmcp2Status = "unknown";
+  // Cookie source freshness for the configured `cookieSourceProfile`. Pool
+  // mode snapshots that profile's cookies into every slot at launch; the
+  // freshness pill is the one piece of "specialty MCP" telemetry that's
+  // genuinely useful regardless of which MCP entry feeds the profile, so
+  // we surface it on Pool overview directly rather than as a separate page.
+  let cookieAgeDays = null;
+  let cookieStatus = "unknown";
   try {
     if (cfg.cookieSourceProfile) {
       const cookiesPath = _findCookiesFile(cfg.cookieSourceProfile);
       if (cookiesPath) {
-        bdmcp2CookieAge = _checkCookieAgeDays(cookiesPath);
-        if (bdmcp2CookieAge != null) {
-          bdmcp2Status =
-            bdmcp2CookieAge <= cfg.cookieFreshnessWarnDays ? "fresh" : "stale";
+        cookieAgeDays = _checkCookieAgeDays(cookiesPath);
+        if (cookieAgeDays != null) {
+          cookieStatus =
+            cookieAgeDays <= cfg.cookieFreshnessWarnDays ? "fresh" : "stale";
         }
       }
     }
   } catch { /* leave unknown */ }
 
-  specialty["browser-devtools-mcp-2"] = {
-    cookieSourceProfile: cfg.cookieSourceProfile
+  const cookieSource = {
+    profile: cfg.cookieSourceProfile
       ? redactPath(cfg.cookieSourceProfile)
       : null,
-    cookieAgeDays: bdmcp2CookieAge,
+    ageDays: cookieAgeDays,
     thresholdDays: cfg.cookieFreshnessWarnDays,
-    status: bdmcp2Status,
-    description:
-      "Cookie source profile — feeds the pool's cookie snapshots on launch.",
+    status: cookieStatus,
   };
-  for (const s of STATIC_SPECIALTY) {
-    specialty[s.name] = {
-      cookieSourceProfile: null,
-      cookieAgeDays: null,
-      thresholdDays: cfg.cookieFreshnessWarnDays,
-      status: "unknown",
-      description: s.description,
-      note: s.note,
-    };
-  }
 
   let vaultBlock = {
     enabled: false,
@@ -326,7 +274,7 @@ function buildStatus(seams = {}) {
         : null,
     },
     slots,
-    specialty,
+    cookieSource,
     vault: vaultBlock,
     tools: {
       total: ownCount + forwardedCount,
@@ -462,63 +410,6 @@ function buildToolsCatalog(seams = {}) {
   };
 }
 
-function buildSpecialty(seams = {}) {
-  const _loadConfig = seams._loadConfig || pool.loadConfig;
-  const _findCookiesFile = seams._findCookiesFile || pool.findCookiesFile;
-  const _checkCookieAgeDays =
-    seams._checkCookieAgeDays || pool.checkCookieAgeDays;
-
-  const cfg = _loadConfig();
-  const items = [];
-
-  let mcp2CookieAge = null;
-  let mcp2Status = "unknown";
-  try {
-    if (cfg.cookieSourceProfile) {
-      const cookiesPath = _findCookiesFile(cfg.cookieSourceProfile);
-      if (cookiesPath) {
-        mcp2CookieAge = _checkCookieAgeDays(cookiesPath);
-        if (mcp2CookieAge != null) {
-          mcp2Status =
-            mcp2CookieAge <= cfg.cookieFreshnessWarnDays ? "fresh" : "stale";
-        }
-      }
-    }
-  } catch { /* leave unknown */ }
-
-  items.push({
-    id: "browser-devtools-mcp-2",
-    displayName: BDMCP2_META.displayName,
-    role: BDMCP2_META.role,
-    description: BDMCP2_META.description,
-    status: mcp2Status,
-    cookieSourceProfile: cfg.cookieSourceProfile
-      ? redactPath(cfg.cookieSourceProfile)
-      : null,
-    cookieAgeDays: mcp2CookieAge,
-    thresholdDays: cfg.cookieFreshnessWarnDays,
-    docsUrl: BDMCP2_META.docsUrl,
-    sourceRepoUrl: BDMCP2_META.sourceRepoUrl,
-  });
-
-  for (const s of STATIC_SPECIALTY) {
-    items.push({
-      id: s.name,
-      displayName: s.displayName,
-      role: s.role,
-      description: s.description,
-      status: "unknown",
-      cookieSourceProfile: null,
-      cookieAgeDays: null,
-      thresholdDays: cfg.cookieFreshnessWarnDays,
-      docsUrl: s.docsUrl,
-      sourceRepoUrl: s.sourceRepoUrl,
-    });
-  }
-
-  return { items };
-}
-
 /** Build the per-slot detail payload for /api/slot/:n. Returns null if `n`
  *  is out of range, so the caller can 404 cleanly. The payload is the full
  *  slot entry from buildStatus + a `recentTraffic` array (last 200 events). */
@@ -543,7 +434,6 @@ const STATIC_MAP = {
   "/": "index.html",
   "/index.html": "index.html",
   "/settings": "index.html",
-  "/specialty": "index.html",
   "/tools": "index.html",
   "/activity": "index.html",
   "/styles.css": "styles.css",
@@ -747,26 +637,6 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
       return;
     }
 
-    // -mcp-2 cookie refresh hint. Cannot launch interactively; just returns
-    // instructions that the user must open the MCP entry themselves. Same
-    // CORS gate, same security headers.
-    if (pathname === "/api/specialty/mcp-2/refresh-hint") {
-      if (method !== "POST") {
-        writeJsonHead(res, 405);
-        res.end(JSON.stringify({ error: "method not allowed" }));
-        return;
-      }
-      await readJsonBody(req).catch(() => ({})); // drain
-      writeJsonHead(res, 200);
-      res.end(JSON.stringify({
-        ok: true,
-        message:
-          "Open the browser-devtools-mcp-2 MCP entry in your editor (Cursor / Claude Code), " +
-          "log into the sites you need, then close it. Cookies will refresh on the next pool-mode launch.",
-      }));
-      return;
-    }
-
     // ── Read-only methods only past this point ───────────────────────
     if (method !== "GET" && method !== "HEAD") {
       writeJsonHead(res, 405);
@@ -803,7 +673,6 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
     const apiBuilders = {
       "/api/status": buildStatus,
       "/api/settings": buildSettings,
-      "/api/specialty": buildSpecialty,
       "/api/tools": buildToolsCatalog,
       "/api/activity": buildActivity,
     };
@@ -1152,7 +1021,6 @@ module.exports = {
   attachWebsocket,
   buildStatus,
   buildSettings,
-  buildSpecialty,
   buildToolsCatalog,
   buildSlotDetail,
   buildActivity,
@@ -1166,6 +1034,4 @@ module.exports = {
   inputSchemaPreview,
   TRACKED_ENV_VARS,
   OWN_TOOL_META,
-  STATIC_SPECIALTY,
-  BDMCP2_META,
 };

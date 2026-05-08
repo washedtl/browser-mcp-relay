@@ -1,4 +1,4 @@
-// app.js — Inspector frontend (W7 Pool Overview + W8 Settings + Specialty).
+// app.js — Inspector frontend (Pool Overview + Settings + Tools + Activity).
 //
 // Vanilla JS, no build toolchain. Uses createElement + textContent only —
 // never innerHTML with dynamic data (XSS prevention even on a localhost UI).
@@ -6,7 +6,7 @@
 //
 // Routing model: full-page nav (anchor links). On DOMContentLoaded we read
 // location.pathname and dispatch to renderHome() / renderSettings() /
-// renderSpecialty(). pushState routing is W11.
+// renderTools() / renderActivity().
 
 (function () {
   "use strict";
@@ -143,8 +143,6 @@
     document.getElementById("nav-active-count").textContent = active.length;
     document.getElementById("nav-idle-count").textContent = idle.length;
     document.getElementById("nav-attention-count").textContent = attention.length;
-    const specialtyCount = Object.keys(status.specialty || {}).length;
-    document.getElementById("nav-specialty-count").textContent = specialtyCount;
 
     const slotPathMatch = location.pathname.match(/^\/slot\/(\d+)$/);
     const activeSlot = slotPathMatch ? parseInt(slotPathMatch[1], 10) : null;
@@ -295,46 +293,42 @@
     metaNode.appendChild(el("span", { class: "err" }, attention + " attention"));
   }
 
-  function renderSpecialtyCard(name, info) {
-    const status = info.status || "unknown";
-    const head = el("div", { class: "specialty-head" }, [
-      el("span", { class: "specialty-name" }, name),
-      el("span", { class: "specialty-pill " + status }, status),
-    ]);
-    const body = [head];
-    if (info.description) body.push(el("div", { class: "specialty-desc" }, info.description));
-    let metaText = "";
-    if (info.cookieAgeDays != null) {
-      metaText = "cookie " + formatCookieAge(info.cookieAgeDays) + " · threshold " + info.thresholdDays + "d";
-    } else if (info.note) {
-      metaText = info.note;
-    } else {
-      metaText = "Standalone · not introspectable";
-    }
-    body.push(el("div", { class: "specialty-meta" }, metaText));
-    return el("div", { class: "specialty-card" }, body);
-  }
+  // Cookie source card — small panel on Pool overview showing the freshness
+  // of the configured cookieSourceProfile (the profile whose cookies get
+  // snapshotted into every pool slot at launch). One-card-or-empty pattern.
+  function renderCookieSourceCard(status, cardNode) {
+    clearChildren(cardNode);
+    const cs = status.cookieSource || {};
+    const statusText = cs.status || "unknown";
 
-  function renderSpecialtyGridHome(status, gridNode, metaNode) {
-    clearChildren(gridNode);
-    clearChildren(metaNode);
-
-    const entries = Object.entries(status.specialty || {});
-    if (entries.length === 0) {
-      gridNode.appendChild(el("div", { class: "empty-msg" }, "No specialty MCPs."));
+    if (!cs.profile) {
+      cardNode.appendChild(
+        el("div", { class: "cookie-source-card empty" }, [
+          el("div", { class: "cookie-source-label" }, "Cookie source"),
+          el("div", { class: "cookie-source-value muted" }, "Not configured"),
+          el("div", { class: "cookie-source-hint" }, "Set cookieSourceProfile in local-config.json to share saved-login cookies across pool slots."),
+        ]),
+      );
       return;
     }
-    let ready = 0, stale = 0;
-    for (const [name, info] of entries) {
-      gridNode.appendChild(renderSpecialtyCard(name, info));
-      if (info.status === "fresh" || info.status === "ready") ready++;
-      else if (info.status === "stale") stale++;
-    }
-    metaNode.appendChild(el("span", { class: "ok" }, ready + " ready"));
-    if (stale > 0) {
-      metaNode.appendChild(document.createTextNode(" · "));
-      metaNode.appendChild(el("span", { class: "err" }, stale + " stale source"));
-    }
+
+    const ageClass = statusText === "fresh" ? "fresh" : statusText === "stale" ? "stale" : "";
+    cardNode.appendChild(
+      el("div", { class: "cookie-source-card" }, [
+        el("div", { class: "cookie-source-head" }, [
+          el("span", { class: "cookie-source-label" }, "Cookie source"),
+          el("span", { class: "cookie-source-pill " + statusText }, statusText),
+        ]),
+        el("div", { class: "cookie-source-value mono" }, cs.profile),
+        el("div", { class: "cookie-source-meta mono" }, [
+          el("span", { class: "k" }, "Last refresh "),
+          el("span", { class: "value " + ageClass },
+            cs.ageDays != null ? formatCookieAge(cs.ageDays) + " ago" : "—"),
+          el("span", { class: "k" }, " · Threshold "),
+          el("span", { class: "value" }, cs.thresholdDays + "d"),
+        ]),
+      ]),
+    );
   }
 
   function renderVault(status, cardNode, metaNode) {
@@ -381,11 +375,11 @@
 
     main.appendChild(
       el("div", { class: "section-title" }, [
-        el("h2", null, "Specialty MCPs"),
-        el("span", { class: "meta", id: "specialty-meta" }),
+        el("h2", null, "Cookie source"),
+        el("span", { class: "meta" }, "feeds saved-login cookies into every pool slot at launch"),
       ]),
     );
-    main.appendChild(el("div", { class: "specialty-grid", id: "specialty-grid" }, [el("div", { class: "empty-msg" }, "Loading specialty MCPs…")]));
+    main.appendChild(el("div", { class: "cookie-source-wrap", id: "cookie-source-wrap" }, [el("div", { class: "empty-msg" }, "Loading cookie source…")]));
 
     main.appendChild(
       el("div", { class: "section-title" }, [
@@ -409,7 +403,7 @@
       renderHeader(status);
       renderSidebar(status);
       renderSlotGrid(status, document.getElementById("slot-grid"), document.getElementById("pool-meta"));
-      renderSpecialtyGridHome(status, document.getElementById("specialty-grid"), document.getElementById("specialty-meta"));
+      renderCookieSourceCard(status, document.getElementById("cookie-source-wrap"));
       renderVault(status, document.getElementById("vault-card"), document.getElementById("vault-meta"));
     } catch (e) {
       // Aborted-by-newer-request is expected and noisy — swallow it.
@@ -636,104 +630,6 @@
         buildMcpSnippet(),
       ),
     );
-  }
-
-  // ─── SPECIALTY (detail) ───────────────────────────────────────────────
-
-  function specialtyDetailCard(item) {
-    const card = el("div", { class: "specialty-detail-card" });
-
-    const head = el("div", { class: "specialty-detail-head" }, [
-      el("span", { class: "name" }, item.displayName || item.id),
-      el("span", { class: "role-chip " + (item.role || "") }, item.role || ""),
-      el("span", { class: "specialty-pill " + (item.status || "unknown") }, item.status || "unknown"),
-    ]);
-    card.appendChild(head);
-
-    if (item.description) {
-      card.appendChild(el("div", { class: "specialty-desc" }, item.description));
-    }
-
-    if (item.id === "browser-devtools-mcp-2") {
-      // Cookie source dedicated subsection
-      const block = el("div", { class: "cookie-source-block" });
-      block.appendChild(el("span", { class: "label" }, "Cookie source"));
-      const profileLine = el("div", null, [
-        el("span", { class: "label" }, "Profile · "),
-        el("span", { class: "value" }, item.cookieSourceProfile || "—"),
-      ]);
-      block.appendChild(profileLine);
-      const ageClass = item.status === "fresh" ? "fresh" : item.status === "stale" ? "stale" : "";
-      block.appendChild(
-        el("div", null, [
-          el("span", { class: "label" }, "Age · "),
-          el("span", { class: "value " + ageClass }, formatCookieAge(item.cookieAgeDays)),
-          el("span", { class: "label" }, " · Threshold · "),
-          el("span", { class: "value" }, item.thresholdDays + "d"),
-        ]),
-      );
-      const refreshBtn = el("button", { class: "specialty-refresh-btn", type: "button" }, "Refresh cookies…");
-      refreshBtn.addEventListener("click", () => {
-        if (window.__inspector && window.__inspector.refreshHint) window.__inspector.refreshHint();
-      });
-      block.appendChild(refreshBtn);
-      card.appendChild(block);
-    } else {
-      card.appendChild(
-        el("div", { class: "standalone-block" }, "Optional · standalone — refer to docs / repo to install + configure separately."),
-      );
-    }
-
-    // Meta footer with links
-    const meta = el("div", { class: "specialty-meta-row" });
-    meta.appendChild(
-      el("span", null, [
-        el("span", { class: "k" }, "Last invocation"),
-        document.createTextNode(item.id === "browser-devtools-mcp-2" ? "—" : "—"),
-      ]),
-    );
-    if (item.docsUrl) {
-      const a = el("a", { href: item.docsUrl, target: "_blank", rel: "noopener noreferrer" }, "docs");
-      meta.appendChild(el("span", null, [el("span", { class: "k" }, "Docs"), a]));
-    }
-    if (item.sourceRepoUrl) {
-      const a = el("a", { href: item.sourceRepoUrl, target: "_blank", rel: "noopener noreferrer" }, "repo");
-      meta.appendChild(el("span", null, [el("span", { class: "k" }, "Source"), a]));
-    }
-    card.appendChild(meta);
-
-    return card;
-  }
-
-  async function renderSpecialty(main) {
-    clearChildren(main);
-    main.appendChild(el("div", { class: "empty-msg" }, "Loading specialty MCPs…"));
-
-    let data;
-    try {
-      data = await fetchJson("/api/specialty");
-    } catch (e) {
-      clearChildren(main);
-      main.appendChild(el("div", { class: "empty-msg" }, "Failed to load /api/specialty: " + e.message));
-      return;
-    }
-
-    clearChildren(main);
-    main.appendChild(
-      el("div", { class: "page-header" }, [
-        el("h2", null, "Specialty MCPs"),
-        el("span", { class: "page-sub" }, "Auxiliary servers used alongside the relay · read-only"),
-      ]),
-    );
-
-    const list = el("div", { class: "specialty-list" });
-    for (const item of data.items || []) {
-      list.appendChild(specialtyDetailCard(item));
-    }
-    if (!(data.items || []).length) {
-      list.appendChild(el("div", { class: "empty-msg" }, "No specialty MCPs registered."));
-    }
-    main.appendChild(list);
   }
 
   // ─── TOOLS (catalog) ──────────────────────────────────────────────────
@@ -1646,43 +1542,9 @@
     }
   }
 
-  async function refreshHintAction() {
-    try {
-      const r = await fetch("/api/specialty/mcp-2/refresh-hint", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        showToast((body && body.message) || ("Request failed (" + r.status + ")"), "error");
-        return;
-      }
-      showRefreshHintModal(body.message || "");
-    } catch (e) {
-      showToast("Refresh hint failed: " + e.message, "error");
-    }
-  }
-
-  function showRefreshHintModal(message) {
-    // Lightweight modal — overlay + card with the message + close button.
-    const overlay = el("div", { class: "modal-overlay" });
-    const card = el("div", { class: "modal-card" }, [
-      el("div", { class: "modal-title" }, "Refresh cookie source"),
-      el("div", { class: "modal-body" }, message),
-      el("button", { class: "modal-close", type: "button" }, "Got it"),
-    ]);
-    overlay.appendChild(card);
-    document.body.appendChild(overlay);
-    const close = () => { try { document.body.removeChild(overlay); } catch { /* gone */ } };
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-    card.querySelector(".modal-close").addEventListener("click", close);
-  }
-
   // Expose the reap action so the orphan-slot card can wire its button up.
   window.__inspector = window.__inspector || {};
   window.__inspector.reapSlot = reapSlotAction;
-  window.__inspector.refreshHint = refreshHintAction;
   window.__inspector.showToast = showToast;
   // Test seam — exposed on window so unit tests can drive the pure filter
   // without spinning up a DOM.
@@ -1718,7 +1580,6 @@
       "/": "home", "/index.html": "home",
       "/tools": "tools",
       "/activity": "activity",
-      "/specialty": "specialty",
       "/settings": "settings",
     };
     const want = map[pathname] || "home";
@@ -1746,7 +1607,7 @@
       const node = document.getElementById(id);
       if (node) clearChildren(node);
     }
-    for (const id of ["nav-active-count", "nav-idle-count", "nav-attention-count", "nav-specialty-count"]) {
+    for (const id of ["nav-active-count", "nav-idle-count", "nav-attention-count"]) {
       const node = document.getElementById(id);
       if (node) node.textContent = "—";
     }
@@ -1788,10 +1649,6 @@
       blankStatStrip();
       blankSidebarLists();
       renderSettings(main);
-    } else if (pathname === "/specialty") {
-      blankStatStrip();
-      blankSidebarLists();
-      renderSpecialty(main);
     } else if (pathname === "/tools") {
       blankStatStrip();
       blankSidebarLists();

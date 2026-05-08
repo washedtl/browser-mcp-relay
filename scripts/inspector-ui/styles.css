@@ -358,17 +358,9 @@ body {
   font-family: 'JetBrains Mono', monospace;
 }
 
-/* ─── Specialty MCPs ──────────────────────────────────────────── */
-.specialty-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  margin-bottom: 32px;
-}
-@media (max-width: 1100px) { .specialty-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 600px)  { .specialty-grid { grid-template-columns: 1fr; } }
-
-.specialty-card {
+/* ─── Cookie source (Pool overview) ───────────────────────────── */
+.cookie-source-wrap { margin-bottom: 32px; }
+.cookie-source-card {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
@@ -376,13 +368,19 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-width: 520px;
   transition: background 200ms cubic-bezier(0.23, 1, 0.32, 1), border-color 200ms cubic-bezier(0.23, 1, 0.32, 1);
 }
-.specialty-card:hover { background: var(--card-elevated); border-color: var(--border-strong); }
-
-.specialty-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.specialty-name { font-size: 13px; font-weight: 600; color: var(--text); letter-spacing: -0.005em; }
-.specialty-pill {
+.cookie-source-card:hover { background: var(--card-elevated); border-color: var(--border-strong); }
+.cookie-source-card.empty { color: var(--text-muted); }
+.cookie-source-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.cookie-source-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+.cookie-source-pill {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -393,18 +391,25 @@ body {
   color: var(--text-muted);
   font-family: 'JetBrains Mono', monospace;
 }
-.specialty-pill.fresh,
-.specialty-pill.ready { background: var(--success-soft); color: var(--success); }
-.specialty-pill.stale { background: var(--warn-soft); color: var(--warn); }
-.specialty-pill.unknown { background: var(--surface-2); color: var(--text-muted); }
-.specialty-desc { font-size: 12px; color: var(--text-muted); }
-.specialty-meta {
-  margin-top: 4px;
-  font-size: 11px;
+.cookie-source-pill.fresh { background: var(--success-soft); color: var(--success); }
+.cookie-source-pill.stale { background: var(--warn-soft); color: var(--warn); }
+.cookie-source-pill.unknown { background: var(--surface-2); color: var(--text-muted); }
+.cookie-source-value {
+  font-size: 13px;
+  color: var(--text);
+  letter-spacing: -0.005em;
+}
+.cookie-source-value.muted { color: var(--text-muted); font-weight: 500; }
+.cookie-source-meta {
+  font-size: 11.5px;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
   font-feature-settings: 'tnum';
 }
+.cookie-source-meta .k { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; }
+.cookie-source-meta .value { color: var(--text-2); }
+.cookie-source-meta .value.fresh { color: var(--success); }
+.cookie-source-meta .value.stale { color: var(--warn); }
+.cookie-source-hint { font-size: 11.5px; color: var(--text-faint); }
 
 /* ─── Vault card ──────────────────────────────────────────────── */
 .vault-card {
@@ -601,96 +606,6 @@ body {
 }
 .copy-btn:hover { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
 .copy-btn.copied { background: var(--success-soft); color: var(--success); border-color: rgba(74, 222, 128, 0.30); }
-
-/* ─── Specialty page (detail) ──────────────────────────────── */
-.specialty-list { display: flex; flex-direction: column; gap: 14px; margin-bottom: 24px; }
-
-.specialty-detail-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  padding: 18px 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  transition: background 200ms cubic-bezier(0.23, 1, 0.32, 1), border-color 200ms cubic-bezier(0.23, 1, 0.32, 1);
-}
-.specialty-detail-card:hover { background: var(--card-elevated); border-color: var(--border-strong); }
-
-.specialty-detail-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.specialty-detail-head .name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: -0.005em;
-  font-family: 'JetBrains Mono', monospace;
-}
-.role-chip {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  padding: 2px 8px;
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  color: var(--text-2);
-  font-family: 'JetBrains Mono', monospace;
-  font-weight: 500;
-}
-.role-chip.cookie-source { background: rgba(147, 197, 253, 0.10); color: var(--info); }
-.role-chip.scrape-fallback { background: var(--accent-soft); color: var(--accent); }
-
-.specialty-detail-card .specialty-desc { color: var(--text-2); font-size: 13px; line-height: 1.55; }
-
-.specialty-meta-row {
-  display: flex;
-  gap: 22px;
-  flex-wrap: wrap;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 11.5px;
-  color: var(--text-muted);
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-}
-.specialty-meta-row .k { color: var(--text-faint); margin-right: 5px; text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; }
-.specialty-meta-row a { color: var(--info); text-decoration: none; }
-.specialty-meta-row a:hover { text-decoration: underline; }
-
-.cookie-source-block {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-input);
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 12px;
-  color: var(--text-2);
-}
-.cookie-source-block .label {
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-faint);
-}
-.cookie-source-block .value { color: var(--text); font-feature-settings: 'tnum'; }
-.cookie-source-block .value.fresh { color: var(--success); }
-.cookie-source-block .value.stale { color: var(--warn); }
-
-.standalone-block {
-  background: var(--surface-2);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--r-input);
-  padding: 9px 12px;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
 
 /* ─── Tools catalog page ──────────────────────────────────────── */
 .tools-layout {
@@ -1275,51 +1190,6 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .toast.error { border-color: var(--error-border); }
 .toast .toast-msg { line-height: 1.4; }
 
-/* ─── W11: Modal (for refresh-hint) ─────────────────────────────────── */
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-.modal-card {
-  background: var(--card-elevated);
-  border: 1px solid var(--border-strong);
-  border-radius: 12px;
-  padding: 20px 22px;
-  max-width: 520px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.modal-title {
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  color: var(--text);
-}
-.modal-body {
-  font-size: 13px;
-  color: var(--text-2);
-  line-height: 1.55;
-}
-.modal-close {
-  align-self: flex-end;
-  background: var(--accent);
-  color: #1a0a00;
-  border: none;
-  padding: 6px 14px;
-  border-radius: var(--r-input);
-  font-size: 12.5px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.modal-close:hover { filter: brightness(1.1); }
-
 /* ─── W11: Reap button on orphan slot card ──────────────────────────── */
 .slot-reap-btn {
   margin-top: 8px;
@@ -1335,23 +1205,6 @@ a.nav-item, a.icon-btn { text-decoration: none; }
   transition: background 120ms ease;
 }
 .slot-reap-btn:hover { background: rgba(248, 113, 113, 0.18); }
-
-/* ─── W11: Refresh-hint button on -mcp-2 specialty card ─────────────── */
-.specialty-refresh-btn {
-  margin-top: 10px;
-  background: transparent;
-  color: var(--accent);
-  border: 1px solid var(--border-strong);
-  padding: 5px 12px;
-  border-radius: var(--r-input);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease;
-}
-.specialty-refresh-btn:hover {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-}
 
 /* ─── W11: Activity history controls ────────────────────────────────── */
 .activity-controls {
