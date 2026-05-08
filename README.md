@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-139%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-291%20passing-brightgreen.svg)](#)
 [![Tools](https://img.shields.io/badge/tools-67%20%2851%20forwarded%20%2B%2016%20own%29-blue.svg)](#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](#platform-support)
 [![MCP](https://img.shields.io/badge/MCP-stdio-orange.svg)](https://modelcontextprotocol.io/)
@@ -560,17 +560,18 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 
 #### Pages
 
-The Inspector has five surfaces — all read-only:
+The Inspector has six surfaces:
 
-- **Pool overview** (`/`) — slot grid (claimed / idle / orphan), specialty MCPs, vault summary
+- **Pool overview** (`/`) — slot grid (claimed / idle / orphan), specialty MCPs, vault summary. Orphan slots get a **Reap** button that clears the stale lock + kills any leftover Brave processes holding that user-data-dir.
 - **Tools catalog** (`/tools`) — all 67 tools (16 first-party + 51 forwarded), filter + per-tool detail
-- **Specialty MCPs** (`/specialty`) — auxiliary MCP servers + cookie source freshness
+- **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode.
+- **Specialty MCPs** (`/specialty`) — auxiliary MCP servers + cookie source freshness. The `browser-devtools-mcp-2` card has a **Refresh cookies…** button that surfaces the next-step instructions for picking up new logins (the inspector can't trigger interactive Brave logins on its own).
 - **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet
 - **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode.
 
-Mutating actions (refresh cookies, save settings, invoke tools) come in a later release once we add proper CORS gating.
+Mutating endpoints (`POST /api/slots/N/reap`, `POST /api/specialty/mcp-2/refresh-hint`) require a same-origin Origin header (or no Origin — the curl path); cross-origin POSTs are rejected with 403.
 
-> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). It's read-only in this version (no mutating endpoints), so the worst case is information disclosure — but that's still worth taking seriously.
+> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. **Treat the inspector port as if it had your bearer tokens on it** — `tools/call` arguments routinely contain auth tokens, URLs of authed sessions, the cookies your AI is sending, etc. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). Defenses in place: localhost-only bind, Origin allowlist on the WS upgrade and on every mutating POST, `X-Frame-Options: DENY` + `frame-ancestors 'none'` (clickjacking gate), `Cache-Control: no-store` on every API response, path-traversal hard stop, 64 KB WS frame cap + 1 MB back-pressure cap.
 
 ---
 

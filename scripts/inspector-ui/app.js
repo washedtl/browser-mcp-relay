@@ -14,6 +14,10 @@
   const REFRESH_MS = 5000;
   let refreshTimer = null;
   let paused = false;
+  // Holds the AbortController for the in-flight /api/status fetch on the
+  // home page so a slow response can't pile up requests when the timer
+  // fires faster than the network. Bumped on every refresh.
+  let homeFetchAbort = null;
 
   // ─── small DOM/format helpers ─────────────────────────────────────────
 
@@ -83,9 +87,22 @@
 
   // ─── data fetch ───────────────────────────────────────────────────────
 
-  async function fetchJson(p) {
-    const r = await fetch(p, { headers: { Accept: "application/json" } });
-    if (!r.ok) throw new Error(p + " → " + r.status);
+  async function fetchJson(p, opts) {
+    const init = { headers: { Accept: "application/json" } };
+    if (opts && opts.signal) init.signal = opts.signal;
+    if (opts && opts.method) init.method = opts.method;
+    if (opts && opts.body) init.body = opts.body;
+    if (opts && opts.headers) Object.assign(init.headers, opts.headers);
+    if (opts && opts.credentials) init.credentials = opts.credentials;
+    const r = await fetch(p, init);
+    if (!r.ok) {
+      let body = null;
+      try { body = await r.json(); } catch { /* ignore */ }
+      const e = new Error(p + " → " + r.status);
+      e.status = r.status;
+      e.body = body;
+      throw e;
+    }
     return r.json();
   }
 
@@ -211,9 +228,18 @@
       const orphanMsg = slot.pid != null
         ? "PID " + slot.pid + " not alive · lock held " + formatDuration(slot.lockHeldMs ? slot.lockHeldMs / 1000 : null)
         : "Stale lock · " + formatDuration(slot.lockHeldMs ? slot.lockHeldMs / 1000 : null);
+      const reapBtn = el("button", { class: "slot-reap-btn", type: "button" }, "Reap");
+      reapBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (window.__inspector && window.__inspector.reapSlot) {
+          window.__inspector.reapSlot(slot.index);
+        }
+      });
       card.appendChild(
         el("div", { class: "orphan-body" }, [
           el("div", { class: "orphan-message" }, orphanMsg),
+          reapBtn,
         ]),
       );
       card.appendChild(
@@ -371,14 +397,23 @@
   }
 
   async function refreshHome() {
+    // Abort any prior in-flight fetch — prevents request piling on slow
+    // networks when the 5s timer fires before the previous fetch completes.
+    if (homeFetchAbort) {
+      try { homeFetchAbort.abort(); } catch { /* noop */ }
+    }
+    homeFetchAbort = new AbortController();
+    const signal = homeFetchAbort.signal;
     try {
-      const status = await fetchJson("/api/status");
+      const status = await fetchJson("/api/status", { signal });
       renderHeader(status);
       renderSidebar(status);
       renderSlotGrid(status, document.getElementById("slot-grid"), document.getElementById("pool-meta"));
       renderSpecialtyGridHome(status, document.getElementById("specialty-grid"), document.getElementById("specialty-meta"));
       renderVault(status, document.getElementById("vault-card"), document.getElementById("vault-meta"));
     } catch (e) {
+      // Aborted-by-newer-request is expected and noisy — swallow it.
+      if (e && (e.name === "AbortError" || e.code === 20)) return;
       const pill = document.getElementById("health-pill");
       const label = document.getElementById("health-label");
       pill.classList.remove("warn");
@@ -391,8 +426,22 @@
 
   function startHomeTimer() {
     if (refreshTimer) clearInterval(refreshTimer);
-    refreshTimer = setInterval(() => { if (!paused) refreshHome(); }, REFRESH_MS);
+    refreshTimer = setInterval(() => {
+      // Pause polling when the tab isn't visible — saves CPU on the relay
+      // and keeps the cookie-source / brave-process probes from firing
+      // when no one is looking. Resumes immediately on visibilitychange.
+      if (paused || document.hidden) return;
+      refreshHome();
+    }, REFRESH_MS);
   }
+
+  // Resume polling promptly when the tab becomes visible again rather than
+  // waiting up to REFRESH_MS for the next interval tick.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && !paused && (location.pathname === "/" || location.pathname === "/index.html")) {
+      refreshHome();
+    }
+  });
 
   function renderHome(main) {
     buildHomeShell(main);
@@ -623,6 +672,11 @@
           el("span", { class: "value" }, item.thresholdDays + "d"),
         ]),
       );
+      const refreshBtn = el("button", { class: "specialty-refresh-btn", type: "button" }, "Refresh cookies…");
+      refreshBtn.addEventListener("click", () => {
+        if (window.__inspector && window.__inspector.refreshHint) window.__inspector.refreshHint();
+      });
+      block.appendChild(refreshBtn);
       card.appendChild(block);
     } else {
       card.appendChild(
@@ -1398,6 +1452,242 @@
     connectWs(token);
   }
 
+  // ─── Toast (W11) ──────────────────────────────────────────────────────
+
+  function showToast(message, kind) {
+    const container = document.getElementById("toast-container");
+    if (!container) return;
+    const t = el("div", { class: "toast " + (kind === "error" ? "error" : kind === "info" ? "info" : "ok") }, [
+      el("span", { class: "toast-dot" }),
+      el("span", { class: "toast-msg" }, message),
+    ]);
+    container.appendChild(t);
+    // CSS animates in via a class added on next frame.
+    requestAnimationFrame(() => t.classList.add("in"));
+    setTimeout(() => {
+      t.classList.add("out");
+      setTimeout(() => { try { container.removeChild(t); } catch { /* gone */ } }, 250);
+    }, 4000);
+  }
+
+  // ─── ACTIVITY (cross-slot history) ───────────────────────────────────
+  //
+  // /api/activity returns the same ring buffer that /api/slot/:n exposes,
+  // but here we surface it as a global activity log with type filters and
+  // a time-range picker. WS not used — page is read-on-load + manual refresh.
+
+  let activityState = {
+    raw: [],
+    filter: "all",     // all | requests | responses | errors
+    range: "1h",       // 5m | 1h | 24h
+  };
+
+  const ACTIVITY_RANGE_MS = {
+    "5m": 5 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+  };
+
+  // Pure helper exposed for tests: filter the ring-buffer events by
+  // {filter, range}. Returns events sorted newest-first.
+  function filterActivityEvents(events, filter, range, now) {
+    const cutoff = now - (ACTIVITY_RANGE_MS[range] || ACTIVITY_RANGE_MS["1h"]);
+    const out = [];
+    for (const e of events || []) {
+      const t = e.time ? Date.parse(e.time) : 0;
+      if (!Number.isFinite(t) || t < cutoff) continue;
+      if (filter === "requests" && e.method !== "tools/call") continue;
+      if (filter === "responses" && e.status == null) continue;
+      if (filter === "errors" && e.status !== "error") continue;
+      out.push(e);
+    }
+    // Newest first.
+    out.sort((a, b) => Date.parse(b.time || 0) - Date.parse(a.time || 0));
+    return out;
+  }
+
+  function renderActivityCardEntry(evt) {
+    const isRequest = evt.method === "tools/call";
+    const isError = evt.status === "error";
+    const iconClass = isRequest ? "pending" : (isError ? "err" : "ok");
+    const sourceClass = evt.source === "own" ? "first-party" : "";
+    const sourceLabel = evt.source === "own" ? "First-party" : evt.source ? "Forwarded" : "";
+    const title = isRequest ? evt.name : ("Response · " + (evt.status || "ok"));
+    const sub = isRequest
+      ? summariseArgs(evt.args)
+      : (evt.durationMs != null ? formatMs(evt.durationMs) : "");
+    return el("div", { class: "activity-card" }, [
+      el("span", { class: "activity-icon " + iconClass }),
+      el("div", { class: "activity-body" }, [
+        el("div", { class: "activity-title" }, [
+          el("span", { class: "activity-tool" }, title),
+          sourceLabel ? el("span", { class: "activity-source " + sourceClass }, sourceLabel) : null,
+        ]),
+        el("div", { class: "activity-args mono" }, sub || ""),
+      ]),
+      el("div", { class: "activity-meta" }, [
+        el("span", { class: "activity-time mono" }, formatHHMMSS(evt.time)),
+      ]),
+    ]);
+  }
+
+  function renderActivityList() {
+    const node = document.getElementById("activity-list");
+    if (!node) return;
+    clearChildren(node);
+    const filtered = filterActivityEvents(activityState.raw, activityState.filter, activityState.range, Date.now());
+    if (filtered.length === 0) {
+      node.appendChild(
+        el("div", { class: "activity-empty" },
+          activityState.raw.length === 0
+            ? "No activity captured yet. Make an MCP tool call to see it appear here."
+            : "No events match the current filter."),
+      );
+      return;
+    }
+    for (const evt of filtered) node.appendChild(renderActivityCardEntry(evt));
+    const meta = document.getElementById("activity-meta");
+    if (meta) {
+      clearChildren(meta);
+      meta.appendChild(el("span", null, filtered.length + " event" + (filtered.length === 1 ? "" : "s")));
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(el("span", { class: "muted" }, "of " + activityState.raw.length + " captured"));
+    }
+  }
+
+  function buildActivityShell(main) {
+    clearChildren(main);
+
+    main.appendChild(
+      el("div", { class: "page-header" }, [
+        el("h2", null, "Activity history"),
+        el("span", { class: "page-sub" }, "Cross-slot ring buffer · last ~200 events · standalone Inspector shows nothing"),
+      ]),
+    );
+
+    // Filter pills + range picker.
+    const pills = ["all", "requests", "responses", "errors"].map((kind) =>
+      el("button", { class: "tools-pill" + (activityState.filter === kind ? " active" : ""), type: "button", "data-kind": kind },
+        kind === "all" ? "All" : kind === "requests" ? "Requests" : kind === "responses" ? "Responses" : "Errors"),
+    );
+    pills.forEach((b) => {
+      b.addEventListener("click", () => {
+        activityState.filter = b.dataset.kind;
+        pills.forEach((p) => p.classList.toggle("active", p.dataset.kind === activityState.filter));
+        renderActivityList();
+      });
+    });
+
+    const rangeButtons = ["5m", "1h", "24h"].map((r) =>
+      el("button", { class: "tools-pill" + (activityState.range === r ? " active" : ""), type: "button", "data-range": r }, r),
+    );
+    rangeButtons.forEach((b) => {
+      b.addEventListener("click", () => {
+        activityState.range = b.dataset.range;
+        rangeButtons.forEach((p) => p.classList.toggle("active", p.dataset.range === activityState.range));
+        renderActivityList();
+      });
+    });
+
+    main.appendChild(
+      el("div", { class: "activity-controls" }, [
+        el("div", { class: "activity-filter-group" }, pills),
+        el("div", { class: "activity-range-group" }, [
+          el("span", { class: "activity-range-label" }, "Range"),
+          ...rangeButtons,
+        ]),
+        el("span", { class: "meta", id: "activity-meta" }),
+      ]),
+    );
+
+    main.appendChild(el("div", { class: "activity-feed", id: "activity-list" }, [
+      el("div", { class: "activity-empty" }, "Loading…"),
+    ]));
+  }
+
+  async function renderActivity(main) {
+    buildActivityShell(main);
+    let data;
+    try {
+      data = await fetchJson("/api/activity");
+    } catch (e) {
+      const node = document.getElementById("activity-list");
+      if (node) {
+        clearChildren(node);
+        node.appendChild(el("div", { class: "activity-empty" }, "Failed to load /api/activity: " + e.message));
+      }
+      return;
+    }
+    activityState.raw = Array.isArray(data.events) ? data.events : [];
+    renderActivityList();
+  }
+
+  // ─── Mutating action wiring (W11) ─────────────────────────────────────
+
+  async function reapSlotAction(slotIndex) {
+    try {
+      const r = await fetch("/api/slots/" + slotIndex + "/reap", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      });
+      let body = null;
+      try { body = await r.json(); } catch { /* ignore */ }
+      if (!r.ok) {
+        showToast((body && body.message) || ("Reap failed (" + r.status + ")"), "error");
+        return;
+      }
+      showToast((body && body.message) || "Slot reaped", "ok");
+      // Refresh state so the slot turns idle.
+      if (location.pathname === "/" || location.pathname === "/index.html") refreshHome();
+      else if (/^\/slot\/\d+$/.test(location.pathname)) location.reload();
+    } catch (e) {
+      showToast("Reap failed: " + e.message, "error");
+    }
+  }
+
+  async function refreshHintAction() {
+    try {
+      const r = await fetch("/api/specialty/mcp-2/refresh-hint", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        showToast((body && body.message) || ("Request failed (" + r.status + ")"), "error");
+        return;
+      }
+      showRefreshHintModal(body.message || "");
+    } catch (e) {
+      showToast("Refresh hint failed: " + e.message, "error");
+    }
+  }
+
+  function showRefreshHintModal(message) {
+    // Lightweight modal — overlay + card with the message + close button.
+    const overlay = el("div", { class: "modal-overlay" });
+    const card = el("div", { class: "modal-card" }, [
+      el("div", { class: "modal-title" }, "Refresh cookie source"),
+      el("div", { class: "modal-body" }, message),
+      el("button", { class: "modal-close", type: "button" }, "Got it"),
+    ]);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    const close = () => { try { document.body.removeChild(overlay); } catch { /* gone */ } };
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    card.querySelector(".modal-close").addEventListener("click", close);
+  }
+
+  // Expose the reap action so the orphan-slot card can wire its button up.
+  window.__inspector = window.__inspector || {};
+  window.__inspector.reapSlot = reapSlotAction;
+  window.__inspector.refreshHint = refreshHintAction;
+  window.__inspector.showToast = showToast;
+  // Test seam — exposed on window so unit tests can drive the pure filter
+  // without spinning up a DOM.
+  window.__inspector.filterActivityEvents = filterActivityEvents;
+
   // ─── Header / sidebar wiring (chrome shared across views) ─────────────
 
   // Header buttons. Refresh + Pause only matter on Home.
@@ -1424,7 +1714,13 @@
 
   // Highlight the active sidebar link for the current pathname.
   function applyActiveNav(pathname) {
-    const map = { "/": "home", "/index.html": "home", "/tools": "tools", "/specialty": "specialty", "/settings": "settings" };
+    const map = {
+      "/": "home", "/index.html": "home",
+      "/tools": "tools",
+      "/activity": "activity",
+      "/specialty": "specialty",
+      "/settings": "settings",
+    };
     const want = map[pathname] || "home";
     const items = document.querySelectorAll(".nav-item[data-nav]");
     items.forEach((n) => {
@@ -1500,6 +1796,10 @@
       blankStatStrip();
       blankSidebarLists();
       renderTools(main);
+    } else if (pathname === "/activity") {
+      blankStatStrip();
+      blankSidebarLists();
+      renderActivity(main);
     } else {
       renderHome(main);
     }

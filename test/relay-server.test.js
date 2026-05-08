@@ -364,3 +364,40 @@ test("RelayServer.handleToolsCall ids increment across calls", async () => {
   assert.ok(ids[1] > ids[0]);
   assert.ok(ids[2] > ids[1]);
 });
+
+// ─── W11: subscriber-throws-mid-emit safety ──────────────────────────
+
+test("RelayServer.handleToolsCall: a throwing subscriber must not bubble out", async () => {
+  // A buggy/disconnected Inspector subscriber should NOT take out a tool
+  // call. The relay catches emit() throws on both the request and response
+  // emit paths.
+  const relay = makeRelay();
+  relay.trafficEmitter.on("request", () => { throw new Error("subscriber boom (request)"); });
+  relay.trafficEmitter.on("response", () => { throw new Error("subscriber boom (response)"); });
+
+  const result = await relay.handleToolsCall({
+    name: "navigation_go-to",
+    arguments: { url: "about:blank" },
+  });
+  // Caller should see the upstream's normal response, NOT the subscriber error.
+  assert.strictEqual(result.content[0].text, "forwarded navigation_go-to");
+});
+
+test("RelayServer.handleToolsCall: throwing subscriber on error path also doesn't bubble", async () => {
+  // Forwarded tool path that throws — the catch block emits a response
+  // event with the error, then rethrows. A throwing subscriber on THAT
+  // emit must not mask the original error.
+  const upstream = {
+    async request(method) {
+      if (method === "tools/list") return { tools: [{ name: "x", description: "", inputSchema: {} }] };
+      throw new Error("upstream-down");
+    },
+    close() {},
+  };
+  const relay = new RelayServer({ getUpstream: async () => upstream });
+  relay.trafficEmitter.on("response", () => { throw new Error("subscriber boom"); });
+  await assert.rejects(
+    () => relay.handleToolsCall({ name: "x", arguments: {} }),
+    /upstream-down/,
+  );
+});

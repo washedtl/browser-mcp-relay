@@ -1051,3 +1051,389 @@ test("WS upgrade allowedOrigins option overrides default allowlist", async () =>
     await handle.close();
   }
 });
+
+// ─── W11: V2 polish — path traversal, method enforcement, headers ───
+
+test("GET /../package.json → 404 (path traversal blocked)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/../package.json");
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /styles.css/../inspector.js → 404 (path traversal blocked)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/styles.css/../inspector.js");
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /%2e%2e/foo → 404 (encoded path traversal blocked)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/%2e%2e/foo");
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("PUT /api/status → 405 (read-only method enforcement)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/status", "PUT");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+test("DELETE /api/status → 405", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/status", "DELETE");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+test("PATCH /api/status → 405", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/status", "PATCH");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+test("OPTIONS /api/status → 405 (we don't honor CORS preflight)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/status", "OPTIONS");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+test("All responses include X-Frame-Options: DENY (clickjacking gate)", async () => {
+  const { server, port } = await startServer();
+  try {
+    for (const p of ["/api/status", "/", "/styles.css", "/notfound"]) {
+      const r = await fetch(port, p);
+      assert.strictEqual(r.headers["x-frame-options"], "DENY", p + " missing X-Frame-Options");
+      assert.match(r.headers["content-security-policy"] || "", /frame-ancestors 'none'/, p + " CSP missing");
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("Cache-Control: no-store on /api/* responses", async () => {
+  const { server, port } = await startServer();
+  try {
+    for (const p of ["/api/status", "/api/settings", "/api/specialty", "/api/tools", "/api/slot/1"]) {
+      const r = await fetch(port, p);
+      assert.match(r.headers["cache-control"] || "", /no-store/, p + " missing no-store");
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("redactErrorPaths: redacts Win absolute paths inside an error message", () => {
+  const { redactErrorPaths } = require("../scripts/inspector.js");
+  const out = redactErrorPaths(
+    "tried C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe — not found",
+  );
+  assert.ok(!out.includes("Program Files"), "absolute path leaked: " + out);
+  assert.ok(out.includes("brave.exe"));
+});
+
+test("redactErrorPaths: redacts POSIX absolute paths", () => {
+  const { redactErrorPaths } = require("../scripts/inspector.js");
+  const out = redactErrorPaths("could not access /home/me/.config/brave-something");
+  assert.ok(!out.includes("/home/me"), "POSIX path leaked: " + out);
+  assert.ok(out.includes("brave-something"));
+});
+
+test("buildStatus: braveDetectError is redacted (no full path leak)", () => {
+  const seams = makeSeams({
+    config: {
+      poolDirs: ["C:/fake/.browser-data-mcp-pool-1"],
+      slotRoles: {},
+      cookieFreshnessWarnDays: 7,
+      cookieSourceProfile: null,
+      bravePath: null,
+      braveDetectError: new Error(
+        "tried C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe",
+      ),
+      standalone: true,
+    },
+  });
+  const status = buildStatus(seams);
+  const detect = status.config.braveDetectError;
+  assert.ok(detect, "braveDetectError should pass through");
+  assert.ok(!detect.includes("Program Files"), "braveDetectError leaked path: " + detect);
+  assert.ok(detect.includes("brave.exe"));
+});
+
+// ─── W11: Activity endpoint ─────────────────────────────────────────
+
+test("GET /api/activity → 200 with empty events when no traffic buffer", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/activity");
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.ok(Array.isArray(body.events));
+    assert.strictEqual(body.events.length, 0);
+    assert.strictEqual(body.totalCaptured, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/activity → returns ring-buffer events when in-process", async () => {
+  const ee = makeTestEmitter();
+  ee.push({ id: 1, time: new Date().toISOString(), method: "tools/call", name: "tabs_list", args: {}, source: "own" });
+  ee.push({ id: 1, time: new Date().toISOString(), status: "ok", durationMs: 12, response: { content: [] } });
+  const handle = await startInspector({
+    port: 0, bind: "127.0.0.1",
+    seams: makeSeams(),
+    trafficEmitter: ee,
+    getRecent: () => ee.getRecent(),
+  });
+  try {
+    const r = await fetch(handle.port, "/api/activity");
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.strictEqual(body.events.length, 2);
+    assert.strictEqual(body.totalCaptured, 2);
+    assert.strictEqual(body.events[0].name, "tabs_list");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("GET /activity → 200 serves index.html (SPA route)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/activity");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-type"], /text\/html/);
+    assert.ok(r.body.includes("Inspector"));
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/activity → 405 (read-only)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/activity", "POST");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+// ─── W11: Mutating endpoints + Origin gating ────────────────────────
+
+const { createInspector: createInspectorRaw } = require("../src/inspector-server.js");
+
+function fetchWithHeaders(port, path, method, headers, body) {
+  headers = headers || {};
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, path, method, headers },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        }));
+      },
+    );
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+test("POST /api/slots/1/reap with hostile Origin → 403", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", {
+      Origin: "http://evil.example.com",
+    });
+    assert.strictEqual(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/slots/1/reap with no Origin → not 403 (curl path)", async () => {
+  // Slot 1 in default seams is `claimed`, so it should return 400 not-orphan.
+  // The point of this test is: 403 came BEFORE seeing the body, no-Origin
+  // should not produce 403.
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", {});
+    assert.notStrictEqual(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/slots/1/reap on a non-orphan slot → 400", async () => {
+  // Default seams: slot 1 is claimed. Reaping should refuse with 400.
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", {
+      Origin: "http://localhost:9090",
+    });
+    assert.strictEqual(r.status, 400);
+    const body = JSON.parse(r.body);
+    assert.strictEqual(body.ok, false);
+    assert.match(body.message || "", /not orphan/);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/slots/2/reap on orphan slot → 200 with reaped:true (mutator seam)", async () => {
+  // Set up a seam where slot 2 is orphan (lock present, PID dead).
+  const orphanSeams = makeSeams({
+    lockFiles: {
+      "C:/fake/.browser-data-mcp-pool-2/.mcp-wrapper-lock": JSON.stringify({
+        pid: 9999, // not alive
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+      }),
+    },
+  });
+  let mutatorCalled = false;
+  let mutatorArg = null;
+  const server = createInspectorRaw({
+    seams: orphanSeams,
+    mutators: {
+      reapSlot: (dir, n) => {
+        mutatorCalled = true;
+        mutatorArg = { dir, n };
+        return 1;
+      },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/2/reap", "POST", {
+      Origin: "http://localhost:9090",
+    });
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.strictEqual(body.ok, true);
+    assert.strictEqual(body.reaped, true);
+    assert.match(body.message || "", /Reaped/);
+    assert.strictEqual(mutatorCalled, true);
+    assert.strictEqual(mutatorArg.n, 2);
+    // The dir we passed to the mutator must be the absolute pool dir, NOT
+    // the redacted basename — the mutator needs the real path to act.
+    assert.ok(mutatorArg.dir.includes("/fake/"), "mutator must receive abs path: " + mutatorArg.dir);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/slots/99/reap → 404 (out of range)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/99/reap", "POST", {
+      Origin: "http://localhost:9090",
+    });
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/slots/1/reap → 405 (POST only)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/slots/1/reap");
+    assert.strictEqual(r.status, 405);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/specialty/mcp-2/refresh-hint with bad Origin → 403", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", {
+      Origin: "http://evil.example.com",
+    });
+    assert.strictEqual(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/specialty/mcp-2/refresh-hint with no Origin → 200 with message", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", {});
+    assert.strictEqual(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.strictEqual(body.ok, true);
+    assert.match(body.message, /MCP entry/);
+    assert.match(body.message, /pool-mode launch/);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/slots/abc/reap → 404 (slot index validation)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/abc/reap", "POST", {
+      Origin: "http://localhost:9090",
+    });
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/slots/0/reap → 404 (slots are 1-indexed)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/0/reap", "POST", {
+      Origin: "http://localhost:9090",
+    });
+    assert.strictEqual(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("buildActivity: returns events from _trafficBuffer seam", () => {
+  const { buildActivity } = require("../src/inspector-server.js");
+  const buf = [
+    { id: 1, time: new Date().toISOString(), method: "tools/call", name: "x" },
+    { id: 1, time: new Date().toISOString(), status: "ok" },
+  ];
+  const out = buildActivity({ _trafficBuffer: buf });
+  assert.strictEqual(out.events.length, 2);
+  assert.strictEqual(out.totalCaptured, 2);
+});

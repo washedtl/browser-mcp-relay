@@ -1232,3 +1232,146 @@ a.nav-item, a.icon-btn { text-decoration: none; }
   color: var(--text-muted);
   font-size: 12.5px;
 }
+
+/* ─── W11: Toast notifications ──────────────────────────────────────── */
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--card-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-input);
+  color: var(--text);
+  font-size: 13px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: translateX(8px);
+  transition: opacity 200ms ease, transform 200ms ease;
+  max-width: 380px;
+}
+.toast.in { opacity: 1; transform: translateX(0); }
+.toast.out { opacity: 0; transform: translateX(8px); }
+.toast .toast-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex-shrink: 0;
+}
+.toast.error .toast-dot { background: var(--error); }
+.toast.info .toast-dot { background: var(--info); }
+.toast.error { border-color: var(--error-border); }
+.toast .toast-msg { line-height: 1.4; }
+
+/* ─── W11: Modal (for refresh-hint) ─────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-card {
+  background: var(--card-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  padding: 20px 22px;
+  max-width: 520px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.modal-body {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+.modal-close {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #1a0a00;
+  border: none;
+  padding: 6px 14px;
+  border-radius: var(--r-input);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.modal-close:hover { filter: brightness(1.1); }
+
+/* ─── W11: Reap button on orphan slot card ──────────────────────────── */
+.slot-reap-btn {
+  margin-top: 8px;
+  align-self: flex-start;
+  background: var(--error-soft);
+  color: var(--error);
+  border: 1px solid var(--error-border);
+  padding: 4px 10px;
+  border-radius: var(--r-input);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.slot-reap-btn:hover { background: rgba(248, 113, 113, 0.18); }
+
+/* ─── W11: Refresh-hint button on -mcp-2 specialty card ─────────────── */
+.specialty-refresh-btn {
+  margin-top: 10px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--border-strong);
+  padding: 5px 12px;
+  border-radius: var(--r-input);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.specialty-refresh-btn:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* ─── W11: Activity history controls ────────────────────────────────── */
+.activity-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 0 0 14px 0;
+}
+.activity-filter-group,
+.activity-range-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.activity-range-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  font-family: 'JetBrains Mono', monospace;
+  margin-right: 4px;
+}
