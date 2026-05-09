@@ -249,8 +249,16 @@
       return card;
     }
 
-    // Claimed
-    card.appendChild(el("div", { class: "slot-client" }, "Brave PID " + (slot.pid != null ? slot.pid : "—")));
+    // Claimed. `slot.pid` is the lock-holder PID (the relay's own process) — not Brave.
+    // Real Brave PIDs come from `slot.bravePids` (populated by findBraveProcessesForDir).
+    // Brave is lazy-launched on first tools/call, so a slot can be claimed with no Brave yet.
+    const _bravePid = (slot.bravePids && slot.bravePids[0]) || null;
+    const _clientLabel = _bravePid != null
+      ? "Brave PID " + _bravePid
+      : slot.pid != null
+        ? "Owner PID " + slot.pid + " · Brave not launched"
+        : "—";
+    card.appendChild(el("div", { class: "slot-client" }, _clientLabel));
     card.appendChild(
       el("span", { class: "slot-role" + (slot.role && slot.role !== "default" ? " " + slot.role : "") }, slot.role || "default"),
     );
