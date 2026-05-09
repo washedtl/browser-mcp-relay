@@ -3,23 +3,25 @@
    slot/card patterns are the source of truth. */
 
 :root {
-  --bg: #0d0b0b;
-  --surface: #161313;
-  --surface-2: #1c1818;
-  --card: #1a1716;
-  --card-elevated: #1f1c1a;
-  --border: #2a2624;
-  --border-strong: #3a3531;
+  /* cool/neutral dark surfaces (was warm red-tinted: #0d0b0b / #161313 / #1a1716) */
+  --bg: #0A0A0B;
+  --surface: #111114;
+  --surface-2: #16161A;
+  --card: #16161A;
+  --card-elevated: #1A1A1E;
+  --border: #1F1F24;
+  --border-strong: #2A2A30;
 
-  --text: #f0eeec;
-  --text-2: #b8b3af;
-  --text-muted: #898481;
-  --text-faint: #5e5854;
+  --text: #F4F4F5;
+  --text-2: #A1A1AA;
+  --text-muted: #A1A1AA;
+  --text-faint: #71717A;
 
-  --accent: #ff6a00;
-  --accent-soft: rgba(255, 106, 0, 0.10);
-  --accent-glow: rgba(255, 106, 0, 0.20);
-  --accent-text: #ffe4c9;
+  /* Firecrawl brand orange — was #ff6a00 (rgb 255,106,0) */
+  --accent: #FF4C00;
+  --accent-soft: rgba(255, 76, 0, 0.10);
+  --accent-glow: rgba(255, 76, 0, 0.20);
+  --accent-text: #FFD7C2;
 
   --success: #4ade80;
   --success-soft: rgba(74, 222, 128, 0.10);
@@ -51,7 +53,12 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-.mono { font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace; font-feature-settings: 'tnum'; }
+.mono {
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-feature-settings: 'tnum', 'cv11', 'ss01';
+  font-variant-numeric: tabular-nums slashed-zero;
+  letter-spacing: -0.005em;
+}
 
 /* ─── Top header ──────────────────────────────────────────────── */
 .top-header {
@@ -72,10 +79,10 @@ body {
 .stat-strip .stat .label {
   font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
   font-weight: 500;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .stat-strip .stat .value { color: var(--text-2); font-feature-settings: 'tnum'; }
 
@@ -156,12 +163,12 @@ body {
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
 }
 .nav-section-label .count {
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-weight: 500;
 }
 
@@ -197,8 +204,8 @@ body {
 .nav-item .nav-icon { width: 14px; height: 14px; flex-shrink: 0; color: var(--text-muted); }
 .nav-item.active .nav-icon { color: var(--accent); }
 .nav-item .name { font-size: 13px; font-weight: 500; color: inherit; flex: 1; }
-.nav-item .name.mono { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
-.nav-item .nav-meta { font-size: 11px; color: var(--text-faint); font-family: 'JetBrains Mono', monospace; }
+.nav-item .name.mono { font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 12.5px; }
+.nav-item .nav-meta { font-size: 11px; color: var(--text-faint); font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; }
 .nav-item .nav-status { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .nav-item .nav-status.ok { background: var(--success); }
 .nav-item .nav-status.idle { background: var(--text-muted); opacity: 0.5; }
@@ -225,7 +232,7 @@ body {
   color: var(--text);
   letter-spacing: -0.008em;
 }
-.section-title .meta { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+.section-title .meta { font-size: 12px; color: var(--text-muted); font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; }
 .section-title .meta .ok { color: var(--success); }
 .section-title .meta .idle { color: var(--text-muted); }
 .section-title .meta .err { color: var(--error); }
@@ -233,7 +240,7 @@ body {
 .empty-msg {
   color: var(--text-muted);
   font-size: 13px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   padding: 12px 0;
 }
 
@@ -263,7 +270,7 @@ body {
 .slot-card:hover { background: var(--card-elevated); border-color: var(--border-strong); }
 .slot-card.active {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), 0 4px 20px rgba(255, 106, 0, 0.06);
+  box-shadow: 0 0 0 1px var(--accent), 0 4px 20px rgba(255, 76, 0, 0.06);
 }
 .slot-card.orphan { border-color: var(--error-border); }
 .slot-card.idle { background: transparent; border-style: dashed; }
@@ -286,7 +293,7 @@ body {
 .slot-status.warn { background: var(--error-soft); color: var(--error); }
 .slot-status.active { background: var(--accent-soft); color: var(--accent); }
 
-.slot-client { font-size: 12.5px; color: var(--text-2); font-family: 'JetBrains Mono', monospace; font-feature-settings: 'tnum'; margin-top: -4px; }
+.slot-client { font-size: 12.5px; color: var(--text-2); font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; font-feature-settings: 'tnum'; margin-top: -4px; }
 .slot-card.idle .slot-client { color: var(--text-faint); }
 
 .slot-role {
@@ -300,7 +307,7 @@ body {
   color: var(--text-2);
   text-transform: lowercase;
   letter-spacing: 0.02em;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   width: fit-content;
 }
 .slot-role.scrape { background: rgba(147, 197, 253, 0.10); color: var(--info); }
@@ -308,12 +315,12 @@ body {
 .slot-meta-row {
   display: flex;
   gap: 12px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 11px;
   color: var(--text-muted);
   flex-wrap: wrap;
 }
-.slot-meta-row .k { color: var(--text-faint); margin-right: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+.slot-meta-row .k { color: var(--text-faint); margin-right: 4px; text-transform: uppercase; letter-spacing: 0.1em; }
 .slot-meta-row .v { color: var(--text-2); }
 
 .slot-footer {
@@ -322,7 +329,7 @@ body {
   align-items: center;
   font-size: 11px;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-feature-settings: 'tnum';
   padding-top: 6px;
   border-top: 1px solid var(--border);
@@ -339,7 +346,7 @@ body {
   justify-content: center;
   color: var(--text-faint);
   font-size: 12px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   text-align: center;
   line-height: 1.4;
   flex-direction: column;
@@ -355,7 +362,7 @@ body {
 .orphan-message {
   font-size: 11.5px;
   color: var(--error);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 /* ─── Cookie source (Pool overview) ───────────────────────────── */
@@ -377,19 +384,19 @@ body {
 .cookie-source-label {
   font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
 }
 .cookie-source-pill {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   padding: 2px 7px;
   border-radius: var(--r-pill);
   background: var(--surface-2);
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .cookie-source-pill.fresh { background: var(--success-soft); color: var(--success); }
 .cookie-source-pill.stale { background: var(--warn-soft); color: var(--warn); }
@@ -405,7 +412,7 @@ body {
   color: var(--text-faint);
   font-feature-settings: 'tnum';
 }
-.cookie-source-meta .k { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; }
+.cookie-source-meta .k { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.1em; font-size: 10.5px; }
 .cookie-source-meta .value { color: var(--text-2); }
 .cookie-source-meta .value.fresh { color: var(--success); }
 .cookie-source-meta .value.stale { color: var(--warn); }
@@ -423,12 +430,12 @@ body {
   display: flex;
   gap: 24px;
   flex-wrap: wrap;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 12px;
   color: var(--text-2);
 }
-.vault-card .vault-row .k { color: var(--text-faint); margin-right: 6px; text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; }
-.vault-card .vault-files { margin-top: 12px; font-size: 11.5px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+.vault-card .vault-row .k { color: var(--text-faint); margin-right: 6px; text-transform: uppercase; letter-spacing: 0.1em; font-size: 10.5px; }
+.vault-card .vault-files { margin-top: 12px; font-size: 11.5px; color: var(--text-muted); font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; }
 .vault-card .vault-files .file { padding: 3px 0; }
 .vault-card .vault-files .file.skipped { color: var(--warn); }
 
@@ -451,7 +458,7 @@ body {
 .page-header .page-sub {
   font-size: 12.5px;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 .banner {
@@ -469,7 +476,7 @@ body {
 .banner.ok { border-color: rgba(74, 222, 128, 0.30); background: var(--success-soft); color: var(--success); }
 .banner.info { border-color: var(--border-strong); }
 .banner svg { flex-shrink: 0; width: 16px; height: 16px; }
-.banner .banner-detail { color: var(--text-muted); margin-left: 6px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.banner .banner-detail { color: var(--text-muted); margin-left: 6px; font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 12px; }
 
 .config-grid {
   display: grid;
@@ -491,15 +498,15 @@ body {
 .config-card .config-key {
   font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-weight: 500;
 }
 .config-card .config-value {
   font-size: 13px;
   color: var(--text);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-feature-settings: 'tnum';
   word-break: break-all;
 }
@@ -507,7 +514,7 @@ body {
 .config-card .config-source {
   font-size: 10.5px;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
@@ -527,7 +534,7 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 12px;
   color: var(--text-2);
   padding: 4px 0;
@@ -544,7 +551,7 @@ body {
 .env-row .env-status {
   font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
 }
 .env-row.set .env-status { color: var(--success); }
@@ -568,19 +575,19 @@ body {
 .snippet-title {
   font-size: 12px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-weight: 500;
 }
-.snippet-hint { font-size: 11.5px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+.snippet-hint { font-size: 11.5px; color: var(--text-muted); font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif; }
 .snippet-block pre {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--r-input);
   padding: 12px 14px;
   margin: 0;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 12px;
   color: var(--text-2);
   overflow-x: auto;
@@ -593,7 +600,7 @@ body {
   gap: 6px;
   padding: 5px 11px;
   font-size: 11.5px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-weight: 500;
   border: 1px solid var(--border);
   background: transparent;
@@ -653,7 +660,7 @@ body {
 .tools-list-titlerow .count {
   font-size: 12px;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-feature-settings: 'tnum';
 }
 
@@ -676,7 +683,7 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--r-input);
   padding: 7px 56px 7px 30px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 12px;
   color: var(--text);
   outline: none;
@@ -688,7 +695,7 @@ body {
 .tools-filter kbd {
   position: absolute;
   right: 8px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 10px;
   color: var(--text-faint);
   background: var(--card);
@@ -706,7 +713,7 @@ body {
 .tools-pill {
   padding: 4px 10px;
   font-size: 11px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text-2);
@@ -732,18 +739,18 @@ body {
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .tools-group-label .group-count { color: var(--text-muted); }
 .tools-subgroup-label {
   padding: 8px 16px 4px;
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 .tool-row {
@@ -773,7 +780,7 @@ body {
   background: var(--accent);
 }
 .tool-row .tool-name {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 12px;
   font-weight: 500;
   color: var(--text);
@@ -801,7 +808,7 @@ body {
   gap: 14px;
 }
 .tool-detail-name {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 18px;
   font-weight: 600;
   color: var(--text);
@@ -815,11 +822,11 @@ body {
 .tool-source-pill {
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   font-weight: 600;
   padding: 3px 9px;
   border-radius: var(--r-pill);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--surface-2);
   color: var(--text-muted);
 }
@@ -828,12 +835,12 @@ body {
 .tool-cat-chip {
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   padding: 3px 9px;
   border-radius: var(--r-pill);
   background: var(--surface-2);
   color: var(--text-2);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .tool-detail-desc {
   font-size: 13px;
@@ -849,21 +856,21 @@ body {
 .tool-detail-section .section-key {
   font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-weight: 500;
 }
 .tool-detail-section .section-value {
   font-size: 12.5px;
   color: var(--text);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .tool-detail-section .section-value.muted { color: var(--text-muted); }
 .tool-detail-section a {
   color: var(--info);
   text-decoration: none;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 12.5px;
 }
 .tool-detail-section a:hover { text-decoration: underline; }
@@ -872,7 +879,7 @@ body {
   align-self: flex-start;
   padding: 7px 14px;
   font-size: 12px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-weight: 500;
   border: 1px solid var(--border);
   background: transparent;
@@ -886,7 +893,7 @@ body {
   text-align: center;
   color: var(--text-muted);
   font-size: 12px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 /* Anchor reset for nav-item / icon-btn used as <a> */
@@ -926,7 +933,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
   font-weight: 500;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   border: 1px solid var(--border);
 }
 .live-pill.ok { background: var(--success-soft); color: var(--success); border-color: rgba(74, 222, 128, 0.20); }
@@ -963,7 +970,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .slot-summary-stats .k {
   font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
   margin-right: 6px;
   font-weight: 500;
@@ -1022,7 +1029,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .activity-source {
   padding: 1px 7px;
@@ -1038,7 +1045,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .activity-source.first-party {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(255, 106, 0, 0.20);
+  border-color: rgba(255, 76, 0, 0.20);
 }
 .activity-args {
   font-size: 12px;
@@ -1052,7 +1059,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
   flex-direction: column;
   align-items: flex-end;
   gap: 2px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 11px;
 }
 .activity-duration { color: var(--text-2); font-feature-settings: 'tnum'; }
@@ -1086,7 +1093,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .detail-tool {
   font-size: 14px;
   font-weight: 600;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   color: var(--text);
 }
 .detail-badges { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -1101,7 +1108,7 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .detail-badges .badge.first-party {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(255, 106, 0, 0.20);
+  border-color: rgba(255, 76, 0, 0.20);
 }
 .detail-badges .badge.ok {
   background: var(--success-soft);
@@ -1121,11 +1128,11 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .detail-section-label {
   font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
   margin-bottom: 8px;
   font-weight: 500;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .detail-section .json-block {
   background: var(--bg);
@@ -1223,8 +1230,645 @@ a.nav-item, a.icon-btn { text-decoration: none; }
 .activity-range-label {
   font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--text-faint);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
   margin-right: 4px;
 }
+
+/* ============================================================
+   DEPTH + LIGHTING + GRADIENTS  (added 2026-05-09)
+   ─────────────────────────────────────────────────────────
+   Layered overrides via cascade — keeps original token rules
+   intact above, applies depth/lighting on top. Easy revert:
+   delete from here to EOF.
+   ============================================================ */
+
+/* ─── Page-level lighting ───────────────────────────────────
+   Subtle radial Firecrawl glow at top-center of viewport,
+   plus a wide vignette that pools darkness toward bottom edges.
+   Reads as "light from above" without being theatrical. */
+body {
+  background:
+    radial-gradient(ellipse 120% 60% at 50% -10%, rgba(255, 76, 0, 0.05) 0%, transparent 55%),
+    radial-gradient(ellipse 140% 80% at 50% 110%, rgba(0, 0, 0, 0.5) 0%, transparent 60%),
+    var(--bg);
+}
+
+/* ─── Top header — light from above ─────────────────────── */
+.top-header {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025) 0%, rgba(255, 255, 255, 0) 60%),
+    var(--surface);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 1px 0 rgba(0, 0, 0, 0.4);
+}
+
+/* ─── Sidebar — recess shadow on right edge for depth ───── */
+.sidebar {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.015) 0%, transparent 30%),
+    var(--surface);
+  box-shadow: inset -8px 0 16px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* ─── Card depth (apply to all card-like surfaces) ─────────
+   Top-edge inner highlight (light catches edge from above),
+   subtle 1px lower border (defines bottom plane),
+   soft drop shadow (separates from background). */
+.slot-card,
+.vault-card,
+.cookie-source-card,
+.banner,
+.section-title + .grid > div,
+.empty-state,
+.activity-list,
+.activity-item,
+.tools-list,
+.settings-card,
+.transport-card,
+.tool-detail,
+.snippet,
+.slot-summary,
+.scroll-card {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025) 0%, rgba(255, 255, 255, 0) 50%),
+    var(--card);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 1px 0 rgba(0, 0, 0, 0.5),
+    0 4px 14px rgba(0, 0, 0, 0.18),
+    0 12px 40px rgba(0, 0, 0, 0.12);
+  position: relative;
+}
+
+/* hovered/focused cards — nudge the lighting up */
+.slot-card:hover,
+.vault-card:hover,
+.cookie-source-card:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0%, rgba(255, 255, 255, 0) 60%),
+    var(--card-elevated);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 1px 0 rgba(0, 0, 0, 0.5),
+    0 6px 20px rgba(0, 0, 0, 0.24),
+    0 18px 56px rgba(0, 0, 0, 0.16);
+}
+
+/* ─── Slot card — orphan / active variants get accent glow ─── */
+.slot-card.orphan {
+  background:
+    linear-gradient(180deg, rgba(248, 113, 113, 0.04) 0%, transparent 40%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02) 0%, transparent 50%),
+    var(--card);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    inset 0 0 0 1px rgba(248, 113, 113, 0.18),
+    0 0 24px rgba(248, 113, 113, 0.08),
+    0 4px 14px rgba(0, 0, 0, 0.2);
+}
+.slot-card.active {
+  background:
+    linear-gradient(180deg, rgba(255, 76, 0, 0.05) 0%, transparent 40%),
+    var(--card);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 76, 0, 0.16),
+    inset 0 0 0 1px var(--accent),
+    0 0 28px rgba(255, 76, 0, 0.14),
+    0 4px 18px rgba(0, 0, 0, 0.22);
+}
+
+/* ─── Sidebar active nav — horizontal accent gradient ────── */
+.nav-item.active {
+  background:
+    linear-gradient(90deg,
+      rgba(255, 76, 0, 0.18) 0%,
+      rgba(255, 76, 0, 0.06) 60%,
+      transparent 100%);
+  box-shadow:
+    inset 2px 0 0 var(--accent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+.nav-item.active::after {
+  box-shadow: 0 0 8px rgba(255, 76, 0, 0.6);
+}
+
+/* ─── Health pill — soft halo glow ─────────────────────── */
+.health-pill {
+  background:
+    linear-gradient(180deg, rgba(74, 222, 128, 0.16) 0%, rgba(74, 222, 128, 0.06) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 16px rgba(74, 222, 128, 0.1);
+}
+.health-pill.warn {
+  background:
+    linear-gradient(180deg, rgba(251, 191, 36, 0.18) 0%, rgba(251, 191, 36, 0.06) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 18px rgba(251, 191, 36, 0.14);
+}
+.health-pill.err {
+  background:
+    linear-gradient(180deg, rgba(248, 113, 113, 0.2) 0%, rgba(248, 113, 113, 0.06) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 20px rgba(248, 113, 113, 0.16);
+}
+
+/* ─── Icon buttons — subtle inset ─────────────────────── */
+.icon-btn {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025) 0%, transparent 60%),
+    transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.icon-btn:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%),
+    var(--surface-2);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.icon-btn.paused {
+  background:
+    linear-gradient(180deg, rgba(255, 76, 0, 0.18) 0%, rgba(255, 76, 0, 0.06) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 76, 0, 0.2),
+    inset 0 -4px 8px rgba(255, 76, 0, 0.08),
+    0 0 12px rgba(255, 76, 0, 0.18);
+}
+
+/* ─── Reap button — Firecrawl-style filled gradient ─────── */
+.reap-btn,
+button.reap,
+.btn-reap {
+  background:
+    linear-gradient(180deg, rgba(255, 76, 0, 0.16) 0%, rgba(255, 76, 0, 0.04) 100%);
+  border: 1px solid rgba(255, 76, 0, 0.4);
+  color: var(--accent-text);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 76, 0, 0.18),
+    inset 0 -6px 12px rgba(255, 76, 0, 0.08),
+    0 0 14px rgba(255, 76, 0, 0.18),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1),
+              background 200ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.reap-btn:hover,
+button.reap:hover,
+.btn-reap:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 76, 0, 0.24) 0%, rgba(255, 76, 0, 0.08) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 76, 0, 0.28),
+    inset 0 -6px 12px rgba(255, 76, 0, 0.14),
+    0 0 22px rgba(255, 76, 0, 0.28),
+    0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+/* ─── Pulse on healthy dot — softer halo with new accent ── */
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.55), 0 0 6px rgba(74, 222, 128, 0.5); }
+  50%      { box-shadow: 0 0 0 6px rgba(74, 222, 128, 0), 0 0 6px rgba(74, 222, 128, 0); }
+}
+
+/* ─── Banner card — Firecrawl-tinted accent surface ─────── */
+.banner {
+  background:
+    linear-gradient(180deg, rgba(255, 76, 0, 0.06) 0%, transparent 60%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025) 0%, transparent 50%),
+    var(--card);
+  border: 1px solid rgba(255, 76, 0, 0.2);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 76, 0, 0.1),
+    0 0 22px rgba(255, 76, 0, 0.08),
+    0 4px 14px rgba(0, 0, 0, 0.18);
+}
+
+/* ============================================================
+   DEPTH PASS 2 — sidebar pillification + banner/empty + boosted cards
+   (added 2026-05-09)
+   ============================================================ */
+
+/* ─── Sidebar nav items — rounded pills with depth ────── */
+.nav-section { padding: 4px 8px; }
+.nav-section-label { padding: 12px 10px 8px; }
+
+.nav-item {
+  padding: 7px 12px 7px 12px;
+  margin: 1px 0;
+  border-radius: 8px;
+  border-left: none;            /* remove old left-edge accent strip */
+  transition:
+    background 200ms cubic-bezier(0.23, 1, 0.32, 1),
+    color 160ms cubic-bezier(0.23, 1, 0.32, 1),
+    box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.nav-item:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%),
+    var(--surface-2);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 8px rgba(0, 0, 0, 0.32);
+  transform: translateY(-1px);
+}
+.nav-item:active { transform: translateY(0); }
+
+.nav-item.active,
+.nav-item.active:hover {
+  padding-left: 12px;           /* override original padding-left:17 */
+  background:
+    linear-gradient(135deg,
+      rgba(255, 76, 0, 0.22) 0%,
+      rgba(255, 76, 0, 0.08) 55%,
+      rgba(255, 76, 0, 0.02) 100%);
+  border-left: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 0 0 1px rgba(255, 76, 0, 0.28),
+    0 0 18px rgba(255, 76, 0, 0.18),
+    0 2px 6px rgba(0, 0, 0, 0.32);
+  transform: translateY(0);
+}
+.nav-item.active::after {
+  /* glowing dot indicator */
+  background: var(--accent);
+  box-shadow:
+    0 0 10px rgba(255, 76, 0, 0.7),
+    0 0 4px rgba(255, 76, 0, 0.5);
+}
+
+/* nav-divider — softer, with subtle highlight */
+.nav-divider {
+  height: 1px;
+  margin: 8px 14px;
+  background: linear-gradient(90deg, transparent 0%, var(--border) 20%, var(--border) 80%, transparent 100%);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.025);
+}
+
+/* ─── Sidebar shell — bevel feel ────────────────────────── */
+.sidebar {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 0%, transparent 30%),
+    var(--surface);
+  box-shadow:
+    inset -1px 0 0 rgba(255, 255, 255, 0.025),
+    inset -10px 0 18px -10px rgba(0, 0, 0, 0.5),
+    1px 0 0 rgba(0, 0, 0, 0.3);
+}
+
+/* ─── Search input (when present) ─────────────────────── */
+.search-input,
+.sidebar input[type="text"],
+.sidebar input[type="search"] {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.12) 0%, transparent 50%),
+    var(--bg);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.4),
+    inset 0 0 0 1px var(--border);
+}
+
+/* ─── Card depth — boosted shadow stack so it reads at a glance ── */
+.slot-card,
+.vault-card,
+.cookie-source-card,
+.empty-state,
+.tools-list,
+.tool-detail,
+.settings-card,
+.transport-card,
+.snippet,
+.slot-summary,
+.activity-list,
+.activity-item {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    0 6px 18px rgba(0, 0, 0, 0.32),
+    0 22px 56px rgba(0, 0, 0, 0.22);
+}
+
+/* ─── Vault card — empty state subtle accent if disabled ── */
+.vault-card .empty-msg {
+  display: block;
+  padding: 14px 16px;
+  margin: -16px -16px;          /* fill the card's padding for the empty state */
+  background:
+    linear-gradient(180deg, rgba(251, 191, 36, 0.04) 0%, transparent 70%),
+    transparent;
+  border-radius: inherit;
+  color: var(--text-muted);
+}
+
+/* ─── Banner — make sure depth + variant accents both render ── */
+.banner {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, transparent 50%),
+    var(--card);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 1px 0 rgba(0, 0, 0, 0.5),
+    0 4px 14px rgba(0, 0, 0, 0.22);
+}
+.banner.ok {
+  border-color: rgba(74, 222, 128, 0.3);
+  background:
+    linear-gradient(180deg, rgba(74, 222, 128, 0.08) 0%, transparent 65%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, transparent 50%),
+    var(--card);
+  color: var(--success);
+  box-shadow:
+    inset 0 1px 0 rgba(74, 222, 128, 0.18),
+    0 0 18px rgba(74, 222, 128, 0.1),
+    0 4px 14px rgba(0, 0, 0, 0.22);
+}
+.banner.info {
+  background:
+    linear-gradient(180deg, rgba(255, 76, 0, 0.05) 0%, transparent 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025) 0%, transparent 50%),
+    var(--card);
+  border-color: rgba(255, 76, 0, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 76, 0, 0.12),
+    0 0 18px rgba(255, 76, 0, 0.08),
+    0 4px 14px rgba(0, 0, 0, 0.22);
+}
+
+/* ─── Section title — slight depth on the panel container ── */
+.section-title h2 {
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
+}
+
+/* ─── Tone down orphan glow slightly (less alarm, more presence) ── */
+.slot-card.orphan {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    inset 0 0 0 1px rgba(248, 113, 113, 0.16),
+    0 0 18px rgba(248, 113, 113, 0.06),
+    0 6px 18px rgba(0, 0, 0, 0.28);
+}
+
+/* ============================================================
+   DEPTH PASS 3 — EXPLORATORY (revert candidates)  2026-05-09
+   ─────────────────────────────────────────────────────────
+   Three independent experiments. Each is in its own block
+   marked /* EXP-N: ... */ — keep the ones you like, delete
+   the ones you don't. Order: 1 sidebar, 2 idle dots, 3 sheen.
+   ============================================================ */
+
+/* ─── EXP-1: darker sidebar ──────────────────────────────
+   Push the sidebar deeper than the main bg so the main panel
+   reads as foreground floating ABOVE the sidebar plane.
+   Revert: delete this block. */
+.sidebar {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.012) 0%, transparent 30%),
+    #060608;                              /* deeper than var(--bg) #0A0A0B */
+  box-shadow:
+    inset -1px 0 0 rgba(255, 255, 255, 0.03),
+    inset -10px 0 18px -10px rgba(0, 0, 0, 0.6),
+    1px 0 0 rgba(0, 0, 0, 0.4),
+    2px 0 8px -4px rgba(0, 0, 0, 0.5);    /* main feels lifted off the sidebar */
+}
+.sidebar-scroll {
+  /* one extra hairline at the top of the scroll region for that "carved" feel */
+  border-top: 1px solid rgba(255, 255, 255, 0.018);
+}
+/* nav-item hover bg slightly bumped to match the new darker sidebar */
+.nav-item:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.015) 100%),
+    rgba(255, 255, 255, 0.02);
+}
+
+/* ─── EXP-2: idle slot dot — visible but quiet ────────────
+   Swap the half-opacity gray for a cool blue-gray with a
+   tiny halo. Reads as "present" without any sense of state.
+   Revert: delete this block. */
+.nav-item .nav-status.idle {
+  background: #6B7280;                    /* cool gray, less faint than --text-muted */
+  opacity: 1;
+  box-shadow:
+    0 0 0 2px rgba(107, 114, 128, 0.15),
+    0 0 6px rgba(107, 114, 128, 0.25);
+}
+/* "ok" (active) dot also gets a slightly more visible halo while we're here */
+.nav-item .nav-status.ok {
+  box-shadow:
+    0 0 0 2px rgba(74, 222, 128, 0.18),
+    0 0 8px rgba(74, 222, 128, 0.45);
+}
+/* "warn" (orphan) gets a soft red halo */
+.nav-item .nav-status.warn {
+  box-shadow:
+    0 0 0 2px rgba(248, 113, 113, 0.18),
+    0 0 8px rgba(248, 113, 113, 0.4);
+}
+
+/* ─── EXP-3: hover sheen on cards (smoothed) ──────────────
+   Faint diagonal highlight that drifts across the card on
+   hover. Smooth-pass version: GPU-composited transform (not
+   `left`), wider+feathered gradient, gentler easing, longer
+   duration. Reads as a soft drift, not a swipe.
+   Revert: delete from here to /EXP-3. */
+.slot-card,
+.vault-card,
+.cookie-source-card,
+.banner,
+.empty-state,
+.tools-list,
+.tool-detail,
+.settings-card,
+.transport-card,
+.snippet,
+.slot-summary {
+  overflow: hidden;
+}
+.slot-card::before,
+.vault-card::before,
+.cookie-source-card::before,
+.banner::before,
+.empty-state::before,
+.tool-detail::before,
+.settings-card::before,
+.transport-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 200%;                                    /* 2× container so the band has room to drift */
+  height: 100%;
+  background: linear-gradient(
+    115deg,
+    transparent 0%,
+    transparent 30%,
+    rgba(255, 255, 255, 0.022) 42%,
+    rgba(255, 255, 255, 0.032) 49%,
+    rgba(255, 76, 0, 0.028) 51%,
+    rgba(255, 255, 255, 0.022) 58%,
+    transparent 70%,
+    transparent 100%
+  );
+  transform: translate3d(-60%, 0, 0);             /* start: band off the left */
+  transition: transform 1100ms cubic-bezier(0.33, 0, 0.18, 1),
+              opacity 220ms ease-out;
+  opacity: 0;                                     /* idle: invisible (no perma-band) */
+  will-change: transform, opacity;
+  pointer-events: none;
+  z-index: 0;
+}
+.slot-card:hover::before,
+.vault-card:hover::before,
+.cookie-source-card:hover::before,
+.banner:hover::before,
+.empty-state:hover::before,
+.tool-detail:hover::before,
+.settings-card:hover::before,
+.transport-card:hover::before {
+  transform: translate3d(-10%, 0, 0);             /* end: band drifts gently to the right */
+  opacity: 1;
+}
+/* keep card content above the sheen */
+.slot-card > *,
+.vault-card > *,
+.cookie-source-card > *,
+.banner > *,
+.empty-state > *,
+.tool-detail > *,
+.settings-card > *,
+.transport-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* respect users who don't want motion */
+@media (prefers-reduced-motion: reduce) {
+  .slot-card::before,
+  .vault-card::before,
+  .cookie-source-card::before,
+  .banner::before,
+  .empty-state::before,
+  .tool-detail::before,
+  .settings-card::before,
+  .transport-card::before {
+    transition: none;
+    transform: translate3d(0, 0, 0);
+  }
+}
+/* /EXP-3 */
+
+/* ============================================================
+   SIDEBAR KPI CARDS  2026-05-09
+   ─────────────────────────────────────────────────────────
+   The .stat-strip moved out of the top header into the
+   sidebar; restyle from inline-flex row → vertical stack of
+   modular rounded cards. Each .stat is now a self-contained
+   card with the same depth language as the rest of the UI.
+   ============================================================ */
+
+/* override the original .stat-strip header layout */
+.sidebar .stat-strip {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 12px 12px 4px;
+  margin: 0;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* each KPI gets its own rounded card */
+.sidebar .stat-strip .stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, transparent 60%),
+    linear-gradient(180deg, var(--card) 0%, #131318 100%);
+  border: 1px solid var(--border);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 1px 0 rgba(0, 0, 0, 0.45),
+    0 3px 10px rgba(0, 0, 0, 0.28);
+  position: relative;
+  transition:
+    background 200ms cubic-bezier(0.23, 1, 0.32, 1),
+    box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 160ms cubic-bezier(0.23, 1, 0.32, 1);
+  align-items: stretch;
+  cursor: default;
+  overflow: hidden;
+}
+.sidebar .stat-strip .stat:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, transparent 60%),
+    linear-gradient(180deg, var(--card-elevated) 0%, var(--card) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 1px 0 rgba(0, 0, 0, 0.5),
+    0 6px 18px rgba(0, 0, 0, 0.36);
+  transform: translateY(-1px);
+}
+
+/* the "Uptime" card is the most active value; let it take
+   a full-width row at the bottom for breathing room */
+.sidebar .stat-strip .stat:last-child {
+  grid-column: 1 / -1;
+}
+
+/* label: small, uppercase, muted */
+.sidebar .stat-strip .stat .label {
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  line-height: 1;
+}
+
+/* value: prominent number/text */
+.sidebar .stat-strip .stat .value {
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: 'tnum', 'cv11', 'ss01';
+  line-height: 1.1;
+  word-break: break-all;
+}
+
+/* faint Firecrawl-tinted accent on the top edge — looks like
+   light spilling onto the card from above-left */
+.sidebar .stat-strip .stat::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg,
+    rgba(255, 76, 0, 0.04) 0%,
+    transparent 35%,
+    transparent 100%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 240ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.sidebar .stat-strip .stat:hover::before {
+  opacity: 1;
+}
+
+/* tighten header now that the stat-strip is gone */
+.top-header {
+  padding: 14px 28px;
+}
+.header-title-row { gap: 12px; align-items: baseline; }
