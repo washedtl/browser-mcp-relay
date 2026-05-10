@@ -179,7 +179,15 @@ function loadVaultFromEnv() {
   const envVal = process.env.BROWSER_RELAY_VAULT_FILES;
   // Unset OR empty string → empty vault (autofill becomes a no-op).
   if (envVal === undefined || envVal === "") return new Vault([]);
-  const files = envVal.split(";").map((s) => s.trim()).filter(Boolean);
+  // F0-1 (2026-05-10): use the platform's native PATH delimiter. Node's
+  // `path.delimiter` is `;` on Windows and `:` on POSIX — matches user
+  // muscle-memory from PATH. Windows path `C:\foo` doesn't get
+  // mis-split because `path.delimiter` is `;` there.
+  // Previously this was hardcoded `;` which meant Mac/Linux users typing
+  // the natural `:`-separated form got ONE non-existent "file" with the
+  // whole string and silently empty vault.
+  const path = require("node:path");
+  const files = envVal.split(path.delimiter).map((s) => s.trim()).filter(Boolean);
   return new Vault(files);
 }
 

@@ -2,10 +2,17 @@
 //
 // Two modes:
 //
-//   1. STANDALONE (default) — the relay manages a single user-data-dir at
-//      `<repo>/.browser-data` (gitignored). Atomic wrapper-lock on that dir
-//      prevents two relay processes from corrupting one Brave profile.
-//      Cookie snapshot is skipped (no source profile to snapshot from).
+//   1. STANDALONE (default) — the relay manages a single user-data-dir.
+//      Resolution: if the repo dir is writable, use `<repo>/.browser-data`
+//      (gitignored, matches the legacy behavior most users expect). If the
+//      repo lives somewhere read-only (e.g. system-wide install at
+//      /opt/browser-mcp-relay or a read-only npm global) we fall back to a
+//      per-user cache dir: $XDG_CACHE_HOME/browser-mcp-relay/browser-data
+//      (Linux) / ~/Library/Caches/browser-mcp-relay/browser-data (macOS) /
+//      %LOCALAPPDATA%\browser-mcp-relay\Cache\browser-data (Windows). Atomic
+//      wrapper-lock on the chosen dir prevents two relay processes from
+//      corrupting one Brave profile. Cookie snapshot is skipped (no source
+//      profile to snapshot from).
 //
 //   2. POOL (opt-in) — set both BROWSER_RELAY_POOL_DIR and BROWSER_RELAY_POOL_SLOT.
 //      The relay claims that one specific dir. If the host also has an
@@ -96,6 +103,62 @@ try {
 }
 
 // ───────────────────────────── Config ────────────────────────────────
+
+/**
+ * Compute the standalone-mode default user-data-dir.
+ *
+ * Behavior (F1-9): legacy `<repo>/.browser-data` when the repo dir is
+ * writable; per-user cache dir otherwise. Writability is probed via
+ * fs.accessSync(repoRoot, W_OK) — synchronous, no probe file written.
+ * Errors during fallback path resolution all degrade to the legacy
+ * path so a misconfigured env never produces "no path at all".
+ *
+ * Pure (no side effects). Idempotent — safe to call repeatedly.
+ *
+ * Per-user cache dir resolution:
+ *   - linux:   $XDG_CACHE_HOME/browser-mcp-relay/browser-data
+ *              (falls back to ~/.cache when XDG_CACHE_HOME is unset/empty)
+ *   - darwin:  ~/Library/Caches/browser-mcp-relay/browser-data
+ *   - win32:   %LOCALAPPDATA%\browser-mcp-relay\Cache\browser-data
+ *
+ * @param {string} repoRoot
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string} absolute path to the standalone user-data-dir
+ */
+function defaultStandaloneDir(repoRoot, env) {
+  const legacy = path.join(repoRoot, ".browser-data");
+  // Writability check: prefer fs.accessSync (POSIX W_OK / Win cursory perm
+  // bit) over a write-probe so we don't litter the repo with sentinel
+  // files at module-load. fs.accessSync's win32 contract is loose
+  // (effectively just "exists"), so the legacy path on Windows is taken
+  // whenever repoRoot exists — that matches user expectation (npm install
+  // into AppData puts repoRoot under user-writable LOCALAPPDATA anyway).
+  let writable = false;
+  try {
+    fs.accessSync(repoRoot, fs.constants.W_OK);
+    writable = true;
+  } catch { /* not writable */ }
+  if (writable) return legacy;
+
+  try {
+    const platform = process.platform;
+    let cacheRoot;
+    if (platform === "win32") {
+      const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+      cacheRoot = path.join(localAppData, "browser-mcp-relay", "Cache");
+    } else if (platform === "darwin") {
+      cacheRoot = path.join(os.homedir(), "Library", "Caches", "browser-mcp-relay");
+    } else {
+      const xdg = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.length > 0
+        ? env.XDG_CACHE_HOME
+        : path.join(os.homedir(), ".cache");
+      cacheRoot = path.join(xdg, "browser-mcp-relay");
+    }
+    return path.join(cacheRoot, "browser-data");
+  } catch {
+    return legacy;
+  }
+}
 
 /**
  * Build the relay's runtime config. Resolution order:
@@ -204,8 +267,12 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
     cookieFreshnessWarnDays = wrapperConfig.cookieFreshnessWarnDays || 7;
     staleAfterMs = wrapperConfig.staleAfterMs || staleAfterMs;
   } else {
-    // Standalone default: one dir under the repo, gitignored.
-    poolDirs = [path.join(repoRoot, ".browser-data")];
+    // Standalone default. F1-9 (2026-05-10): prefer `<repo>/.browser-data`
+    // (legacy) when the repo is writable; fall back to a per-user cache
+    // dir for system-wide / read-only install paths (npm -g into a root-
+    // owned prefix, /opt/<dir>, etc.). The per-user cache path is XDG-ish
+    // on Linux, ~/Library/Caches on macOS, %LOCALAPPDATA%\Cache on Win.
+    poolDirs = [defaultStandaloneDir(repoRoot, env)];
   }
 
   // V1-1: proxyUrl resolution. The wrapper's browser-mcp-config.json may
@@ -437,7 +504,10 @@ function claimSlot() {
 
     let fd;
     try {
-      fd = fs.openSync(lockPath, "wx");
+      // F1-10 (2026-05-10): explicit 0o600 mode on POSIX so the lock file
+      // (which contains pid + hostname + start-time) isn't world-readable
+      // on multi-user systems. Windows ignores the mode arg.
+      fd = fs.openSync(lockPath, "wx", 0o600);
     } catch (e) {
       if (e.code === "EEXIST") continue;
       throw e;
@@ -497,6 +567,13 @@ function snapshotCookiesFrom(srcProfile, dstProfile) {
       if (fs.existsSync(s)) {
         fs.mkdirSync(path.dirname(d), { recursive: true });
         fs.copyFileSync(s, d);
+        // F1-4 (2026-05-10): tighten permissions on copied secrets. These
+        // files contain DPAPI-wrapped cookie keys, encrypted password DBs,
+        // and SQLite stores with auth tokens — should be 0o600 (owner-only)
+        // on multi-user POSIX systems. Windows ignores chmod.
+        if (process.platform !== "win32") {
+          try { fs.chmodSync(d, 0o600); } catch { /* best-effort */ }
+        }
         copied++;
       }
     } catch (e) {
@@ -571,6 +648,8 @@ module.exports = {
   pickDirCandidates,
   snapshotCookiesFrom,
   snapshotDirsFrom,
+  /** F1-9: exported for tests of the standalone-default fallback path. */
+  defaultStandaloneDir,
   /** Test seam: whether the optional pool wrapper was found at require time. */
   hasPoolWrapper: upstreamWrapper !== null,
 };

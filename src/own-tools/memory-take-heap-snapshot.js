@@ -40,7 +40,17 @@ module.exports = {
       },
     },
   },
-  handler: async ({ outputPath }) => withActivePage(async ({ bridge, page }) => {
+  handler: async (_args = {}) => withActivePage(async ({ bridge, page }) => {
+    // F0-9 reviewer V1 (2026-05-10): null/undefined → use default; reject
+    // empty-string explicitly so `outputPath: ""` doesn't sneak past as a
+    // truthy-but-useless path.
+    const outputPath = _args.outputPath;
+    if (outputPath != null && (typeof outputPath !== "string" || outputPath.length === 0)) {
+      return {
+        content: [{ type: "text", text: `memory_take-heap-snapshot: outputPath must be a non-empty string when provided (got ${JSON.stringify(outputPath)})` }],
+        isError: true,
+      };
+    }
     // V1-1: per-page CDP cache — session is auto-detached on page close.
     // Detach is no longer manual, so a takeHeapSnapshot throw cannot leak
     // the session.
@@ -50,11 +60,27 @@ module.exports = {
     // T1-3: stream chunks to disk as they arrive. Track byte count locally;
     // a final fsp.stat would also work but bytes-written is cheaper.
     await fsp.mkdir(path.dirname(dst), { recursive: true });
+    // F1-13 (2026-05-10): capture stream-level errors (disk full, EACCES,
+    // EROFS) so they propagate to the structured error path instead of
+    // being unhandled-error'd through the event loop. Without this listener,
+    // a mid-snapshot disk-full would crash the relay process.
+    //
+    // Reviewer V1 (2026-05-10): register the listener in the SAME tick as
+    // the stream is created, before any other awaits. Node fires the open's
+    // 'error' event via nextTick at minimum, but defensive coding says
+    // attach listeners before any await boundary so a yield-back from the
+    // microtask queue can't run an error event handler-less.
+    let streamError = null;
     const ws = fs.createWriteStream(dst, { encoding: "utf8" });
+    ws.on("error", (e) => { streamError = streamError || e; });
 
     let bytesWritten = 0;
     let backpressureWaits = 0;
     const onChunk = (e) => {
+      // F1-13: skip writing once a stream error has been captured — Node
+      // would otherwise queue more failing writes that pile errors on the
+      // already-failed stream.
+      if (streamError) return;
       // ws.write returns false when the internal buffer is full; we don't
       // await drain here because CDP events keep arriving and we'd block the
       // event loop. Node will buffer for us; backpressureWaits is just a
@@ -76,10 +102,19 @@ module.exports = {
     }
 
     // Close the write stream and wait for OS-level flush.
-    await new Promise((resolve, reject) => {
-      ws.end((err) => (err ? reject(err) : resolve()));
+    await new Promise((resolve) => {
+      // F1-13: don't reject on end() error — capture it and surface via the
+      // unified streamError path below. Rejecting from a finally-style
+      // cleanup loses the original snapshotError reason.
+      ws.end((err) => {
+        if (err) streamError = streamError || err;
+        resolve();
+      });
     });
 
+    // F1-13: surface stream errors with the same shape as snapshot errors;
+    // snapshot error wins if both fired (it's the more diagnostic root cause).
+    snapshotError = snapshotError || streamError;
     if (snapshotError) {
       // Best-effort cleanup of the (likely partial) file.
       try { await fsp.unlink(dst); } catch { /* ignore */ }

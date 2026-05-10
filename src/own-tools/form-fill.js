@@ -49,7 +49,45 @@ module.exports = {
     },
     required: ["fields"],
   },
-  handler: async ({ fields, timeoutMs = 5000, continueOnError = false } = {}) => withActivePage(async ({ page }) => {
+  handler: async (_args = {}) => withActivePage(async ({ page }) => {
+    // F0-9 reviewer V1 (2026-05-10): treat null/undefined as missing for
+    // every defaulted parameter. JSON-RPC clients sending {"timeoutMs":null}
+    // would otherwise propagate `null` to page.fill which throws cryptically.
+    const fields = _args.fields;
+    const timeoutMs = (_args.timeoutMs == null) ? 5000 : _args.timeoutMs;
+    const continueOnError = !!_args.continueOnError;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) {
+      return {
+        content: [{ type: "text", text: `form_fill: timeoutMs must be a finite integer in [100, 60000] (got ${JSON.stringify(_args.timeoutMs)})` }],
+        isError: true,
+      };
+    }
+    // F0-3 (2026-05-10): validate fields is an array of objects upfront.
+    // JSON-RPC clients can send anything; without this guard, `for...of`
+    // crashes with `TypeError: fields is not iterable` on null/object,
+    // and per-field `f.selector` access throws cryptically on null entries.
+    if (!Array.isArray(fields)) {
+      return {
+        content: [{ type: "text", text: "form_fill: fields must be an array of {selector, value}" }],
+        isError: true,
+      };
+    }
+    if (fields.length === 0) {
+      return {
+        content: [{ type: "text", text: "form_fill: fields array is empty (no-op)" }],
+        isError: true,
+      };
+    }
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      if (!f || typeof f !== "object" || typeof f.selector !== "string" || typeof f.value !== "string") {
+        return {
+          content: [{ type: "text", text: `form_fill: fields[${i}] must be an object with string selector + value` }],
+          isError: true,
+        };
+      }
+    }
+
     const filled = [];
     for (const f of fields) {
       try {

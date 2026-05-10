@@ -29,7 +29,37 @@ module.exports = {
       timeoutMs: { type: "integer", default: 30000, description: "Max wait for the dialog to appear" },
     },
   },
-  handler: async ({ action = "accept", promptText, timeoutMs = 30000 }) => withActivePage(async ({ page }) => {
+  handler: async ({ action, promptText, timeoutMs } = {}) => withActivePage(async ({ page }) => {
+    // F0-9 + F0-6 (2026-05-10): defaults treat both `undefined` and `null`
+    // as "missing" (JSON-RPC clients commonly send null for unset optionals;
+    // JS destructure defaults only fire on undefined). Action runtime-validated
+    // against the enum — pre-fix, `"ACCEPT"` (caps) silently dismissed.
+    if (action == null) action = "accept";
+    if (timeoutMs == null) timeoutMs = 30000;
+    if (action !== "accept" && action !== "dismiss") {
+      return {
+        content: [{ type: "text", text: `dialog_handle: action must be "accept" or "dismiss" (got ${JSON.stringify(action)})` }],
+        isError: true,
+      };
+    }
+    // Reviewer V1 (2026-05-10): timeoutMs accepted any number including
+    // negative / NaN before; setTimeout(..., -1) fires immediately and
+    // setTimeout(..., NaN) coerces to 1ms — both produce instant-timeout
+    // behavior that doesn't match the user's intent. Bound it.
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 10 * 60 * 1000) {
+      return {
+        content: [{ type: "text", text: `dialog_handle: timeoutMs must be a finite non-negative integer ≤ 600000 (got ${JSON.stringify(timeoutMs)})` }],
+        isError: true,
+      };
+    }
+    // promptText, if provided, must be a string (Playwright would reject
+    // numbers/objects with a less actionable message).
+    if (promptText !== undefined && promptText !== null && typeof promptText !== "string") {
+      return {
+        content: [{ type: "text", text: `dialog_handle: promptText must be a string when provided (got ${typeof promptText})` }],
+        isError: true,
+      };
+    }
     return await new Promise((resolve) => {
       // V1-3: if the timeout fires AND the dialog arrives in the same tick,
       // both branches would resolve the promise (only the first take effect)

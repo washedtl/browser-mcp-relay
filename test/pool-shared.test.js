@@ -45,6 +45,67 @@ test("loadConfig() returns a fresh object with standalone defaults when no env /
   assert.strictEqual(typeof cfg.standalone, "boolean");
 });
 
+// ───── F1-9: defaultStandaloneDir fallback ─────
+
+test("F1-9: defaultStandaloneDir is exported", () => {
+  assert.strictEqual(typeof pool.defaultStandaloneDir, "function");
+});
+
+test("F1-9: defaultStandaloneDir returns legacy <repo>/.browser-data when repo is writable", () => {
+  // os.tmpdir() is universally writable on every supported platform — perfect
+  // stand-in for a writable repo root in tests.
+  const os = require("node:os");
+  const path = require("node:path");
+  const result = pool.defaultStandaloneDir(os.tmpdir(), {});
+  assert.strictEqual(
+    result,
+    path.join(os.tmpdir(), ".browser-data"),
+    "writable repoRoot must resolve to <repo>/.browser-data",
+  );
+});
+
+test("F1-9: defaultStandaloneDir falls back to per-user cache dir when repo is read-only", () => {
+  const path = require("node:path");
+  const os = require("node:os");
+  // /nonexistent-readonly is guaranteed not to exist + accessSync W_OK fails
+  // for both a missing parent and an unwritable existing dir, so this exercises
+  // the fallback branch without needing a chmod helper.
+  const result = pool.defaultStandaloneDir("/__definitely__nonexistent__path__/repo", {});
+  // Must NOT be the legacy path.
+  assert.ok(
+    !result.includes("/__definitely__nonexistent__path__/repo/.browser-data") &&
+    !result.includes("\\__definitely__nonexistent__path__\\repo\\.browser-data"),
+    `read-only repoRoot must NOT resolve to <repo>/.browser-data (got ${result})`,
+  );
+  // Must contain the project name + a "browser-data" leaf segment.
+  assert.match(result, /browser-mcp-relay/);
+  assert.match(result, /browser-data$/);
+  // Per-platform path-shape sanity (the helper lives outside the user's repo).
+  if (process.platform === "win32") {
+    assert.match(result, /\\Cache\\browser-data$/);
+  } else if (process.platform === "darwin") {
+    assert.match(result, /\/Library\/Caches\/browser-mcp-relay\/browser-data$/);
+  } else {
+    assert.match(result, /(\.cache|\/cache)\/browser-mcp-relay\/browser-data$/);
+  }
+  // Always absolute.
+  assert.ok(path.isAbsolute(result), "fallback path must be absolute");
+});
+
+test("F1-9: defaultStandaloneDir on linux honors XDG_CACHE_HOME when set", () => {
+  if (process.platform !== "linux") {
+    // The helper consults process.platform internally — only linux exercises
+    // the XDG branch. Skip on win32/darwin.
+    return;
+  }
+  const path = require("node:path");
+  const result = pool.defaultStandaloneDir(
+    "/__definitely__nonexistent__path__/repo",
+    { XDG_CACHE_HOME: "/tmp/custom-xdg" },
+  );
+  assert.strictEqual(result, path.join("/tmp/custom-xdg", "browser-mcp-relay", "browser-data"));
+});
+
 test("loadConfig() honors BROWSER_RELAY_POOL_DIR override (single-element pool)", () => {
   const override = "C:\\custom\\profile-dir";
   const cfg = pool.loadConfig({ env: { BROWSER_RELAY_POOL_DIR: override }, repoRoot: "C:\\fake\\repo" });

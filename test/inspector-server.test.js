@@ -1543,3 +1543,74 @@ test("forwardedCount matches the actual hardcoded catalog length (drift guard)",
     "buildStatus.tools.forwardedCount must equal the catalog length — update the constant when adding a forwarded tool",
   );
 });
+
+// F1-6 (2026-05-10): inspector-forwarded-tools.js shape + duplicate-name guard.
+// The catalog is hand-maintained; a missing field or accidentally-pasted-twice
+// entry would silently render with broken UI. Catch at test time instead.
+test("inspector-forwarded-tools: every entry has name+description+category", () => {
+  const forwarded = require("../scripts/inspector-forwarded-tools.js");
+  assert.ok(Array.isArray(forwarded.tools), "tools must be an array");
+  assert.ok(typeof forwarded.upstreamSource === "string" && forwarded.upstreamSource.length > 0,
+    "upstreamSource must be a non-empty string");
+  assert.ok(typeof forwarded.upstreamRepoUrl === "string" && /^https?:\/\//.test(forwarded.upstreamRepoUrl),
+    "upstreamRepoUrl must be a real http(s) URL");
+  for (let i = 0; i < forwarded.tools.length; i++) {
+    const t = forwarded.tools[i];
+    assert.ok(t && typeof t === "object" && !Array.isArray(t),
+      `tools[${i}] must be a plain object`);
+    assert.ok(typeof t.name === "string" && t.name.length > 0,
+      `tools[${i}].name must be a non-empty string (got ${JSON.stringify(t.name)})`);
+    assert.ok(typeof t.description === "string" && t.description.length > 0,
+      `tools[${i}].description must be a non-empty string (entry: ${t.name})`);
+    assert.ok(typeof t.category === "string" && t.category.length > 0,
+      `tools[${i}].category must be a non-empty string (entry: ${t.name})`);
+    // Categories should be lowercase identifier-ish — drift signal if a
+    // refactor introduces "Accessibility" vs "accessibility" inconsistency.
+    assert.match(t.category, /^[a-z][a-z0-9_-]*$/,
+      `tools[${i}].category should be lowercase identifier-ish (entry: ${t.name}, got ${t.category})`);
+  }
+});
+
+test("inspector-forwarded-tools: no duplicate names", () => {
+  const forwarded = require("../scripts/inspector-forwarded-tools.js");
+  const seen = new Set();
+  const dupes = [];
+  for (const t of forwarded.tools) {
+    if (seen.has(t.name)) dupes.push(t.name);
+    else seen.add(t.name);
+  }
+  assert.deepStrictEqual(dupes, [], `forwarded tool names must be unique; duplicates: ${dupes.join(", ")}`);
+});
+
+test("inspector-forwarded-tools: names match upstream prefix → category mapping", () => {
+  // Catch the failure mode where an entry's category doesn't match its name
+  // prefix — e.g. an `interaction_*` tool tagged `category: "navigation"`.
+  const forwarded = require("../scripts/inspector-forwarded-tools.js");
+  // upstream prefix → expected category. If a new prefix is added, extend this map.
+  const expected = {
+    a11y: "accessibility",
+    content: "content",
+    debug: "debug",
+    interaction: "interaction",
+    navigation: "navigation",
+    o11y: "observability",
+    react: "react",
+    "scenario-add": "scenario",
+    "scenario-delete": "scenario",
+    "scenario-list": "scenario",
+    "scenario-run": "scenario",
+    "scenario-search": "scenario",
+    "scenario-update": "scenario",
+    stub: "stub",
+    sync: "sync",
+    execute: "execute",
+  };
+  for (const t of forwarded.tools) {
+    // Strip "<prefix>_<rest>" or use the full token as prefix (e.g. "execute").
+    const prefix = t.name.includes("_") ? t.name.slice(0, t.name.indexOf("_")) : t.name;
+    const want = expected[prefix];
+    if (!want) continue; // unknown prefix — drift will show up if the catalog grows a new prefix family
+    assert.strictEqual(t.category, want,
+      `tool "${t.name}" has prefix "${prefix}" → expected category "${want}", got "${t.category}"`);
+  }
+});

@@ -106,11 +106,12 @@ test("listProcessesByCommand on Win returns [] when PowerShell exits non-zero", 
 
 // ───── listProcessesByCommand — POSIX path uses ps ─────
 
-test("listProcessesByCommand on Linux shells out to `ps -eo pid,command`", () => {
-  let cmdSeen, argsSeen;
-  const fakeSpawn = (cmd, args) => {
+test("listProcessesByCommand on Linux shells out to `ps -eo pid,command -ww`", () => {
+  let cmdSeen, argsSeen, optsSeen;
+  const fakeSpawn = (cmd, args, opts) => {
     cmdSeen = cmd;
     argsSeen = args;
+    optsSeen = opts;
     return {
       status: 0,
       stdout:
@@ -125,7 +126,9 @@ test("listProcessesByCommand on Linux shells out to `ps -eo pid,command`", () =>
     _spawnSync: fakeSpawn,
   });
   assert.strictEqual(cmdSeen, "ps");
-  assert.deepStrictEqual(argsSeen, ["-eo", "pid,command"]);
+  // F0-7: -ww disables BSD ps command-column truncation; LC_ALL=C forces ASCII header.
+  assert.deepStrictEqual(argsSeen, ["-eo", "pid,command", "-ww"]);
+  assert.ok(optsSeen && optsSeen.env && optsSeen.env.LC_ALL === "C", "must force LC_ALL=C in spawn env");
   assert.strictEqual(result.length, 2);
   assert.strictEqual(result[0].pid, 1111);
   assert.strictEqual(result[1].pid, 2222);
@@ -256,7 +259,11 @@ test("isPidAlive on POSIX returns true when kill throws EPERM (alive but not our
   );
 });
 
-test("isPidAlive on POSIX returns false on unexpected throw codes", () => {
+test("F1-11: isPidAlive on POSIX returns true (fail-safe = alive) on unknown errno", () => {
+  // F1-11: blast-radius asymmetry — false-dead steals a slot from a live
+  // Brave (corrupts the profile); false-alive only delays stale-lock TTL by
+  // 5 minutes. So unknown errno (ENOSYS, EINVAL, EFAULT, EBUSY, ...) must
+  // resolve to ALIVE. Only ESRCH counts as definitively dead.
   const fakeKill = () => {
     const e = new Error("weird");
     e.code = "EWEIRD";
@@ -264,7 +271,58 @@ test("isPidAlive on POSIX returns false on unexpected throw codes", () => {
   };
   assert.strictEqual(
     isPidAlive(4321, { _platform: "linux", _processKill: fakeKill }),
+    true,
+  );
+});
+
+test("F1-11: isPidAlive on POSIX returns false ONLY on ESRCH", () => {
+  const fakeKill = () => {
+    const e = new Error("no such process");
+    e.code = "ESRCH";
+    throw e;
+  };
+  assert.strictEqual(
+    isPidAlive(4321, { _platform: "linux", _processKill: fakeKill }),
     false,
+  );
+});
+
+test("F1-11: isPidAlive on POSIX treats unparseable throw as alive", () => {
+  // No `code` field on the thrown value → unparseable → fail safe.
+  const fakeKill = () => { throw null; };
+  assert.strictEqual(
+    isPidAlive(4321, { _platform: "linux", _processKill: fakeKill }),
+    true,
+  );
+});
+
+test("F1-11: isPidAlive on Win returns true (fail-safe) when tasklist itself fails", () => {
+  // Spawn returned an error object — tasklist missing on PATH or wedged.
+  const fakeSpawn = () => ({
+    status: null,
+    error: Object.assign(new Error("ENOENT"), { code: "ENOENT" }),
+    stdout: "",
+    stderr: "",
+  });
+  assert.strictEqual(
+    isPidAlive(4321, { _platform: "win32", _spawnSync: fakeSpawn }),
+    true,
+  );
+});
+
+test("F1-11: isPidAlive on Win returns true (fail-safe) when tasklist exits non-zero", () => {
+  const fakeSpawn = () => ({ status: 2, error: null, stdout: "", stderr: "" });
+  assert.strictEqual(
+    isPidAlive(4321, { _platform: "win32", _spawnSync: fakeSpawn }),
+    true,
+  );
+});
+
+test("F1-11: isPidAlive on Win returns true (fail-safe) when tasklist is signaled (timeout)", () => {
+  const fakeSpawn = () => ({ status: null, signal: "SIGTERM", error: null, stdout: "", stderr: "" });
+  assert.strictEqual(
+    isPidAlive(4321, { _platform: "win32", _spawnSync: fakeSpawn }),
+    true,
   );
 });
 

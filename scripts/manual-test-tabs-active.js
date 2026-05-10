@@ -29,6 +29,7 @@
 const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
+const url = require("node:url");
 const { spawn } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -44,7 +45,11 @@ const TIMEOUT_MS = 90_000;
 const FIXTURE_A = `<!doctype html><html><head><title>Page A</title></head><body style="background:#ff0000;font:48px monospace;color:#fff;padding:80px;">PAGE A — RED — ${Date.now()}</body></html>`;
 const FIXTURE_B = `<!doctype html><html><head><title>Page B</title></head><body style="background:#0000ff;font:48px monospace;color:#fff;padding:80px;">PAGE B — BLUE — ${Date.now()}</body></html>`;
 
-function pathToFileURL(p) { return "file:///" + p.replace(/\\/g, "/"); }
+// F0-8 (2026-05-10): use Node's standard url.pathToFileURL. Previously this
+// hand-rolled `"file:///" + p.replace(/\\/g,"/")` which produced
+// `file:////home/...` (4 slashes) on POSIX where p already starts with /.
+// Brave was lenient and loaded it anyway, but the URL was non-standard.
+function pathToFileURL(p) { return url.pathToFileURL(p).href; }
 
 function send(child, msg) { child.stdin.write(JSON.stringify(msg) + "\n"); }
 

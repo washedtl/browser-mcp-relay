@@ -52,7 +52,17 @@ module.exports = {
     },
     required: ["url"],
   },
-  handler: async ({ url, formFactor = "desktop", onlyCategories }) => {
+  handler: async (_args = {}) => {
+    // F0-9 reviewer V1 (2026-05-10): null-as-missing for defaulted params.
+    const url = _args.url;
+    const formFactor = (_args.formFactor == null) ? "desktop" : _args.formFactor;
+    const onlyCategories = _args.onlyCategories;
+    if (formFactor !== "desktop" && formFactor !== "mobile") {
+      return {
+        content: [{ type: "text", text: `lighthouse_audit: formFactor must be 'desktop' or 'mobile' (got ${JSON.stringify(_args.formFactor)})` }],
+        isError: true,
+      };
+    }
     const bridge = globalThis.__relayBridge;
     if (!bridge) {
       return {
@@ -90,7 +100,31 @@ module.exports = {
       };
     }
 
-    const cats = onlyCategories || ["performance", "accessibility", "best-practices", "seo"];
+    // F1-12 (2026-05-10): validate onlyCategories upfront. An empty array
+    // is treated as "use default" rather than "run zero categories" (which
+    // is what lighthouse would do verbatim — produces an empty/useless
+    // report). Non-array values surface a structured error.
+    const VALID_CATS = new Set(["performance", "accessibility", "best-practices", "seo", "pwa"]);
+    let cats;
+    if (onlyCategories === undefined || onlyCategories === null) {
+      cats = ["performance", "accessibility", "best-practices", "seo"];
+    } else if (!Array.isArray(onlyCategories)) {
+      return {
+        content: [{ type: "text", text: `lighthouse_audit: onlyCategories must be an array (got ${typeof onlyCategories})` }],
+        isError: true,
+      };
+    } else if (onlyCategories.length === 0) {
+      cats = ["performance", "accessibility", "best-practices", "seo"];
+    } else {
+      const bad = onlyCategories.filter((c) => !VALID_CATS.has(c));
+      if (bad.length > 0) {
+        return {
+          content: [{ type: "text", text: `lighthouse_audit: invalid categories ${JSON.stringify(bad)}; valid: ${[...VALID_CATS].join(", ")}` }],
+          isError: true,
+        };
+      }
+      cats = onlyCategories;
+    }
 
     // T0-6: wrap the lighthouse() call in try/catch. Bad URL, unreachable host,
     // dead Brave (relay's CDP port 9333+slot not listening), Lighthouse internal

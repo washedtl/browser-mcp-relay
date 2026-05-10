@@ -56,3 +56,64 @@ test("T0-9: download_capture short-circuits when page closes before download", a
     globalThis.__relayBridge = prev;
   }
 });
+
+// ───── F1-14: sanitizeDownloadFilename ─────
+
+test("F1-14: sanitizeDownloadFilename defangs Linux path traversal", () => {
+  const out = tool.sanitizeDownloadFilename("../../etc/passwd");
+  assert.ok(!out.includes("/"), `must not contain path separators (got ${out})`);
+  assert.ok(!out.startsWith(".."), `must not start with .. (got ${out})`);
+  assert.ok(!out.startsWith("."), `must not start with . (got ${out})`);
+});
+
+test("F1-14: sanitizeDownloadFilename defangs Windows path traversal", () => {
+  const out = tool.sanitizeDownloadFilename("..\\..\\windows\\system32\\foo.exe");
+  assert.ok(!out.includes("\\"), `must not contain backslashes (got ${out})`);
+  assert.ok(!out.includes("/"), `must not contain forward slashes (got ${out})`);
+  assert.ok(!out.startsWith("."), `must not start with . (got ${out})`);
+});
+
+test("F1-14: sanitizeDownloadFilename strips control chars", () => {
+  // Build the test input from char codes so the source file stays plain
+  // ASCII (literal U+0000 / U+001F bytes would tip git's binary heuristic).
+  const NUL = String.fromCharCode(0x00);
+  const US = String.fromCharCode(0x1f);
+  const DEL = String.fromCharCode(0x7f);
+  const out = tool.sanitizeDownloadFilename("foo" + NUL + "bar" + US + "baz" + DEL + "trailing");
+  // eslint-disable-next-line no-control-regex
+  assert.ok(!/[\x00-\x1f\x7f]/.test(out), `must not contain control chars (got ${JSON.stringify(out)})`);
+});
+
+test("F1-14: sanitizeDownloadFilename defangs colon (Windows ADS / drive letter)", () => {
+  const out = tool.sanitizeDownloadFilename("C:\\evil.exe");
+  assert.ok(!out.includes(":"), `must not contain colon (got ${out})`);
+});
+
+test("F1-14: sanitizeDownloadFilename caps length to 200 chars", () => {
+  const out = tool.sanitizeDownloadFilename("x".repeat(500));
+  assert.strictEqual(out.length, 200);
+});
+
+test("F1-14: sanitizeDownloadFilename returns 'file.bin' for empty / null / all-dots", () => {
+  assert.strictEqual(tool.sanitizeDownloadFilename(""), "file.bin");
+  assert.strictEqual(tool.sanitizeDownloadFilename(null), "file.bin");
+  assert.strictEqual(tool.sanitizeDownloadFilename(undefined), "file.bin");
+  assert.strictEqual(tool.sanitizeDownloadFilename("...."), "file.bin");
+});
+
+test("F1-14: sanitizeDownloadFilename leaves a normal filename mostly untouched", () => {
+  assert.strictEqual(tool.sanitizeDownloadFilename("report.pdf"), "report.pdf");
+  assert.strictEqual(tool.sanitizeDownloadFilename("invoice-2025-Q1.csv"), "invoice-2025-Q1.csv");
+});
+
+test("F1-14: sanitizeDownloadFilename coerces non-string input safely", () => {
+  // Number coerces to its decimal string — safe.
+  assert.strictEqual(tool.sanitizeDownloadFilename(123), "123");
+  // Object coerces to "[object Object]" via Object.prototype.toString —
+  // contains no path separators, control chars, or colons, so it survives
+  // sanitization unchanged. Acceptable: caller passing an object is a bug
+  // on their end, but we don't crash.
+  const objOut = tool.sanitizeDownloadFilename({});
+  assert.ok(!objOut.includes("/") && !objOut.includes("\\") && !objOut.includes(":"),
+    `object coercion must not contain path separators (got ${objOut})`);
+});
