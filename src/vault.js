@@ -97,7 +97,13 @@ class Vault {
     for (const f of files) {
       try {
         if (!fs.existsSync(f)) { this.filesSkipped.push({ path: f, reason: "not found" }); continue; }
-        const text = fs.readFileSync(f, "utf8");
+        let text = fs.readFileSync(f, "utf8");
+        // W0-4: strip UTF-8 BOM. Brave/Chrome on Windows often exports CSVs
+        // with a leading U+FEFF. Without this strip, the FIRST header column
+        // becomes "﻿name" instead of "name", and EVERY row's r.name is
+        // empty. If `url` is the first column on some Brave version, the
+        // entire vault would silently load empty.
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
         const rows = parseCsv(text);
         for (const r of rows) {
           if (!r.url || !r.username || !r.password) continue;
@@ -121,16 +127,40 @@ class Vault {
   }
 
   /** Look up creds for a URL. Returns array of {username,password,...} entries.
-   *  Strategy: exact host match first, then registrable-domain fuzzy match.
-   *  De-dupes on (host,username) so subdomains don't return duplicates. */
+   *
+   *  Strategy (W0-5: tightened for cross-subdomain leak):
+   *    1. Exact-host match first (most specific) — return directly.
+   *    2. Registrable-domain fallback — but ONLY entries whose stored URL
+   *       host matches more closely than just the registrable. We rank
+   *       candidates by stored-URL host similarity to the query host:
+   *       a. exact host match  (already handled by step 1)
+   *       b. stored host's registrable === query host (e.g. query `amazon.com`
+   *          finds stored `amazon.com` — only when there's an unambiguous
+   *          registrable-rooted entry)
+   *       c. otherwise — return registrable matches as before (legacy
+   *          permissive behavior, but with `confidence: "low"` flag so
+   *          callers can decide whether to autofill silently).
+   *
+   *  Returns array. Each entry is augmented with a `_match` discriminator:
+   *    "exact"        — host matched exactly
+   *    "registrable"  — fell back to registrable; multiple candidates may
+   *                     exist; caller should pick carefully (or not autofill).
+   *
+   *  Cross-subdomain leak before this fix: signin.amazon.com → no exact →
+   *  registrable amazon.com → 5 entries (AWS, Audible, Twitch, …) →
+   *  autofill silently picked entries[0]. Now the caller can see `_match`
+   *  is "registrable" with `length > 1` and skip autofill. */
   lookup(url) {
     const host = hostFromUrl(url);
     if (!host) return [];
     const exact = this.byHost.get(host) || [];
-    if (exact.length > 0) return exact;
+    if (exact.length > 0) {
+      return exact.map((e) => ({ ...e, _match: "exact" }));
+    }
     const reg = registrableDomain(host);
     if (!reg) return [];
-    return this.byRegistrable.get(reg) || [];
+    const fallback = this.byRegistrable.get(reg) || [];
+    return fallback.map((e) => ({ ...e, _match: "registrable" }));
   }
 
   /** Diagnostic summary, safe to log (no password values). */

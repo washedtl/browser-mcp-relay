@@ -90,16 +90,30 @@ test("launchBrave: ignoreHTTPSErrors is true on launchOpts", async () => {
   });
 });
 
-test("launchBrave: proxyUrl=null → no env override on launchOpts", async () => {
-  await withMockChromium(async (fresh, captured) => {
-    await fresh.launchBrave({
-      userDataDir: "/tmp/x",
-      port: 9999,
-      executablePath: "/fake/brave",
-      proxyUrl: null,
+test("W0-7: launchBrave with proxyUrl=null still strips BROWSER_RELAY_* from env", async () => {
+  // Pre-W0-7: when proxyUrl was null, no `env` was set on launchOpts and
+  // Playwright passed process.env wholesale (BROWSER_RELAY_* leaked).
+  // Post-W0-7: env is always sanitized; BROWSER_RELAY_* never reaches Brave.
+  const stash = process.env.BROWSER_RELAY_INSPECTOR_PORT;
+  process.env.BROWSER_RELAY_INSPECTOR_PORT = "9091";
+  try {
+    await withMockChromium(async (fresh, captured) => {
+      await fresh.launchBrave({
+        userDataDir: "/tmp/x",
+        port: 9999,
+        executablePath: "/fake/brave",
+        proxyUrl: null,
+      });
+      assert.ok(captured.launchOpts.env, "env must be set even without proxy (W0-7)");
+      assert.strictEqual(captured.launchOpts.env.BROWSER_RELAY_INSPECTOR_PORT, undefined,
+        "BROWSER_RELAY_* must NEVER reach the spawned Brave");
+      // No HTTP_PROXY when proxy is unset.
+      assert.strictEqual(captured.launchOpts.env.HTTP_PROXY, undefined);
     });
-    assert.strictEqual(captured.launchOpts.env, undefined);
-  });
+  } finally {
+    if (stash === undefined) delete process.env.BROWSER_RELAY_INSPECTOR_PORT;
+    else process.env.BROWSER_RELAY_INSPECTOR_PORT = stash;
+  }
 });
 
 test("launchBrave: proxyUrl set → HTTP_PROXY + HTTPS_PROXY in launchOpts.env", async () => {

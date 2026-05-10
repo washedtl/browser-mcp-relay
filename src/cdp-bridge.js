@@ -69,30 +69,32 @@ async function launchBrave({
   };
   if (executablePath) launchOpts.executablePath = executablePath;
 
+  // W0-7 (2026-05-09): unconditionally strip BROWSER_RELAY_* env vars from
+  // the env passed to Brave. Previously the strip only happened when proxyUrl
+  // was set — when proxyUrl was unset, no `env` was set on launchOpts at all,
+  // so Playwright defaulted to passing process.env wholesale to Chromium.
+  // BROWSER_RELAY_INSPECTOR_PORT, BROWSER_RELAY_VAULT_FILES, BROWSER_RELAY_*
+  // are relay-internal and shouldn't be visible to Brave (which would try
+  // to interpret them on a chrome:// extension page that loads Node-aware
+  // code, etc.). Always sanitize.
+  const sanitizedEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("BROWSER_RELAY_")) continue; // relay-internal
+    sanitizedEnv[k] = v;
+  }
+
   // Per-process proxy whitelist: when proxyUrl is set, Brave inherits
   // HTTP_PROXY / HTTPS_PROXY env so outbound traffic routes through the
   // configured HTTP proxy. The user's system proxy stays off — only this
   // launched Brave opts in.
-  //
-  // V2-7: previously this was `{ ...process.env, HTTP_PROXY, HTTPS_PROXY }`
-  // which leaked every BROWSER_RELAY_* / BROWSER_* env var into the spawned
-  // Brave process. Brave doesn't read those, but the leak is a smell — Brave
-  // shouldn't see relay-internal config. Strip the BROWSER_RELAY_* prefix
-  // (relay-internal) and pass through the rest of process.env so Brave still
-  // gets PATH, USERPROFILE, etc. that it needs to launch.
   if (proxyUrl) {
-    const cleanEnv = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (k.startsWith("BROWSER_RELAY_")) continue; // relay-internal, not for Brave
-      cleanEnv[k] = v;
-    }
-    cleanEnv.HTTP_PROXY = proxyUrl;
-    cleanEnv.HTTPS_PROXY = proxyUrl;
-    launchOpts.env = cleanEnv;
+    sanitizedEnv.HTTP_PROXY = proxyUrl;
+    sanitizedEnv.HTTPS_PROXY = proxyUrl;
     process.stderr.write(
       `[mcp-relay] proxy whitelist ACTIVE — Brave traffic routes through ${proxyUrl}\n`,
     );
   }
+  launchOpts.env = sanitizedEnv;
 
   const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
 

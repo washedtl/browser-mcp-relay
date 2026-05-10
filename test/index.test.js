@@ -93,3 +93,73 @@ test("V0-4: shutdownAsync uses memoized promise (not boolean flag)", () => {
     "expected `try { await shutdownAsync() } catch {} ` in SIGTERM handler",
   );
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W0-8: upstream-exit handler must NOT use process.kill(pid, signal)
+// (re-raises the signal → handler recursion on POSIX, no-op on
+// Windows). Convert signal name to numeric exit code via SIGNAL_NUMS.
+// ──────────────────────────────────────────────────────────────────
+
+test("W0-8: upstream-exit handler uses signal-num exit codes (not process.kill self)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  let src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  // Strip comments before pattern-checking — the W0-8 fix's docblock
+  // describes the previous bug literally ("`process.kill(process.pid, signal)`")
+  // which would trip the negative assertion below.
+  src = src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "");
+
+  // Source-level guard: previous bug was process.kill(process.pid, signal)
+  // immediately after upstream-exit's await shutdownAsync. That re-raised
+  // SIGINT into the registered handler → recursion on POSIX, and was a
+  // no-op on Windows so the relay never exited.
+  assert.ok(!/process\.kill\(\s*process\.pid\s*,\s*signal\s*\)/.test(src),
+    "W0-8: must NOT call process.kill(process.pid, signal) — re-raises signal");
+  // Must declare the SIGNAL_NUMS map (POSIX convention 128 + sigNum).
+  assert.ok(/SIGNAL_NUMS\s*=\s*\{[^}]*SIGINT:\s*2[^}]*SIGTERM:\s*15/.test(src),
+    "expected SIGNAL_NUMS map with SIGINT:2 SIGTERM:15");
+  // Must compute exit code as 128 + sigNum.
+  assert.ok(/128\s*\+\s*sigNum/.test(src),
+    "expected exit code computed as 128 + sigNum (POSIX convention)");
+});
+
+// ──────────────────────────────────────────────────────────────────
+// W1-5: getUpstream must wrap spawnUpstream in Promise.resolve().then
+// so a synchronous throw from spawnUpstream (e.g. resolveBdmcpEntry
+// throwing) is captured by the .catch instead of bypassing the
+// memoization assignment entirely.
+// ──────────────────────────────────────────────────────────────────
+
+test("W1-5: getUpstream wraps spawnUpstream() in Promise.resolve().then for sync-throw safety", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  // Must use the Promise.resolve().then pattern, not a naked spawnUpstream() call.
+  assert.ok(/Promise\.resolve\(\)\.then\(\s*spawnUpstream\s*\)/.test(src),
+    "expected `Promise.resolve().then(spawnUpstream)` to capture sync throws");
+});
+
+// ──────────────────────────────────────────────────────────────────
+// W1-6: releasePool() must come BEFORE the long-running closeBrave
+// in shutdownAsync — second Ctrl-C interrupts mid-await, leaves lock
+// stranded if released last.
+// ──────────────────────────────────────────────────────────────────
+
+test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first ordering)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  // Find the shutdownAsync function body and check the order: releasePool
+  // call site appears textually BEFORE closeBrave call site.
+  const m = src.match(/function\s+shutdownAsync[\s\S]*?shutdownDone\s*=\s*true/);
+  assert.ok(m, "expected to find shutdownAsync body");
+  const body = m[0];
+  const releaseIdx = body.indexOf("releasePool()");
+  const closeBraveIdx = body.indexOf("closeBrave(");
+  assert.ok(releaseIdx >= 0, "releasePool() must be called");
+  assert.ok(closeBraveIdx >= 0, "closeBrave() must be called");
+  assert.ok(releaseIdx < closeBraveIdx,
+    "releasePool() must come BEFORE closeBrave() (W1-6 lock-first ordering for double-Ctrl-C safety)");
+});

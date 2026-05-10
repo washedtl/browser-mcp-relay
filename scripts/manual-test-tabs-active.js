@@ -33,7 +33,10 @@ const { spawn } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_ENTRY = path.join(REPO_ROOT, "src", "index.js");
-const FIXTURE_DIR = path.join(__dirname);
+// W1-8 (2026-05-09): write fixtures into a fresh tmp dir, not into scripts/.
+// Previously left manual-test-page-{A,B}.html under scripts/ which polluted
+// the working tree and showed up as untracked files on every clone.
+const FIXTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "tabs-active-test-"));
 const PAGE_A = path.join(FIXTURE_DIR, "manual-test-page-A.html");
 const PAGE_B = path.join(FIXTURE_DIR, "manual-test-page-B.html");
 const TIMEOUT_MS = 90_000;
@@ -143,13 +146,29 @@ async function main() {
       `[manual] PASS: screenshot bytes differ (A=${a.length}, B=${b.length}) — upstream tracked the active tab.\n`,
     );
     process.stdout.write("OK\n");
-    child.kill();
-    process.exit(0);
+    cleanupAndExit(child, 0);
   } catch (e) {
     process.stderr.write(`[manual] FAIL: ${e.message}\n`);
-    child.kill();
-    process.exit(1);
+    cleanupAndExit(child, 1);
   }
+}
+
+// W1-8: cross-platform process-tree kill + tmp-dir cleanup.
+// Same pattern as smoke.js / setup.js — bare `child.kill()` on Windows
+// orphans the relay's spawned upstream BDMCP + Brave process tree.
+function killTree(child) {
+  if (!child || !child.pid) return;
+  if (process.platform === "win32") {
+    try { require("node:child_process").execSync(`taskkill /F /T /PID ${child.pid}`, { stdio: "ignore", windowsHide: true }); } catch {}
+  } else {
+    try { child.kill("SIGTERM"); } catch {}
+  }
+}
+function cleanupAndExit(child, code) {
+  killTree(child);
+  // Best-effort fixture-dir cleanup so manual-test runs leave no residue.
+  try { fs.rmSync(FIXTURE_DIR, { recursive: true, force: true }); } catch {}
+  process.exit(code);
 }
 
 function extractText(res) {

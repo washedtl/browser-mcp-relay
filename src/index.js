@@ -189,9 +189,17 @@ async function main() {
     });
     upstreamChild.on("exit", async (code, signal) => {
       process.stderr.write(`[mcp-relay] upstream child exited code=${code} signal=${signal}\n`);
-      await shutdownAsync();
-      if (signal) process.kill(process.pid, signal);
-      else process.exit(code ?? 0);
+      try { await shutdownAsync(); } catch { /* shutdown is best-effort */ }
+      // W0-8: previously `process.kill(process.pid, signal)` re-raised the
+      // signal that just killed the child — on POSIX this re-enters the
+      // SIGINT/SIGTERM handler (potential recursion), and on Windows
+      // `process.kill` with a signal name is a no-op so the relay would
+      // never exit at all. Use a numeric exit code derived from the signal
+      // (POSIX convention: 128 + signal number) when available, else the
+      // child's exit code, else 1.
+      const SIGNAL_NUMS = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1, SIGQUIT: 3 };
+      const sigNum = signal && SIGNAL_NUMS[signal];
+      process.exit(sigNum ? 128 + sigNum : (code ?? 1));
     });
 
     upstreamClient = new UpstreamClient(upstreamChild.stdout, upstreamChild.stdin);
@@ -201,7 +209,13 @@ async function main() {
   async function getUpstream() {
     if (upstreamClient) return upstreamClient;
     if (!upstreamSpawnPromise) {
-      upstreamSpawnPromise = spawnUpstream().catch((e) => {
+      // W1-5: wrap spawnUpstream in Promise.resolve().then so a synchronous
+      // throw from spawnUpstream() (e.g. resolveBdmcpEntry throwing because
+      // the upstream module isn't installed) is captured by the .catch
+      // below. Without this, the assignment line itself throws, the
+      // .catch never registers, and upstreamSpawnPromise stays as the
+      // never-set undefined — every retry hits the same race window.
+      upstreamSpawnPromise = Promise.resolve().then(spawnUpstream).catch((e) => {
         upstreamSpawnPromise = null; // allow retry
         throw e;
       });
@@ -377,11 +391,16 @@ async function main() {
   function shutdownAsync() {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
+      // W1-6: release the pool lock FIRST so a second Ctrl-C (which
+      // process.exit's mid-await) leaves the slot reclaimable by the next
+      // relay. If we released after the long closeBrave/await chain and
+      // got interrupted, the lock would persist past process exit and
+      // future relays would see it as a stale lock requiring stale-clean.
+      try { releasePool(); } catch {}
       if (upstreamClient) { try { upstreamClient.close(); } catch {} }
       if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
       if (bridge) { try { await closeBrave(bridge); } catch {} }
       if (inspectorHandle) { try { await inspectorHandle.close(); } catch {} }
-      try { releasePool(); } catch {}
       shutdownDone = true;
     })();
     return shutdownPromise;

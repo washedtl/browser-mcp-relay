@@ -429,8 +429,16 @@ async function main() {
   step8_printMcpSnippet();
 
   const smoke = await step9_smokeTest();
-  if (smoke.ok) {
-    process.stdout.write(`✓ Relay healthy. ${smoke.count} tools available.\n`);
+  // W1-3 (2026-05-09): match smoke.js's MIN_TOOLS gate. Previously, ANY
+  // tools/list response was "healthy", even `tools: []` from a broken
+  // upstream — a friend running setup against an unconfigured environment
+  // would see a green checkmark with 0 tools. Mirror smoke.js's threshold.
+  const MIN_TOOLS = 60;
+  if (smoke.ok && smoke.count >= MIN_TOOLS) {
+    process.stdout.write(`✓ Relay healthy. ${smoke.count} tools available (≥${MIN_TOOLS}).\n`);
+  } else if (smoke.ok && smoke.count < MIN_TOOLS) {
+    process.stdout.write(`✗ Smoke test FAILED: only ${smoke.count} tools returned (expected ≥${MIN_TOOLS}). Likely upstream BDMCP not installed or environment misconfigured.\n`);
+    process.stdout.write("[setup] Re-run with `npm run smoke` after fixing.\n");
   } else {
     process.stdout.write(`✗ Smoke test failed: ${smoke.reason}\n`);
     process.stdout.write("[setup] You can re-run the smoke test anytime with `npm run smoke`.\n");

@@ -2,7 +2,7 @@
 // scripts/smoke.js — non-interactive smoke test.
 //
 // Spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
-// waits for the response, verifies ≥50 tools (41 forwarded + 16 own = 57),
+// waits for the response, verifies ≥60 tools (51 forwarded + 19 own = 70),
 // kills the relay, exits 0 on success / non-zero on failure.
 //
 // For CI / sanity checks. <60 seconds. No prompts. Reads local-config.json
@@ -14,7 +14,12 @@ const { spawn, execSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_ENTRY = path.join(REPO_ROOT, "src", "index.js");
-const MIN_TOOLS = 50; // expectation: 41 forwarded + 16 own = 57; threshold 50 allows minor upstream churn
+// W0-9 (2026-05-09): bumped from 50 → 60. Expectation today is 51 forwarded
+// + 19 own = 70. The previous 50 threshold allowed ~34/51 forwarded missing
+// (2/3 of the catalog) and still reported "healthy" — false positive. 60
+// catches catastrophic upstream-tool registration failures while still
+// tolerating minor upstream churn (one new tool added, one renamed).
+const MIN_TOOLS = 60;
 const DEFAULT_TIMEOUT_MS = 60000;
 
 /**

@@ -66,9 +66,19 @@ if (require.main === module) {
     // No trafficEmitter — Activity feed will show the standalone message.
   })
     .then((handle) => {
-      process.stdout.write(
-        `Inspector running at http://${bind === "0.0.0.0" ? "localhost" : bind}:${handle.port}\n`,
-      );
+      // W1-7 (2026-05-09): when bind=0.0.0.0, the URL line previously printed
+      // "localhost" — masking the LAN exposure surface from the user.
+      // Print the actual bind plus a localhost hint so the user can paste
+      // either into their browser, but knows the LAN is reachable.
+      if (bind === "0.0.0.0") {
+        process.stdout.write(
+          `Inspector running at http://0.0.0.0:${handle.port}/ (LAN-exposed; from this machine: http://localhost:${handle.port}/)\n`,
+        );
+      } else {
+        process.stdout.write(
+          `Inspector running at http://${bind}:${handle.port}/\n`,
+        );
+      }
       for (const sig of ["SIGINT", "SIGTERM"]) {
         process.on(sig, async () => {
           try { await handle.close(); } catch { /* noop */ }

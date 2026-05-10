@@ -36,8 +36,17 @@
     if (children) {
       for (const c of [].concat(children)) {
         if (c == null) continue;
-        if (typeof c === "string" || typeof c === "number") node.appendChild(document.createTextNode(String(c)));
-        else node.appendChild(c);
+        if (typeof c === "string" || typeof c === "number") {
+          node.appendChild(document.createTextNode(String(c)));
+        } else if (c instanceof Node) {
+          node.appendChild(c);
+        } else {
+          // W1-4: a non-Node value (e.g. cfg.bravePath unexpectedly an object
+          // due to config drift) would crash the entire render here. Coerce
+          // to text so the UI stays usable; the value will look weird but
+          // the page still loads.
+          node.appendChild(document.createTextNode(String(c)));
+        }
       }
     }
     return node;
@@ -75,7 +84,10 @@
   }
 
   function formatCookieAge(days) {
-    if (days == null || !Number.isFinite(days)) return "—";
+    // W0-1: also reject negative inputs — clock skew or fresh-write
+    // timestamps can produce small-negative day deltas, which previously
+    // rendered as "-30m" in the UI. Treat as unknown.
+    if (days == null || !Number.isFinite(days) || days < 0) return "—";
     if (days < 1 / 24) return Math.round(days * 24 * 60) + "m";
     if (days < 1) return Math.round(days * 24) + "h";
     return days.toFixed(1) + "d";
@@ -115,12 +127,19 @@
     };
     const slots = status.slots || [];
     const active = slots.filter((s) => s.state === "claimed").length;
-    setStat("tools", String(status.tools.total));
+    // W0-2: defensive guards — backend response shape is documented but
+    // an early-startup or degraded-response can omit nested keys, and the
+    // caller's catch turns the resulting TypeError into "Disconnected"
+    // when the backend is actually fine.
+    const tools = status.tools || {};
+    const config = status.config || {};
+    const server = status.server || {};
+    setStat("tools", tools.total != null ? String(tools.total) : "—");
     setStat("pool", active + " / " + slots.length + " active");
-    setStat("mode", status.config.mode);
+    setStat("mode", config.mode || "—");
     const vault = status.vault || {};
     setStat("vault", vault.enabled ? vault.totalEntries + " entries" : "off");
-    setStat("uptime", formatDuration(status.server.uptimeSeconds));
+    setStat("uptime", formatDuration(server.uptimeSeconds));
 
     const orphans = slots.filter((s) => s.state === "orphan").length;
     const pill = document.getElementById("health-pill");
@@ -1133,6 +1152,12 @@
     if (!evt || !evt.type || evt.id == null) return;
 
     if (evt.type === "request") {
+      // W1-1: dedupe — GET-then-WS backfill paths can deliver the same
+      // request event twice. Without this, the feed shows two cards with
+      // the same id but only one entry in eventMap (latter overwrites),
+      // and clicking the duplicate either selects the wrong one or breaks
+      // the response-pairing.
+      if (slotState.eventMap.has(evt.id)) return;
       const merged = { id: evt.id, request: evt, response: null };
       slotState.eventMap.set(evt.id, merged);
       slotState.feed.unshift(merged);
@@ -1415,7 +1440,11 @@
       out.push(e);
     }
     // Newest first.
-    out.sort((a, b) => Date.parse(b.time || 0) - Date.parse(a.time || 0));
+    // W0-3: previously `Date.parse(b.time || 0)` — when `b.time` is null/
+    // undefined, `0` coerces to the string `"0"` which `Date.parse` returns
+    // NaN for, breaking the sort. Use the same fallback pattern as the filter
+    // loop above (Date.parse(t) → fallback 0).
+    out.sort((a, b) => (Date.parse(b.time) || 0) - (Date.parse(a.time) || 0));
     return out;
   }
 
