@@ -1,0 +1,65 @@
+# clean-clone.yml — friend-flow CI.
+#
+# Runs the full friend-onboarding path on a fresh Windows runner:
+#   1. Checkout (clean clone — no leftover state)
+#   2. npm install (no cache — proves the lock works from scratch)
+#   3. npm test (unit suite, ~441 tests)
+#   4. npm run smoke (spawns the relay, sends MCP handshake + tools/list,
+#      asserts ≥60 tools)
+#
+# Catches the class of regression where unit tests pass but onboarding
+# silently breaks — broken setup wizard, missing dependency, MCP SDK
+# import path drift, etc.
+#
+# Windows-only by design (per maintainer's daily-driver platform).
+# macOS + Linux deferred — code is written portably but not yet
+# maintainer-verified end-to-end.
+
+name: Clean-clone friend flow
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install (no cache — clean-clone is the test)
+        run: npm install --no-audit --no-fund
+        # `npm ci` would be faster but assumes package-lock.json + node_modules
+        # are already in sync with the repo state. `npm install` proves the
+        # lock + dependencies actually resolve from a fresh state, matching
+        # what a friend would run.
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Smoke test — spawn relay + tools/list
+        run: npm run smoke
+        # Smoke spawns the relay, sends initialize + tools/list over stdio,
+        # asserts ≥60 tools, then kills the relay's process tree (V0-5
+        # taskkill /F /T). Exit non-zero on any failure mode.
+
+      - name: Show smoke + setup wizard self-check (optional context)
+        if: failure()
+        run: |
+          echo "Smoke or test failed. Repo state:"
+          dir
+          echo ""
+          echo "node_modules layout:"
+          dir node_modules /b 2>nul | head -20
+        shell: cmd
