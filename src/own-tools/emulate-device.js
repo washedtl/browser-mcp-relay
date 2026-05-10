@@ -97,13 +97,17 @@ module.exports = {
       applied.viewport = viewport;
     }
     if (network) {
+      // F0-9 (2026-05-10): coerce numeric fields with Number.isFinite guard.
+      // Pre-fix, NaN/Infinity from the wire would silently propagate to CDP
+      // which rejects with an opaque error.
+      const finiteOrSentinel = (v) => Number.isFinite(v) ? v : -1;
       sends.push({
         name: "network",
         p: cdp.send("Network.emulateNetworkConditions", {
           offline: !!network.offline,
-          downloadThroughput: network.downloadKbps != null ? (network.downloadKbps * 1024 / 8) : -1,
-          uploadThroughput: network.uploadKbps != null ? (network.uploadKbps * 1024 / 8) : -1,
-          latency: network.latencyMs ?? 0,
+          downloadThroughput: network.downloadKbps != null ? (finiteOrSentinel(Number(network.downloadKbps)) * 1024 / 8) : -1,
+          uploadThroughput: network.uploadKbps != null ? (finiteOrSentinel(Number(network.uploadKbps)) * 1024 / 8) : -1,
+          latency: Number.isFinite(network.latencyMs) ? network.latencyMs : 0,
         }),
       });
       applied.network = network;

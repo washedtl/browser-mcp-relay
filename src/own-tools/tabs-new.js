@@ -40,7 +40,13 @@ module.exports = {
       },
     },
   },
-  handler: async ({ url, waitUntil = "load", timeoutMs = 30000 } = {}) => {
+  handler: async (_args = {}) => {
+    // F0-9 (2026-05-10): treat null as missing.
+    const url = _args.url ?? undefined;
+    let waitUntil = _args.waitUntil;
+    if (!["load", "domcontentloaded", "networkidle", "commit"].includes(waitUntil)) waitUntil = "load";
+    let timeoutMs = _args.timeoutMs;
+    if (timeoutMs == null || !Number.isFinite(timeoutMs) || timeoutMs < 100) timeoutMs = 30000;
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const page = await bridge.context.newPage();

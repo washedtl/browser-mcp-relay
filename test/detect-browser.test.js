@@ -165,22 +165,43 @@ test("detectBravePath probes the Windows registry as a last resort and reports i
 
 // ───── standardLocations pure helper ─────
 
-test("standardLocations returns 3 paths on Windows in the expected order", () => {
+test("standardLocations returns 12 paths on Windows (4 channels × 3 roots) in expected order", () => {
   const env = {
     PROGRAMFILES: "C:\\PF",
     "PROGRAMFILES(X86)": "C:\\PF86",
     LOCALAPPDATA: "C:\\Users\\u\\AppData\\Local",
   };
   const locs = standardLocations("win32", env);
-  assert.strictEqual(locs.length, 3);
-  assert.match(locs[0], /^C:\\PF\\BraveSoftware/);
-  assert.match(locs[1], /^C:\\PF86\\BraveSoftware/);
-  assert.match(locs[2], /^C:\\Users\\u\\AppData\\Local\\BraveSoftware/);
+  // F1-8: 4 channels (Brave-Browser stable / Beta / Nightly / Dev) × 3 roots
+  // (Program Files / Program Files (x86) / LOCALAPPDATA) = 12.
+  assert.strictEqual(locs.length, 12);
+  // Stable channel listed first so it wins on multi-channel installs.
+  assert.match(locs[0], /^C:\\PF\\BraveSoftware\\Brave-Browser\\/);
+  assert.match(locs[1], /^C:\\PF86\\BraveSoftware\\Brave-Browser\\/);
+  assert.match(locs[2], /^C:\\Users\\u\\AppData\\Local\\BraveSoftware\\Brave-Browser\\/);
+  // Beta after stable.
+  assert.match(locs[3], /Brave-Browser-Beta/);
+  // Pre-release channels included.
+  assert.ok(locs.some((p) => /Brave-Browser-Beta/.test(p)));
+  assert.ok(locs.some((p) => /Brave-Browser-Nightly/.test(p)));
+  assert.ok(locs.some((p) => /Brave-Browser-Dev/.test(p)));
 });
 
-test("standardLocations returns at least one entry on darwin and linux", () => {
-  assert.ok(standardLocations("darwin", {}).length >= 1);
-  assert.ok(standardLocations("linux", {}).length >= 1);
+test("standardLocations covers all four Brave channels on darwin", () => {
+  const locs = standardLocations("darwin", {});
+  assert.ok(locs.length >= 8); // 4 channels × 2 install roots
+  assert.ok(locs.some((p) => /\/Brave Browser\.app\//.test(p)));
+  assert.ok(locs.some((p) => /\/Brave Browser Beta\.app\//.test(p)));
+  assert.ok(locs.some((p) => /\/Brave Browser Nightly\.app\//.test(p)));
+  assert.ok(locs.some((p) => /\/Brave Browser Dev\.app\//.test(p)));
+});
+
+test("standardLocations covers all four Brave channels on linux", () => {
+  const locs = standardLocations("linux", {});
+  assert.ok(locs.length >= 4);
+  assert.ok(locs.some((p) => /brave-browser-beta/.test(p)));
+  assert.ok(locs.some((p) => /brave-browser-nightly/.test(p)));
+  assert.ok(locs.some((p) => /brave-browser-dev/.test(p)));
 });
 
 test("standardLocations returns [] for unknown platforms", () => {

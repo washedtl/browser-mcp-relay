@@ -87,11 +87,25 @@ function listProcessesWin(needle, spawn) {
  *  Windows (and to handle macOS where the binary is "Brave Browser" with
  *  capital B but callers may pass lowercase "brave"). */
 function listProcessesPosix(needle, spawn) {
-  const result = spawn("ps", ["-eo", "pid,command"], {
+  // F0-7 (2026-05-10): pass `-ww` to disable command-column truncation on
+  // BSD/macOS ps. Default truncates to ~80 chars per line — Brave on macOS
+  // launches helpers with command lines well over 80 chars (paths inside
+  // `Brave Browser.app` bundle are long), so the `--user-data-dir=` token
+  // gets cut off → findBraveProcessesForDir misses helpers → reapOrphansFor
+  // only kills the parent → helpers respawn → ghost processes.
+  // Linux GNU ps also accepts -ww as a no-op (it doesn't truncate by default).
+  //
+  // F0-7: also force LC_ALL=C so the header line is "PID COMMAND" in ASCII
+  // regardless of locale — line.startsWith("PID ") then works reliably on
+  // non-English systems (where French/German/Russian/etc. would otherwise
+  // produce a translated header that the skip would miss; harmless because
+  // the line wouldn't match the digit regex anyway, but cleaner).
+  const result = spawn("ps", ["-eo", "pid,command", "-ww"], {
     encoding: "utf8",
     // G1-3: same caps as Windows path — see listProcessesWin.
     maxBuffer: 16 * 1024 * 1024,
     timeout: 15000,
+    env: { ...process.env, LC_ALL: "C" },
   });
   if (!result || result.status !== 0) {
     const stderr = result && result.stderr ? String(result.stderr).trim() : "";
@@ -154,24 +168,54 @@ function isPidAlive(pid, opts = {}) {
     const result = spawn(
       "tasklist",
       ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"],
-      { encoding: "utf8", windowsHide: true },
+      // F1-11: short timeout + caps. Pre-fix, a wedged tasklist would
+      // hang the relay's slot-claim path indefinitely.
+      { encoding: "utf8", windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 },
     );
-    if (!result || result.status !== 0) return false;
+    // F1-11 (2026-05-10): fail-safe = "assume alive" when tasklist itself
+    // fails (timeout, signaled, missing on PATH, error stdout). Same
+    // rationale as the POSIX branch — stealing a live slot crashes Brave;
+    // waiting for the stale-lock TTL costs 5 minutes.
+    if (!result) return true;
+    if (result.error) return true; // ENOENT / ETIMEDOUT etc.
+    if (typeof result.signal === "string" && result.signal) return true;
+    if (result.status !== 0) {
+      // tasklist exits 0 even when no match (it prints INFO: line); a
+      // non-zero status means a real failure. Fail safe.
+      return true;
+    }
     const stdout = result.stdout || "";
+    // F1-11 reviewer V1 (2026-05-10): empty stdout from a status-0 tasklist
+    // means *neither* the no-match INFO line nor a CSV row was emitted —
+    // genuinely ambiguous output. Fail safe (alive) rather than treating
+    // the silent path as "definitively dead." Same blast-radius logic as
+    // the rest of F1-11.
+    if (stdout.length === 0) return true;
     // tasklist prints `INFO: No tasks are running...` to stdout when nothing
     // matches; a real match has the pid quoted as a CSV cell.
     return stdout.includes(`,"${pid}",`);
   }
 
   // POSIX: signal 0 does no work. Throws ESRCH if dead, EPERM if alive but
-  // owned by another user (still alive). Anything else (rare) → treat as dead.
+  // owned by another user (still alive).
+  //
+  // F1-11 (2026-05-10): treat unknown errno (ENOSYS, EINVAL, EFAULT, EBUSY,
+  // any future addition) as ALIVE rather than dead. Rationale: the
+  // consequence of a false-dead is "we steal the slot from an actually-
+  // running Brave + crash it"; the consequence of a false-alive is "we
+  // wait an extra 5 minutes for the stale-lock TTL". The asymmetric blast
+  // radius makes "fail safe = assume alive" the correct default for any
+  // errno we haven't explicitly classified. Only ESRCH (definitively
+  // "no such process") returns false. Errors with no `code` field also
+  // get the safe-side treatment.
   const kill = opts._processKill || ((p, s) => process.kill(p, s));
   try {
     kill(pid, 0);
     return true;
   } catch (e) {
-    if (e && e.code === "EPERM") return true;
-    return false;
+    if (!e) return true; // unparseable — fail safe
+    if (e.code === "ESRCH") return false; // canonical "dead"
+    return true; // EPERM, ENOSYS, EINVAL, anything else — treat as alive
   }
 }
 

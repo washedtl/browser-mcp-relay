@@ -45,7 +45,15 @@ module.exports = {
       },
     },
   },
-  handler: async ({ languages = ["en-US", "en"], force = false } = {}) => {
+  handler: async (_args = {}) => {
+    // F0-9 (2026-05-10): treat null as missing (JSON-RPC clients commonly
+    // send null for unset optionals; JS destructure defaults only fire on
+    // undefined). Languages: must be a non-empty string-array.
+    let languages = _args.languages;
+    if (!Array.isArray(languages) || languages.length === 0 || !languages.every((s) => typeof s === "string" && s.length > 0)) {
+      languages = ["en-US", "en"];
+    }
+    const force = !!_args.force;
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
 

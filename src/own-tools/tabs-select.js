@@ -33,11 +33,20 @@ module.exports = {
         isError: true,
       };
     }
-    await pages[index].bringToFront();
-    // Track this as the active page so own-tools (capture_xhr, dialog_handle
-    // etc.) target it instead of pages[0]. See _active-page.js.
+    // F1-3 (2026-05-10): track active page BEFORE bringToFront. If
+    // bringToFront rejects (page being navigated, page closed mid-call),
+    // we still track the user-intended page so subsequent own-tool calls
+    // target it correctly. Previously a rejection meant setActivePage was
+    // never called and the active page was whatever the prior caller set.
     setActivePage(pages[index]);
     const url = pages[index].url();
+    try {
+      await pages[index].bringToFront();
+    } catch (e) {
+      // bringToFront is cosmetic (just visual focus); failure shouldn't
+      // block the active-page tracking. Log + continue with propagation.
+      process.stderr.write(`[tabs_select] bringToFront failed (continuing): ${e.message}\n`);
+    }
     // Propagate to upstream so content_take-screenshot etc. target this
     // tab's URL. Best-effort; about:blank is skipped to avoid churn.
     const propagation = await propagateActivePageToUpstream(url);

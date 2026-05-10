@@ -2,8 +2,11 @@
 //
 // Order of resolution:
 //   1. BROWSER_RELAY_BRAVE_PATH env var (explicit override; verified to exist).
-//   2. Per-platform standard install locations.
-//   3. (Windows only) HKLM registry probe via PowerShell as a last resort.
+//   2. Per-platform standard install locations (Stable, Beta, Nightly, Dev
+//      across system + per-user Program Files / LOCALAPPDATA on win32; matching
+//      `.app` bundles on darwin; channel-named binaries on linux).
+//   3. (Windows only) Registry probe across HKLM + HKCU for all four channels
+//      via PowerShell as a last resort.
 //   4. Throw a clear, actionable error.
 //
 // Pure module — no top-level filesystem or process work, so requiring it
@@ -72,21 +75,44 @@ function detectBravePath(opts = {}) {
   } else if (platform === "win32") {
     // Registry probe — only fires if file probes all missed. Cheap-ish
     // but we put it last so happy paths never shell out to PowerShell.
+    //
+    // F1-8 (2026-05-10): probe BOTH HKLM (system-wide install) AND HKCU
+    // (per-user install, which is the default for unprivileged installers
+    // and the LOCALAPPDATA install path). Stable channel only — Brave's
+    // pre-release channels use distinct keys (Brave-Browser-Beta etc.)
+    // which would expand this list further; if a user has only pre-release
+    // Brave installed AND it's in a non-standard location AND the file
+    // probes missed it, we fall through to the generic not-found error.
+    // That's an acceptable corner case.
+    const probes = [
+      "HKLM:\\Software\\BraveSoftware\\Brave-Browser\\BLBeacon",
+      "HKCU:\\Software\\BraveSoftware\\Brave-Browser\\BLBeacon",
+      "HKLM:\\Software\\BraveSoftware\\Brave-Browser-Beta\\BLBeacon",
+      "HKCU:\\Software\\BraveSoftware\\Brave-Browser-Beta\\BLBeacon",
+      "HKLM:\\Software\\BraveSoftware\\Brave-Browser-Nightly\\BLBeacon",
+      "HKCU:\\Software\\BraveSoftware\\Brave-Browser-Nightly\\BLBeacon",
+      "HKLM:\\Software\\BraveSoftware\\Brave-Browser-Dev\\BLBeacon",
+      "HKCU:\\Software\\BraveSoftware\\Brave-Browser-Dev\\BLBeacon",
+    ];
+    const psSnippet = probes
+      .map((p) => `(Get-ItemProperty -Path '${p}' -ErrorAction SilentlyContinue).version`)
+      .join("; ");
     const reg = spawn(
       "powershell",
-      [
-        "-NoProfile",
-        "-Command",
-        "(Get-ItemProperty -Path 'HKLM:\\Software\\BraveSoftware\\Brave-Browser\\BLBeacon' -ErrorAction SilentlyContinue).version",
-      ],
+      ["-NoProfile", "-Command", psSnippet],
       { encoding: "utf8", windowsHide: true },
     );
     // Registry just confirms install; file path is still under PROGRAMFILES.
     // If the registry says it's installed but our file probes missed it,
     // log a hint and continue to throw.
     if (reg && reg.status === 0 && reg.stdout && reg.stdout.trim().length > 0) {
+      // First non-empty version line wins (stable preferred — listed first).
+      const version = reg.stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0);
       throw braveNotFoundError(candidates, platform, {
-        registryVersion: reg.stdout.trim(),
+        registryVersion: version || reg.stdout.trim(),
       });
     }
   }
@@ -104,26 +130,49 @@ function standardLocations(platform, env) {
     const programFiles = env.PROGRAMFILES || "C:\\Program Files";
     const programFilesX86 = env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)";
     const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-    return [
-      path.join(programFiles, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-      path.join(programFilesX86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-      path.join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-    ];
+    // F1-8 (2026-05-10): probe Brave Beta / Nightly / Dev install dirs in
+    // addition to stable. Stable wins when multiple are installed (it's
+    // listed first); other channels are fallbacks for users who only have
+    // pre-release Brave installed.
+    const channels = ["Brave-Browser", "Brave-Browser-Beta", "Brave-Browser-Nightly", "Brave-Browser-Dev"];
+    const roots = [programFiles, programFilesX86, localAppData];
+    const out = [];
+    for (const ch of channels) {
+      for (const root of roots) {
+        out.push(path.join(root, "BraveSoftware", ch, "Application", "brave.exe"));
+      }
+    }
+    return out;
   }
   if (platform === "darwin") {
-    return [
-      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-      // Per-user install (rare but supported by Brave installer)
-      path.join(os.homedir(), "Applications", "Brave Browser.app", "Contents", "MacOS", "Brave Browser"),
+    // F1-8: Beta/Nightly/Dev .app bundles use distinct names on macOS.
+    const apps = [
+      "Brave Browser.app",
+      "Brave Browser Beta.app",
+      "Brave Browser Nightly.app",
+      "Brave Browser Dev.app",
     ];
+    const out = [];
+    for (const app of apps) {
+      const inner = app.replace(/\.app$/, "");
+      out.push(`/Applications/${app}/Contents/MacOS/${inner}`);
+      out.push(path.join(os.homedir(), "Applications", app, "Contents", "MacOS", inner));
+    }
+    return out;
   }
   if (platform === "linux") {
     return [
       "/usr/bin/brave-browser",
       "/usr/bin/brave",
+      "/usr/bin/brave-browser-beta",
+      "/usr/bin/brave-browser-nightly",
+      "/usr/bin/brave-browser-dev",
       "/snap/bin/brave",
       "/opt/brave.com/brave/brave-browser",
       "/opt/brave.com/brave/brave",
+      "/opt/brave.com/brave-beta/brave-browser-beta",
+      "/opt/brave.com/brave-nightly/brave-browser-nightly",
+      "/opt/brave.com/brave-dev/brave-browser-dev",
     ];
   }
   return [];

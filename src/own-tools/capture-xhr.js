@@ -71,16 +71,25 @@ module.exports = {
       },
     },
   },
-  handler: async ({
-    navigateToUrl,
-    durationMs = 5000,
-    navTimeoutMs,
-    waitUntil = "domcontentloaded",
-    urlFilter,
-    includeBody = true,
-    maxBodyBytes = 100000,
-    maxResponses = 500,
-  }) => withActivePage(async ({ page }) => {
+  handler: async (_args = {}) => withActivePage(async ({ page }) => {
+    // F0-9 (2026-05-10): JS destructure defaults only fire on `undefined`,
+    // not `null`. JSON-RPC clients commonly serialize unset optionals as
+    // null. Apply defaults explicitly so null is treated as "missing".
+    // Also Number.isFinite-guard numeric inputs (NaN/Infinity from the
+    // wire would silently produce empty captures or hang CDP).
+    const navigateToUrl = _args.navigateToUrl ?? undefined;
+    let durationMs = _args.durationMs;
+    if (durationMs == null || !Number.isFinite(durationMs) || durationMs < 100) durationMs = 5000;
+    const navTimeoutMs = (_args.navTimeoutMs != null && Number.isFinite(_args.navTimeoutMs)) ? _args.navTimeoutMs : undefined;
+    let waitUntil = _args.waitUntil;
+    if (!["load", "domcontentloaded", "networkidle", "commit"].includes(waitUntil)) waitUntil = "domcontentloaded";
+    const urlFilter = _args.urlFilter ?? undefined;
+    const includeBody = _args.includeBody == null ? true : !!_args.includeBody;
+    let maxBodyBytes = _args.maxBodyBytes;
+    if (maxBodyBytes == null || !Number.isFinite(maxBodyBytes) || maxBodyBytes < 1) maxBodyBytes = 100000;
+    let maxResponses = _args.maxResponses;
+    if (maxResponses == null || !Number.isFinite(maxResponses) || maxResponses < 1) maxResponses = 500;
+
     let filter = null;
     if (urlFilter) {
       try {

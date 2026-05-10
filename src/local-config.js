@@ -20,7 +20,17 @@ const path = require("node:path");
 const REPO_ROOT = path.resolve(__dirname, "..");
 const LOCAL_CONFIG_PATH = path.join(REPO_ROOT, "local-config.json");
 
-let cached = null;
+// F0-2 (2026-05-10): cache an mtime alongside the parsed result so the
+// next call can detect file changes. Previously a "missing file" or
+// "parse error" cached `{}` permanently — user creating local-config.json
+// or fixing JSON syntax mid-session never saw it until restart.
+//
+// Cache shape: { value: object, mtimeMs: number | null }
+// mtimeMs === null means we cached a "file didn't exist" result; on every
+// subsequent call we re-stat to see if it appeared. mtimeMs as a number
+// means we cached a successful parse; we re-stat and only re-read if the
+// mtime changed.
+let cached = null; // { value, mtimeMs } | null
 let cacheKey = null;
 
 /**
@@ -36,23 +46,35 @@ let cacheKey = null;
  */
 function loadLocalConfig(opts = {}) {
   const filePath = opts.path || LOCAL_CONFIG_PATH;
-  if (!opts.refresh && cached !== null && cacheKey === filePath) return cached;
+
+  // F0-2: cache reuse only when (a) same file path, (b) cache is for THIS
+  // file's current mtime (or both null = "file still doesn't exist").
+  if (!opts.refresh && cached !== null && cacheKey === filePath) {
+    let currentMtime = null;
+    try { currentMtime = fs.statSync(filePath).mtimeMs; } catch { /* missing */ }
+    if (currentMtime === cached.mtimeMs) return cached.value;
+    // mtime drift → fall through to re-read.
+  }
   cacheKey = filePath;
 
   let parsed;
+  let mtimeMs = null;
   try {
     if (!fs.existsSync(filePath)) {
-      cached = {};
-      return cached;
+      cached = { value: {}, mtimeMs: null };
+      return cached.value;
     }
+    mtimeMs = fs.statSync(filePath).mtimeMs;
     const raw = fs.readFileSync(filePath, "utf8");
     parsed = JSON.parse(raw);
   } catch (e) {
-    // Silent failure — log to stderr but don't crash. Mis-edited config
-    // shouldn't take down the relay.
+    // F0-2: do NOT cache parse failures. Previous behavior: parse failure
+    // cached `{}` permanently — user fixing JSON syntax mid-session never
+    // saw the fix until restart. Now: log + return `{}` but invalidate
+    // the cache so the next call re-reads.
     process.stderr.write(`[mcp-relay] WARN: failed to parse ${filePath}: ${e.message}\n`);
-    cached = {};
-    return cached;
+    cached = null;
+    return {};
   }
 
   const out = {};
@@ -62,8 +84,8 @@ function loadLocalConfig(opts = {}) {
     if (v.length === 0) continue; // empty placeholder
     out[k] = v;
   }
-  cached = out;
-  return cached;
+  cached = { value: out, mtimeMs };
+  return out;
 }
 
 /**
