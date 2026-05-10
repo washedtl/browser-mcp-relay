@@ -247,6 +247,29 @@ async function main() {
           }
         }
         process.stderr.write(`[mcp-relay] launching Brave (port=${port}, exe=${bravePath})...\n`);
+        // F1-16 (2026-05-10): pre-launch reap of any orphan Brave squatting
+        // on our user-data-dir. Closes the gap where:
+        //   1. claimSlot() reaped at lock-acquire time, BUT no Brave was on
+        //      `dir` then (lazy launch, etc.).
+        //   2. Between claim and first ensureBrave() call, a different
+        //      relay's Brave became orphaned on `dir` (parent died — Cursor
+        //      hard-killed, blue screen, etc.).
+        //   3. launchBrave's chromium.launchPersistentContext fails with
+        //      "user data dir already in use" because the squatter is
+        //      holding the dir's SingletonLock.
+        // The reap is idempotent and cheap (one tasklist + targeted
+        // taskkill /F /T per matching PID, capped at 10s in pool-shared).
+        // Best-effort — failure here doesn't block the launch attempt; we
+        // let Playwright surface the original "user data dir in use" error
+        // so the user sees a real diagnostic, not a silent reap failure.
+        try {
+          const reaped = pool.reapOrphansFor(dir);
+          if (reaped > 0) {
+            process.stderr.write(`[mcp-relay] pre-launch reap removed ${reaped} squatter(s) on ${dir}\n`);
+          }
+        } catch (reapErr) {
+          process.stderr.write(`[mcp-relay] pre-launch reap failed (continuing): ${reapErr.message}\n`);
+        }
         const extensionPath = RELAY_ENV.BROWSER_LOAD_EXTENSIONS || null;
         // V0-1/V0-2: launchBrave resolves with a live Brave subprocess +
         // open BrowserContext. If anything between here and the bridge
