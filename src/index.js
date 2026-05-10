@@ -167,6 +167,25 @@ async function main() {
 
   async function spawnUpstream() {
     const bdmcpEntry = resolveBdmcpEntry();
+    // F1-20 (2026-05-10): patch upstream's bundled HttpResourceType enum
+    // before spawn. Upstream's enum is missing ping/prefetch/signedexchange/
+    // cspviolationreport/preflight/fedcm — Playwright returns those (Amazon
+    // affiliate links fire <a ping="..."> beacons → resourceType="ping" →
+    // upstream's zod schema rejects → o11y_get-http-requests fails).
+    //
+    // We can't use Module._compile / --require because upstream is ESM and
+    // those hooks are CJS-only. Patching the bundle on disk is reliable
+    // across both module systems. Idempotent + safe — bails on bundler
+    // shape changes rather than corrupting the file.
+    try {
+      const { applyPatch } = require("../scripts/patch-bdmcp-bundle.js");
+      const result = applyPatch();
+      if (!result.patched) {
+        process.stderr.write(`[mcp-relay] F1-20 patch skipped: ${result.reason} (o11y_get-http-requests may reject ping/prefetch/etc resourceTypes)\n`);
+      }
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] F1-20 patch threw (continuing): ${e.message}\n`);
+    }
     process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet, entry=${bdmcpEntry})...\n`);
     // CDP env points at the port we'll launch Brave on. Upstream is lazy
     // about its CDP attach (only runs in newBrowserContext on first tool
