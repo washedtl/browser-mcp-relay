@@ -94,8 +94,23 @@ test("W0-7: launchBrave with proxyUrl=null still strips BROWSER_RELAY_* from env
   // Pre-W0-7: when proxyUrl was null, no `env` was set on launchOpts and
   // Playwright passed process.env wholesale (BROWSER_RELAY_* leaked).
   // Post-W0-7: env is always sanitized; BROWSER_RELAY_* never reaches Brave.
-  const stash = process.env.BROWSER_RELAY_INSPECTOR_PORT;
+  //
+  // F1-20 fixup (2026-05-10): also stash + clear HTTP_PROXY / HTTPS_PROXY
+  // so the test passes on developer machines that have a system-wide HTTP
+  // proxy set (e.g. powhttp debug proxy at 127.0.0.1:8888). Without this,
+  // process.env.HTTP_PROXY leaks through the relay's
+  // `for (k of Object.entries(process.env))` env copy and the assertion
+  // `env.HTTP_PROXY === undefined` fires on a perfectly working relay.
+  // CI runners don't have this env var → test passes there. CLAUDE.md
+  // anti-pattern: "tests that pass on my env state."
+  const stashed = {
+    BROWSER_RELAY_INSPECTOR_PORT: process.env.BROWSER_RELAY_INSPECTOR_PORT,
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+  };
   process.env.BROWSER_RELAY_INSPECTOR_PORT = "9091";
+  delete process.env.HTTP_PROXY;
+  delete process.env.HTTPS_PROXY;
   try {
     await withMockChromium(async (fresh, captured) => {
       await fresh.launchBrave({
@@ -107,12 +122,14 @@ test("W0-7: launchBrave with proxyUrl=null still strips BROWSER_RELAY_* from env
       assert.ok(captured.launchOpts.env, "env must be set even without proxy (W0-7)");
       assert.strictEqual(captured.launchOpts.env.BROWSER_RELAY_INSPECTOR_PORT, undefined,
         "BROWSER_RELAY_* must NEVER reach the spawned Brave");
-      // No HTTP_PROXY when proxy is unset.
+      // No HTTP_PROXY when proxy is unset (and no host-env HTTP_PROXY leaked).
       assert.strictEqual(captured.launchOpts.env.HTTP_PROXY, undefined);
     });
   } finally {
-    if (stash === undefined) delete process.env.BROWSER_RELAY_INSPECTOR_PORT;
-    else process.env.BROWSER_RELAY_INSPECTOR_PORT = stash;
+    for (const [k, v] of Object.entries(stashed)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
 });
 

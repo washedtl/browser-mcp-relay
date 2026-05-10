@@ -16,6 +16,16 @@ This file is the canonical source for "what's known but not yet shipped." Items 
 
 ---
 
+## Upstream issues to file
+
+### F1-20 (workaround SHIPPED v0.3.6, upstream fix still pending)
+
+**Bug:** `browser-devtools-mcp`'s bundled `HttpResourceType` enum is missing `ping`, `prefetch`, `signedexchange`, `cspviolationreport`, `preflight`, `fedcm`. Playwright's `request.resourceType()` returns these for real-world page traffic (Amazon's `<a ping="...">` beacons, `<link rel="prefetch">`, etc.). Upstream's zod validation rejects → `o11y_get-http-requests` returns an error instead of the request data.
+
+**Workaround in relay:** `scripts/patch-bdmcp-bundle.js` patches the upstream bundle on disk at relay startup (idempotent, runs at every spawn — re-applies after `npm install` overwrites the file). See `src/index.js:spawnUpstream` for the call site.
+
+**TODO:** file an upstream issue at https://github.com/serkan-ozal/browser-devtools-mcp/issues. The fix is one line: extend the `HttpResourceType` enum to include the 6 missing values. Once shipped + bumped in our `package.json` dep range, we can delete `scripts/patch-bdmcp-bundle.js` and its tests.
+
 ## Stealth — Tier 2 (SHIPPED in v0.3.5 — 2026-05-10)
 
 The four stealth-fingerprint patches in Tier 2 shipped together. The fifth Tier 2 item (humanlike interaction tools) was different scope and ship-gated separately as Tier 2.5 below.
