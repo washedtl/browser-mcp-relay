@@ -57,7 +57,20 @@ function listProcessesWin(needle, spawn) {
   const result = spawn(
     "powershell",
     ["-NoProfile", "-Command", psScript],
-    { encoding: "utf8", windowsHide: true },
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      // G1-3 (2026-05-10): cap stdout buffer at 16MB. Default Node 1MB
+      // can truncate on systems with 100+ Brave helper processes (each
+      // command line ~500-2000 chars), making findBraveProcessesForDir
+      // miss entries → reaper no-ops → ghost Brave persists.
+      maxBuffer: 16 * 1024 * 1024,
+      // G1-3: cap PowerShell at 15s. spawnSync without timeout could hang
+      // on a wedged kernel handle; without this, claimSlot's pre-claim
+      // probe and the inspector's status poll would both hang the entire
+      // relay.
+      timeout: 15000,
+    },
   );
   if (!result || result.status !== 0) {
     const stderr = result && result.stderr ? String(result.stderr).trim() : "";
@@ -74,7 +87,12 @@ function listProcessesWin(needle, spawn) {
  *  Windows (and to handle macOS where the binary is "Brave Browser" with
  *  capital B but callers may pass lowercase "brave"). */
 function listProcessesPosix(needle, spawn) {
-  const result = spawn("ps", ["-eo", "pid,command"], { encoding: "utf8" });
+  const result = spawn("ps", ["-eo", "pid,command"], {
+    encoding: "utf8",
+    // G1-3: same caps as Windows path — see listProcessesWin.
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 15000,
+  });
   if (!result || result.status !== 0) {
     const stderr = result && result.stderr ? String(result.stderr).trim() : "";
     if (stderr) {

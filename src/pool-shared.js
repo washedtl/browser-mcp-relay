@@ -301,8 +301,13 @@ function reapOrphansFor(dir, opts = {}) {
   let killed = 0;
   for (const { pid } of matched) {
     if (platform === "win32") {
+      // G1-4 (2026-05-10): cap taskkill at 10s. Normally fast (<200ms) but
+      // a wedged kernel handle (target stuck in uninterruptible kernel wait)
+      // can make it block forever. Without this cap, claimSlot's pre-claim
+      // reap could hang the entire relay startup.
       const result = spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
         windowsHide: true,
+        timeout: 10000,
       });
       if (result && result.status === 0) {
         killed++;

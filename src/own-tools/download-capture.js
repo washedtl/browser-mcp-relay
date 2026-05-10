@@ -42,8 +42,15 @@ module.exports = {
     // crash) leaves waitForEvent pending until the full timeoutMs (default 30s).
     // The close-promise rejects with a clean message so the user gets actionable
     // feedback instead of a generic timeout.
+    //
+    // G0-1 (2026-05-10): hoist `onClose` outside the Promise constructor so it
+    // can be `page.off()`'d on the SUCCESS path. Previously the close listener
+    // was only removed when it fired (rejection path) — every successful
+    // download leaked one `close` listener until the page actually closed,
+    // tripping MaxListenersExceededWarning after ~10 sequential downloads.
+    let onClose;
     const closePromise = new Promise((_, reject) => {
-      const onClose = () => reject(new Error("page closed before download started"));
+      onClose = () => reject(new Error("page closed before download started"));
       page.once("close", onClose);
     });
 
@@ -51,6 +58,8 @@ module.exports = {
       try {
         await page.click(clickSelector, { timeout: timeoutMs });
       } catch (e) {
+        // Cleanup before early-return.
+        if (onClose) page.off("close", onClose);
         return { content: [{ type: "text", text: `click failed: ${e.message}` }], isError: true };
       }
     }
@@ -60,6 +69,10 @@ module.exports = {
       download = await Promise.race([downloadPromise, closePromise]);
     } catch (e) {
       const isPageClosed = /page closed/i.test(e.message);
+      // If we're here because of a NON-close error (timeout, etc.), the
+      // close listener is still attached and needs removal. If we're here
+      // because of close, the listener already fired (page.once auto-cleans).
+      if (!isPageClosed && onClose) page.off("close", onClose);
       return {
         content: [{
           type: "text",
@@ -70,6 +83,9 @@ module.exports = {
         isError: true,
       };
     }
+    // G0-1: success path — remove the close listener now that the download
+    // has fired. Otherwise it accumulates per call until the page closes.
+    if (onClose) page.off("close", onClose);
 
     const suggested = download.suggestedFilename() || "file.bin";
     const dst = savePath || path.join(os.tmpdir(), `download-${Date.now()}-${suggested}`);

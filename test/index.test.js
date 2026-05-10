@@ -163,3 +163,74 @@ test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first or
   assert.ok(releaseIdx < closeBraveIdx,
     "releasePool() must come BEFORE closeBrave() (W1-6 lock-first ordering for double-Ctrl-C safety)");
 });
+
+// ──────────────────────────────────────────────────────────────────
+// G0-3: upstreamChild.kill() must use process-tree kill on Windows.
+// Bare child.kill() only TerminateProcess's the immediate node PID,
+// orphaning any BDMCP-launched Brave subtree (renderers/GPU/utility).
+// ──────────────────────────────────────────────────────────────────
+
+test("G0-3: shutdown uses killUpstreamTree (taskkill /F /T on Windows)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  // Must define a killUpstreamTree helper.
+  assert.ok(/function\s+killUpstreamTree\s*\(/.test(src),
+    "expected killUpstreamTree helper");
+  // Helper must use taskkill /F /T on win32.
+  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID\s+\$\{upstreamChild\.pid\}/.test(src),
+    "killUpstreamTree must call `taskkill /F /T /PID ${upstreamChild.pid}` on win32");
+  // Both shutdown paths must call it (not bare upstreamChild.kill()).
+  // Strip comments first since the change-rationale comment mentions the bug.
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "");
+  assert.ok(/killUpstreamTree\(\)/.test(code),
+    "expected killUpstreamTree() call site in shutdown paths");
+  assert.ok(!/upstreamChild\.kill\(\)/.test(code),
+    "must not have bare upstreamChild.kill() — orphans Brave subtree on Windows");
+});
+
+// ──────────────────────────────────────────────────────────────────
+// G0-4: uncaughtException + unhandledRejection handlers — without
+// these, an unhandled throw orphans Brave + strands the lock.
+// ──────────────────────────────────────────────────────────────────
+
+test("G0-4: registers uncaughtException + unhandledRejection handlers", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  assert.ok(/process\.on\(\s*["']uncaughtException["']/.test(src),
+    "expected process.on('uncaughtException', ...) registration");
+  assert.ok(/process\.on\(\s*["']unhandledRejection["']/.test(src),
+    "expected process.on('unhandledRejection', ...) registration");
+  // uncaughtException handler must call shutdownAsync before exiting.
+  const m = src.match(/process\.on\(\s*["']uncaughtException["'][\s\S]{0,500}/);
+  assert.ok(m && /shutdownAsync\(\)/.test(m[0]),
+    "uncaughtException handler must invoke shutdownAsync() so Brave + lock get cleaned up");
+});
+
+// ──────────────────────────────────────────────────────────────────
+// G0-7 + G1-2: shutdown awaits closeBrave + inspectorHandle.close in
+// PARALLEL via Promise.all([withTimeout, withTimeout]). Sequential
+// awaits with no timeout means a hung Brave + hung inspector = sum
+// of waits. Parallel + per-step timeout = max of waits, capped.
+// ──────────────────────────────────────────────────────────────────
+
+test("G0-7 + G1-2: shutdownAsync uses withTimeout + Promise.all (parallel + capped)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  // Must define withTimeout helper.
+  assert.ok(/function\s+withTimeout\s*\(/.test(src),
+    "expected withTimeout helper for shutdown timeout safety");
+  // shutdownAsync must use Promise.all on the close tasks.
+  const m = src.match(/function\s+shutdownAsync[\s\S]*?shutdownDone\s*=\s*true/);
+  assert.ok(m, "expected shutdownAsync body");
+  assert.ok(/Promise\.all\(\s*tasks\s*\)/.test(m[0]),
+    "shutdownAsync must run close tasks in parallel via Promise.all");
+  assert.ok(/withTimeout\(closeBrave/.test(m[0]),
+    "closeBrave must be wrapped in withTimeout");
+  assert.ok(/withTimeout\(inspectorHandle\.close/.test(m[0]),
+    "inspectorHandle.close must be wrapped in withTimeout");
+});

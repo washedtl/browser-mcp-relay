@@ -13,6 +13,18 @@ let activePage = null;
 
 function setActivePage(page) {
   activePage = page;
+  // G1-1 (2026-05-10): if the page closes externally (Brave UI close, page
+  // crash, navigation that destroys the page object), null out the
+  // tracked ref. Without this, the closed Page object stays GC-pinned by
+  // the module scope until the next setActivePage call. Also matters for
+  // getActivePage's fallback chain — `activePage.isClosed()` returns true
+  // after close, but the explicit null means `getActivePageRaw()` and
+  // anything else reading the variable directly sees the right answer.
+  if (page && typeof page.once === "function") {
+    page.once("close", () => {
+      if (activePage === page) activePage = null;
+    });
+  }
 }
 
 /**

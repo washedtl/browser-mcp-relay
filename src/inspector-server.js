@@ -669,7 +669,18 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
           try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
           return killed;
         });
-        const killed = await Promise.resolve(reapFn(absDir, n));
+        // G0-8 (2026-05-10): cap the reap operation at 10s. taskkill /F /T
+        // is normally fast but a wedged kernel handle (rare; happens when
+        // a target process is stuck in an uninterruptible kernel wait) can
+        // make it block forever. Without this, the inspector's HTTP handler
+        // hangs indefinitely on a Reap click — bad UX, and the inspector
+        // backend's HTTP server can't drain.
+        const REAP_TIMEOUT_MS = 10000;
+        const reapPromise = Promise.resolve(reapFn(absDir, n));
+        const killed = await Promise.race([
+          reapPromise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error("reap timed out after " + REAP_TIMEOUT_MS + "ms")), REAP_TIMEOUT_MS)),
+        ]);
         writeJsonHead(res, 200);
         res.end(JSON.stringify({
           ok: true,
@@ -949,6 +960,15 @@ function startInspector(opts = {}) {
   });
   const server = http.createServer(handler);
 
+  // G0-6 (2026-05-10): cap idle keep-alive sockets so they don't accumulate
+  // over hours of inspector-tab idleness. Default Node keepAliveTimeout is
+  // 5s but defaults change between versions; pin them. requestTimeout caps
+  // a stuck request mid-body so a misbehaving client can't hold the server
+  // open indefinitely.
+  server.keepAliveTimeout = 5000;
+  server.headersTimeout = 10000;
+  server.requestTimeout = 30000;
+
   const wss = attachWebsocket(server, {
     trafficEmitter: opts.trafficEmitter || null,
     getRecent,
@@ -991,6 +1011,15 @@ function startInspector(opts = {}) {
             }
           } catch { /* noop */ }
           try { wss.close(); } catch { /* noop */ }
+          // G0-5 (2026-05-10): force-close idle keep-alive HTTP sockets so
+          // server.close() resolves promptly. Without this, an idle
+          // inspector tab with a keep-alive TCP socket would block close()
+          // for up to keepAliveTimeout (5s) per stuck connection. Node 18.2+
+          // exposes server.closeAllConnections (idle + active). Fall through
+          // gracefully on older Node.
+          if (typeof server.closeAllConnections === "function") {
+            try { server.closeAllConnections(); } catch { /* noop */ }
+          }
           server.close(() => r());
         }),
       });

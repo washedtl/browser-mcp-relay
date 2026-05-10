@@ -37,6 +37,22 @@ class UpstreamClient {
   _onData(chunk) {
     // Stream is in object mode? defensive: coerce.
     this.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    // G1-5 (2026-05-10): cap the unparsed buffer at 200MB. Without a cap,
+    // a runaway upstream sending a huge single line (no newline) — e.g. a
+    // misbehaving content_get-as-html on a multi-GB page — would grow the
+    // buffer indefinitely until the relay OOMs. 200MB is generous for
+    // legitimate large responses (multi-MB heap snapshot, capture_xhr body
+    // dumps) while bounded enough to fail loudly on a stuck stream.
+    const MAX_LINE_BYTES = 200 * 1024 * 1024;
+    if (this.buffer.length > MAX_LINE_BYTES) {
+      process.stderr.write(
+        `[mcp-relay] upstream line exceeds ${MAX_LINE_BYTES} bytes without newline — closing client to prevent OOM\n`,
+      );
+      // Drop the buffer; reject pending requests; mark closed.
+      this.buffer = "";
+      this._onError(new Error(`upstream line size exceeded ${MAX_LINE_BYTES} bytes`));
+      return;
+    }
     let nl;
     while ((nl = this.buffer.indexOf("\n")) !== -1) {
       const line = this.buffer.slice(0, nl);

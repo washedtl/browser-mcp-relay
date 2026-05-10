@@ -377,15 +377,47 @@ async function main() {
   let shutdownPromise = null;
   let shutdownDone = false;
 
+  // G0-3 (2026-05-10): cross-platform process-tree kill for the upstream
+  // child. Bare `child.kill()` on Windows only TerminateProcess's the node
+  // PID — its spawned BDMCP-launched children (Brave subtree if BDMCP fell
+  // back to standalone-launch) become reparented orphans. taskkill /F /T
+  // walks the tree.
+  function killUpstreamTree() {
+    if (!upstreamChild || !upstreamChild.pid) return;
+    if (process.platform === "win32") {
+      try {
+        require("node:child_process").execSync(
+          `taskkill /F /T /PID ${upstreamChild.pid}`,
+          { stdio: "ignore", windowsHide: true, timeout: 5000 },
+        );
+      } catch { /* best-effort */ }
+    } else {
+      try { upstreamChild.kill("SIGTERM"); } catch {}
+    }
+  }
+
+  // G0-7 / G1-2: race awaitable shutdown steps against a per-step timeout
+  // and run them in parallel. closeBrave can hang on a wedged renderer;
+  // inspectorHandle.close can hang on idle keep-alive sockets. Without
+  // timeouts a single slow component blocks the whole shutdown.
+  function withTimeout(promise, ms, label) {
+    return new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ status: "timeout", label }), ms);
+      promise
+        .then(() => { clearTimeout(t); resolve({ status: "ok", label }); })
+        .catch((e) => { clearTimeout(t); resolve({ status: "error", label, error: e }); });
+    });
+  }
+
   function shutdownSync() {
     // Only path here is process.on("exit") — no async, no awaits.
     if (shutdownDone) return;
     shutdownDone = true;
+    try { releasePool(); } catch {}
     if (upstreamClient) { try { upstreamClient.close(); } catch {} }
-    if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
+    killUpstreamTree();
     if (bridge) { closeBrave(bridge).catch(() => {}); }
     if (inspectorHandle) { inspectorHandle.close().catch(() => {}); }
-    try { releasePool(); } catch {}
   }
 
   function shutdownAsync() {
@@ -393,18 +425,44 @@ async function main() {
     shutdownPromise = (async () => {
       // W1-6: release the pool lock FIRST so a second Ctrl-C (which
       // process.exit's mid-await) leaves the slot reclaimable by the next
-      // relay. If we released after the long closeBrave/await chain and
-      // got interrupted, the lock would persist past process exit and
-      // future relays would see it as a stale lock requiring stale-clean.
+      // relay.
       try { releasePool(); } catch {}
       if (upstreamClient) { try { upstreamClient.close(); } catch {} }
-      if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
-      if (bridge) { try { await closeBrave(bridge); } catch {} }
-      if (inspectorHandle) { try { await inspectorHandle.close(); } catch {} }
+      // G0-3: kill the upstream tree, not just the parent PID.
+      killUpstreamTree();
+      // G1-2: run Brave-close and inspector-close in PARALLEL with per-step
+      // timeouts. Sequential await previously meant a hung Brave (30s) +
+      // hung inspector (5s) = 35s shutdown wall time.
+      const tasks = [];
+      if (bridge) tasks.push(withTimeout(closeBrave(bridge), 8000, "closeBrave"));
+      if (inspectorHandle) tasks.push(withTimeout(inspectorHandle.close(), 3000, "inspector"));
+      const results = await Promise.all(tasks);
+      for (const r of results) {
+        if (r.status === "timeout") {
+          process.stderr.write(`[mcp-relay] shutdown ${r.label} timed out — proceeding\n`);
+        }
+      }
       shutdownDone = true;
     })();
     return shutdownPromise;
   }
+
+  // G0-4 (2026-05-10): catch otherwise-uncaught throws so the relay can
+  // still run shutdown (release lock, close Brave, terminate upstream tree)
+  // before exiting. Without these, an unhandled rejection from any async
+  // path (autofill listener, inspector WS handler, capture-xhr body fetch)
+  // crashes the relay and orphans Brave + lock.
+  process.on("uncaughtException", async (e) => {
+    process.stderr.write(`[mcp-relay] uncaughtException: ${e?.stack || e}\n`);
+    try { await shutdownAsync(); } catch {}
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    // Don't shut down on unhandled rejection — it's often non-fatal (a
+    // background Promise like a body fetch that nobody awaited). Log loudly
+    // so it shows up in inspector stderr and can be debugged.
+    process.stderr.write(`[mcp-relay] unhandledRejection: ${(reason && reason.stack) || reason}\n`);
+  });
 
   // Stash on the closure so the upstream-exit handler in spawnUpstream() can
   // await the same promise. (It captures `shutdownAsync` lexically already,
