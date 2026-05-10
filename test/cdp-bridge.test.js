@@ -154,8 +154,15 @@ test("V2-7: launchBrave with proxyUrl strips BROWSER_RELAY_* env from spawned Br
       for (const k of testKeys) {
         assert.strictEqual(env[k], undefined, `expected BROWSER_RELAY_* var ${k} to be stripped from Brave env`);
       }
-      // Sanity: PATH still passes through.
-      assert.ok(env.PATH, "expected PATH to pass through to Brave");
+      // Sanity: PATH still passes through. Case-insensitive lookup because
+      // on Windows, process.env preserves key casing as `Path` (or rarely
+      // `path`) — and the relay's `for (k of Object.entries(process.env))`
+      // copy preserves whatever case the OS gave us. Locally on Win
+      // git-bash it usually surfaces as PATH; on a fresh GitHub Actions
+      // windows-latest pwsh runner it surfaces as Path. Either is correct.
+      const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH");
+      assert.ok(pathKey, `expected PATH to pass through to Brave (got keys: ${Object.keys(env).slice(0, 10).join(", ")}...)`);
+      assert.ok(env[pathKey] && env[pathKey].length > 0, "PATH must have a non-empty value");
       // Sanity: proxy still set.
       assert.strictEqual(env.HTTP_PROXY, "http://127.0.0.1:8888");
     });

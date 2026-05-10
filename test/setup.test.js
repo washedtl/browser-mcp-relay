@@ -113,7 +113,15 @@ test("package.json: setup + smoke scripts are wired", () => {
   assert.ok(pkg.scripts && typeof pkg.scripts === "object");
   assert.strictEqual(pkg.scripts.setup, "node scripts/setup.js");
   assert.strictEqual(pkg.scripts.smoke, "node scripts/smoke.js");
-  assert.ok(pkg.scripts.test && pkg.scripts.test.includes("node --test"));
+  // Test script: either inline `node --test ...globs...` (legacy bash-only)
+  // or the cross-shell wrapper `node scripts/run-tests.js` (current). Either
+  // form is acceptable; the wrapper just shells through to `node --test`.
+  assert.ok(
+    pkg.scripts.test &&
+      (pkg.scripts.test.includes("node --test") ||
+        pkg.scripts.test.includes("scripts/run-tests.js")),
+    `expected pkg.scripts.test to invoke node --test (got: ${pkg.scripts.test})`,
+  );
   assert.strictEqual(pkg.scripts.start, "node src/index.js");
 });
 
