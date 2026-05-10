@@ -31,4 +31,32 @@ function getActivePage(context) {
   return pages[pages.length - 1] || pages[0];
 }
 
-module.exports = { setActivePage, getActivePage };
+/**
+ * V1-9: tool-handler wrapper that resolves bridge + active page, returning
+ * a structured "bridge missing" / "no pages open" error result if either
+ * is unavailable. Removes ~10 lines of identical boilerplate from each of
+ * 13 own-tool handlers + standardizes the error messages.
+ *
+ * @template T
+ * @param {(ctx: { bridge: { context: import('playwright-core').BrowserContext, port: number, cdpConnectUrl: string }, page: import('playwright-core').Page }) => Promise<T>} handler
+ * @returns {Promise<T | { content: Array<{type:"text", text:string}>, isError: true }>}
+ */
+async function withActivePage(handler) {
+  const bridge = globalThis.__relayBridge;
+  if (!bridge) {
+    return {
+      content: [{ type: "text", text: "bridge missing" }],
+      isError: true,
+    };
+  }
+  const page = getActivePage(bridge.context);
+  if (!page) {
+    return {
+      content: [{ type: "text", text: "no pages open" }],
+      isError: true,
+    };
+  }
+  return handler({ bridge, page });
+}
+
+module.exports = { setActivePage, getActivePage, withActivePage };

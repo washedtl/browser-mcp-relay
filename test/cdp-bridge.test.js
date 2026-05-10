@@ -116,6 +116,43 @@ test("launchBrave: proxyUrl set → HTTP_PROXY + HTTPS_PROXY in launchOpts.env",
   });
 });
 
+// V2-7: BROWSER_RELAY_* env vars are relay-internal — Brave shouldn't see them.
+test("V2-7: launchBrave with proxyUrl strips BROWSER_RELAY_* env from spawned Brave", async () => {
+  // Stash + set test env vars before triggering launchBrave.
+  const stash = {};
+  const testKeys = ["BROWSER_RELAY_INSPECTOR_PORT", "BROWSER_RELAY_VAULT_FILES", "BROWSER_RELAY_BRAVE_PATH"];
+  for (const k of testKeys) {
+    stash[k] = process.env[k];
+    process.env[k] = "test-value-" + k;
+  }
+  process.env.PATH = process.env.PATH || "/usr/bin"; // make sure PATH passes through
+  try {
+    await withMockChromium(async (fresh, captured) => {
+      await fresh.launchBrave({
+        userDataDir: "/tmp/x",
+        port: 9999,
+        executablePath: "/fake/brave",
+        proxyUrl: "http://127.0.0.1:8888",
+      });
+      const env = captured.launchOpts.env;
+      assert.ok(env, "env must be set with proxyUrl");
+      // Critical: BROWSER_RELAY_* must NOT leak.
+      for (const k of testKeys) {
+        assert.strictEqual(env[k], undefined, `expected BROWSER_RELAY_* var ${k} to be stripped from Brave env`);
+      }
+      // Sanity: PATH still passes through.
+      assert.ok(env.PATH, "expected PATH to pass through to Brave");
+      // Sanity: proxy still set.
+      assert.strictEqual(env.HTTP_PROXY, "http://127.0.0.1:8888");
+    });
+  } finally {
+    for (const k of testKeys) {
+      if (stash[k] === undefined) delete process.env[k];
+      else process.env[k] = stash[k];
+    }
+  }
+});
+
 // ─────────────── Original integration test (skips if no Brave) ───────────────
 
 // playwright-core has no bundled chromium — use the system Brave install
@@ -156,4 +193,56 @@ test("waitForCdpReady polls /json/version until it succeeds", async () => {
     waitForCdpReady(9399, 500),
     /timeout|not ready/i,
   );
+});
+
+// ──────────────────────────────────────────────────────────────────
+// V0-3: launchBrave must close the BrowserContext if waitForCdpReady
+// throws. Otherwise the live context (with its file lock on
+// userDataDir) leaks until reboot, blocking any future relay from
+// claiming the slot.
+// ──────────────────────────────────────────────────────────────────
+
+test("V0-3: launchBrave closes context if waitForCdpReady throws", async () => {
+  const playwrightCorePath = require.resolve("playwright-core");
+  const cdpBridgePath = require.resolve("../src/cdp-bridge.js");
+  const origPlaywright = require.cache[playwrightCorePath];
+  const origCdpBridge = require.cache[cdpBridgePath];
+  const origFetch = global.fetch;
+  let closeCalls = 0;
+  // chromium stub returns a context whose close() bumps closeCalls.
+  require.cache[playwrightCorePath] = {
+    id: playwrightCorePath,
+    filename: playwrightCorePath,
+    loaded: true,
+    exports: {
+      chromium: {
+        launchPersistentContext: async () => ({
+          close: async () => { closeCalls++; },
+        }),
+      },
+    },
+  };
+  delete require.cache[cdpBridgePath];
+  // fetch always 503 → waitForCdpReady will eventually time out.
+  global.fetch = async () => ({ ok: false, status: 503 });
+  try {
+    const fresh = require("../src/cdp-bridge.js");
+    await assert.rejects(
+      fresh.launchBrave({
+        userDataDir: "/tmp/x",
+        port: 9990,
+        executablePath: "/fake/brave",
+      }),
+      /not ready/i,
+    );
+    // Critical assertion: context.close() was invoked exactly once on the
+    // way out, so the user-data-dir lock isn't leaked.
+    assert.strictEqual(closeCalls, 1, "expected context.close() to fire on waitForCdpReady throw");
+  } finally {
+    if (origPlaywright) require.cache[playwrightCorePath] = origPlaywright;
+    else delete require.cache[playwrightCorePath];
+    if (origCdpBridge) require.cache[cdpBridgePath] = origCdpBridge;
+    else delete require.cache[cdpBridgePath];
+    global.fetch = origFetch;
+  }
 });

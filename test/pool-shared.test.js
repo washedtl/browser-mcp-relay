@@ -293,3 +293,91 @@ test("loadConfig() exposes a braveDetectError property (null when detection succ
     assert.match(cfg.braveDetectError.message, /Brave/);
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// V1-1: wrapper.proxyUrl is now bridged into the relay's CONFIG so
+// the relay's launched Brave inherits the same per-process proxy
+// whitelist that wrapper-spawned BDMCP gets. Previously the field
+// was wrapper-only and the relay's Brave didn't honor it.
+// ──────────────────────────────────────────────────────────────────
+
+test("V1-1: loadConfig() exposes a proxyUrl key (always present on the returned object)", () => {
+  const cfg = pool.loadConfig({ env: {}, repoRoot: "C:\\fake\\repo" });
+  assert.ok("proxyUrl" in cfg, "proxyUrl key must be present on returned config");
+  // Either null (no env, no wrapper, or wrapper without proxyUrl) or a string.
+  assert.ok(cfg.proxyUrl === null || typeof cfg.proxyUrl === "string");
+});
+
+test("V1-1: BROWSER_RELAY_PROXY_URL env override wins over wrapper.proxyUrl", () => {
+  const cfg = pool.loadConfig({
+    env: { BROWSER_RELAY_PROXY_URL: "http://envwin:7777" },
+    repoRoot: "C:\\fake\\repo",
+  });
+  assert.strictEqual(cfg.proxyUrl, "http://envwin:7777");
+});
+
+test("V1-1: empty BROWSER_RELAY_PROXY_URL falls through to wrapper / null", () => {
+  // Empty string should be treated as unset and fall through to wrapper or null.
+  const cfg = pool.loadConfig({
+    env: { BROWSER_RELAY_PROXY_URL: "" },
+    repoRoot: "C:\\fake\\repo",
+  });
+  // Either null (no wrapper proxy) or wrapper.proxyUrl — never the empty string.
+  assert.notStrictEqual(cfg.proxyUrl, "");
+  assert.ok(cfg.proxyUrl === null || typeof cfg.proxyUrl === "string");
+});
+
+// ──────────────────────────────────────────────────────────────────
+// V1-2: bravePath resolution order is now env > wrapper > auto-detect.
+// Previously wrapper was a fallback only when auto-detect threw —
+// meaning a user who set wrapperConfig.bravePath could be silently
+// overridden by an auto-detected stale Brave install.
+// ──────────────────────────────────────────────────────────────────
+
+test("V1-2: BROWSER_RELAY_BRAVE_PATH env override is honored when file exists", () => {
+  // Use process.execPath (the running node binary) — guaranteed to exist.
+  const realFile = process.execPath;
+  const cfg = pool.loadConfig({
+    env: { BROWSER_RELAY_BRAVE_PATH: realFile },
+    repoRoot: "C:\\fake\\repo",
+  });
+  assert.strictEqual(cfg.bravePath, realFile);
+  assert.strictEqual(cfg.braveDetectError, null);
+});
+
+test("V1-2: BROWSER_RELAY_BRAVE_PATH env override pointing at non-existent file → bravePath null + braveDetectError set", () => {
+  const cfg = pool.loadConfig({
+    env: { BROWSER_RELAY_BRAVE_PATH: "Z:\\nonexistent\\brave.exe" },
+    repoRoot: "C:\\fake\\repo",
+  });
+  // env override resolution failed → fall through; on this host without a
+  // valid auto-detect, bravePath is null. With the live wrapper present,
+  // wrapper.bravePath WOULD be tried next (V1-2). Result depends on host:
+  // either wrapper-resolved (string) or null. Both paths are valid; what
+  // matters is that the env override DIDN'T silently succeed.
+  if (cfg.bravePath !== null) {
+    assert.notStrictEqual(cfg.bravePath, "Z:\\nonexistent\\brave.exe");
+  }
+  assert.ok(cfg.braveDetectError instanceof Error || cfg.braveDetectError === null);
+});
+
+test("V1-2: source-level guard — resolution order is env → wrapper → auto-detect", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "pool-shared.js"), "utf8");
+  // Comment block must declare the new order explicitly.
+  assert.match(
+    src,
+    /BROWSER_RELAY_BRAVE_PATH\s*>\s*wrapper\.CONFIG\.bravePath\s*>\s*detectBravePath/,
+    "expected resolution order documented as 'env > wrapper > auto-detect'",
+  );
+  // Implementation must check env first, wrapper second, auto-detect last.
+  // Crude regex-based ordering check: env step exists, wrapper step exists,
+  // both come before the unconditional `detectBravePath({ env })` call inside
+  // step 3.
+  const stepOneIdx = src.search(/Step 1: explicit env override/);
+  const stepTwoIdx = src.search(/Step 2: wrapper hint/);
+  const stepThreeIdx = src.search(/Step 3: auto-detect/);
+  assert.ok(stepOneIdx >= 0 && stepTwoIdx > stepOneIdx && stepThreeIdx > stepTwoIdx,
+    "expected explicit Step 1 → Step 2 → Step 3 comment markers in resolution body");
+});

@@ -12,7 +12,7 @@ const path = require("node:path");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
-const { getActivePage } = require("./_active-page.js");
+const { withActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "memory_take-heap-snapshot",
@@ -29,23 +29,7 @@ module.exports = {
       },
     },
   },
-  handler: async ({ outputPath }) => {
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) {
-      return {
-        content: [{ type: "text", text: "memory_take-heap-snapshot unavailable: relay bridge not initialized" }],
-        isError: true,
-      };
-    }
-    // Use the tracked active page (set by tabs_new / tabs_select) — not
-    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
-    const page = getActivePage(bridge.context);
-    if (!page) {
-      return {
-        content: [{ type: "text", text: "no pages open in browser context" }],
-        isError: true,
-      };
-    }
+  handler: async ({ outputPath }) => withActivePage(async ({ bridge, page }) => {
     // V1-1: per-page CDP cache — session is auto-detached on page close.
     // Detach is no longer manual, so a takeHeapSnapshot throw cannot leak
     // the session.
@@ -70,5 +54,5 @@ module.exports = {
         text: JSON.stringify({ outputPath: dst, sizeBytes, sizeMB: (sizeBytes / 1024 / 1024).toFixed(2) }, null, 2),
       }],
     };
-  },
+  }),
 };

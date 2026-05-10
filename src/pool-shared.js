@@ -100,7 +100,14 @@ try {
 /**
  * Build the relay's runtime config. Resolution order:
  *
- *   - bravePath: BROWSER_RELAY_BRAVE_PATH > detectBravePath() > wrapper config
+ *   - bravePath: BROWSER_RELAY_BRAVE_PATH > wrapper.CONFIG.bravePath > detectBravePath()
+ *     (V1-2: wrapper now wins over auto-detect when present, since auto-detect
+ *     might find a stale Brave at the standard path even when the wrapper has
+ *     an explicit override.)
+ *   - proxyUrl:  BROWSER_RELAY_PROXY_URL > wrapper.CONFIG.proxyUrl > null
+ *     (V1-1: wrapper.proxyUrl is now bridged so the relay's launched Brave
+ *     inherits the same per-process proxy whitelist that wrapper-spawned
+ *     BDMCP gets. Previously the field was wrapper-only.)
  *   - poolDirs:  BROWSER_RELAY_POOL_DIR (single-element array, opt-in)
  *                > wrapper.CONFIG.poolDirs (when the optional wrapper is present)
  *                > [<repo>/.browser-data] (standalone default)
@@ -118,25 +125,59 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
   // the file's value (if any) is used. Auto-detection still runs underneath.
   env = applyLocalConfigToEnv(env);
 
-  // Brave path: env override wins; otherwise auto-detect; otherwise wrapper hint.
+  // Brave path resolution order (V1-2):
+  //   1. BROWSER_RELAY_BRAVE_PATH (env override)  — explicit, always wins
+  //   2. wrapper.CONFIG.bravePath                 — when the optional wrapper
+  //                                                 declares one, trust it
+  //                                                 over auto-detect because
+  //                                                 the user explicitly set it
+  //   3. detectBravePath() auto-detect            — standard install paths,
+  //                                                 then registry/which probes
+  //
   // braveDetectError captures any auto-detect failure so launch-time error
-  // messages can include the original detection context (V2 follow-up from W1).
+  // messages can include the original detection context.
+  //
+  // V1-2 follow-up: step 1 now validates the env path with fs.statSync
+  // directly (not via detectBravePath, which would itself fall through to
+  // auto-detect when the env path doesn't exist). That way a bad env path
+  // truly falls through to step 2 (wrapper), not step 3 (auto-detect),
+  // matching what the doc claims.
   let bravePath = null;
   let braveDetectError = null;
-  try {
-    bravePath = detectBravePath({ env });
-  } catch (detectErr) {
-    braveDetectError = detectErr;
-    if (wrapperConfig && wrapperConfig.bravePath) {
-      bravePath = wrapperConfig.bravePath;
-    } else {
-      // Re-throw the detect error — we'll only need bravePath at launch time
-      // anyway, but tests / CONFIG inspection should see the failure.
-      // Actually: defer. Many tests just want CONFIG.poolDirs and shouldn't
-      // crash because Brave isn't installed in CI. Store null and surface
-      // the error via getBravePath() when the launch path actually needs it.
-      // The captured braveDetectError is exposed on the returned config so
-      // launch-path code can fold its message into a richer error.
+  // Step 1: explicit env override — only succeeds when file exists.
+  if (env.BROWSER_RELAY_BRAVE_PATH && env.BROWSER_RELAY_BRAVE_PATH.length > 0) {
+    const envPath = env.BROWSER_RELAY_BRAVE_PATH;
+    try {
+      if (fs.statSync(envPath).isFile()) {
+        bravePath = envPath;
+      } else {
+        braveDetectError = new Error(
+          `[browser-mcp-relay] BROWSER_RELAY_BRAVE_PATH="${envPath}" is not a file. Falling through to wrapper / auto-detect.`,
+        );
+      }
+    } catch (statErr) {
+      braveDetectError = new Error(
+        `[browser-mcp-relay] BROWSER_RELAY_BRAVE_PATH="${envPath}" but stat failed: ${statErr.message}. Falling through to wrapper / auto-detect.`,
+      );
+    }
+  }
+  // Step 2: wrapper hint (only if step 1 didn't produce a value).
+  if (!bravePath && wrapperConfig && typeof wrapperConfig.bravePath === "string" && wrapperConfig.bravePath.length > 0) {
+    try {
+      if (fs.statSync(wrapperConfig.bravePath).isFile()) {
+        bravePath = wrapperConfig.bravePath;
+      }
+    } catch { /* file missing or stat failed — fall through to auto-detect */ }
+  }
+  // Step 3: auto-detect (only if neither step 1 nor step 2 produced a value).
+  if (!bravePath) {
+    try {
+      bravePath = detectBravePath({ env });
+    } catch (detectErr) {
+      // Defer error: many tests just want CONFIG.poolDirs and shouldn't crash
+      // because Brave isn't installed in CI. Store null + capture the error
+      // so launch-path code can fold its message into a richer error.
+      braveDetectError = braveDetectError || detectErr;
       bravePath = null;
     }
   }
@@ -167,9 +208,21 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
     poolDirs = [path.join(repoRoot, ".browser-data")];
   }
 
+  // V1-1: proxyUrl resolution. The wrapper's browser-mcp-config.json may
+  // declare a proxy that wrapper-spawned BDMCP routes through; bridge it
+  // into the relay's CONFIG so index.js can pass it to launchBrave too.
+  // Env override (BROWSER_RELAY_PROXY_URL) still wins.
+  let proxyUrl = null;
+  if (env.BROWSER_RELAY_PROXY_URL && env.BROWSER_RELAY_PROXY_URL.length > 0) {
+    proxyUrl = env.BROWSER_RELAY_PROXY_URL;
+  } else if (wrapperConfig && typeof wrapperConfig.proxyUrl === "string" && wrapperConfig.proxyUrl.length > 0) {
+    proxyUrl = wrapperConfig.proxyUrl;
+  }
+
   return {
     bravePath,
     braveDetectError,
+    proxyUrl,
     poolDirs,
     slotRoles,
     cookieSourceProfile,
@@ -393,6 +446,14 @@ function claimSlot() {
         relay: true,
       }),
     );
+    // V1-4: fdatasync flushes the lock contents to disk so a crash between
+    // write and the OS's lazy flush doesn't leave a zero-length / partial
+    // lock file that other relays would see as "stale" (and unlink) — even
+    // though this process is alive and holding fd. The stale-clean in this
+    // function self-heals partial files via JSON.parse failure → pidAlive
+    // false, but the data loss window during that gap could cause a brief
+    // double-claim. fdatasync closes that window.
+    try { fs.fdatasyncSync(fd); } catch { /* fdatasync unsupported on platform */ }
 
     // Reap orphan brave AFTER lock acquired.
     reapOrphansFor(dir);

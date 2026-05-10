@@ -33,12 +33,9 @@ async function getOrCreatePageCdp(page, context) {
   return cdp;
 }
 
-/**
- * Clear the cached session for `page` (used by tools that intentionally
- * release the session — e.g. one-shot use). Does not detach; caller does.
- */
-function clearPageCdp(page) {
-  PAGE_CDP_SESSIONS.delete(page);
-}
-
-module.exports = { getOrCreatePageCdp, clearPageCdp, PAGE_CDP_SESSIONS };
+// V2-4: clearPageCdp had zero callers (page closure is the only intended
+// removal path, registered above as a `close` listener). Removed.
+// PAGE_CDP_SESSIONS stays exported as a test-only seam — emulate-device
+// and memory-take-heap-snapshot tests need to reset between runs since
+// the WeakMap survives across handler invocations on the same fake page.
+module.exports = { getOrCreatePageCdp, PAGE_CDP_SESSIONS };

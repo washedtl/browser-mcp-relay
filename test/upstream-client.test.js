@@ -98,3 +98,137 @@ test("UpstreamClient handles multiple concurrent requests with id multiplexing",
     child.kill();
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// V0-2: setEncoding('utf8') prevents multi-byte UTF-8 corruption on
+// chunk boundaries. Without it, an emoji / CJK / accented char split
+// across two chunks decodes as U+FFFD, breaking JSON.parse.
+// ──────────────────────────────────────────────────────────────────
+
+test("V0-2: constructor calls setEncoding('utf8') on the readable", () => {
+  const calls = [];
+  const fakeReadable = {
+    setEncoding(enc) { calls.push(enc); },
+    on() { /* no-op for this test */ },
+    off() {},
+  };
+  const fakeWritable = { write() {} };
+  // eslint-disable-next-line no-new
+  new UpstreamClient(fakeReadable, fakeWritable);
+  assert.deepStrictEqual(calls, ["utf8"], "expected setEncoding('utf8') to be called exactly once");
+});
+
+test("V0-2: multi-byte UTF-8 char split across chunks decodes correctly via PassThrough", async () => {
+  const { PassThrough } = require("node:stream");
+  const readable = new PassThrough();
+  const writable = new PassThrough(); // not actually used in this test
+  const client = new UpstreamClient(readable, writable);
+
+  // Send a request promise and resolve it via the response.
+  // The response includes a multi-byte char (😀 = 4-byte UTF-8 F0 9F 98 80)
+  // split between two raw-byte writes. setEncoding('utf8') buffers the
+  // partial sequence inside Node's StringDecoder; without it, both halves
+  // would surface as U+FFFD and JSON.parse would fail.
+  const reqP = client.request("test/method", {}, 1000);
+  const responseObj = { jsonrpc: "2.0", id: 1, result: { greeting: "hi 😀" } };
+  const line = JSON.stringify(responseObj) + "\n";
+  const buf = Buffer.from(line, "utf8");
+  // Find a byte index inside the multi-byte emoji.
+  const emojiStart = buf.indexOf(Buffer.from("😀", "utf8"));
+  assert.ok(emojiStart > 0, "fixture should contain emoji bytes");
+  const splitAt = emojiStart + 2; // mid-emoji split
+
+  readable.write(buf.subarray(0, splitAt));
+  readable.write(buf.subarray(splitAt));
+
+  const result = await reqP;
+  assert.strictEqual(result.greeting, "hi 😀");
+  client.close();
+});
+
+// ──────────────────────────────────────────────────────────────────
+// V0-5a: JSON-RPC 2.0 id may be number, string, or null. Production
+// previously rejected anything not typeof === "number" — silently
+// dropping spec-compliant string-id responses, causing the matching
+// request() to time out at 180s instead of resolving immediately.
+// ──────────────────────────────────────────────────────────────────
+
+test("V0-5a: response with string id is dispatched (not silently dropped)", async () => {
+  const { PassThrough } = require("node:stream");
+  const readable = new PassThrough();
+  const writable = new PassThrough();
+  const client = new UpstreamClient(readable, writable);
+  // Manually inject a pending entry with a string id (simulates a peer
+  // that uses string ids — spec-allowed).
+  let resolved = null;
+  client.pending.set("custom-id", {
+    resolve: (r) => { resolved = r; },
+    reject: () => {},
+    timer: setTimeout(() => {}, 0),
+  });
+  const line = JSON.stringify({ jsonrpc: "2.0", id: "custom-id", result: { ok: true } }) + "\n";
+  readable.write(line);
+  // Allow the data event to flush.
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(resolved, { ok: true });
+  client.close();
+});
+
+// ──────────────────────────────────────────────────────────────────
+// V0-5b: After _onError fires (e.g. transport error), subsequent
+// request() calls must reject FAST instead of queueing into a doomed
+// pending Map and timing out at 180s.
+// ──────────────────────────────────────────────────────────────────
+
+test("V0-5b: request() after _onError rejects fast (closed flag set)", async () => {
+  const { PassThrough } = require("node:stream");
+  const readable = new PassThrough();
+  const writable = new PassThrough();
+  const client = new UpstreamClient(readable, writable);
+  // Trigger _onError directly.
+  client._onError(new Error("transport boom"));
+  await assert.rejects(
+    client.request("any/method", {}, 30000),
+    /closed/i,
+    "expected fast rejection after _onError",
+  );
+});
+
+// ──────────────────────────────────────────────────────────────────
+// V0-7: _onClose / _onError / close() detach data/close/error listeners
+// so a still-alive readable stops feeding chunks into a dead client.
+// ──────────────────────────────────────────────────────────────────
+
+test("V0-7: close() removes listeners from the readable", () => {
+  const { EventEmitter } = require("node:events");
+  const readable = new EventEmitter();
+  readable.setEncoding = () => {}; // satisfy guard
+  const writable = { write() {} };
+  const client = new UpstreamClient(readable, writable);
+  // Three listeners attached: data, close, error.
+  assert.strictEqual(readable.listenerCount("data"), 1);
+  assert.strictEqual(readable.listenerCount("close"), 1);
+  assert.strictEqual(readable.listenerCount("error"), 1);
+  client.close();
+  assert.strictEqual(readable.listenerCount("data"), 0, "data listener should be removed");
+  assert.strictEqual(readable.listenerCount("close"), 0, "close listener should be removed");
+  assert.strictEqual(readable.listenerCount("error"), 0, "error listener should be removed");
+});
+
+test("V0-7: _onClose is idempotent (double-fire safe)", () => {
+  const { EventEmitter } = require("node:events");
+  const readable = new EventEmitter();
+  readable.setEncoding = () => {};
+  const writable = { write() {} };
+  const client = new UpstreamClient(readable, writable);
+  // Inject a pending; after first close it should reject; second close should be a no-op.
+  let rejectCount = 0;
+  client.pending.set(1, {
+    resolve: () => {},
+    reject: () => { rejectCount++; },
+    timer: setTimeout(() => {}, 1000),
+  });
+  readable.emit("close");
+  readable.emit("close"); // second emit must not double-reject
+  assert.strictEqual(rejectCount, 1);
+});

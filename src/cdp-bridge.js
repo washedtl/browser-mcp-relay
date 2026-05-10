@@ -73,8 +73,22 @@ async function launchBrave({
   // HTTP_PROXY / HTTPS_PROXY env so outbound traffic routes through the
   // configured HTTP proxy. The user's system proxy stays off — only this
   // launched Brave opts in.
+  //
+  // V2-7: previously this was `{ ...process.env, HTTP_PROXY, HTTPS_PROXY }`
+  // which leaked every BROWSER_RELAY_* / BROWSER_* env var into the spawned
+  // Brave process. Brave doesn't read those, but the leak is a smell — Brave
+  // shouldn't see relay-internal config. Strip the BROWSER_RELAY_* prefix
+  // (relay-internal) and pass through the rest of process.env so Brave still
+  // gets PATH, USERPROFILE, etc. that it needs to launch.
   if (proxyUrl) {
-    launchOpts.env = { ...process.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl };
+    const cleanEnv = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (k.startsWith("BROWSER_RELAY_")) continue; // relay-internal, not for Brave
+      cleanEnv[k] = v;
+    }
+    cleanEnv.HTTP_PROXY = proxyUrl;
+    cleanEnv.HTTPS_PROXY = proxyUrl;
+    launchOpts.env = cleanEnv;
     process.stderr.write(
       `[mcp-relay] proxy whitelist ACTIVE — Brave traffic routes through ${proxyUrl}\n`,
     );
@@ -84,7 +98,25 @@ async function launchBrave({
 
   // Wait for the CDP HTTP endpoint to respond before returning. Upstream's
   // connectOverCDP will hit /json/version, so we want it ready first.
-  await waitForCdpReady(port, 10000);
+  //
+  // V0-3: launchPersistentContext returned a LIVE context that holds a file
+  // lock on userDataDir. If waitForCdpReady throws (timeout, unreachable CDP),
+  // the context would leak forever — the lock blocks any other relay from
+  // claiming this slot until the user reboots / kills brave.exe by hand. So
+  // we close the context on any waitForCdpReady failure before re-throwing.
+  // attachWithCleanupOnError in index.js only wraps post-launch steps, so
+  // this cleanup must live here.
+  try {
+    await waitForCdpReady(port, 10000);
+  } catch (e) {
+    try { await context.close(); }
+    catch (closeErr) {
+      process.stderr.write(
+        `[mcp-relay] cdp-bridge: context.close() failed during waitForCdpReady cleanup: ${closeErr.message}\n`,
+      );
+    }
+    throw e;
+  }
 
   return {
     context,

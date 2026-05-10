@@ -2,7 +2,7 @@
 // (alert/confirm/prompt) on the active page. Use this BEFORE triggering an
 // action that opens a dialog.
 
-const { getActivePage } = require("./_active-page.js");
+const { withActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "dialog_handle",
@@ -18,15 +18,7 @@ module.exports = {
       timeoutMs: { type: "integer", default: 30000, description: "Max wait for the dialog to appear" },
     },
   },
-  handler: async ({ action = "accept", promptText, timeoutMs = 30000 }) => {
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    // Use the tracked active page (set by tabs_new / tabs_select) — not
-    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
-    const page = getActivePage(bridge.context);
-    if (!page) {
-      return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    }
+  handler: async ({ action = "accept", promptText, timeoutMs = 30000 }) => withActivePage(async ({ page }) => {
     return await new Promise((resolve) => {
       // V1-3: if the timeout fires AND the dialog arrives in the same tick,
       // both branches would resolve the promise (only the first take effect)
@@ -55,5 +47,5 @@ module.exports = {
       };
       page.once("dialog", onDialog);
     });
-  },
+  }),
 };

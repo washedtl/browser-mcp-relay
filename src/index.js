@@ -240,13 +240,18 @@ async function main() {
         // logging code itself), the live context would leak with its
         // user-data-dir lock held forever. attachWithCleanupOnError closes
         // the context on any throw before rethrowing.
+        // V1-1: proxyUrl resolution prefers env override, then bridges through
+        // pool.CONFIG.proxyUrl (which itself reads from wrapper's
+        // browser-mcp-config.json when the wrapper bridge is active). This
+        // closes the gap where wrapper-spawned BDMCP routed through the
+        // configured proxy but the relay's launched Brave didn't.
         const launched = await launchBrave({
           userDataDir: dir,
           port,
           headless: RELAY_ENV.BROWSER_HEADLESS_ENABLE === "true",
           extensionPath,
           executablePath: bravePath,
-          proxyUrl: RELAY_ENV.BROWSER_RELAY_PROXY_URL || null,
+          proxyUrl: RELAY_ENV.BROWSER_RELAY_PROXY_URL || pool.CONFIG.proxyUrl || null,
         });
         return await attachWithCleanupOnError(launched, async (l) => {
           process.stderr.write(`[mcp-relay] Brave ready (cdpConnectUrl=${l.cdpConnectUrl})\n`);
@@ -343,14 +348,25 @@ async function main() {
   //      context.close is async; we lose the await here. Brave subprocesses
   //      may briefly orphan on abrupt exit — acceptable last-ditch path.)
   //    - shutdownAsync: for SIGINT/SIGTERM/upstream-child-exit, where we have
-  //      a chance to await Brave teardown before process.exit. Eliminates
-  //      the orphan-Brave race in the common graceful-exit cases.
-  //    Both paths share the `shutdownStarted` flag for idempotency.
-  let shutdownStarted = false;
+  //      a chance to await Brave teardown before process.exit.
+  //
+  // V0-4: shutdownAsync is now memoized into `shutdownPromise`. The previous
+  // implementation used a `shutdownStarted` flag — but a flag only prevents
+  // re-running the body, it doesn't make concurrent callers wait for the
+  // first caller's await chain. Result: signal handler and upstream-exit
+  // handler could BOTH fire simultaneously; the second caller would early-
+  // return from the flag check and immediately `process.exit`, cutting the
+  // first caller's `await closeBrave()` short. Brave subprocesses orphaned.
+  //
+  // Single in-flight promise → all callers await the same chain → exit
+  // happens only after the chain settles.
+  let shutdownPromise = null;
+  let shutdownDone = false;
 
   function shutdownSync() {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
+    // Only path here is process.on("exit") — no async, no awaits.
+    if (shutdownDone) return;
+    shutdownDone = true;
     if (upstreamClient) { try { upstreamClient.close(); } catch {} }
     if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
     if (bridge) { closeBrave(bridge).catch(() => {}); }
@@ -358,19 +374,31 @@ async function main() {
     try { releasePool(); } catch {}
   }
 
-  async function shutdownAsync() {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    if (upstreamClient) { try { upstreamClient.close(); } catch {} }
-    if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
-    if (bridge) { try { await closeBrave(bridge); } catch {} }
-    if (inspectorHandle) { try { await inspectorHandle.close(); } catch {} }
-    try { releasePool(); } catch {}
+  function shutdownAsync() {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      if (upstreamClient) { try { upstreamClient.close(); } catch {} }
+      if (upstreamChild) { try { upstreamChild.kill(); } catch {} }
+      if (bridge) { try { await closeBrave(bridge); } catch {} }
+      if (inspectorHandle) { try { await inspectorHandle.close(); } catch {} }
+      try { releasePool(); } catch {}
+      shutdownDone = true;
+    })();
+    return shutdownPromise;
   }
 
+  // Stash on the closure so the upstream-exit handler in spawnUpstream() can
+  // await the same promise. (It captures `shutdownAsync` lexically already,
+  // so this works without explicit hoisting — keep this comment as a marker.)
   process.on("exit", shutdownSync);
-  process.on("SIGINT", async () => { await shutdownAsync(); process.exit(130); });
-  process.on("SIGTERM", async () => { await shutdownAsync(); process.exit(143); });
+  process.on("SIGINT", async () => {
+    try { await shutdownAsync(); } catch {}
+    process.exit(130);
+  });
+  process.on("SIGTERM", async () => {
+    try { await shutdownAsync(); } catch {}
+    process.exit(143);
+  });
 }
 
 if (require.main === module) {

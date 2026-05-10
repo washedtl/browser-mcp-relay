@@ -249,8 +249,16 @@
       return card;
     }
 
-    // Claimed
-    card.appendChild(el("div", { class: "slot-client" }, "Brave PID " + (slot.pid != null ? slot.pid : "—")));
+    // Claimed. `slot.pid` is the lock-holder PID (the relay's own process) — not Brave.
+    // Real Brave PIDs come from `slot.bravePids` (populated by findBraveProcessesForDir).
+    // Brave is lazy-launched on first tools/call, so a slot can be claimed with no Brave yet.
+    const _bravePid = (slot.bravePids && slot.bravePids[0]) || null;
+    const _clientLabel = _bravePid != null
+      ? "Brave PID " + _bravePid
+      : slot.pid != null
+        ? "Owner PID " + slot.pid + " · Brave not launched"
+        : "—";
+    card.appendChild(el("div", { class: "slot-client" }, _clientLabel));
     card.appendChild(
       el("span", { class: "slot-role" + (slot.role && slot.role !== "default" ? " " + slot.role : "") }, slot.role || "default"),
     );
@@ -1295,9 +1303,18 @@
       el("div", { class: "slot-summary-name" }, "Slot " + slot.index),
       el("div", { class: "slot-summary-dir mono" }, slot.dir || "—"),
     ]);
+    // V1-3: same data-shape gotcha as the home-page card. `slot.pid` is the
+    // lock-holder PID (relay's node), `slot.bravePids[]` is the live Brave
+    // process tree. Show both, clearly distinguished, so a user inspecting a
+    // slot doesn't confuse the relay's PID with Brave's.
+    const _slotBravePid = (slot.bravePids && slot.bravePids[0]) || null;
+    const _slotBravePidLabel = _slotBravePid != null
+      ? String(_slotBravePid) + (slot.bravePids.length > 1 ? " +" + (slot.bravePids.length - 1) : "")
+      : (slot.state === "claimed" ? "not launched" : "—");
     const headRight = el("div", { class: "slot-summary-stats mono" }, [
       el("span", null, [el("span", { class: "k" }, "STATE"), el("span", { class: "v " + stateClass }, stateLabel)]),
-      el("span", null, [el("span", { class: "k" }, "PID"), el("span", { class: "v" }, slot.pid != null ? String(slot.pid) : "—")]),
+      el("span", null, [el("span", { class: "k" }, "OWNER PID"), el("span", { class: "v" }, slot.pid != null ? String(slot.pid) : "—")]),
+      el("span", null, [el("span", { class: "k" }, "BRAVE PID"), el("span", { class: "v" }, _slotBravePidLabel)]),
       el("span", null, [el("span", { class: "k" }, "ROLE"), el("span", { class: "v" }, slot.role || "default")]),
       el("span", null, [el("span", { class: "k" }, "UP"), el("span", { class: "v" }, slot.lockHeldMs != null ? formatDuration(slot.lockHeldMs / 1000) : "—")]),
       el("span", null, [el("span", { class: "k" }, "COOKIE"), el("span", { class: "v" }, formatCookieAge(slot.cookieAgeDays))]),
@@ -1521,6 +1538,18 @@
   // ─── Mutating action wiring (W11) ─────────────────────────────────────
 
   async function reapSlotAction(slotIndex) {
+    // V2-3: explicit confirmation. Mis-clicking on an orphan card otherwise
+    // silently kills processes for that slot. The check is cheap and the
+    // action is non-trivial (taskkill /F /T can interrupt user work in
+    // rare cases where the orphan PID has been recycled).
+    if (typeof window !== "undefined" && typeof window.confirm === "function") {
+      const ok = window.confirm(
+        "Reap orphan slot " + slotIndex + "?\n\n" +
+        "This kills any Brave processes still holding the slot's user-data-dir " +
+        "and clears the stale lock file. Use only if the slot is genuinely orphaned."
+      );
+      if (!ok) return;
+    }
     try {
       const r = await fetch("/api/slots/" + slotIndex + "/reap", {
         method: "POST",

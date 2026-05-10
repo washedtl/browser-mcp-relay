@@ -82,13 +82,23 @@ function redactErrorPaths(text) {
   // Concretely: drive-letter + slash + any number of segments containing
   // \w / spaces / dots / dashes ending in a slash, then a final segment.
   const winRe = /[A-Za-z]:[\\/](?:[\w .\-+]+[\\/])+([\w .\-+]+)/g;
+  // V2-2: UNC paths (\\server\share\dir\file). Two leading backslashes are
+  // significant on Windows; collapse the host + share + intermediate dirs
+  // into <...> and keep the basename for context.
+  const uncRe = /\\\\[\w.\-]+\\[\w.\-+ ]+(?:\\[\w .\-+]+)+\\([\w .\-+]+)/g;
   // POSIX absolute: a leading slash, at least one mid-segment with a
   // trailing slash, then a final segment. Anchored either at the start or
   // after a whitespace/punct boundary so we don't eat random `/` characters.
   const posixRe = /(^|(?<=[\s"'(,]))\/(?:[\w .\-+]+\/)+([\w .\-+]+)/g;
+  // V2-2: POSIX single-segment absolute paths (`/etc`, `/var`, `/foo`) —
+  // these don't have an intermediate dir but still leak the absolute prefix.
+  // Anchor on word-boundary + leading slash + a single segment + edge.
+  const posixSingleRe = /(^|(?<=[\s"'(,]))\/([\w.\-+]+)(?=$|[\s"'),:;])/g;
   return String(text)
+    .replace(uncRe, (_m, base) => "<...>/" + base)
     .replace(winRe, (_m, base) => "<...>/" + base)
-    .replace(posixRe, (_m, lead, base) => lead + "<...>/" + base);
+    .replace(posixRe, (_m, lead, base) => lead + "<...>/" + base)
+    .replace(posixSingleRe, (_m, lead, base) => lead + "<...>/" + base);
 }
 
 function formatDuration(seconds) {
@@ -442,9 +452,25 @@ const STATIC_MAP = {
 
 // Defense-in-depth headers applied to every response. The inspector never
 // embeds in iframes or admits cross-origin reads, so these are blanket-set.
+//
+// V2-1: CSP tightened from `frame-ancestors 'none'`-only to a full directive
+// list. `default-src 'self'` denies cross-origin script/img/etc by default;
+// `script-src 'self' 'unsafe-inline'` keeps the inspector's inline init
+// script working without opening up to remote eval; `connect-src 'self'`
+// limits XHR/WS to same-origin (defense against compromised inline script).
+// Forms blocked entirely (we have one POST endpoint reached via fetch).
 const SECURITY_HEADERS = {
   "X-Frame-Options": "DENY",
-  "Content-Security-Policy": "frame-ancestors 'none'",
+  "Content-Security-Policy": [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+  ].join("; "),
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
 };
@@ -558,10 +584,25 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
     }
 
     // Origin gate for non-GET/HEAD. POST is the FIRST mutating method we
-    // expose (W11). Missing Origin = trusted (curl). Hostile cross-origin
-    // POST → 403 even before reaching the route handler.
+    // expose (W11).
+    //
+    // V1-6: previously this matched the WS path's "missing Origin = trusted"
+    // semantics, which is correct for WS upgrade (curl / native ws clients
+    // don't send Origin) but unsafe for POST. Cross-origin form POSTs from
+    // a hostile webpage on `evil.com` SHOULD always include Origin per modern
+    // browser policy, and a 403 stops them. But Origin can be stripped on
+    // certain redirect paths or by older clients, and a missing-Origin = OK
+    // policy lets that bypass slip through to the reap endpoint. Tighten:
+    // for mutating methods, require Origin to be PRESENT and allowed. Local
+    // CLI clients (curl, scripts) can still call the read-only GETs without
+    // Origin; CSRF protection only matters for the mutating POSTs anyway.
     if (method !== "GET" && method !== "HEAD") {
       const origin = req.headers && req.headers.origin;
+      if (!origin) {
+        writeJsonHead(res, 403);
+        res.end(JSON.stringify({ error: "missing origin header (required on mutating requests)" }));
+        return;
+      }
       if (!isOriginAllowed(origin)) {
         writeJsonHead(res, 403);
         res.end(JSON.stringify({ error: "forbidden origin" }));
