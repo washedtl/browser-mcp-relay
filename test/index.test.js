@@ -234,3 +234,42 @@ test("G0-7 + G1-2: shutdownAsync uses withTimeout + Promise.all (parallel + capp
   assert.ok(/withTimeout\(inspectorHandle\.close/.test(m[0]),
     "inspectorHandle.close must be wrapped in withTimeout");
 });
+
+// ──────────────────────────────────────────────────────────────────
+// F1-16 (2026-05-10): pre-launch reap of orphan Brave squatters.
+//
+// claimSlot() reaps orphans at lock-acquire time, but a relay can claim
+// a slot without launching Brave (lazy launch on first tool call). If a
+// previous-session Brave is later orphaned onto that user-data-dir
+// (parent died, hard-killed Cursor, blue screen), claimSlot's old reap
+// has already run and missed it. launchBrave then fails with "user data
+// dir already in use".
+//
+// Invariant: the reap call MUST appear in ensureBrave's body BEFORE the
+// launchBrave() call, so any squatter that sneaked in after the
+// claim-time reap is killed before Playwright touches the dir.
+// ──────────────────────────────────────────────────────────────────
+
+test("F1-16: ensureBrave reaps orphans BEFORE calling launchBrave", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+
+  // Find the slice from the "launching Brave" log line through the
+  // launchBrave call. The reap must appear in this slice; anything before
+  // the log line is too early (could be from claimSlot's own reap path
+  // bleeding in via comments).
+  const launchMatch = src.match(/launching Brave[\s\S]*?await\s+launchBrave\(/);
+  assert.ok(launchMatch, "expected launching-Brave log + await launchBrave block in ensureBrave");
+  const slice = launchMatch[0];
+
+  assert.ok(/pool\.reapOrphansFor\(\s*dir\s*\)/.test(slice),
+    "F1-16: ensureBrave must call pool.reapOrphansFor(dir) between the launch log and launchBrave()");
+
+  // Belt-and-brace: the reap should be inside a try/catch so a reap
+  // failure doesn't block the launch attempt itself (we'd rather see
+  // Playwright's "user data dir in use" diagnostic than a silent reap
+  // exception).
+  assert.ok(/try\s*\{[\s\S]*?pool\.reapOrphansFor\([\s\S]*?\}\s*catch/.test(slice),
+    "F1-16: pre-launch reap must be wrapped in try/catch (best-effort)");
+});
