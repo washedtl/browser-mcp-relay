@@ -69,6 +69,12 @@ module.exports = {
         maximum: 5000,
         description: "Stop recording new responses after this many. Default 500 — prevents unbounded heap on chatty pages. When the cap is hit, `truncated: true` is set on the result and any responses past the cap are dropped.",
       },
+      maxTotalBytes: {
+        type: "integer",
+        default: 50_000_000,
+        minimum: 1024,
+        description: "Aggregate cap on captured body bytes (default 50MB). Once exceeded, headers are still recorded but bodies are skipped with `bodyError: 'aggregate cap reached'`. Belt-and-suspenders against memory balloon when maxBodyBytes × maxResponses is set high.",
+      },
     },
   },
   handler: async (_args = {}) => withActivePage(async ({ page }) => {
@@ -89,6 +95,8 @@ module.exports = {
     if (maxBodyBytes == null || !Number.isFinite(maxBodyBytes) || maxBodyBytes < 1) maxBodyBytes = 100000;
     let maxResponses = _args.maxResponses;
     if (maxResponses == null || !Number.isFinite(maxResponses) || maxResponses < 1) maxResponses = 500;
+    let maxTotalBytes = _args.maxTotalBytes;
+    if (maxTotalBytes == null || !Number.isFinite(maxTotalBytes) || maxTotalBytes < 1024) maxTotalBytes = 50_000_000;
 
     let filter = null;
     if (urlFilter) {
@@ -112,6 +120,12 @@ module.exports = {
     const captured = [];
     const pendingBodies = []; // T0-2: parallel body fetches resolved at end
     let truncated = false;
+    // F1-18 (2026-05-10): track aggregate body bytes captured so far so we
+    // can stop fetching bodies once we've hit the aggregate cap. This is
+    // belt-and-suspenders against the case where a caller sets
+    // maxBodyBytes × maxResponses to a multi-GB combined budget.
+    let totalBytes = 0;
+    let aggregateCapHit = false;
 
     const onResponse = (response) => {
       // T0-3: hard cap to prevent unbounded heap. Drop the rest, mark truncated.
@@ -136,21 +150,40 @@ module.exports = {
         // Push synchronously so ordering is preserved relative to event arrival.
         captured.push(entry);
         if (includeBody) {
-          // T0-2: don't await here — fire-and-forget into pendingBodies. If body
-          // N is slow, body N+1's listener doesn't queue behind it. We
-          // Promise.allSettled at the end before serializing.
-          pendingBodies.push(
-            response.body()
-              .then((buf) => {
-                const text = buf.toString("utf8");
-                entry.body = text.length > maxBodyBytes
-                  ? text.slice(0, maxBodyBytes) + "...[truncated]"
-                  : text;
-              })
-              .catch((e) => {
-                entry.bodyError = e.message || String(e);
-              })
-          );
+          // F1-18 (2026-05-10): if we're already over the aggregate cap,
+          // don't even fetch the body — Playwright's response.body() loads
+          // the FULL response into memory before our maxBodyBytes truncation
+          // runs, so a 50MB JSON returned by a single endpoint would balloon
+          // RSS even if maxBodyBytes is set to 100KB. Skipping the fetch
+          // keeps memory bounded by the aggregate cap regardless of
+          // maxBodyBytes / maxResponses settings.
+          if (totalBytes >= maxTotalBytes) {
+            entry.bodyError = "aggregate cap reached";
+            aggregateCapHit = true;
+          } else {
+            // T0-2: don't await here — fire-and-forget into pendingBodies. If body
+            // N is slow, body N+1's listener doesn't queue behind it. We
+            // Promise.allSettled at the end before serializing.
+            pendingBodies.push(
+              response.body()
+                .then((buf) => {
+                  const text = buf.toString("utf8");
+                  const truncatedText = text.length > maxBodyBytes
+                    ? text.slice(0, maxBodyBytes) + "...[truncated]"
+                    : text;
+                  // F1-18: charge the kept bytes (post-truncation) toward
+                  // the aggregate cap. This means a single 5GB response
+                  // truncated to 100KB only counts as 100KB — what we keep
+                  // is what bounds memory.
+                  totalBytes += truncatedText.length;
+                  entry.body = truncatedText;
+                  if (totalBytes >= maxTotalBytes) aggregateCapHit = true;
+                })
+                .catch((e) => {
+                  entry.bodyError = e.message || String(e);
+                })
+            );
+          }
         }
       } catch { /* ignore per-response errors */ }
     };
@@ -210,6 +243,8 @@ module.exports = {
         type: "text",
         text: JSON.stringify({
           count: captured.length,
+          totalBodyBytes: totalBytes,
+          aggregateCapHit,
           responses: captured,
           navError,
           truncated,

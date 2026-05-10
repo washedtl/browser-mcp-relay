@@ -60,6 +60,42 @@ module.exports = {
         isError: true,
       };
     }
+    // F1-17 (2026-05-10): validate per-field shape upfront. The in-page
+    // try/catch (line 103-105) catches selector errors per-field and records
+    // them as { __error: ... } so OTHER fields proceed — that's the right
+    // behavior for runtime failures (e.g. selector matches nothing). But a
+    // STRUCTURAL error (`{ selector: null }`, `{ selector: 123 }`,
+    // `{ selector: "" }`, missing `selector` entirely) is a caller bug, not
+    // a runtime mismatch — surface it at handler entry with the field name
+    // so the user knows EXACTLY which field they got wrong, instead of
+    // getting `{ __error: "Failed to execute querySelector: ... is not a
+    // valid selector" }` buried in the per-field result.
+    for (const [field, spec] of Object.entries(schema)) {
+      if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+        return {
+          content: [{ type: "text", text: `extract_structured: schema.${field} must be an object with at least { selector }` }],
+          isError: true,
+        };
+      }
+      if (typeof spec.selector !== "string" || spec.selector.length === 0) {
+        return {
+          content: [{ type: "text", text: `extract_structured: schema.${field}.selector must be a non-empty string (got ${JSON.stringify(spec.selector)})` }],
+          isError: true,
+        };
+      }
+      if (spec.attribute !== undefined && typeof spec.attribute !== "string") {
+        return {
+          content: [{ type: "text", text: `extract_structured: schema.${field}.attribute must be a string when provided (got ${typeof spec.attribute})` }],
+          isError: true,
+        };
+      }
+      if (spec.multiple !== undefined && typeof spec.multiple !== "boolean") {
+        return {
+          content: [{ type: "text", text: `extract_structured: schema.${field}.multiple must be boolean when provided (got ${typeof spec.multiple})` }],
+          isError: true,
+        };
+      }
+    }
     if (navigateToUrl) {
       try { await page.goto(navigateToUrl, { waitUntil: "domcontentloaded" }); }
       catch (e) { return { content: [{ type: "text", text: `nav failed: ${e.message}` }], isError: true }; }
