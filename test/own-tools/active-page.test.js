@@ -225,3 +225,71 @@ test("emulate_device: targets the tracked active page, not pages[0]", async () =
     clearActivePage();
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// V1-9: withActivePage helper. Removes ~70 LoC of duplicated
+// bridge+page boilerplate from 8 own-tools and standardizes the
+// error messages ("bridge missing" / "no pages open").
+// ──────────────────────────────────────────────────────────────────
+
+test("V1-9: withActivePage returns 'bridge missing' isError when bridge undefined", async () => {
+  const { withActivePage } = require("../../src/own-tools/_active-page.js");
+  const prev = globalThis.__relayBridge;
+  globalThis.__relayBridge = undefined;
+  try {
+    const result = await withActivePage(async () => {
+      throw new Error("handler should not be called");
+    });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.content[0].text, /bridge missing/);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("V1-9: withActivePage returns 'no pages open' isError when context has no pages", async () => {
+  const { withActivePage } = require("../../src/own-tools/_active-page.js");
+  const prev = globalThis.__relayBridge;
+  globalThis.__relayBridge = { context: { pages: () => [] } };
+  try {
+    const result = await withActivePage(async () => {
+      throw new Error("handler should not be called");
+    });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.content[0].text, /no pages open/);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("V1-9: withActivePage passes { bridge, page } to handler on success", async () => {
+  const { withActivePage, setActivePage, clearActivePage } = require("../../src/own-tools/_active-page.js");
+  const prev = globalThis.__relayBridge;
+  const _clear = clearActivePage || (() => setActivePage(null));
+  const fakePage2 = { url: () => "https://example.com", isClosed: () => false };
+  const fakeContext = { pages: () => [fakePage2] };
+  const fakeBridge = { context: fakeContext, port: 9333, cdpConnectUrl: "http://x" };
+  globalThis.__relayBridge = fakeBridge;
+  setActivePage(fakePage2);
+  try {
+    const observed = await withActivePage(async ({ bridge, page }) => {
+      return { bridgeIs: bridge === fakeBridge, pageIs: page === fakePage2 };
+    });
+    assert.deepStrictEqual(observed, { bridgeIs: true, pageIs: true });
+  } finally {
+    globalThis.__relayBridge = prev;
+    _clear();
+  }
+});
+
+test("V1-9: withActivePage propagates handler return value as-is", async () => {
+  const { withActivePage } = require("../../src/own-tools/_active-page.js");
+  const prev = globalThis.__relayBridge;
+  globalThis.__relayBridge = { context: { pages: () => [{ url: () => "x", isClosed: () => false }] } };
+  try {
+    const ret = await withActivePage(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    assert.deepStrictEqual(ret, { content: [{ type: "text", text: "ok" }] });
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});

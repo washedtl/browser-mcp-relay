@@ -85,7 +85,7 @@ function makeSeams(overrides = {}) {
     }),
     _now: () => Date.now(),
     _startedAt: Date.now() - 5000,
-    _ownTools: new Array(16).fill({ name: "x" }),
+    _ownTools: new Array(19).fill({ name: "x" }),
     _env: {},
     ...overrides.extra,
   };
@@ -212,8 +212,8 @@ test("buildStatus: bravePath is redacted to basename", () => {
 
 test("buildStatus: tools.ownCount comes from ownTools length", () => {
   const status = buildStatus(makeSeams());
-  assert.strictEqual(status.tools.ownCount, 16);
-  assert.strictEqual(status.tools.total, 16 + 51);
+  assert.strictEqual(status.tools.ownCount, 19);
+  assert.strictEqual(status.tools.total, 19 + 51);
 });
 
 // ─── v0.2.1: cookieSource block on buildStatus ──────────────────────────
@@ -375,9 +375,11 @@ test("GET /unknown → 404 with JSON error", async () => {
 });
 
 test("POST /api/status → 405 method not allowed", async () => {
+  // V1-6: must send a valid Origin header to pass the CSRF gate, otherwise
+  // the request is rejected with 403 before reaching the route's method check.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/status", "POST");
+    const r = await fetchWithHeaders(port, "/api/status", "POST", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
     const body = JSON.parse(r.body);
     assert.strictEqual(body.error, "method not allowed");
@@ -550,9 +552,10 @@ test("GET /specialty → 404 (page removed v0.2.1)", async () => {
 });
 
 test("POST /api/settings → 405 method not allowed (no mutating endpoints in W8)", async () => {
+  // V1-6: send Origin to pass CSRF gate so we test the method check.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/settings", "POST");
+    const r = await fetchWithHeaders(port, "/api/settings", "POST", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -599,14 +602,17 @@ test("inputSchemaPreview: returns comma-separated top-level field names", () => 
   assert.strictEqual(s, "url, formFactor, onlyCategories");
 });
 
-test("buildToolsCatalog: total = own + forwarded = 67 (16 + 51)", () => {
+test("buildToolsCatalog: total = own + forwarded = 70 (19 + 51)", () => {
+  // Updated 2026-05-09: added storage_get-local / storage_set-local /
+  // storage_clear-local own-tools (auth tokens for Discord/Notion/etc live
+  // in localStorage, not HTTP cookies). 16 → 19 own-tools.
   const c = buildToolsCatalog();
-  assert.strictEqual(c.total, 67);
-  assert.strictEqual(c.ownCount, 16);
+  assert.strictEqual(c.total, 70);
+  assert.strictEqual(c.ownCount, 19);
   assert.strictEqual(c.forwardedCount, 51);
   assert.ok(Array.isArray(c.own));
   assert.ok(Array.isArray(c.forwarded));
-  assert.strictEqual(c.own.length, 16);
+  assert.strictEqual(c.own.length, 19);
   assert.strictEqual(c.forwarded.length, 51);
 });
 
@@ -680,10 +686,10 @@ test("GET /api/tools → 200 with valid shape", async () => {
     assert.strictEqual(r.status, 200);
     assert.match(r.headers["content-type"], /application\/json/);
     const body = JSON.parse(r.body);
-    assert.strictEqual(body.total, 67);
-    assert.strictEqual(body.ownCount, 16);
+    assert.strictEqual(body.total, 70);
+    assert.strictEqual(body.ownCount, 19);
     assert.strictEqual(body.forwardedCount, 51);
-    assert.strictEqual(body.own.length, 16);
+    assert.strictEqual(body.own.length, 19);
     assert.strictEqual(body.forwarded.length, 51);
   } finally {
     server.close();
@@ -717,9 +723,10 @@ test("/api/tools response never leaks absolute paths (sourceFile basename only)"
 });
 
 test("POST /api/tools → 405 method not allowed (read-only in W9)", async () => {
+  // V1-6: send Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/tools", "POST");
+    const r = await fetchWithHeaders(port, "/api/tools", "POST", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1134,9 +1141,10 @@ test("GET /%2e%2e/foo → 404 (encoded path traversal blocked)", async () => {
 });
 
 test("PUT /api/status → 405 (read-only method enforcement)", async () => {
+  // V1-6: include Origin so the CSRF gate doesn't 403 first.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/status", "PUT");
+    const r = await fetchWithHeaders(port, "/api/status", "PUT", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1144,9 +1152,10 @@ test("PUT /api/status → 405 (read-only method enforcement)", async () => {
 });
 
 test("DELETE /api/status → 405", async () => {
+  // V1-6: include Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/status", "DELETE");
+    const r = await fetchWithHeaders(port, "/api/status", "DELETE", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1154,9 +1163,10 @@ test("DELETE /api/status → 405", async () => {
 });
 
 test("PATCH /api/status → 405", async () => {
+  // V1-6: include Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/status", "PATCH");
+    const r = await fetchWithHeaders(port, "/api/status", "PATCH", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1164,9 +1174,10 @@ test("PATCH /api/status → 405", async () => {
 });
 
 test("OPTIONS /api/status → 405 (we don't honor CORS preflight)", async () => {
+  // V1-6: include Origin to pass CSRF gate so we test method enforcement.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/status", "OPTIONS");
+    const r = await fetchWithHeaders(port, "/api/status", "OPTIONS", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1286,9 +1297,10 @@ test("GET /activity → 200 serves index.html (SPA route)", async () => {
 });
 
 test("POST /api/activity → 405 (read-only)", async () => {
+  // V1-6: send Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetch(port, "/api/activity", "POST");
+    const r = await fetchWithHeaders(port, "/api/activity", "POST", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1332,14 +1344,29 @@ test("POST /api/slots/1/reap with hostile Origin → 403", async () => {
   }
 });
 
-test("POST /api/slots/1/reap with no Origin → not 403 (curl path)", async () => {
-  // Slot 1 in default seams is `claimed`, so it should return 400 not-orphan.
-  // The point of this test is: 403 came BEFORE seeing the body, no-Origin
-  // should not produce 403.
+test("V1-6: POST /api/slots/1/reap with NO Origin → 403 missing origin (CSRF defense)", async () => {
+  // V1-6 contract change: previously a missing Origin header was treated as
+  // "trusted" (curl path) and the request fell through to the route. CSRF
+  // defense now requires Origin to be PRESENT and allowed for any mutating
+  // method. CLI clients can still call read-only GETs without an Origin.
   const { server, port } = await startServer();
   try {
     const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", {});
-    assert.notStrictEqual(r.status, 403);
+    assert.strictEqual(r.status, 403, "expected 403 when Origin header is absent on POST");
+    const body = JSON.parse(r.body);
+    assert.match(body.error || "", /missing origin/i);
+  } finally {
+    server.close();
+  }
+});
+
+test("V1-6: GET /api/status with NO Origin still works (read-only, no CSRF impact)", async () => {
+  // Confirm we didn't break the curl path for GETs — Origin is only required
+  // on mutating methods.
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/status", "GET", {});
+    assert.strictEqual(r.status, 200);
   } finally {
     server.close();
   }
@@ -1439,9 +1466,10 @@ test("GET /api/specialty/mcp-2/refresh-hint → 404 (endpoint removed v0.2.1)", 
 test("POST /api/specialty/mcp-2/refresh-hint → 405 (no longer a mutating route)", async () => {
   // Falls through to the post-mutating-route gate, which 405s any non-GET
   // for unrecognized paths. Confirms the route was removed (formerly 200).
+  // V1-6: pass an Origin header so the CSRF gate doesn't intercept first.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", {});
+    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", { Origin: "http://localhost:9090" });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1489,8 +1517,11 @@ test("forwardedCount matches the actual hardcoded catalog length (drift guard)",
   // The status response hardcodes forwardedCount: 51. If upstream gets a tool added
   // and the catalog list is updated but not the constant, this test catches it.
   // If both stay in sync, this passes.
+  // V2-6: previously this fixture passed `mode: "standalone"` (string) — production
+  // reads `cfg.standalone` (boolean), so the field was ignored and "standalone"
+  // would resolve to "pool" by accident. Use the production shape.
   const status = buildStatus({
-    _loadConfig: () => ({ poolDirs: [], slotRoles: {}, cookieFreshnessWarnDays: 7, mode: "standalone" }),
+    _loadConfig: () => ({ poolDirs: [], slotRoles: {}, cookieFreshnessWarnDays: 7, standalone: true }),
     _findCookiesFile: () => null,
     _checkCookieAgeDays: () => null,
     _existsFile: () => false,
@@ -1501,6 +1532,11 @@ test("forwardedCount matches the actual hardcoded catalog length (drift guard)",
     _findProcessesFor: () => [],
     _isPidAlive: () => false,
   });
+  // V2-6: drift guard for the boolean cfg.standalone contract. Previously
+  // the fixture passed `mode: "standalone"` (string) which prod ignored —
+  // boolean form is what loadConfig() actually returns. The mode lives at
+  // status.config.mode (and cookieSource.mode) on the response shape.
+  assert.strictEqual(status.config.mode, "standalone", "buildStatus must read cfg.standalone (boolean) and emit config.mode='standalone' when true");
   assert.strictEqual(
     status.tools.forwardedCount,
     catalogLen,

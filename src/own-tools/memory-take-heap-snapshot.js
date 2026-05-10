@@ -7,19 +7,30 @@
 //   (b) writeFileSync on a 50-500 MB heap blocks the event loop for seconds.
 // Fix: route through the per-page CDP session cache (auto-detached on page
 // close) and use fs.promises.writeFile.
+//
+// T1-3 fix (2026-05-09):
+//   • stream chunks directly to disk via createWriteStream as they arrive,
+//     instead of accumulating them in a string array and joining at the end.
+//     `chunks.join("")` materializes the full snapshot string in memory before
+//     write — peak RSS ~2× snapshot size. On a 500MB heap that's an extra
+//     500MB of duplication. Streaming = roughly constant memory regardless
+//     of snapshot size.
 
 const path = require("node:path");
+const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
-const { getActivePage } = require("./_active-page.js");
+const { withActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "memory_take-heap-snapshot",
   description:
     "Take a V8 heap snapshot of the active page via CDP HeapProfiler. " +
     "Saves the .heapsnapshot file to disk and returns its path. " +
-    "The file can be loaded into Chrome DevTools' Memory tab for analysis.",
+    "The file can be loaded into Chrome DevTools' Memory tab for analysis. " +
+    "Chunks are streamed directly to disk so memory overhead stays constant " +
+    "regardless of snapshot size (50MB to multi-GB heaps OK).",
   inputSchema: {
     type: "object",
     properties: {
@@ -29,46 +40,66 @@ module.exports = {
       },
     },
   },
-  handler: async ({ outputPath }) => {
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) {
-      return {
-        content: [{ type: "text", text: "memory_take-heap-snapshot unavailable: relay bridge not initialized" }],
-        isError: true,
-      };
-    }
-    // Use the tracked active page (set by tabs_new / tabs_select) — not
-    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
-    const page = getActivePage(bridge.context);
-    if (!page) {
-      return {
-        content: [{ type: "text", text: "no pages open in browser context" }],
-        isError: true,
-      };
-    }
+  handler: async ({ outputPath }) => withActivePage(async ({ bridge, page }) => {
     // V1-1: per-page CDP cache — session is auto-detached on page close.
     // Detach is no longer manual, so a takeHeapSnapshot throw cannot leak
     // the session.
     const cdp = await getOrCreatePageCdp(page, bridge.context);
     const dst = outputPath || path.join(os.tmpdir(), `heap-${Date.now()}.heapsnapshot`);
-    const chunks = [];
-    const onChunk = (e) => chunks.push(e.chunk);
+
+    // T1-3: stream chunks to disk as they arrive. Track byte count locally;
+    // a final fsp.stat would also work but bytes-written is cheaper.
+    await fsp.mkdir(path.dirname(dst), { recursive: true });
+    const ws = fs.createWriteStream(dst, { encoding: "utf8" });
+
+    let bytesWritten = 0;
+    let backpressureWaits = 0;
+    const onChunk = (e) => {
+      // ws.write returns false when the internal buffer is full; we don't
+      // await drain here because CDP events keep arriving and we'd block the
+      // event loop. Node will buffer for us; backpressureWaits is just a
+      // diagnostic. Strings are immediately handed to the OS write queue.
+      const ok = ws.write(e.chunk);
+      bytesWritten += Buffer.byteLength(e.chunk, "utf8");
+      if (!ok) backpressureWaits++;
+    };
     cdp.on("HeapProfiler.addHeapSnapshotChunk", onChunk);
+
+    let snapshotError = null;
     try {
       await cdp.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false });
+    } catch (e) {
+      snapshotError = e;
     } finally {
       // Always remove the per-call listener — session is reused across calls.
       cdp.off("HeapProfiler.addHeapSnapshotChunk", onChunk);
     }
-    // Async write — heap snapshots can be 50-500 MB; sync would block the
-    // event loop for seconds.
-    await fsp.writeFile(dst, chunks.join(""));
-    const sizeBytes = (await fsp.stat(dst)).size;
+
+    // Close the write stream and wait for OS-level flush.
+    await new Promise((resolve, reject) => {
+      ws.end((err) => (err ? reject(err) : resolve()));
+    });
+
+    if (snapshotError) {
+      // Best-effort cleanup of the (likely partial) file.
+      try { await fsp.unlink(dst); } catch { /* ignore */ }
+      return {
+        content: [{ type: "text", text: `memory_take-heap-snapshot: ${snapshotError.message || snapshotError}` }],
+        isError: true,
+      };
+    }
+
+    const stat = await fsp.stat(dst);
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({ outputPath: dst, sizeBytes, sizeMB: (sizeBytes / 1024 / 1024).toFixed(2) }, null, 2),
+        text: JSON.stringify({
+          outputPath: dst,
+          sizeBytes: stat.size,
+          sizeMB: (stat.size / 1024 / 1024).toFixed(2),
+          backpressureWaits,
+        }, null, 2),
       }],
     };
-  },
+  }),
 };

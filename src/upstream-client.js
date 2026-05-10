@@ -15,13 +15,44 @@ class UpstreamClient {
     this.buffer = "";
     this.closed = false;
 
-    readable.on("data", (chunk) => this._onData(chunk));
-    readable.on("close", () => this._onClose());
-    readable.on("error", (e) => this._onError(e));
+    // setEncoding('utf8') makes the stream's internal StringDecoder buffer
+    // partial multi-byte UTF-8 sequences across chunk boundaries. Without
+    // this, an emoji / CJK / accented char that lands on a chunk boundary
+    // would surface as U+FFFD replacement chars, corrupting the JSON line
+    // and causing JSON.parse to throw on otherwise-valid upstream output.
+    // (Listeners then get pre-decoded strings, so we drop the .toString call
+    // in _onData.)
+    if (readable && typeof readable.setEncoding === "function") {
+      readable.setEncoding("utf8");
+    }
+
+    this._dataHandler = (chunk) => this._onData(chunk);
+    this._closeHandler = () => this._onClose();
+    this._errorHandler = (e) => this._onError(e);
+    readable.on("data", this._dataHandler);
+    readable.on("close", this._closeHandler);
+    readable.on("error", this._errorHandler);
   }
 
   _onData(chunk) {
-    this.buffer += chunk.toString("utf8");
+    // Stream is in object mode? defensive: coerce.
+    this.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    // G1-5 (2026-05-10): cap the unparsed buffer at 200MB. Without a cap,
+    // a runaway upstream sending a huge single line (no newline) — e.g. a
+    // misbehaving content_get-as-html on a multi-GB page — would grow the
+    // buffer indefinitely until the relay OOMs. 200MB is generous for
+    // legitimate large responses (multi-MB heap snapshot, capture_xhr body
+    // dumps) while bounded enough to fail loudly on a stuck stream.
+    const MAX_LINE_BYTES = 200 * 1024 * 1024;
+    if (this.buffer.length > MAX_LINE_BYTES) {
+      process.stderr.write(
+        `[mcp-relay] upstream line exceeds ${MAX_LINE_BYTES} bytes without newline — closing client to prevent OOM\n`,
+      );
+      // Drop the buffer; reject pending requests; mark closed.
+      this.buffer = "";
+      this._onError(new Error(`upstream line size exceeded ${MAX_LINE_BYTES} bytes`));
+      return;
+    }
     let nl;
     while ((nl = this.buffer.indexOf("\n")) !== -1) {
       const line = this.buffer.slice(0, nl);
@@ -39,7 +70,10 @@ class UpstreamClient {
   }
 
   _dispatch(msg) {
-    if (!msg || typeof msg.id !== "number") return; // ignore notifications
+    // JSON-RPC 2.0 id MAY be number, string, or null. Notifications have
+    // no id at all (undefined). Treat any present id we have a pending
+    // entry for as a response; ignore unknown ids and notifications.
+    if (!msg || msg.id === undefined) return; // notification or malformed
     const pending = this.pending.get(msg.id);
     if (!pending) return; // unknown id; ignore
     this.pending.delete(msg.id);
@@ -52,20 +86,36 @@ class UpstreamClient {
   }
 
   _onClose() {
+    if (this.closed) return; // idempotent
     this.closed = true;
-    for (const [id, p] of this.pending) {
+    for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error("upstream closed"));
     }
     this.pending.clear();
+    this._removeListeners();
   }
 
   _onError(e) {
-    for (const [id, p] of this.pending) {
+    // Set closed=true so subsequent request() calls reject fast instead of
+    // queueing into a doomed pending Map and timing out at 180s.
+    this.closed = true;
+    for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(e);
     }
     this.pending.clear();
+    this._removeListeners();
+  }
+
+  _removeListeners() {
+    // Detach our handlers so a still-alive `readable` (e.g. piped from a
+    // child whose stdout EOFs but is held by another consumer) doesn't
+    // keep buffering chunks for us.
+    if (!this.readable) return;
+    try { this.readable.off("data", this._dataHandler); } catch { /* legacy stream */ }
+    try { this.readable.off("close", this._closeHandler); } catch {}
+    try { this.readable.off("error", this._errorHandler); } catch {}
   }
 
   /**
@@ -104,12 +154,14 @@ class UpstreamClient {
   }
 
   close() {
+    if (this.closed) return; // idempotent
     this.closed = true;
-    for (const [id, p] of this.pending) {
+    for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error("client closed"));
     }
     this.pending.clear();
+    this._removeListeners();
   }
 }
 

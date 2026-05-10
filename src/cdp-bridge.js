@@ -69,22 +69,56 @@ async function launchBrave({
   };
   if (executablePath) launchOpts.executablePath = executablePath;
 
+  // W0-7 (2026-05-09): unconditionally strip BROWSER_RELAY_* env vars from
+  // the env passed to Brave. Previously the strip only happened when proxyUrl
+  // was set — when proxyUrl was unset, no `env` was set on launchOpts at all,
+  // so Playwright defaulted to passing process.env wholesale to Chromium.
+  // BROWSER_RELAY_INSPECTOR_PORT, BROWSER_RELAY_VAULT_FILES, BROWSER_RELAY_*
+  // are relay-internal and shouldn't be visible to Brave (which would try
+  // to interpret them on a chrome:// extension page that loads Node-aware
+  // code, etc.). Always sanitize.
+  const sanitizedEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("BROWSER_RELAY_")) continue; // relay-internal
+    sanitizedEnv[k] = v;
+  }
+
   // Per-process proxy whitelist: when proxyUrl is set, Brave inherits
   // HTTP_PROXY / HTTPS_PROXY env so outbound traffic routes through the
   // configured HTTP proxy. The user's system proxy stays off — only this
   // launched Brave opts in.
   if (proxyUrl) {
-    launchOpts.env = { ...process.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl };
+    sanitizedEnv.HTTP_PROXY = proxyUrl;
+    sanitizedEnv.HTTPS_PROXY = proxyUrl;
     process.stderr.write(
       `[mcp-relay] proxy whitelist ACTIVE — Brave traffic routes through ${proxyUrl}\n`,
     );
   }
+  launchOpts.env = sanitizedEnv;
 
   const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
 
   // Wait for the CDP HTTP endpoint to respond before returning. Upstream's
   // connectOverCDP will hit /json/version, so we want it ready first.
-  await waitForCdpReady(port, 10000);
+  //
+  // V0-3: launchPersistentContext returned a LIVE context that holds a file
+  // lock on userDataDir. If waitForCdpReady throws (timeout, unreachable CDP),
+  // the context would leak forever — the lock blocks any other relay from
+  // claiming this slot until the user reboots / kills brave.exe by hand. So
+  // we close the context on any waitForCdpReady failure before re-throwing.
+  // attachWithCleanupOnError in index.js only wraps post-launch steps, so
+  // this cleanup must live here.
+  try {
+    await waitForCdpReady(port, 10000);
+  } catch (e) {
+    try { await context.close(); }
+    catch (closeErr) {
+      process.stderr.write(
+        `[mcp-relay] cdp-bridge: context.close() failed during waitForCdpReady cleanup: ${closeErr.message}\n`,
+      );
+    }
+    throw e;
+  }
 
   return {
     context,

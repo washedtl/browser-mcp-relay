@@ -36,8 +36,17 @@
     if (children) {
       for (const c of [].concat(children)) {
         if (c == null) continue;
-        if (typeof c === "string" || typeof c === "number") node.appendChild(document.createTextNode(String(c)));
-        else node.appendChild(c);
+        if (typeof c === "string" || typeof c === "number") {
+          node.appendChild(document.createTextNode(String(c)));
+        } else if (c instanceof Node) {
+          node.appendChild(c);
+        } else {
+          // W1-4: a non-Node value (e.g. cfg.bravePath unexpectedly an object
+          // due to config drift) would crash the entire render here. Coerce
+          // to text so the UI stays usable; the value will look weird but
+          // the page still loads.
+          node.appendChild(document.createTextNode(String(c)));
+        }
       }
     }
     return node;
@@ -75,7 +84,10 @@
   }
 
   function formatCookieAge(days) {
-    if (days == null || !Number.isFinite(days)) return "—";
+    // W0-1: also reject negative inputs — clock skew or fresh-write
+    // timestamps can produce small-negative day deltas, which previously
+    // rendered as "-30m" in the UI. Treat as unknown.
+    if (days == null || !Number.isFinite(days) || days < 0) return "—";
     if (days < 1 / 24) return Math.round(days * 24 * 60) + "m";
     if (days < 1) return Math.round(days * 24) + "h";
     return days.toFixed(1) + "d";
@@ -115,12 +127,19 @@
     };
     const slots = status.slots || [];
     const active = slots.filter((s) => s.state === "claimed").length;
-    setStat("tools", String(status.tools.total));
+    // W0-2: defensive guards — backend response shape is documented but
+    // an early-startup or degraded-response can omit nested keys, and the
+    // caller's catch turns the resulting TypeError into "Disconnected"
+    // when the backend is actually fine.
+    const tools = status.tools || {};
+    const config = status.config || {};
+    const server = status.server || {};
+    setStat("tools", tools.total != null ? String(tools.total) : "—");
     setStat("pool", active + " / " + slots.length + " active");
-    setStat("mode", status.config.mode);
+    setStat("mode", config.mode || "—");
     const vault = status.vault || {};
     setStat("vault", vault.enabled ? vault.totalEntries + " entries" : "off");
-    setStat("uptime", formatDuration(status.server.uptimeSeconds));
+    setStat("uptime", formatDuration(server.uptimeSeconds));
 
     const orphans = slots.filter((s) => s.state === "orphan").length;
     const pill = document.getElementById("health-pill");
@@ -249,8 +268,16 @@
       return card;
     }
 
-    // Claimed
-    card.appendChild(el("div", { class: "slot-client" }, "Brave PID " + (slot.pid != null ? slot.pid : "—")));
+    // Claimed. `slot.pid` is the lock-holder PID (the relay's own process) — not Brave.
+    // Real Brave PIDs come from `slot.bravePids` (populated by findBraveProcessesForDir).
+    // Brave is lazy-launched on first tools/call, so a slot can be claimed with no Brave yet.
+    const _bravePid = (slot.bravePids && slot.bravePids[0]) || null;
+    const _clientLabel = _bravePid != null
+      ? "Brave PID " + _bravePid
+      : slot.pid != null
+        ? "Owner PID " + slot.pid + " · Brave not launched"
+        : "—";
+    card.appendChild(el("div", { class: "slot-client" }, _clientLabel));
     card.appendChild(
       el("span", { class: "slot-role" + (slot.role && slot.role !== "default" ? " " + slot.role : "") }, slot.role || "default"),
     );
@@ -1125,6 +1152,12 @@
     if (!evt || !evt.type || evt.id == null) return;
 
     if (evt.type === "request") {
+      // W1-1: dedupe — GET-then-WS backfill paths can deliver the same
+      // request event twice. Without this, the feed shows two cards with
+      // the same id but only one entry in eventMap (latter overwrites),
+      // and clicking the duplicate either selects the wrong one or breaks
+      // the response-pairing.
+      if (slotState.eventMap.has(evt.id)) return;
       const merged = { id: evt.id, request: evt, response: null };
       slotState.eventMap.set(evt.id, merged);
       slotState.feed.unshift(merged);
@@ -1295,9 +1328,18 @@
       el("div", { class: "slot-summary-name" }, "Slot " + slot.index),
       el("div", { class: "slot-summary-dir mono" }, slot.dir || "—"),
     ]);
+    // V1-3: same data-shape gotcha as the home-page card. `slot.pid` is the
+    // lock-holder PID (relay's node), `slot.bravePids[]` is the live Brave
+    // process tree. Show both, clearly distinguished, so a user inspecting a
+    // slot doesn't confuse the relay's PID with Brave's.
+    const _slotBravePid = (slot.bravePids && slot.bravePids[0]) || null;
+    const _slotBravePidLabel = _slotBravePid != null
+      ? String(_slotBravePid) + (slot.bravePids.length > 1 ? " +" + (slot.bravePids.length - 1) : "")
+      : (slot.state === "claimed" ? "not launched" : "—");
     const headRight = el("div", { class: "slot-summary-stats mono" }, [
       el("span", null, [el("span", { class: "k" }, "STATE"), el("span", { class: "v " + stateClass }, stateLabel)]),
-      el("span", null, [el("span", { class: "k" }, "PID"), el("span", { class: "v" }, slot.pid != null ? String(slot.pid) : "—")]),
+      el("span", null, [el("span", { class: "k" }, "OWNER PID"), el("span", { class: "v" }, slot.pid != null ? String(slot.pid) : "—")]),
+      el("span", null, [el("span", { class: "k" }, "BRAVE PID"), el("span", { class: "v" }, _slotBravePidLabel)]),
       el("span", null, [el("span", { class: "k" }, "ROLE"), el("span", { class: "v" }, slot.role || "default")]),
       el("span", null, [el("span", { class: "k" }, "UP"), el("span", { class: "v" }, slot.lockHeldMs != null ? formatDuration(slot.lockHeldMs / 1000) : "—")]),
       el("span", null, [el("span", { class: "k" }, "COOKIE"), el("span", { class: "v" }, formatCookieAge(slot.cookieAgeDays))]),
@@ -1398,7 +1440,11 @@
       out.push(e);
     }
     // Newest first.
-    out.sort((a, b) => Date.parse(b.time || 0) - Date.parse(a.time || 0));
+    // W0-3: previously `Date.parse(b.time || 0)` — when `b.time` is null/
+    // undefined, `0` coerces to the string `"0"` which `Date.parse` returns
+    // NaN for, breaking the sort. Use the same fallback pattern as the filter
+    // loop above (Date.parse(t) → fallback 0).
+    out.sort((a, b) => (Date.parse(b.time) || 0) - (Date.parse(a.time) || 0));
     return out;
   }
 
@@ -1521,6 +1567,18 @@
   // ─── Mutating action wiring (W11) ─────────────────────────────────────
 
   async function reapSlotAction(slotIndex) {
+    // V2-3: explicit confirmation. Mis-clicking on an orphan card otherwise
+    // silently kills processes for that slot. The check is cheap and the
+    // action is non-trivial (taskkill /F /T can interrupt user work in
+    // rare cases where the orphan PID has been recycled).
+    if (typeof window !== "undefined" && typeof window.confirm === "function") {
+      const ok = window.confirm(
+        "Reap orphan slot " + slotIndex + "?\n\n" +
+        "This kills any Brave processes still holding the slot's user-data-dir " +
+        "and clears the stale lock file. Use only if the slot is genuinely orphaned."
+      );
+      if (!ok) return;
+    }
     try {
       const r = await fetch("/api/slots/" + slotIndex + "/reap", {
         method: "POST",

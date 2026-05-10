@@ -21,12 +21,15 @@ test("stealth_apply returns isError when bridge missing", async () => {
   }
 });
 
-// V1-6: addInitScript is additive — calling stealth_apply twice means both
-// copies run on the next page load. On the second run, redefining the
-// already-non-configurable `navigator.webdriver` etc. throws and takes the
-// entire init script down.
-test("V1-6: stealth_apply can be called twice without throwing", async () => {
+// V1-6 + T0-4 + T1-7: stealth_apply is now idempotent per context. First call
+// installs the init script; second call no-ops with alreadyApplied:true; only
+// `force: true` re-applies. Previously, repeat calls accumulated init scripts
+// AND chained `navigator.permissions.query` recursively (each call's monkey-
+// patch wrapped the previous override).
+test("T0-4/T1-7: stealth_apply is idempotent per context (second call no-ops)", async () => {
   const prev = globalThis.__relayBridge;
+  // Fresh WeakMap per test by getting a fresh context each time.
+  tool._APPLIED_CONTEXTS && (() => {})(); // (sanity — _APPLIED_CONTEXTS exists for inspection)
   const initScripts = [];
   const fakeContext = {
     addInitScript: async (s) => { initScripts.push(s); },
@@ -38,10 +41,48 @@ test("V1-6: stealth_apply can be called twice without throwing", async () => {
     const r2 = await tool.handler({ languages: ["fr-FR", "fr"] });
     assert.strictEqual(r1.isError, undefined, "first call must not error");
     assert.strictEqual(r2.isError, undefined, "second call must not error");
-    assert.strictEqual(initScripts.length, 2, "addInitScript called twice");
+    assert.strictEqual(initScripts.length, 1, "addInitScript called ONCE — second call must be no-op (T1-7)");
+    const r2Body = JSON.parse(r2.content[0].text);
+    assert.strictEqual(r2Body.alreadyApplied, true, "second call must report alreadyApplied=true");
+    assert.strictEqual(r2Body.applied, false, "second call must report applied=false");
   } finally {
     globalThis.__relayBridge = prev;
   }
+});
+
+test("T1-7: stealth_apply with force=true re-applies even if already applied", async () => {
+  const prev = globalThis.__relayBridge;
+  const initScripts = [];
+  const fakeContext = {
+    addInitScript: async (s) => { initScripts.push(s); },
+    pages: () => [],
+  };
+  globalThis.__relayBridge = { context: fakeContext };
+  try {
+    await tool.handler({ languages: ["en-US"] });
+    const r2 = await tool.handler({ languages: ["fr-FR"], force: true });
+    assert.strictEqual(initScripts.length, 2, "force=true must re-add the init script");
+    const r2Body = JSON.parse(r2.content[0].text);
+    assert.strictEqual(r2Body.applied, true);
+    assert.deepStrictEqual(r2Body.languages, ["fr-FR"]);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("T0-4: stealth script has window.__relayStealthApplied sentinel for page-level idempotency", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(
+    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
+    "utf8",
+  );
+  // The script must start with the sentinel guard so a re-run on the same
+  // page short-circuits before re-monkey-patching navigator.permissions.query.
+  assert.ok(/window\.__relayStealthApplied/.test(src),
+    "stealth script must include window.__relayStealthApplied sentinel");
+  assert.ok(/if\s*\(\s*window\.__relayStealthApplied\s*\)\s*return/.test(src),
+    "stealth script must early-return when sentinel set");
 });
 
 test("V1-6: stealth script source guards each defineProperty in try/catch", () => {

@@ -136,7 +136,14 @@ class RelayServer {
     this.trafficEmitter.push(requestEvent);
     // emit() throws back to the caller if a listener throws — wrap in
     // try/catch so a busted Inspector subscriber can't take out a tool call.
-    try { this.trafficEmitter.emit("request", requestEvent); } catch { /* noop */ }
+    try { this.trafficEmitter.emit("request", requestEvent); }
+    catch (emitErr) {
+      // V1-5: don't drop subscriber errors silently — a broken Inspector
+      // subscriber is a real bug we want to see in stderr, not invisible.
+      try {
+        process.stderr.write(`[mcp-relay] traffic-emitter "request" subscriber threw: ${emitErr.stack || emitErr.message}\n`);
+      } catch { /* stderr itself is gone — give up */ }
+    }
 
     let status = "ok";
     let response;
@@ -172,7 +179,13 @@ class RelayServer {
         response: truncateForEmit({ error: e.message }),
       };
       this.trafficEmitter.push(responseEvent);
-      try { this.trafficEmitter.emit("response", responseEvent); } catch { /* noop */ }
+      try { this.trafficEmitter.emit("response", responseEvent); }
+    catch (emitErr) {
+      // V1-5: surface subscriber errors instead of swallowing.
+      try {
+        process.stderr.write(`[mcp-relay] traffic-emitter "response" subscriber threw: ${emitErr.stack || emitErr.message}\n`);
+      } catch { /* stderr itself is gone */ }
+    }
       throw e;
     }
 
@@ -185,7 +198,13 @@ class RelayServer {
       response: truncateForEmit(response),
     };
     this.trafficEmitter.push(responseEvent);
-    try { this.trafficEmitter.emit("response", responseEvent); } catch { /* noop */ }
+    try { this.trafficEmitter.emit("response", responseEvent); }
+    catch (emitErr) {
+      // V1-5: surface subscriber errors instead of swallowing.
+      try {
+        process.stderr.write(`[mcp-relay] traffic-emitter "response" subscriber threw: ${emitErr.stack || emitErr.message}\n`);
+      } catch { /* stderr itself is gone */ }
+    }
 
     return response;
   }

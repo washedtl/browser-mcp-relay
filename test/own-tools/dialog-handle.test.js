@@ -22,6 +22,74 @@ test("dialog_handle returns isError when bridge missing", async () => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────
+// T0-9: short-circuit on page close — without this, dialog wait on a
+// closed page hangs until full timeoutMs (default 30s).
+// ──────────────────────────────────────────────────────────────────
+
+test("T0-9: dialog_handle short-circuits when page closes before dialog", async () => {
+  const prev = globalThis.__relayBridge;
+  let registeredCloseHandler = null;
+  const fakePage = {
+    once: (event, fn) => {
+      if (event === "close") registeredCloseHandler = fn;
+    },
+    off: () => {},
+  };
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    // Start dialog wait with a long timeout, then trigger close.
+    const promise = tool.handler({ action: "accept", timeoutMs: 30000 });
+    // Trigger close immediately.
+    setTimeout(() => {
+      if (registeredCloseHandler) registeredCloseHandler();
+    }, 10);
+    const result = await Promise.race([
+      promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("hung > 1s after close")), 1000)),
+    ]);
+    assert.strictEqual(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.strictEqual(payload.pageClosed, true);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────
+// T0-10: defaultValue is a method, not a getter. The `?.` was dead.
+// ──────────────────────────────────────────────────────────────────
+
+test("T0-10: dialog_handle calls defaultValue() as a method", async () => {
+  const prev = globalThis.__relayBridge;
+  let registeredDialogHandler = null;
+  const fakePage = {
+    once: (event, fn) => { if (event === "dialog") registeredDialogHandler = fn; },
+    off: () => {},
+  };
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  let dvCallCount = 0;
+  const fakeDialog = {
+    type: () => "prompt",
+    message: () => "Enter name",
+    defaultValue: () => { dvCallCount++; return "alice"; },
+    accept: async () => {},
+  };
+  try {
+    const promise = tool.handler({ action: "accept", timeoutMs: 1000 });
+    // Allow the once() registration to occur.
+    await new Promise((r) => setImmediate(r));
+    await registeredDialogHandler(fakeDialog);
+    const result = await promise;
+    assert.notStrictEqual(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.strictEqual(dvCallCount, 1, "defaultValue() must be called exactly once");
+    assert.strictEqual(payload.defaultValue, "alice", "defaultValue value must reach the response");
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
 // V1-3: if timeout fires AND dialog arrives in the same tick, both branches
 // would resolve the promise. The `settled` guard ensures exactly one outcome.
 test("V1-3: dialog_handle settles exactly once when timeout + dialog race", async () => {

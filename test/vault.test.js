@@ -242,3 +242,72 @@ test("loadVaultFromEnv: env semicolon-separated paths loads each file", () => {
     else process.env.BROWSER_RELAY_VAULT_FILES = orig;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W0-4: CSV with UTF-8 BOM at file start. Brave/Chrome on Windows
+// often exports CSVs with BOM; without strip the first column header
+// becomes "﻿name" → first column is silently dropped from every
+// row. If `url` is the first column on some Brave version, the entire
+// vault would silently load empty.
+// ──────────────────────────────────────────────────────────────────
+
+test("W0-4: Vault strips UTF-8 BOM from CSV file", () => {
+  const csvWithBom =
+    "﻿" + // BOM
+    "name,url,username,password,note\n" +
+    "Test,https://example.com,alice,pwd,\n";
+  const f = tmpFile(csvWithBom);
+  try {
+    const v = new Vault([f]);
+    assert.strictEqual(v.totalEntries, 1, "entry must load despite BOM");
+    const matches = v.lookup("https://example.com/login");
+    assert.strictEqual(matches.length, 1, "lookup must find the entry — header row was correctly parsed despite BOM");
+    assert.strictEqual(matches[0].username, "alice");
+    // The `name` field must also have been read correctly (was empty pre-W0-4 because header became "﻿name").
+    assert.strictEqual(matches[0].name, "Test", "first-column value must be preserved");
+  } finally {
+    fs.unlinkSync(f);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────
+// W0-5: lookup tags entries with `_match` so the autofill-injector can
+// distinguish exact-host matches from registrable-fallback matches.
+// Cross-subdomain leak prevention.
+// ──────────────────────────────────────────────────────────────────
+
+test("W0-5: lookup tags exact-host matches with _match='exact'", () => {
+  const csv =
+    "name,url,username,password,note\n" +
+    "Foo,https://signin.amazon.com,alice,pwd,\n";
+  const f = tmpFile(csv);
+  try {
+    const v = new Vault([f]);
+    const m = v.lookup("https://signin.amazon.com/login");
+    assert.strictEqual(m.length, 1);
+    assert.strictEqual(m[0]._match, "exact");
+  } finally {
+    fs.unlinkSync(f);
+  }
+});
+
+test("W0-5: lookup tags registrable-fallback matches with _match='registrable'", () => {
+  const csv =
+    "name,url,username,password,note\n" +
+    "AWS,https://aws.amazon.com,aws-user,pwd,\n" +
+    "Audible,https://www.audible.com.amazon.com,audible-user,pwd,\n";
+  const f = tmpFile(csv);
+  try {
+    const v = new Vault([f]);
+    // Query for signin.amazon.com — no exact match → falls back to
+    // registrable amazon.com → both stored entries surface.
+    const m = v.lookup("https://signin.amazon.com/ap/signin");
+    assert.ok(m.length >= 1, "registrable fallback must return ≥1 candidate");
+    for (const c of m) {
+      assert.strictEqual(c._match, "registrable",
+        "fallback candidates must be tagged registrable so autofill can decide whether to skip");
+    }
+  } finally {
+    fs.unlinkSync(f);
+  }
+});

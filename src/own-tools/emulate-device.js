@@ -10,7 +10,7 @@
 // Auto-cleanup on page close.
 
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
-const { getActivePage } = require("./_active-page.js");
+const { withActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "emulate_device",
@@ -45,46 +45,83 @@ module.exports = {
       },
     },
   },
-  handler: async ({ userAgent, viewport, network }) => {
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) {
-      return { content: [{ type: "text", text: "emulate_device unavailable: bridge missing" }], isError: true };
+  handler: async ({ userAgent, viewport, network }) => withActivePage(async ({ bridge, page }) => {
+    // T1-9: validate viewport.{width, height} when a viewport block is provided.
+    // The schema declares them required, but JSON-RPC + the MCP SDK don't
+    // enforce nested-required. CDP throws an opaque ParameterError on
+    // missing dimensions; this guard surfaces the issue at handler entry.
+    if (viewport && (typeof viewport !== "object" || viewport.width == null || viewport.height == null)) {
+      return {
+        content: [{ type: "text", text: "emulate_device: viewport requires both width and height (got " + JSON.stringify(viewport) + ")" }],
+        isError: true,
+      };
     }
-    // Use the tracked active page (set by tabs_new / tabs_select) — not
-    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
-    const page = getActivePage(bridge.context);
-    if (!page) {
-      return { content: [{ type: "text", text: "no pages open" }], isError: true };
-    }
+
     // V0-3: do NOT detach after applying — Emulation overrides revert on
     // detach. The session stays alive for the page's lifetime.
     const cdp = await getOrCreatePageCdp(page, bridge.context);
     const applied = {};
+
+    // T1-2: build the list of CDP commands and dispatch in parallel.
+    // Each Emulation.* / Network.* override is independent, so parallel
+    // dispatch saves ~30-80ms vs the previous sequential round-trips.
+    //
+    // Reviewer V1 (2026-05-09): use Promise.allSettled so a partial failure
+    // (e.g. CDP rejects setDeviceMetricsOverride mid-flight) returns a
+    // structured per-command result instead of short-circuiting and leaving
+    // the page in a half-applied state with no diagnostics.
+    const sends = [];
     if (userAgent) {
-      await cdp.send("Network.setUserAgentOverride", { userAgent });
+      sends.push({ name: "userAgent", p: cdp.send("Network.setUserAgentOverride", { userAgent }) });
       applied.userAgent = userAgent;
     }
     if (viewport) {
-      await cdp.send("Emulation.setDeviceMetricsOverride", {
-        width: viewport.width,
-        height: viewport.height,
-        deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
-        mobile: !!viewport.mobile,
+      sends.push({
+        name: "viewport",
+        p: cdp.send("Emulation.setDeviceMetricsOverride", {
+          width: viewport.width,
+          height: viewport.height,
+          deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
+          mobile: !!viewport.mobile,
+        }),
       });
-      if (viewport.hasTouch) {
-        await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true });
-      }
+      // T1-8: always send setTouchEmulationEnabled with the requested state.
+      // Previously it was only sent when hasTouch was truthy — calling
+      // emulate_device twice (once with hasTouch:true, once with false)
+      // would leave touch enabled because the second call never sent the
+      // "disable" command. Always sending makes the touch state idempotent.
+      sends.push({
+        name: "touch",
+        p: cdp.send("Emulation.setTouchEmulationEnabled", { enabled: !!viewport.hasTouch }),
+      });
       applied.viewport = viewport;
     }
     if (network) {
-      await cdp.send("Network.emulateNetworkConditions", {
-        offline: !!network.offline,
-        downloadThroughput: network.downloadKbps != null ? (network.downloadKbps * 1024 / 8) : -1,
-        uploadThroughput: network.uploadKbps != null ? (network.uploadKbps * 1024 / 8) : -1,
-        latency: network.latencyMs ?? 0,
+      sends.push({
+        name: "network",
+        p: cdp.send("Network.emulateNetworkConditions", {
+          offline: !!network.offline,
+          downloadThroughput: network.downloadKbps != null ? (network.downloadKbps * 1024 / 8) : -1,
+          uploadThroughput: network.uploadKbps != null ? (network.uploadKbps * 1024 / 8) : -1,
+          latency: network.latencyMs ?? 0,
+        }),
       });
       applied.network = network;
     }
-    return { content: [{ type: "text", text: JSON.stringify({ applied }, null, 2) }] };
-  },
+    const results = await Promise.allSettled(sends.map((s) => s.p));
+    const failed = [];
+    results.forEach((r, i) => {
+      if (r.status === "rejected") {
+        failed.push({ name: sends[i].name, error: r.reason && (r.reason.message || String(r.reason)) });
+      }
+    });
+    const result = {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ applied, failed: failed.length ? failed : undefined }, null, 2),
+      }],
+    };
+    if (failed.length) result.isError = true;
+    return result;
+  }),
 };

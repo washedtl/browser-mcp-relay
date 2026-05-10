@@ -2,19 +2,29 @@
 // Each field calls page.fill(selector, value) sequentially. Stops on first failure
 // (returning the partial-fill state for diagnosis).
 
-const { getActivePage } = require("./_active-page.js");
+const { withActivePage } = require("./_active-page.js");
+
+// T1-11: page.fill default timeout is 30s. With N fields, a flaky page that
+// blocks element-resolution can hang the tool for 30s × N. Shorter per-field
+// default + tunable knob + opt-in continueOnError makes form_fill resilient
+// without breaking the existing fail-fast semantics.
 
 module.exports = {
   name: "form_fill",
   description:
     "Fill multiple form fields on the active page in one call. Each field is " +
-    "{ selector, value }. Fills sequentially; on first failure returns partial-fill state " +
-    "with the failing field. Useful when you have many text inputs and want one round-trip.",
+    "{ selector, value }. By default fills sequentially and stops on first " +
+    "failure (returning partial state). Set `continueOnError: true` to attempt " +
+    "every field regardless of failures. `timeoutMs` caps each field's wait " +
+    "(default 5000ms — Playwright's default 30000ms is too long when stacking " +
+    "many fields against a slow page). Useful when you have many text inputs " +
+    "and want one round-trip.",
   inputSchema: {
     type: "object",
     properties: {
       fields: {
         type: "array",
+        minItems: 1,
         items: {
           type: "object",
           properties: {
@@ -24,29 +34,58 @@ module.exports = {
           required: ["selector", "value"],
         },
       },
+      timeoutMs: {
+        type: "integer",
+        minimum: 100,
+        maximum: 60000,
+        default: 5000,
+        description: "Per-field timeout for the fill operation in ms (default 5000). Total time is roughly fields.length × timeoutMs in the worst case.",
+      },
+      continueOnError: {
+        type: "boolean",
+        default: false,
+        description: "If true, attempt every field even after a failure. Result includes per-field ok/error. Default false (fail-fast).",
+      },
     },
     required: ["fields"],
   },
-  handler: async ({ fields }) => {
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    // Use the tracked active page (set by tabs_new / tabs_select) — not
-    // pages[0] which is Brave's auto-opened about:blank. See _active-page.js.
-    const page = getActivePage(bridge.context);
-    if (!page) return { content: [{ type: "text", text: "no pages open" }], isError: true };
+  handler: async ({ fields, timeoutMs = 5000, continueOnError = false } = {}) => withActivePage(async ({ page }) => {
     const filled = [];
     for (const f of fields) {
       try {
-        await page.fill(f.selector, f.value);
+        // T1-11: pass through the per-field timeout to Playwright.
+        await page.fill(f.selector, f.value, { timeout: timeoutMs });
         filled.push({ selector: f.selector, ok: true });
       } catch (e) {
         filled.push({ selector: f.selector, ok: false, error: e.message });
-        return {
-          content: [{ type: "text", text: JSON.stringify({ filledCount: filled.filter(x => x.ok).length, total: fields.length, failed: f, partial: filled }, null, 2) }],
-          isError: true,
-        };
+        if (!continueOnError) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                filledCount: filled.filter((x) => x.ok).length,
+                total: fields.length,
+                failed: f,
+                partial: filled,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
       }
     }
-    return { content: [{ type: "text", text: JSON.stringify({ filledCount: filled.length, total: fields.length, all: filled }, null, 2) }] };
-  },
+    const okCount = filled.filter((x) => x.ok).length;
+    const allOk = okCount === fields.length;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          filledCount: okCount,
+          total: fields.length,
+          all: filled,
+        }, null, 2),
+      }],
+      ...(allOk ? {} : { isError: true }),
+    };
+  }),
 };

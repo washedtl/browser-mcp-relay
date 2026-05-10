@@ -82,13 +82,23 @@ function redactErrorPaths(text) {
   // Concretely: drive-letter + slash + any number of segments containing
   // \w / spaces / dots / dashes ending in a slash, then a final segment.
   const winRe = /[A-Za-z]:[\\/](?:[\w .\-+]+[\\/])+([\w .\-+]+)/g;
+  // V2-2: UNC paths (\\server\share\dir\file). Two leading backslashes are
+  // significant on Windows; collapse the host + share + intermediate dirs
+  // into <...> and keep the basename for context.
+  const uncRe = /\\\\[\w.\-]+\\[\w.\-+ ]+(?:\\[\w .\-+]+)+\\([\w .\-+]+)/g;
   // POSIX absolute: a leading slash, at least one mid-segment with a
   // trailing slash, then a final segment. Anchored either at the start or
   // after a whitespace/punct boundary so we don't eat random `/` characters.
   const posixRe = /(^|(?<=[\s"'(,]))\/(?:[\w .\-+]+\/)+([\w .\-+]+)/g;
+  // V2-2: POSIX single-segment absolute paths (`/etc`, `/var`, `/foo`) —
+  // these don't have an intermediate dir but still leak the absolute prefix.
+  // Anchor on word-boundary + leading slash + a single segment + edge.
+  const posixSingleRe = /(^|(?<=[\s"'(,]))\/([\w.\-+]+)(?=$|[\s"'),:;])/g;
   return String(text)
+    .replace(uncRe, (_m, base) => "<...>/" + base)
     .replace(winRe, (_m, base) => "<...>/" + base)
-    .replace(posixRe, (_m, lead, base) => lead + "<...>/" + base);
+    .replace(posixRe, (_m, lead, base) => lead + "<...>/" + base)
+    .replace(posixSingleRe, (_m, lead, base) => lead + "<...>/" + base);
 }
 
 function formatDuration(seconds) {
@@ -365,6 +375,12 @@ const OWN_TOOL_META = {
   stealth_apply: { sourceFile: "stealth-apply.js", category: "session" },
   download_capture: { sourceFile: "download-capture.js", category: "downloads" },
   extract_structured: { sourceFile: "extract-structured.js", category: "data" },
+  // Storage tools (added 2026-05-09) — auth tokens for modern OAuth-style apps
+  // (Discord, Notion, Slack, Linear, Mercury…) live in localStorage rather
+  // than HTTP cookies. These complement cookies_export.
+  "storage_get-local": { sourceFile: "storage-get-local.js", category: "session" },
+  "storage_set-local": { sourceFile: "storage-set-local.js", category: "session" },
+  "storage_clear-local": { sourceFile: "storage-clear-local.js", category: "session" },
 };
 
 function truncate(text, max) {
@@ -442,9 +458,25 @@ const STATIC_MAP = {
 
 // Defense-in-depth headers applied to every response. The inspector never
 // embeds in iframes or admits cross-origin reads, so these are blanket-set.
+//
+// V2-1: CSP tightened from `frame-ancestors 'none'`-only to a full directive
+// list. `default-src 'self'` denies cross-origin script/img/etc by default;
+// `script-src 'self' 'unsafe-inline'` keeps the inspector's inline init
+// script working without opening up to remote eval; `connect-src 'self'`
+// limits XHR/WS to same-origin (defense against compromised inline script).
+// Forms blocked entirely (we have one POST endpoint reached via fetch).
 const SECURITY_HEADERS = {
   "X-Frame-Options": "DENY",
-  "Content-Security-Policy": "frame-ancestors 'none'",
+  "Content-Security-Policy": [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+  ].join("; "),
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
 };
@@ -558,10 +590,25 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
     }
 
     // Origin gate for non-GET/HEAD. POST is the FIRST mutating method we
-    // expose (W11). Missing Origin = trusted (curl). Hostile cross-origin
-    // POST → 403 even before reaching the route handler.
+    // expose (W11).
+    //
+    // V1-6: previously this matched the WS path's "missing Origin = trusted"
+    // semantics, which is correct for WS upgrade (curl / native ws clients
+    // don't send Origin) but unsafe for POST. Cross-origin form POSTs from
+    // a hostile webpage on `evil.com` SHOULD always include Origin per modern
+    // browser policy, and a 403 stops them. But Origin can be stripped on
+    // certain redirect paths or by older clients, and a missing-Origin = OK
+    // policy lets that bypass slip through to the reap endpoint. Tighten:
+    // for mutating methods, require Origin to be PRESENT and allowed. Local
+    // CLI clients (curl, scripts) can still call the read-only GETs without
+    // Origin; CSRF protection only matters for the mutating POSTs anyway.
     if (method !== "GET" && method !== "HEAD") {
       const origin = req.headers && req.headers.origin;
+      if (!origin) {
+        writeJsonHead(res, 403);
+        res.end(JSON.stringify({ error: "missing origin header (required on mutating requests)" }));
+        return;
+      }
       if (!isOriginAllowed(origin)) {
         writeJsonHead(res, 403);
         res.end(JSON.stringify({ error: "forbidden origin" }));
@@ -622,7 +669,18 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
           try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
           return killed;
         });
-        const killed = await Promise.resolve(reapFn(absDir, n));
+        // G0-8 (2026-05-10): cap the reap operation at 10s. taskkill /F /T
+        // is normally fast but a wedged kernel handle (rare; happens when
+        // a target process is stuck in an uninterruptible kernel wait) can
+        // make it block forever. Without this, the inspector's HTTP handler
+        // hangs indefinitely on a Reap click — bad UX, and the inspector
+        // backend's HTTP server can't drain.
+        const REAP_TIMEOUT_MS = 10000;
+        const reapPromise = Promise.resolve(reapFn(absDir, n));
+        const killed = await Promise.race([
+          reapPromise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error("reap timed out after " + REAP_TIMEOUT_MS + "ms")), REAP_TIMEOUT_MS)),
+        ]);
         writeJsonHead(res, 200);
         res.end(JSON.stringify({
           ok: true,
@@ -902,6 +960,15 @@ function startInspector(opts = {}) {
   });
   const server = http.createServer(handler);
 
+  // G0-6 (2026-05-10): cap idle keep-alive sockets so they don't accumulate
+  // over hours of inspector-tab idleness. Default Node keepAliveTimeout is
+  // 5s but defaults change between versions; pin them. requestTimeout caps
+  // a stuck request mid-body so a misbehaving client can't hold the server
+  // open indefinitely.
+  server.keepAliveTimeout = 5000;
+  server.headersTimeout = 10000;
+  server.requestTimeout = 30000;
+
   const wss = attachWebsocket(server, {
     trafficEmitter: opts.trafficEmitter || null,
     getRecent,
@@ -944,6 +1011,15 @@ function startInspector(opts = {}) {
             }
           } catch { /* noop */ }
           try { wss.close(); } catch { /* noop */ }
+          // G0-5 (2026-05-10): force-close idle keep-alive HTTP sockets so
+          // server.close() resolves promptly. Without this, an idle
+          // inspector tab with a keep-alive TCP socket would block close()
+          // for up to keepAliveTimeout (5s) per stuck connection. Node 18.2+
+          // exposes server.closeAllConnections (idle + active). Fall through
+          // gracefully on older Node.
+          if (typeof server.closeAllConnections === "function") {
+            try { server.closeAllConnections(); } catch { /* noop */ }
+          }
           server.close(() => r());
         }),
       });

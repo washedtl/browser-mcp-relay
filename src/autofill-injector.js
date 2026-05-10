@@ -18,21 +18,37 @@ const PASSWORD_FIELD_SELECTORS = [
   'input[autocomplete="new-password"]:not([disabled])',
 ];
 
+// W0-6 (2026-05-09): expanded to cover Microsoft AAD (`name="loginfmt"`),
+// Google (`name="identifier"`), Apple ID (`id="account_name_text_field"`),
+// and common SaaS patterns (`name="account"`, `id="email-input"`,
+// `id="username-input"`, `id="user-email"`).
 const USERNAME_FIELD_SELECTORS = [
+  // Standard autocomplete hints — most reliable, try first.
   'input[autocomplete="username"]:not([disabled])',
   'input[autocomplete="email"]:not([disabled])',
+  // type=email — semantic.
   'input[type="email"]:not([disabled])',
+  // Identity-provider-specific name attributes (most-popular SaaS / IdPs).
+  'input[name="loginfmt"]:not([disabled])',     // Microsoft AAD
+  'input[name="identifier"]:not([disabled])',   // Google
+  'input[name="account"]:not([disabled])',      // misc SaaS
   'input[name="login"]:not([disabled])',
   'input[name="username"]:not([disabled])',
   'input[name="user"]:not([disabled])',
   'input[name="email"]:not([disabled])',
   'input[name="userid"]:not([disabled])',
+  'input[name="user_email"]:not([disabled])',
+  // Common id attribute patterns.
   'input[id="login"]:not([disabled])',
   'input[id="username"]:not([disabled])',
   'input[id="email"]:not([disabled])',
   'input[id="user"]:not([disabled])',
   'input[id="userid"]:not([disabled])',
   'input[id="signinName"]:not([disabled])',
+  'input[id="email-input"]:not([disabled])',
+  'input[id="username-input"]:not([disabled])',
+  'input[id="user-email"]:not([disabled])',
+  'input[id="account_name_text_field"]:not([disabled])', // Apple ID
 ];
 
 /** Body of the injected fill function. Stringified and passed to
@@ -108,11 +124,23 @@ function attachAutofill(context, vault, log = () => {}) {
       if (creds.length === 0) return;
       // Skip if a fill is already in progress for this frame.
       if (ACTIVE_FILLS.has(frame)) return;
-      // Use the first saved cred (most recent or only one — we don't have a
-      // way to disambiguate multi-account here without a UI).
+
+      // W0-5: cross-subdomain credential leak protection. When `lookup`
+      // returns multiple registrable-fallback matches (i.e. no exact-host
+      // entry in the vault), don't silently pick `creds[0]` — the candidate
+      // is ambiguous (e.g. on signin.amazon.com with vault entries for AWS,
+      // Audible, Twitch, all under amazon.com, picking creds[0] would fill
+      // the WRONG account). Skip and log; user can log in manually.
       const c = creds[0];
+      const isAmbiguousFallback = c._match === "registrable" && creds.length > 1;
+      if (isAmbiguousFallback) {
+        let host = "";
+        try { host = new URL(url).hostname; } catch {}
+        log(`[autofill] ${host}: ${creds.length} ambiguous cross-subdomain creds (no exact-host match) — skipping autofill to avoid wrong-account fill`);
+        return;
+      }
       const userPeek = c.username.length > 3 ? c.username.slice(0, 3) + "***" : "***";
-      log(`[autofill] ${new URL(url).hostname}: found ${creds.length} cred(s), trying user=${userPeek}`);
+      log(`[autofill] ${new URL(url).hostname}: found ${creds.length} cred(s) [${c._match}], trying user=${userPeek}`);
       const fillPromise = (async () => {
         try {
           const result = await frame.evaluate(fillScript, {
