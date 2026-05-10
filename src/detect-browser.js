@@ -121,6 +121,23 @@ function detectBravePath(opts = {}) {
 }
 
 /**
+ * F1-15: homedir for the *requested* platform. When `standardLocations` is
+ * called with the current platform (the production case via detectBravePath),
+ * `os.homedir()` is correct. When called with a different platform from
+ * tests / cross-host introspection, `os.homedir()` would produce a path
+ * shape (separator + casing) that doesn't match the requested platform.
+ * Fall back to a generic posix-style root so the returned paths are
+ * coherent for the requested platform.
+ */
+function posixHomedirOrFallback(fallback) {
+  const home = os.homedir();
+  // If host's homedir contains a backslash or drive-letter, it's a Windows
+  // homedir — not a meaningful base for posix-style paths.
+  if (typeof home === "string" && home.length > 0 && home.charAt(0) === "/") return home;
+  return fallback;
+}
+
+/**
  * Per-platform list of standard Brave install paths to probe (in order).
  * Pure helper — exposed so tests can assert per-OS expectations directly
  * without needing to fake `fs.statSync`.
@@ -146,17 +163,25 @@ function standardLocations(platform, env) {
   }
   if (platform === "darwin") {
     // F1-8: Beta/Nightly/Dev .app bundles use distinct names on macOS.
+    //
+    // F1-15 (2026-05-10): use path.posix.join + a posix-style homedir so
+    // calling this with platform="darwin" from a Windows / Linux host
+    // (tests, cross-host introspection) produces correct macOS paths
+    // instead of mixing the host's separator convention. Production is
+    // unaffected because detectBravePath only passes process.platform,
+    // but the helper now matches its "per-platform" docstring claim.
     const apps = [
       "Brave Browser.app",
       "Brave Browser Beta.app",
       "Brave Browser Nightly.app",
       "Brave Browser Dev.app",
     ];
+    const home = posixHomedirOrFallback("/Users/local");
     const out = [];
     for (const app of apps) {
       const inner = app.replace(/\.app$/, "");
       out.push(`/Applications/${app}/Contents/MacOS/${inner}`);
-      out.push(path.join(os.homedir(), "Applications", app, "Contents", "MacOS", inner));
+      out.push(path.posix.join(home, "Applications", app, "Contents", "MacOS", inner));
     }
     return out;
   }
