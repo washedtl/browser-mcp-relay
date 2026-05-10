@@ -12,6 +12,68 @@
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
 const { withActivePage } = require("./_active-page.js");
 
+/**
+ * T2-A (v0.3.5): synthesize a CDP userAgentMetadata struct from a UA string.
+ *
+ * CDP's `Network.setUserAgentOverride` accepts a `userAgentMetadata` arg
+ * that chromium uses to set HTTP-side `Sec-CH-UA-*` headers. If we override
+ * the UA but don't pass userAgentMetadata, chromium falls back to its
+ * INTERNAL UA config — producing Sec-CH-UA-* headers that disagree with
+ * the override UA we just set. Anti-bot vendors use that mismatch as a
+ * detection signal.
+ *
+ * This pairs with stealth_apply's T1-A patch which synthesizes the JS-side
+ * `navigator.userAgentData` from the SAME string. Together they keep the
+ * HTTP-header side and the JS-side aligned.
+ *
+ * Pure helper — exported as a test seam.
+ *
+ * @param {string} ua — the UA string the caller is overriding to
+ * @returns {object} userAgentMetadata in CDP's expected shape
+ */
+function synthesizeUserAgentMetadata(ua) {
+  const cm = ua.match(/Chrome\/(\d+)/);
+  const version = cm ? cm[1] : "127";
+  // CDP's userAgentMetadata.platform names: see the chromium source — they're
+  // human-readable strings matching what real Chrome/Brave reports.
+  // Order matters: Android UAs contain "Linux; Android..." so Android
+  // must be checked BEFORE Linux. iPhone/iPad before macOS for the same
+  // reason (the iOS UA contains "Mac OS X" in the version string).
+  const platform = /Windows/.test(ua) ? "Windows"
+    : /iPhone|iPad/.test(ua) ? "iOS"
+    : /Android/.test(ua) ? "Android"
+    : /Macintosh/.test(ua) ? "macOS"
+    : /Linux/.test(ua) ? "Linux"
+    : "Windows";
+  const mobile = /Mobi|Android|iPhone/.test(ua);
+  const platformVersion = /Windows NT 10/.test(ua) ? "15.0.0"
+    : /Mac OS X (\d+)[._](\d+)/.test(ua) ? RegExp.$1 + "." + RegExp.$2 + ".0"
+    : "15.0.0";
+  const architecture = /Win64|x86_64|x64/.test(ua) ? "x86" : "arm";
+  const bitness = /Win64|x86_64|x64|arm64/.test(ua) ? "64" : "32";
+  // The "Not?A_Brand" is the canonical Greasy-spec randomization slot real
+  // Chrome ships — including it makes the brands list look genuine.
+  const brands = [
+    { brand: "Chromium", version },
+    { brand: "Not?A_Brand", version: "24" },
+  ];
+  const fullVersionList = brands.map((b) => ({
+    brand: b.brand,
+    version: `${b.version}.0.0.0`,
+  }));
+  return {
+    brands,
+    fullVersionList,
+    platform,
+    platformVersion,
+    architecture,
+    model: "",
+    mobile,
+    bitness,
+    wow64: false,
+  };
+}
+
 module.exports = {
   name: "emulate_device",
   description:
@@ -72,8 +134,23 @@ module.exports = {
     // the page in a half-applied state with no diagnostics.
     const sends = [];
     if (userAgent) {
-      sends.push({ name: "userAgent", p: cdp.send("Network.setUserAgentOverride", { userAgent }) });
+      // T2-A (v0.3.5): also pass userAgentMetadata so the HTTP-side
+      // Sec-CH-UA-* headers align with the JS-side navigator.userAgentData
+      // that stealth_apply T1-A synthesizes. Without this, sites that read
+      // the headers see Brave's defaults while JS-side reports the override
+      // — instant mismatch flag. CDP's setUserAgentOverride accepts a
+      // userAgentMetadata arg with the full UA decomposition; we synthesize
+      // it from the override UA the same way T1-A does at the JS layer.
+      const uaMetadata = synthesizeUserAgentMetadata(userAgent);
+      sends.push({
+        name: "userAgent",
+        p: cdp.send("Network.setUserAgentOverride", {
+          userAgent,
+          userAgentMetadata: uaMetadata,
+        }),
+      });
       applied.userAgent = userAgent;
+      applied.userAgentMetadata = uaMetadata;
     }
     if (viewport) {
       sends.push({
@@ -128,4 +205,6 @@ module.exports = {
     if (failed.length) result.isError = true;
     return result;
   }),
+  // T2-A: exported as a test seam.
+  synthesizeUserAgentMetadata,
 };

@@ -235,3 +235,112 @@ test("T1: handler runs with new patches without throwing", async () => {
     globalThis.__relayBridge = prev;
   }
 });
+
+// ─── Tier 2 (v0.3.5) — additional patches ───
+
+test("T2-B: stealth script populates window.chrome with loadTimes / csi / app", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(
+    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
+    "utf8",
+  );
+  // chrome.loadTimes — must return an object with timing fields.
+  assert.ok(/window\.chrome\.loadTimes\s*=/.test(src),
+    "must populate window.chrome.loadTimes");
+  assert.ok(/requestTime[\s\S]*startLoadTime/.test(src),
+    "loadTimes must return realistic timing fields");
+  assert.ok(/connectionInfo/.test(src),
+    "loadTimes must include connectionInfo (real Chrome ships it)");
+  // chrome.csi — Client-Side Instrumentation timing.
+  assert.ok(/window\.chrome\.csi\s*=/.test(src),
+    "must populate window.chrome.csi");
+  assert.ok(/onloadT[\s\S]*pageT/.test(src),
+    "csi must return onloadT + pageT fields");
+  // chrome.app — installation/runtime state namespace.
+  assert.ok(/window\.chrome\.app\s*=/.test(src),
+    "must populate window.chrome.app");
+  assert.ok(/InstallState[\s\S]*RunningState/.test(src),
+    "chrome.app must include InstallState + RunningState constants");
+  assert.ok(/getDetails[\s\S]*getIsInstalled/.test(src),
+    "chrome.app must include getDetails + getIsInstalled methods");
+});
+
+test("T2-C: stealth script overrides multiple permission types beyond notifications", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(
+    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
+    "utf8",
+  );
+  // PERMISSION_OVERRIDES map must cover the canonical bot-detection probes.
+  const REQUIRED_PERMISSIONS = [
+    "geolocation",
+    "clipboard-read",
+    "clipboard-write",
+    "camera",
+    "microphone",
+    "midi",
+    "push",
+  ];
+  for (const p of REQUIRED_PERMISSIONS) {
+    assert.ok(new RegExp(`['"]${p}['"]`).test(src),
+      `PERMISSION_OVERRIDES must include '${p}'`);
+  }
+  // Map must be consulted inside the patched query function.
+  assert.ok(/PERMISSION_OVERRIDES\b/.test(src),
+    "permissions.query patch must consult PERMISSION_OVERRIDES");
+  // Notifications must STILL be handled separately (its state is dynamic
+  // based on Notification.permission, not a static map value).
+  assert.ok(/params\.name === ['"]notifications['"]/.test(src),
+    "notifications must still be handled via dynamic Notification.permission lookup");
+});
+
+test("T2-D: stealth script overrides WebGL renderer + vendor on both WebGL1 and WebGL2", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(
+    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
+    "utf8",
+  );
+  // The two debug-renderer-info constants.
+  assert.ok(/0x9245/.test(src),
+    "must reference UNMASKED_VENDOR_WEBGL constant (0x9245)");
+  assert.ok(/0x9246/.test(src),
+    "must reference UNMASKED_RENDERER_WEBGL constant (0x9246)");
+  // Both WebGL1 and WebGL2 prototypes must be patched (WebGL2 has its own
+  // getParameter — patching only WebGL1 leaves WebGL2 callers exposed).
+  assert.ok(/WebGLRenderingContext\.prototype\.getParameter\s*=/.test(src),
+    "must patch WebGLRenderingContext.prototype.getParameter");
+  assert.ok(/WebGL2RenderingContext\.prototype\.getParameter\s*=/.test(src),
+    "must patch WebGL2RenderingContext.prototype.getParameter (WebGL2 has its own getParameter)");
+  // GPU string selection must be UA-aware (per docs/BACKLOG.md: mismatched
+  // UA + GPU = instant flag).
+  assert.ok(/Macintosh/.test(src) && /Linux/.test(src) && /Android/.test(src),
+    "GPU string selection must branch on UA platform (Macintosh / Linux / Android / Windows)");
+});
+
+// T2-A is in emulate-device.js — its tests live in test/own-tools/emulate-device.test.js.
+
+// ─── Sanity: full handler still ships valid JS with Tier 2 patches ───
+
+test("T2: handler still ships valid JS after Tier 2 additions", async () => {
+  const prev = globalThis.__relayBridge;
+  let scriptSeen = null;
+  const fakeContext = {
+    addInitScript: async (s) => { scriptSeen = s; },
+    pages: () => [],
+  };
+  globalThis.__relayBridge = { context: fakeContext };
+  try {
+    await tool.handler({ languages: ["en-US"] });
+    // T2 markers — must all be present.
+    assert.ok(/loadTimes/.test(scriptSeen), "T2-B loadTimes patch missing");
+    assert.ok(/PERMISSION_OVERRIDES/.test(scriptSeen), "T2-C permissions map missing");
+    assert.ok(/UNMASKED_VENDOR_WEBGL|0x9245/.test(scriptSeen), "T2-D WebGL patch missing");
+    assert.doesNotThrow(() => new Function(scriptSeen),
+      "stealth script with Tier 2 patches must be syntactically valid JS");
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
