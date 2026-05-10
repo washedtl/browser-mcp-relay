@@ -1,0 +1,35 @@
+# Force common source/text files to be classified as text regardless of
+# git's binary-detection heuristic. Without this, embedding any literal
+# 0x00 byte in a string literal (e.g. for sanitizer tests) would cause
+# git to treat the whole file as binary and lose diff rendering, breaking
+# code review on PRs.
+*.js text
+*.json text
+*.md text
+*.html text
+*.css text
+*.yml text
+*.yaml text
+*.toml text
+*.txt text
+.gitignore text
+.npmrc text
+.editorconfig text
+
+# Eslint, prettier, and friends — text.
+.eslintrc* text
+.prettierrc* text
+
+# CSV fixtures used by vault tests are 7-bit-clean text (no embedded NULs).
+*.csv text
+
+# Keep image / archive formats as binary (default, but explicit).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.heapsnapshot binary
