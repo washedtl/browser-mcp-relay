@@ -728,6 +728,29 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
       return;
     }
 
+    // Inspector traffic export — returns the same shape as /api/activity but
+    // with a Content-Disposition: attachment header so the browser surfaces
+    // a "Save As..." dialog instead of rendering inline. Useful for filing
+    // bug reports (paste the JSON into an issue) or for offline analysis of
+    // a long-running session's tool-call traffic.
+    if (pathname === "/api/activity/export") {
+      try {
+        const payload = buildActivity(seams);
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const filename = `mcp-relay-activity-${stamp}.json`;
+        res.writeHead(200, {
+          ...SECURITY_HEADERS,
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${filename}"`,
+        });
+        res.end(JSON.stringify(payload, null, 2));
+      } catch (e) {
+        writeJsonHead(res, 500);
+        res.end(JSON.stringify({ error: "build failed", detail: e.message }));
+      }
+      return;
+    }
+
     const apiBuilders = {
       "/api/status": buildStatus,
       "/api/settings": buildSettings,

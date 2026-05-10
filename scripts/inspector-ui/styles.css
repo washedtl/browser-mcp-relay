@@ -460,6 +460,14 @@ body {
   color: var(--text-muted);
   font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
 }
+.page-header-left { display: flex; flex-direction: column; gap: 2px; }
+.page-header-right { display: flex; align-items: center; gap: 8px; }
+.activity-export {
+  text-decoration: none;
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 12.5px;
+}
+.activity-export:hover { background: var(--surface-2); }
 
 .banner {
   display: flex;

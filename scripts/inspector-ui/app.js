@@ -1500,10 +1500,21 @@
   function buildActivityShell(main) {
     clearChildren(main);
 
+    // Export button — anchor with download attribute so the browser handles
+    // the file save without us having to manage a Blob URL. The endpoint
+    // sets Content-Disposition: attachment with a timestamped filename.
+    const exportBtn = el("a",
+      { href: "/api/activity/export", class: "tools-pill activity-export", download: "" },
+      "↓ Export JSON",
+    );
+
     main.appendChild(
       el("div", { class: "page-header" }, [
-        el("h2", null, "Activity history"),
-        el("span", { class: "page-sub" }, "Cross-slot ring buffer · last ~200 events · standalone Inspector shows nothing"),
+        el("div", { class: "page-header-left" }, [
+          el("h2", null, "Activity history"),
+          el("span", { class: "page-sub" }, "Cross-slot ring buffer · last ~200 events · standalone Inspector shows nothing"),
+        ]),
+        el("div", { class: "page-header-right" }, [exportBtn]),
       ]),
     );
 

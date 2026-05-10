@@ -11,12 +11,14 @@ The slim README at the root of the repo is for getting up and running. This file
 - [Architecture](#architecture)
 - [Configuration](#configuration)
 - [Modes](#modes)
+- [How the pool dance actually works](#how-the-pool-dance-actually-works)
 - [Optional features](#optional-features)
   - [Proxy whitelist](#proxy-whitelist)
   - [Credential vault + autofill](#credential-vault--autofill)
 - [Inspector](#inspector)
 - [Platform support](#platform-support)
 - [Troubleshooting](#troubleshooting)
+- [Diagnostic recipes](#diagnostic-recipes)
 - [Limitations](#limitations)
 
 ---
@@ -387,6 +389,92 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 
 ---
 
+## How the pool dance actually works
+
+If you run multiple Cursor windows simultaneously, each spawns its own relay, each claims a pool slot, each launches its own Brave. Here's the full dance — useful for understanding what you're seeing in the Inspector and for debugging restart hangs.
+
+### State per slot
+
+Each pool dir has up to three pieces of state:
+
+| File / process | Purpose |
+|---|---|
+| `<pool-dir>/.mcp-wrapper-lock` | Atomic lock file. JSON `{ pid, startedAt, host, relay: true }`. Created via `O_CREAT \| O_EXCL` (POSIX) or `wx` flag (Win). Mode `0o600` on POSIX so the file isn't world-readable. |
+| `<pool-dir>/Default/...` | The actual Brave user-data — cookies, localStorage, history, etc. Read by every Brave attached to this dir. |
+| Brave subtree | Main Brave process + 5–15 helper subprocesses (renderer / GPU / utility / crashpad), all with `--user-data-dir=<pool-dir>` in their command line. |
+
+### Claim sequence (when a relay starts)
+
+```
+1. claimSlot() iterates pool dirs in order
+2. For each candidate dir:
+   a. mkdir -p <dir> (idempotent)
+   b. If lock file exists:
+      - Read lock JSON, isPidAlive(meta.pid)
+      - If pid is dead → unlink stale lock, proceed
+      - If pid is alive → skip this dir, try next
+   c. fs.openSync(lockPath, "wx", 0o600) — atomic; if fails with EEXIST,
+      another relay raced us; skip this dir, try next
+   d. Write the lock contents + fdatasync
+   e. reapOrphansFor(dir) — kills any Brave processes still pinned to
+      this dir (which wouldn't have a parent — squatters from a previous
+      session that closeBrave didn't cleanly tear down)
+3. If we exhausted all dirs → throw "pool exhausted"
+```
+
+### First tool call (lazy launch)
+
+The relay holds the lock but doesn't launch Brave at startup — only when the first `tools/call` arrives. At that point:
+
+```
+1. ensureBrave() runs
+2. F1-16 (v0.3.2): pool.reapOrphansFor(dir) AGAIN — catches any orphan
+   that appeared on this dir AFTER claim but BEFORE first tool call
+   (lazy-launch gap; the bug that bit me on 2026-05-10)
+3. launchBrave({ userDataDir: dir, port: 9333 + slot - 1, ... })
+4. Brave subtree comes up; CDP endpoint at http://127.0.0.1:<port>
+5. waitForCdpReady polls /json/version until 200 or timeout
+6. attachAutofill listens on framenavigated for vault credentials
+7. Subsequent tool calls reuse the same Brave instance
+```
+
+### Shutdown sequence
+
+```
+On SIGTERM / SIGINT / upstream-child-exit:
+  1. shutdownAsync() — memoized so concurrent triggers all await one chain
+  2. releasePool() FIRST — unlinks the lock so the slot is reclaimable
+     (W1-6: if a second Ctrl-C interrupts mid-await, the slot is already
+     freed)
+  3. upstreamClient.close() — graceful TCP/stdio close
+  4. killUpstreamTree() — taskkill /F /T on the upstream BDMCP node
+     (G0-3: walks the subtree on Win; only the parent on POSIX, where
+     reparenting is graceful)
+  5. closeBrave(bridge) + inspectorHandle.close() in PARALLEL with per-
+     step timeouts (8s / 3s) — G0-7 + G1-2: prevents one wedged step
+     from blocking the whole shutdown
+  6. process.exit(128 + signal-num)
+
+On Windows TerminateProcess (force-quit Cursor, blue screen, power loss):
+  - Only process.on("exit") fires → shutdownSync() runs
+  - closeBrave(bridge).catch(() => {}) is fire-and-forget — Playwright's
+    context.close is async; the process exits before it resolves
+  - Brave is reparented to System; the next relay's claimSlot reaps it
+```
+
+### Why you might see N+1 relays vs N Cursor windows
+
+Cursor's bundled `cursor-browser-devtools-mcp-vscode-0.6.3-universal` extension runs its OWN MCP — separate process tree, separate user-data-dir (`.browser-data-mcp`, no `-pool-N` suffix). Distinguish:
+
+| Process | Identifier in `Get-CimInstance Win32_Process` |
+|---|---|
+| **Your relay** | `node ...\.claude\scripts\browser-mcp-relay\src\index.js` — uses `.browser-data-mcp-pool-N` dirs |
+| **Cursor's bundled MCP** | `node ...\.cursor\extensions\serkan-ozal.browser-devtools-mcp-vscode-...\node_modules\browser-devtools-mcp\dist\index.js --cursor-mcp-server` — uses `.browser-data-mcp` (no `-pool-` suffix) |
+
+Both can be alive simultaneously. The relay's safety net (claim-time + pre-launch reap) only protects YOUR relay's pool dirs — Cursor's bundled MCP has its own lifecycle. If you only ever see Brave processes pinned to `.browser-data-mcp` (no `-pool-`), that's the bundled extension, not your relay.
+
+---
+
 ## Optional features
 
 ### Proxy whitelist
@@ -517,6 +605,100 @@ Get-CimInstance Win32_Process -Filter "Name='brave.exe'" | Where-Object {
 ### Multiple relays from one machine
 
 Each relay process needs its own user-data-dir. Use pool mode (`BROWSER_RELAY_POOL_DIR=/path/to/dir`, different per process) or run each relay in its own checkout.
+
+---
+
+## Diagnostic recipes
+
+Drop-in PowerShell snippets for poking around when something feels off. All of these are **read-only** — they observe state without modifying anything. None require the Inspector to be running.
+
+### Find orphan Brave subtrees pinned to a relay pool dir
+
+The classic "Cursor restart hangs" symptom. Run this in PowerShell BEFORE reopening Cursor — anything returned is an orphan that the next relay's pre-launch reap (F1-16) should clean up automatically on v0.3.2+. Older relays will hang on launch.
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='brave.exe'" | Where-Object {
+  $_.CommandLine -match 'browser-data-mcp' -and -not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue)
+} | Select-Object ProcessId, ParentProcessId, @{
+  N='Dir'; E={ if($_.CommandLine -match '--user-data-dir=("?)([^"]+?)\1'){$Matches[2]} }
+}
+```
+
+Empty output = no orphans. Anything else = list of `(PID, dead-parent-PID, dir)` triples. Manual cleanup if needed: `taskkill /F /T /PID <orphan-main-pid>`.
+
+### Inventory all Brave processes by pool dir
+
+When you want to see which slots are actually in use vs. just lock-claimed.
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='brave.exe'" | ForEach-Object {
+  $dir = if ($_.CommandLine -match '--user-data-dir=("?)([^"]+?)\1') { $Matches[2] } else { '<unknown>' }
+  $type = if ($_.CommandLine -match '--type=(\w+)') { $Matches[1] } else { 'main' }
+  [PSCustomObject]@{ PID = $_.ProcessId; PPID = $_.ParentProcessId; Type = $type; Dir = $dir }
+} | Group-Object Dir | Select-Object Name, Count | Sort-Object Name
+```
+
+### Show the live state of every pool slot lock
+
+Which pool slots have valid locks vs. stale ones. The relay self-heals stale locks at next claim, but it's useful to see them yourself.
+
+```powershell
+1..16 | ForEach-Object {
+  $lock = "$env:USERPROFILE\.browser-data-mcp-pool-$_\.mcp-wrapper-lock"
+  if (Test-Path $lock) {
+    $meta = Get-Content $lock | ConvertFrom-Json
+    $alive = $null -ne (Get-Process -Id $meta.pid -ErrorAction SilentlyContinue)
+    [PSCustomObject]@{ Slot = $_; PID = $meta.pid; Alive = $alive; Held = $meta.startedAt }
+  }
+} | Format-Table -AutoSize
+```
+
+### Check whether a relay is actually responding
+
+If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the slot's CDP port (`9333 + slot - 1`).
+
+```powershell
+Invoke-WebRequest -Uri "http://127.0.0.1:9333/json/version" -UseBasicParsing | Select-Object StatusCode, @{
+  N='Browser'; E={ ($_.Content | ConvertFrom-Json).Browser }
+}
+```
+
+200 + a Brave version → CDP is healthy; relay is responsive. Connection refused → Brave isn't running. Hangs → Brave is wedged (renderer crash, etc.) — `taskkill /F /T /PID <main-brave-pid>` and restart Cursor.
+
+### Confirm which Cursor MCP is which
+
+When you see 12+ MCP-related node processes alive simultaneously and want to distinguish "your relay" from "Cursor's bundled extension":
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {
+  $_.CommandLine -match 'browser-mcp-relay|browser-devtools-mcp'
+} | Select-Object ProcessId, ParentProcessId, @{
+  N='Identity'; E={
+    if ($_.CommandLine -match 'browser-mcp-relay') { 'YOUR relay' }
+    elseif ($_.CommandLine -match 'cursor-mcp-server') { 'Cursor bundled' }
+    else { '<unknown>' }
+  }
+} | Format-Table -AutoSize
+```
+
+### Tail the relay's stderr from the inspector log file
+
+The relay writes diagnostic stderr lines (autofill events, CDP errors, shutdown traces). Cursor swallows them; the inspector's in-process mode captures them in memory but doesn't persist them. For long-running diagnosis, redirect the relay's stderr to a file by tweaking your MCP-client config:
+
+```jsonc
+// ~/.claude.json (excerpt) — adds stderr file capture
+{
+  "mcpServers": {
+    "browser-mcp-relay": {
+      "command": "node",
+      "args": ["<absolute-path>/src/index.js"],
+      "stderr": "<absolute-path>/relay-stderr.log"
+    }
+  }
+}
+```
+
+Then `Get-Content $env:USERPROFILE/.claude/scripts/browser-mcp-relay/relay-stderr.log -Tail 50 -Wait` to follow it live.
 
 ---
 
