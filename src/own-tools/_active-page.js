@@ -16,6 +16,24 @@ function setActivePage(page) {
 }
 
 /**
+ * T0-8: clear the tracked active page. Used by tabs_close when closing the
+ * active page itself — without this, the next own-tool call sees the closed
+ * page, falls through `activePage.isClosed()` to `pages[length-1]`, which
+ * may be Brave's residual about:blank. Tabs-close is the canonical caller.
+ *
+ * Test seam — exposed primarily so unit tests can reset module state, but
+ * also used by tabs-close in production.
+ */
+function clearActivePage() {
+  activePage = null;
+}
+
+/** Read-only accessor for tests + diagnostics. */
+function getActivePageRaw() {
+  return activePage;
+}
+
+/**
  * Get the page own-tools should target. Order:
  *   1. The explicit active page if set + still open
  *   2. The last page in the context (tabs_new appends, so this is usually right)
@@ -59,4 +77,4 @@ async function withActivePage(handler) {
   return handler({ bridge, page });
 }
 
-module.exports = { setActivePage, getActivePage, withActivePage };
+module.exports = { setActivePage, getActivePage, withActivePage, clearActivePage, getActivePageRaw };

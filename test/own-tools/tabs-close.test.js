@@ -73,3 +73,49 @@ test("V1-5: tabs_close with index>=length returns isError (existing behavior pre
     globalThis.__relayBridge = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// T0-8: closing the active page must clear the active-page reference
+// so subsequent own-tool calls don't operate on a closed page.
+// ──────────────────────────────────────────────────────────────────
+
+test("T0-8: tabs_close on the ACTIVE page clears activePage reference", async () => {
+  const prev = globalThis.__relayBridge;
+  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
+  // Two pages; mark page 1 as active; close page 1 — verify activePage cleared.
+  const bridge = makeFakeBridge(["about:blank", "https://target.example.com/"]);
+  globalThis.__relayBridge = bridge;
+  const targetPage = bridge._pages[1];
+  setActivePage(targetPage);
+  try {
+    assert.strictEqual(getActivePageRaw(), targetPage, "precondition: target is the active page");
+    const result = await tool.handler({ index: 1 });
+    assert.notStrictEqual(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.strictEqual(payload.wasActive, true, "must report wasActive=true");
+    assert.strictEqual(getActivePageRaw(), null, "activePage must be cleared after closing the active page");
+  } finally {
+    globalThis.__relayBridge = prev;
+    clearActivePage();
+  }
+});
+
+test("T0-8: tabs_close on a non-active page leaves activePage untouched", async () => {
+  const prev = globalThis.__relayBridge;
+  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
+  const bridge = makeFakeBridge(["about:blank", "https://target.example.com/"]);
+  globalThis.__relayBridge = bridge;
+  const activePage = bridge._pages[1];
+  setActivePage(activePage);
+  try {
+    // Close index 0 (NOT the active one).
+    const result = await tool.handler({ index: 0 });
+    assert.notStrictEqual(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.strictEqual(payload.wasActive, false, "must report wasActive=false");
+    assert.strictEqual(getActivePageRaw(), activePage, "active page reference must be preserved");
+  } finally {
+    globalThis.__relayBridge = prev;
+    clearActivePage();
+  }
+});

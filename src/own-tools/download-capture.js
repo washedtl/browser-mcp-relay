@@ -37,6 +37,16 @@ module.exports = {
     // missing fast downloads.
     const downloadPromise = page.waitForEvent("download", { timeout: timeoutMs });
 
+    // T0-9: race the download wait against the page's `close` event. Without
+    // this, calling tabs_close on the page mid-download (or having the page
+    // crash) leaves waitForEvent pending until the full timeoutMs (default 30s).
+    // The close-promise rejects with a clean message so the user gets actionable
+    // feedback instead of a generic timeout.
+    const closePromise = new Promise((_, reject) => {
+      const onClose = () => reject(new Error("page closed before download started"));
+      page.once("close", onClose);
+    });
+
     if (clickSelector) {
       try {
         await page.click(clickSelector, { timeout: timeoutMs });
@@ -47,9 +57,18 @@ module.exports = {
 
     let download;
     try {
-      download = await downloadPromise;
+      download = await Promise.race([downloadPromise, closePromise]);
     } catch (e) {
-      return { content: [{ type: "text", text: `no download in ${timeoutMs}ms: ${e.message}` }], isError: true };
+      const isPageClosed = /page closed/i.test(e.message);
+      return {
+        content: [{
+          type: "text",
+          text: isPageClosed
+            ? `download_capture: ${e.message}`
+            : `no download in ${timeoutMs}ms: ${e.message}`,
+        }],
+        isError: true,
+      };
     }
 
     const suggested = download.suggestedFilename() || "file.bin";

@@ -26,7 +26,7 @@ test("memory_take-heap-snapshot returns isError when bridge missing", async () =
 //   (a) sync I/O (writeFileSync on a 50-500MB heap) blocks the event loop;
 //   (b) inline cdp.detach() right after takeHeapSnapshot leaks the session
 //       if takeHeapSnapshot threw.
-test("V1-1: memory_take-heap-snapshot source uses async fs writes (no writeFileSync)", () => {
+test("V1-1 + T1-3: memory_take-heap-snapshot streams chunks to disk (no sync I/O, no full-buffer)", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const src = fs.readFileSync(
@@ -42,9 +42,12 @@ test("V1-1: memory_take-heap-snapshot source uses async fs writes (no writeFileS
     "memory-take-heap-snapshot.js must NOT call fs.writeFileSync()");
   assert.ok(!/\bfs\.statSync\s*\(/.test(code),
     "memory-take-heap-snapshot.js must NOT call fs.statSync()");
-  // Must use the async API.
-  assert.ok(/fsp\.writeFile\s*\(|fs\.promises\.writeFile\s*\(/.test(code),
-    "memory-take-heap-snapshot.js must use async fs.promises.writeFile");
+  // T1-3: must stream via createWriteStream, NOT buffer + writeFile at end.
+  // Buffering chunks.join("") doubles peak memory on large heaps.
+  assert.ok(/fs\.createWriteStream\s*\(/.test(code),
+    "memory-take-heap-snapshot.js must use fs.createWriteStream (T1-3 streaming)");
+  assert.ok(!/chunks\.join\s*\(/.test(code),
+    "memory-take-heap-snapshot.js must NOT call chunks.join() (T1-3: stream instead of buffer-and-join)");
 });
 
 test("V1-1: memory_take-heap-snapshot source no longer calls cdp.detach() inline", () => {

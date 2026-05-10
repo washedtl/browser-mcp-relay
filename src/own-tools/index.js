@@ -27,6 +27,11 @@ const tools = [
   require("./stealth-apply.js"),
   require("./download-capture.js"),
   require("./extract-structured.js"),
+  // Local / session storage — auth tokens for many modern SaaS apps
+  // (Discord, Notion, Slack, Linear, Mercury…) live here, not in HTTP cookies.
+  require("./storage-get-local.js"),
+  require("./storage-set-local.js"),
+  require("./storage-clear-local.js"),
 ];
 
 module.exports = { tools };

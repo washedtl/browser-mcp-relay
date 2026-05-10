@@ -85,7 +85,7 @@ function makeSeams(overrides = {}) {
     }),
     _now: () => Date.now(),
     _startedAt: Date.now() - 5000,
-    _ownTools: new Array(16).fill({ name: "x" }),
+    _ownTools: new Array(19).fill({ name: "x" }),
     _env: {},
     ...overrides.extra,
   };
@@ -212,8 +212,8 @@ test("buildStatus: bravePath is redacted to basename", () => {
 
 test("buildStatus: tools.ownCount comes from ownTools length", () => {
   const status = buildStatus(makeSeams());
-  assert.strictEqual(status.tools.ownCount, 16);
-  assert.strictEqual(status.tools.total, 16 + 51);
+  assert.strictEqual(status.tools.ownCount, 19);
+  assert.strictEqual(status.tools.total, 19 + 51);
 });
 
 // ─── v0.2.1: cookieSource block on buildStatus ──────────────────────────
@@ -602,14 +602,17 @@ test("inputSchemaPreview: returns comma-separated top-level field names", () => 
   assert.strictEqual(s, "url, formFactor, onlyCategories");
 });
 
-test("buildToolsCatalog: total = own + forwarded = 67 (16 + 51)", () => {
+test("buildToolsCatalog: total = own + forwarded = 70 (19 + 51)", () => {
+  // Updated 2026-05-09: added storage_get-local / storage_set-local /
+  // storage_clear-local own-tools (auth tokens for Discord/Notion/etc live
+  // in localStorage, not HTTP cookies). 16 → 19 own-tools.
   const c = buildToolsCatalog();
-  assert.strictEqual(c.total, 67);
-  assert.strictEqual(c.ownCount, 16);
+  assert.strictEqual(c.total, 70);
+  assert.strictEqual(c.ownCount, 19);
   assert.strictEqual(c.forwardedCount, 51);
   assert.ok(Array.isArray(c.own));
   assert.ok(Array.isArray(c.forwarded));
-  assert.strictEqual(c.own.length, 16);
+  assert.strictEqual(c.own.length, 19);
   assert.strictEqual(c.forwarded.length, 51);
 });
 
@@ -683,10 +686,10 @@ test("GET /api/tools → 200 with valid shape", async () => {
     assert.strictEqual(r.status, 200);
     assert.match(r.headers["content-type"], /application\/json/);
     const body = JSON.parse(r.body);
-    assert.strictEqual(body.total, 67);
-    assert.strictEqual(body.ownCount, 16);
+    assert.strictEqual(body.total, 70);
+    assert.strictEqual(body.ownCount, 19);
     assert.strictEqual(body.forwardedCount, 51);
-    assert.strictEqual(body.own.length, 16);
+    assert.strictEqual(body.own.length, 19);
     assert.strictEqual(body.forwarded.length, 51);
   } finally {
     server.close();

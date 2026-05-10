@@ -129,3 +129,93 @@ test("tabs_new: about:blank URL skips upstream propagation", async () => {
     globalThis.__relayUpstream = prevUpstream;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// T0-7: bad URL returns isError + structured navError, doesn't propagate.
+// T1-10: waitUntil parameter is honored.
+// ──────────────────────────────────────────────────────────────────
+
+function makeFakeBridgeWithFailingGoto(errMsg = "net::ERR_NAME_NOT_RESOLVED") {
+  const pages = [];
+  return {
+    context: {
+      pages: () => pages,
+      newPage: async () => {
+        const p = {
+          _url: "about:blank",
+          url() { return this._url; },
+          async goto() { throw new Error(errMsg); },
+        };
+        pages.push(p);
+        return p;
+      },
+    },
+  };
+}
+
+test("T0-7: tabs_new with bad URL returns isError + navError + does NOT propagate", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const prevUpstream = globalThis.__relayUpstream;
+  let upstreamCalled = false;
+  globalThis.__relayBridge = makeFakeBridgeWithFailingGoto();
+  globalThis.__relayUpstream = async () => ({
+    request: async () => { upstreamCalled = true; return {}; },
+  });
+  try {
+    const result = await tool.handler({ url: "https://no-such-host.invalid/" });
+    assert.strictEqual(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.match(payload.navError, /ERR_NAME_NOT_RESOLVED|invalid/i);
+    assert.strictEqual(payload.upstreamPropagated, false);
+    assert.strictEqual(upstreamCalled, false, "upstream must NOT be called when goto fails");
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+    globalThis.__relayUpstream = prevUpstream;
+  }
+});
+
+test("T0-7: tabs_new with bad URL still tracks the new page as active", async () => {
+  // The page exists in context.pages() even after a failed goto. setActivePage
+  // must have been called before goto so subsequent own-tools target this
+  // (orphan) tab rather than the previous active page.
+  const { getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
+  const prevBridge = globalThis.__relayBridge;
+  globalThis.__relayBridge = makeFakeBridgeWithFailingGoto();
+  clearActivePage();
+  try {
+    await tool.handler({ url: "https://no-such-host.invalid/" });
+    const tracked = getActivePageRaw();
+    assert.ok(tracked, "active page must be set even after goto failure");
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+    clearActivePage();
+  }
+});
+
+test("T1-10: tabs_new accepts waitUntil parameter and passes it to goto", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  let lastGotoOpts = null;
+  const pages = [];
+  globalThis.__relayBridge = {
+    context: {
+      pages: () => pages,
+      newPage: async () => {
+        const p = {
+          _url: "about:blank",
+          url() { return this._url; },
+          async goto(u, opts) { this._url = u; lastGotoOpts = opts; return null; },
+        };
+        pages.push(p);
+        return p;
+      },
+    },
+  };
+  try {
+    await tool.handler({ url: "https://example.com/", waitUntil: "networkidle", timeoutMs: 60000 });
+    assert.ok(lastGotoOpts, "goto must be called with options");
+    assert.strictEqual(lastGotoOpts.waitUntil, "networkidle");
+    assert.strictEqual(lastGotoOpts.timeout, 60000);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+  }
+});

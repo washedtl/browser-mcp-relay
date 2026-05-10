@@ -375,6 +375,12 @@ const OWN_TOOL_META = {
   stealth_apply: { sourceFile: "stealth-apply.js", category: "session" },
   download_capture: { sourceFile: "download-capture.js", category: "downloads" },
   extract_structured: { sourceFile: "extract-structured.js", category: "data" },
+  // Storage tools (added 2026-05-09) — auth tokens for modern OAuth-style apps
+  // (Discord, Notion, Slack, Linear, Mercury…) live in localStorage rather
+  // than HTTP cookies. These complement cookies_export.
+  "storage_get-local": { sourceFile: "storage-get-local.js", category: "session" },
+  "storage_set-local": { sourceFile: "storage-set-local.js", category: "session" },
+  "storage_clear-local": { sourceFile: "storage-clear-local.js", category: "session" },
 };
 
 function truncate(text, max) {
