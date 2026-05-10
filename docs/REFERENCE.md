@@ -15,6 +15,7 @@ The slim README at the root of the repo is for getting up and running. This file
 - [Optional features](#optional-features)
   - [Proxy whitelist](#proxy-whitelist)
   - [Credential vault + autofill](#credential-vault--autofill)
+- [Stealth model](#stealth-model)
 - [Inspector](#inspector)
 - [Platform support](#platform-support)
 - [Troubleshooting](#troubleshooting)
@@ -73,7 +74,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 |---|---|---|---|
 | `cookies_export` | Export cookies as JSON | `urls` (filter) | Save an authed session for later |
 | `cookies_import` | Import cookies into the context | `cookies` | Restore an authed session |
-| `stealth_apply` | Anti-detection patches | `languages` | Defeat trivial bot checks |
+| `stealth_apply` | Anti-detection patches (Tier 1) | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
 
 #### 💾 Downloads
 
@@ -494,6 +495,50 @@ The relay can auto-fill login forms when a saved credential matches the current 
 The vault loads CSVs at startup, indexes by hostname + registrable domain, and fills the first empty username + password fields on each `framenavigated`. **It does not auto-submit** — you click submit yourself.
 
 > ⚠️ **Security:** Passwords stay in memory only — never logged, never re-written. But anyone with read access to your relay process's memory could read them. Only point this at CSVs you trust. The vault is most useful when scraping authed sites that block Playwright's password manager (e.g. Brave 127+'s App-Bound Encryption).
+
+---
+
+## Stealth model
+
+`stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load in the active context. **Off by default** — call the tool once per session to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
+
+### Tier 1 — what's covered (v0.3.4)
+
+| Patch | What it defeats |
+|---|---|
+| `navigator.webdriver = undefined` | Trivial `if (navigator.webdriver)` checks |
+| `navigator.plugins` faked | Bot detection that flags empty plugins arrays |
+| `navigator.languages` override | Mismatched-language flagging |
+| `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
+| `window.chrome = { runtime: {} }` | The "no Chrome runtime" headless tell |
+| **`navigator.userAgentData` synthesized from current UA** | Sec-CH-UA-* JS-side fingerprinting; tracks `emulate_device`'s UA override |
+| **`toString()` defense on patched getters** | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
+| **AudioContext `getChannelData` stabilization** | Audio-fingerprint hash detection on PerimeterX et al.; per-session deterministic jitter (≤ 1e-7), not random per-call |
+
+This covers trivial bot checks + the bottom ~70% of common fingerprint surface. **Verified by source-pattern tests** (`test/own-tools/stealth-apply.test.js` — T1-A / T1-B / T1-C).
+
+### What it does NOT cover
+
+The relay is honest about these limits — pretending otherwise misleads callers planning around what they think they have.
+
+| Limit | Why | Workaround |
+|---|---|---|
+| **TLS / HTTP/2 fingerprint (JA3 / JA4)** | Server-side detection runs before any JS executes. Playwright's chromium has a recognizable TLS handshake. | Route through a TLS-mimicking proxy (`BROWSER_RELAY_PROXY_URL` + a tool like `tlspoof` or a real-Brave-attach pattern). |
+| **HTTP-side `Sec-CH-UA-*` headers** | Set by chromium's internal config, not `navigator.userAgent`. The Tier 1 patch only covers the JS-side `navigator.userAgentData`. | Tier 2 (deferred): pass `userAgentMetadata` to CDP `Network.setUserAgentOverride` from `emulate_device`. |
+| **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. Tier 1's getter-level toString defense doesn't reach this. | Tier 3 (deferred): rebrowser-patches at the chromium-binary level. |
+| **`event.isTrusted` detection (press-and-hold, captchas)** | Synthetic events from CDP fundamentally have `isTrusted=false`. This is by browser design — there's no JS-level fix. | Don't try to auto-solve press-and-hold CAPTCHAs; route the user through them manually. |
+| **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | Tier 2 (deferred): `humanlike_click` + `humanlike_type` tools. |
+| **WebGL renderer/vendor fingerprint** | Chromium reports `(WebKit)`/`(Brave)`-distinguishing strings. | Tier 2 (deferred). Easy to over-reach (mismatched GPU + UA = instant flag). |
+
+### Hard targets
+
+For sites with sophisticated detection (Akamai, DataDome, advanced PerimeterX deployments), `stealth_apply` is **insufficient** — it's a starting point, not a finish line. Real wins for hard targets are:
+
+- **Real-Brave-attach** (Tier 3, deferred — see BACKLOG): connect to a Brave instance the user is already running interactively, never spawn one. Eliminates the entire "Playwright launched it" fingerprint surface. Already used in the maintainer's Walmart sidecar.
+- **Residential proxies** (Bright Data, IPRoyal): TLS handshake from a residential IP gets a much higher trust score than data-center IPs. Set `BROWSER_RELAY_PROXY_URL`.
+- **Warm session reuse** (`cookies_export` / `cookies_import` + the credential vault): a session with N days of authentic browsing history scores higher than a fresh login.
+
+For the full deferred-work catalog (Tiers 2/3 + anti-patterns NOT to implement), see [`BACKLOG.md`](./BACKLOG.md).
 
 ---
 
