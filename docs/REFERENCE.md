@@ -502,7 +502,9 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 
 `stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load in the active context. **Off by default** — call the tool once per session to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
 
-### Tier 1 — what's covered (v0.3.4)
+### Tier 1+2 — what's covered (v0.3.5)
+
+**Tier 1** (v0.3.4):
 
 | Patch | What it defeats |
 |---|---|
@@ -510,12 +512,20 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 | `navigator.plugins` faked | Bot detection that flags empty plugins arrays |
 | `navigator.languages` override | Mismatched-language flagging |
 | `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
-| `window.chrome = { runtime: {} }` | The "no Chrome runtime" headless tell |
-| **`navigator.userAgentData` synthesized from current UA** | Sec-CH-UA-* JS-side fingerprinting; tracks `emulate_device`'s UA override |
-| **`toString()` defense on patched getters** | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
-| **AudioContext `getChannelData` stabilization** | Audio-fingerprint hash detection on PerimeterX et al.; per-session deterministic jitter (≤ 1e-7), not random per-call |
+| `navigator.userAgentData` synthesized from current UA | Sec-CH-UA-* JS-side fingerprinting; tracks `emulate_device`'s UA override |
+| `toString()` defense on patched getters | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
+| AudioContext `getChannelData` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; per-session deterministic jitter (≤ 1e-7), not random per-call |
 
-This covers trivial bot checks + the bottom ~70% of common fingerprint surface. **Verified by source-pattern tests** (`test/own-tools/stealth-apply.test.js` — T1-A / T1-B / T1-C).
+**Tier 2** (v0.3.5 — added 2026-05-10):
+
+| Patch | What it defeats |
+|---|---|
+| **HTTP-side `Sec-CH-UA-*` headers via `userAgentMetadata`** | The Tier-1 JS-side `userAgentData` paired with HTTP-side `Sec-CH-UA-*` mismatch detection. `emulate_device` now passes a synthesized `userAgentMetadata` to CDP's `Network.setUserAgentOverride`. |
+| **`window.chrome` runtime expansion** | Probes for `chrome.loadTimes()` / `chrome.csi()` / `chrome.app` namespace. Real Chrome ships all three; Tier 1's bare `runtime: {}` was a tell. Now populates plausible-shape stubs. |
+| **Full permissions overrides** | Probes for `geolocation` / `clipboard-read` / `clipboard-write` / `camera` / `microphone` / `midi` / `push` / etc. Tier 1 only covered notifications; Tier 2 extends to the canonical 17 permission types with realistic states. |
+| **WebGL renderer + vendor override** | `getParameter(UNMASKED_VENDOR_WEBGL)` / `getParameter(UNMASKED_RENDERER_WEBGL)` returning Playwright signature strings. UA-aware GPU strings on both `WebGLRenderingContext` and `WebGL2RenderingContext`. |
+
+This covers trivial bot checks + the bottom ~85% of common fingerprint surface. **Verified by source-pattern tests** (`test/own-tools/stealth-apply.test.js` T1-A/B/C + T2-B/C/D, plus `test/own-tools/emulate-device.test.js` T2-A).
 
 ### What it does NOT cover
 
@@ -524,11 +534,9 @@ The relay is honest about these limits — pretending otherwise misleads callers
 | Limit | Why | Workaround |
 |---|---|---|
 | **TLS / HTTP/2 fingerprint (JA3 / JA4)** | Server-side detection runs before any JS executes. Playwright's chromium has a recognizable TLS handshake. | Route through a TLS-mimicking proxy (`BROWSER_RELAY_PROXY_URL` + a tool like `tlspoof` or a real-Brave-attach pattern). |
-| **HTTP-side `Sec-CH-UA-*` headers** | Set by chromium's internal config, not `navigator.userAgent`. The Tier 1 patch only covers the JS-side `navigator.userAgentData`. | Tier 2 (deferred): pass `userAgentMetadata` to CDP `Network.setUserAgentOverride` from `emulate_device`. |
-| **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. Tier 1's getter-level toString defense doesn't reach this. | Tier 3 (deferred): rebrowser-patches at the chromium-binary level. |
-| **`event.isTrusted` detection (press-and-hold, captchas)** | Synthetic events from CDP fundamentally have `isTrusted=false`. This is by browser design — there's no JS-level fix. | Don't try to auto-solve press-and-hold CAPTCHAs; route the user through them manually. |
-| **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | Tier 2 (deferred): `humanlike_click` + `humanlike_type` tools. |
-| **WebGL renderer/vendor fingerprint** | Chromium reports `(WebKit)`/`(Brave)`-distinguishing strings. | Tier 2 (deferred). Easy to over-reach (mismatched GPU + UA = instant flag). |
+| **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. Tier 1's getter-level toString defense doesn't reach this. | Tier 3 (deferred — see BACKLOG): rebrowser-patches at the chromium-binary level. |
+| **`event.isTrusted` detection (press-and-hold, CAPTCHAs)** | Synthetic events from CDP fundamentally have `isTrusted=false`. This is by browser design — there's no JS-level fix. | Don't try to auto-solve press-and-hold CAPTCHAs; route the user through them manually. |
+| **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | Tier 2.5 (deferred — see BACKLOG): `humanlike_click` + `humanlike_type` tools. Has an explicit ship gate (capture the detection signal first; design the humanizer to match the target's tolerance window). |
 
 ### Hard targets
 

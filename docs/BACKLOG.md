@@ -16,53 +16,35 @@ This file is the canonical source for "what's known but not yet shipped." Items 
 
 ---
 
-## Stealth — Tier 2 (opinionated)
+## Stealth — Tier 2 (SHIPPED in v0.3.5 — 2026-05-10)
 
-Useful additions, ~200-400 LOC each. Defer until a specific use case demands them.
+The four stealth-fingerprint patches in Tier 2 shipped together. The fifth Tier 2 item (humanlike interaction tools) was different scope and ship-gated separately as Tier 2.5 below.
+
+| Patch | Ship | Status |
+|---|---|---|
+| HTTP-side `Sec-CH-UA-*` via `userAgentMetadata` (T2-A) | v0.3.5 | ✅ shipped |
+| Chrome runtime expansion — `loadTimes` / `csi` / `app` (T2-B) | v0.3.5 | ✅ shipped |
+| Full permissions overrides — 17 permission types (T2-C) | v0.3.5 | ✅ shipped |
+| WebGL renderer + vendor override — UA-aware (T2-D) | v0.3.5 | ✅ shipped |
+
+See `src/own-tools/stealth-apply.js` + `src/own-tools/emulate-device.js` (T2-A's `synthesizeUserAgentMetadata`) for the implementations.
+
+## Stealth — Tier 2.5 (deferred with explicit ship gate)
 
 ### `humanlike_click` + `humanlike_type` tools
 
 **What:** New first-party tools with humanlike interaction timing — Bezier-curve mouse paths with realistic dwell, gaussian-distributed keystroke delays, occasional typo + correction patterns.
 
-**Why deferred:** "How human is human enough" is itself an arms race. Worth a focused session against a specific site that's flagging current `interaction_click` / `interaction_fill`. Without that signal, we'd be optimizing against an imagined adversary.
+**Why deferred:** "How human is human enough" is itself an arms race. Worth a focused session against a specific site that's flagging current `interaction_click` / `interaction_fill`. Without that signal, we'd be optimizing against an imagined adversary, AND uniform-Bezier-curve clicks are themselves detectable — the patch only works if it matches the target's specific tolerance window.
 
-**Ship gate:** A specific target site is flagging us via behavioral analysis. Capture the detection signal first (timing-side fingerprint), then design the humanizer to match the target's tolerance window.
+**Ship gate (must be met before implementation):**
+1. A specific target site is flagging the relay via behavioral analysis (verifiable: scrape with `interaction_click` → site flags us → capture detection JS via `capture_xhr` → identify the timing-side check).
+2. Capture the target's tolerance window — what kinds of timing distributions does IT consider human? (Some sites accept anything > 50 ms between keystrokes; others require gaussian distributions; PerimeterX deployments measure full-trajectory entropy.)
+3. Design the humanizer to match THAT target's tolerance, not "humanlike in general."
 
-### CDP `Network.setUserAgentOverride` userAgentMetadata
+**Effort:** ~200 LOC + a configurable tolerance profile system. Probably 1 focused session.
 
-**What:** Extend `emulate_device` to pass `userAgentMetadata` (the `userAgentMetadata` arg of CDP's `Network.setUserAgentOverride`) so the HTTP-side `Sec-CH-UA-*` headers align with the JS-side `navigator.userAgentData` that Tier 1 already synthesizes.
-
-**Why deferred:** Most current targets don't read Sec-CH-UA-* headers strictly. Tier 1's JS-side patch alone is sufficient for the 80% case.
-
-**Ship gate:** A target is flagging on the HTTP-vs-JS UA mismatch. Easy to verify: compare `Sec-CH-UA-Platform` header to `navigator.userAgentData.platform` in a captured request — if they disagree, this is the missing piece.
-
-**Effort:** ~50 LOC + an `emulate_device` test asserting the metadata gets through.
-
-### WebGL renderer / vendor override
-
-**What:** Override `WebGLRenderingContext.prototype.getParameter` to return realistic `(Intel Iris)` / `(NVIDIA RTX 3060)` strings instead of Playwright's signature output.
-
-**Why deferred:** Easy to over-reach. A mismatched GPU+UA combination (e.g. `iOS UA + Linux GPU strings`) is an INSTANT flag — worse than no patch. Doing this right requires per-platform realistic GPU strings keyed off the UA.
-
-**Ship gate:** Deploy a Tier-2 effort with realistic GPU vendor/renderer pairs sourced from real-browser fingerprint data, not made-up values.
-
-**Effort:** ~100 LOC + a fingerprint database (~30 KB JSON of real GPU strings by platform).
-
-### Chrome runtime expansion
-
-**What:** Beyond Tier 1's `window.chrome = { runtime: {} }`, populate `chrome.loadTimes()`, `chrome.csi()`, `chrome.app` namespace with realistic shapes from real Chrome.
-
-**Why deferred:** Most current sites don't probe deeper than `chrome.runtime`. Adding more surface = more chances to reveal an inconsistency.
-
-**Ship gate:** A target probes `chrome.loadTimes()` (verifiable via `capture_xhr` plus inspecting the page's bot-detection JS for `chrome.loadTimes` references).
-
-### Permissions full overrides
-
-**What:** Beyond Tier 1's notifications fix, also override `clipboard-read`, `geolocation`, `camera`, `microphone` permission queries to return realistic states.
-
-**Why deferred:** Each adds a small detection surface, marginal aggregate benefit. Easy to ship in batch when Tier 2 work happens.
-
-**Effort:** ~30 LOC (one block extending the existing notifications fix).
+**Bypass:** If you just need a specific site to work and you've identified the friction, you can manually call `interaction_click` with a custom delay loop in JS via `execute` — that's already possible without new tools.
 
 ---
 

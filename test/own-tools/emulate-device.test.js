@@ -174,3 +174,85 @@ test("T1-9: emulate_device rejects viewport without width/height at entry", asyn
     globalThis.__relayBridge = prev;
   }
 });
+
+// ─── Tier 2 (v0.3.5) ───
+//
+// T2-A: emulate_device passes userAgentMetadata to CDP's
+// Network.setUserAgentOverride so HTTP-side Sec-CH-UA-* aligns with the
+// JS-side navigator.userAgentData that stealth_apply T1-A synthesizes.
+
+test("T2-A: synthesizeUserAgentMetadata produces correct shape from a Windows Chrome UA", () => {
+  const out = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+  );
+  assert.strictEqual(out.platform, "Windows");
+  assert.strictEqual(out.platformVersion, "15.0.0");
+  assert.strictEqual(out.architecture, "x86");
+  assert.strictEqual(out.bitness, "64");
+  assert.strictEqual(out.mobile, false);
+  assert.strictEqual(out.wow64, false);
+  assert.strictEqual(out.model, "");
+  assert.ok(Array.isArray(out.brands));
+  assert.ok(out.brands.some((b) => b.brand === "Chromium"),
+    "brands must include Chromium");
+  assert.ok(out.brands.some((b) => b.brand === "Not?A_Brand"),
+    "brands must include the Not?A_Brand randomization slot");
+  assert.ok(Array.isArray(out.fullVersionList));
+  assert.ok(out.fullVersionList[0].version.startsWith("127."),
+    "fullVersionList must reflect the Chrome major version");
+});
+
+test("T2-A: synthesizeUserAgentMetadata branches on platform from UA", () => {
+  // macOS UA → platform: macOS
+  const mac = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+  );
+  assert.strictEqual(mac.platform, "macOS");
+  // Linux UA → platform: Linux
+  const linux = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+  );
+  assert.strictEqual(linux.platform, "Linux");
+  // Android UA → platform: Android, mobile: true
+  const android = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36"
+  );
+  assert.strictEqual(android.platform, "Android");
+  assert.strictEqual(android.mobile, true);
+  // iPhone UA → platform: iOS, mobile: true
+  const ios = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile/15E148 Safari/604.1"
+  );
+  assert.strictEqual(ios.platform, "iOS");
+  assert.strictEqual(ios.mobile, true);
+});
+
+test("T2-A: emulate_device's handler passes userAgentMetadata to setUserAgentOverride", async () => {
+  const prev = globalThis.__relayBridge;
+  const sentCommands = [];
+  const fakePage = { once() {} };
+  const fakeCdp = {
+    send: async (method, params) => { sentCommands.push({ method, params }); },
+    detach: async () => {},
+  };
+  const fakeContext = { pages: () => [fakePage], newCDPSession: async () => fakeCdp };
+  globalThis.__relayBridge = { context: fakeContext };
+  try {
+    const TEST_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36";
+    const r = await tool.handler({ userAgent: TEST_UA });
+    assert.strictEqual(r.isError, undefined, "handler must not error");
+    const setUA = sentCommands.find((c) => c.method === "Network.setUserAgentOverride");
+    assert.ok(setUA, "must send Network.setUserAgentOverride");
+    assert.strictEqual(setUA.params.userAgent, TEST_UA);
+    // T2-A invariant: userAgentMetadata MUST be passed (without it, the
+    // HTTP-side Sec-CH-UA-* headers fall back to chromium's internal UA
+    // config and disagree with the override).
+    assert.ok(setUA.params.userAgentMetadata,
+      "T2-A: setUserAgentOverride must include userAgentMetadata");
+    assert.strictEqual(setUA.params.userAgentMetadata.platform, "Windows");
+    assert.ok(setUA.params.userAgentMetadata.brands.length >= 2);
+  } finally {
+    PAGE_CDP_SESSIONS.delete(fakePage);
+    globalThis.__relayBridge = prev;
+  }
+});
