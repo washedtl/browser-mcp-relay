@@ -321,6 +321,36 @@ async function main() {
           // read globalThis.__relayBridge to drive CDP operations.
           globalThis.__relayBridge = { ...l, port };
           bridge = l;
+          // V1-5 (2026-06-01): invalidate the cached `bridge` when the
+          // underlying Brave context/process dies. Without this listener, a
+          // crashed/force-quit Brave leaves `bridge` pointing at a dead
+          // Playwright BrowserContext. Every subsequent tool call then fails
+          // with "browserContext.newPage: Target page, context or browser
+          // has been closed" — a wedge that only recovers via full relay
+          // restart. With this listener: next ensureBrave() call sees
+          // bridge=null + braveLaunchPromise=null → relaunches Brave fresh
+          // and the relay self-heals.
+          const invalidateBridge = (reason) => {
+            if (bridge !== l) return; // already moved on (e.g. external close)
+            process.stderr.write(
+              `[mcp-relay] Brave context invalidated (${reason}); next ensureBrave() will relaunch\n`,
+            );
+            bridge = null;
+            braveLaunchPromise = null;
+            if (globalThis.__relayBridge && globalThis.__relayBridge.context === l.context) {
+              globalThis.__relayBridge = null;
+            }
+          };
+          l.context.on("close", () => invalidateBridge("context closed"));
+          try {
+            // `browser()` may be null on some persistent-context launches; guard.
+            const br = l.context.browser && l.context.browser();
+            if (br && typeof br.on === "function") {
+              br.on("disconnected", () => invalidateBridge("browser disconnected"));
+            }
+          } catch (e) {
+            process.stderr.write(`[mcp-relay] could not attach browser.disconnected listener: ${e.message}\n`);
+          }
           return bridge;
         });
       })().catch((e) => {
