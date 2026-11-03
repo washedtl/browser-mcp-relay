@@ -158,3 +158,15 @@ test("W1C1: export(outputPath) → import(inputPath) round trip restores the jar
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("W2F: cookies_import skips [bridge-managed] placeholders (a masked export never overwrites the real cookie)", async () => {
+  const target = makeJarContext([{ name: "sid", value: "REAL", domain: ".example.com", path: "/" }]);
+  const r = await withContext(target, (ctx) => tool.handler({ cookies: [
+    { name: "sid", value: exportTool.BRIDGE_MANAGED_VALUE, domain: ".example.com", path: "/" },
+    { name: "other", value: "O", domain: ".example.com", path: "/" },
+  ] }, ctx));
+  assert.deepStrictEqual(JSON.parse(r.content[0].text), { imported: 1, skippedBridgeManaged: 1 });
+  assert.strictEqual(target.jar.find((c) => c.name === "sid").value, "REAL");
+  const none = await withContext(target, (ctx) => tool.handler({ cookies: [{ name: "sid", value: "[bridge-managed]", domain: ".example.com", path: "/" }] }, ctx));
+  assert.deepStrictEqual(JSON.parse(none.content[0].text), { imported: 0, skippedBridgeManaged: 1 });
+});

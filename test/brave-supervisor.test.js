@@ -3,16 +3,17 @@
 // Three layers:
 //   A. pure helpers (flags, Memory Saver pref, proxy probe, env) — no browser
 //   B. the supervisor state machine against test/fixtures/fake-brave.js, a
-//      tiny node stand-in that speaks just enough CDP (/json/version, a
-//      browser websocket, Browser.close, SystemInfo.getProcessInfo) to drive
+//      tiny node stand-in that speaks just enough CDP over the fd 3/4 pipe
+//      (Browser.getVersion, Browser.close, SystemInfo.getProcessInfo) to drive
 //      the branches real Brave can't be made to hit on demand (ignores
 //      Browser.close, lingers after a disconnect, hands off and exits)
 //   C. real Brave on throwaway profiles (skips cleanly when Brave is absent):
 //      crash → recovery, concurrent ensure() → one Brave, graceful close keeps
 //      a fresh cookie (the spike's E7a), --load-extension, Memory Saver.
 //
-// Every profile lives under <repo>/.tmp-profiles/<run id>/ and every CDP
-// port is OS-assigned. The after() hook kills only PIDs this file recorded,
+// Every profile lives under <repo>/.tmp-profiles/<run id>/; Brave runs on a
+// pipe (no port), real-Brave clients connect through a CdpProxy on an
+// OS-assigned port. The after() hook kills only PIDs this file recorded,
 // then asserts no process references the run dir.
 
 const test = require("node:test");
@@ -35,6 +36,7 @@ const {
   braveEnv,
   profileLockHeld,
 } = require("../src/broker/brave-supervisor.js");
+const { CdpProxy } = require("../src/broker/cdp-proxy.js");
 
 const RUN_ID = `bsup-${process.pid}-${Date.now()}`;
 const TMP_ROOT = path.join(__dirname, "..", ".tmp-profiles", RUN_ID);
@@ -72,9 +74,9 @@ function collectLog() {
 // ─────────────── A. pure helpers ───────────────
 
 test("buildBraveArgs: exactly the broker's flag set, nothing else", () => {
-  const args = buildBraveArgs({ port: 9555, profileDir: "C:\\p\\broker" });
+  const args = buildBraveArgs({ profileDir: "C:\\p\\broker" });
   assert.deepStrictEqual(args, [
-    "--remote-debugging-port=9555",
+    "--remote-debugging-pipe",
     "--user-data-dir=C:\\p\\broker",
     "--no-first-run",
     "--no-default-browser-check",
@@ -86,22 +88,31 @@ test("buildBraveArgs: exactly the broker's flag set, nothing else", () => {
   ]);
 });
 
+test("W2G buildBraveArgs: CDP over a pipe, never a TCP debugging port (any local process could drive Brave through one)", () => {
+  for (const args of [buildBraveArgs({ profileDir: "/p" }), buildBraveArgs({ profileDir: "/p", extensionPath: "/e", proxyServer: "http://h:1", headless: true })]) {
+    assert.ok(args.includes("--remote-debugging-pipe"), args.join(" "));
+    assert.ok(!args.some((a) => /^--remote-debugging-(port|address)/.test(a)), args.join(" "));
+    // elevated parent: without it Brave relaunches de-elevated and the pipe is gone (measured: exit 0 at 393 ms)
+    assert.ok(args.some((a) => /^--disable-features=.*\bAutoDeElevate\b/.test(a)));
+  }
+});
+
 test("buildBraveArgs: never Playwright's --enable-automation / --use-mock-keychain, never a URL", () => {
-  const args = buildBraveArgs({ port: 1, profileDir: "/p", extensionPath: "/ext", proxyServer: "http://127.0.0.1:8888" });
+  const args = buildBraveArgs({ profileDir: "/p", extensionPath: "/ext", proxyServer: "http://127.0.0.1:8888" });
   assert.ok(!args.includes("--enable-automation"));
   assert.ok(!args.includes("--use-mock-keychain"));
   assert.ok(args.every((a) => a.startsWith("--")), "a positional URL would open a startup window");
 });
 
 test("buildBraveArgs: one --disable-features switch only (a second one silently drops AutoDeElevate)", () => {
-  const args = buildBraveArgs({ port: 1, profileDir: "/p", extensionPath: "/ext", proxyServer: "http://h:1" });
+  const args = buildBraveArgs({ profileDir: "/p", extensionPath: "/ext", proxyServer: "http://h:1" });
   assert.strictEqual(args.filter((a) => a.startsWith("--disable-features=")).length, 1);
 });
 
 test("buildBraveArgs: --load-extension and --proxy-server only when given", () => {
-  const plain = buildBraveArgs({ port: 1, profileDir: "/p" });
+  const plain = buildBraveArgs({ profileDir: "/p" });
   assert.ok(!plain.some((a) => a.startsWith("--load-extension") || a.startsWith("--proxy-server")));
-  const extra = buildBraveArgs({ port: 1, profileDir: "/p", extensionPath: "C:\\ext\\companion", proxyServer: "http://127.0.0.1:8888" });
+  const extra = buildBraveArgs({ profileDir: "/p", extensionPath: "C:\\ext\\companion", proxyServer: "http://127.0.0.1:8888" });
   assert.ok(extra.includes("--load-extension=C:\\ext\\companion"));
   assert.ok(extra.includes("--proxy-server=http://127.0.0.1:8888"));
 });
@@ -180,17 +191,16 @@ test("W2E TLS: a LOOPBACK proxy in use → ignored (its MITM certificate works);
 });
 
 test("W2E buildBraveArgs: --headless=new only when asked (BROWSER_HEADLESS_ENABLE, as in legacy mode)", () => {
-  assert.ok(!buildBraveArgs({ port: 1, profileDir: "/p" }).some((a) => a.startsWith("--headless")));
-  const args = buildBraveArgs({ port: 1, profileDir: "/p", headless: true });
+  assert.ok(!buildBraveArgs({ profileDir: "/p" }).some((a) => a.startsWith("--headless")));
+  const args = buildBraveArgs({ profileDir: "/p", headless: true });
   assert.deepStrictEqual(args.filter((a) => a.startsWith("--headless")), ["--headless=new"]);
 });
 
 test("W2E ensure(): the headless option reaches the launch", async () => {
   const dir = tmpProfile("fake-headless");
   const { sup } = fakeSupervisor(dir, { headless: true });
-  const info = await sup.ensure();
-  const port = Number(new URL(info.cdpUrl).port);
-  assert.deepStrictEqual(launchesOf(dir)[0].args, buildBraveArgs({ port, profileDir: path.resolve(dir), headless: true }));
+  await sup.ensure();
+  assert.deepStrictEqual(launchesOf(dir)[0].args, buildBraveArgs({ profileDir: path.resolve(dir), headless: true }));
 });
 
 test("disableMemorySaver: fresh profile → Local State created with Memory Saver off", () => {
@@ -334,12 +344,14 @@ test("resolveProxy: unusable URL → throws (W1E policy: never guess direct), me
   }
 });
 
-test("braveEnv: strips relay-internal and proxy env vars, keeps the rest", () => {
+test("braveEnv: strips relay-internal, proxy and CDP-endpoint env vars (the broker's secret URL), keeps the rest", () => {
   const env = braveEnv({
     PATH: "/bin",
     LOCALAPPDATA: "C:\\L",
     BROWSER_RELAY_PROXY_URL: "http://x:1",
     BROWSER_RELAY_INSPECTOR_PORT: "9",
+    BROWSER_CDP_ENDPOINT_URL: `ws://127.0.0.1:1/${"a".repeat(64)}/devtools/browser`,
+    browser_cdp_endpoint_url: "ws://127.0.0.1:1/x", // Windows env names ignore case
     HTTP_PROXY: "http://dead:1",
     https_proxy: "http://dead:1",
     ALL_PROXY: "socks5://dead:1",
@@ -352,6 +364,7 @@ test("braveEnv: strips relay-internal and proxy env vars, keeps the rest", () =>
 const FAKE_BRAVE = path.join(__dirname, "fixtures", "fake-brave.js");
 const spawnedChildren = []; // every process this file spawned (fake or real Brave)
 const supervisors = [];
+const proxies = [];
 
 function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
@@ -368,10 +381,9 @@ function nextEvent(emitter, name) {
   return new Promise((resolve) => emitter.once(name, (...a) => resolve(a)));
 }
 
-/** Minimal CDP client on the browser endpoint behind `cdpUrl`. */
-async function openCdp(cdpUrl) {
-  const { webSocketDebuggerUrl } = await (await fetch(`${cdpUrl}/json/version`)).json();
-  const ws = new WebSocket(webSocketDebuggerUrl);
+/** Minimal CDP client on a browser websocket (the broker's proxy URL: there is no /json/version). */
+async function openCdp(wsUrl) {
+  const ws = new WebSocket(wsUrl, { perMessageDeflate: false });
   await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
   let id = 0;
   const pending = new Map();
@@ -400,7 +412,7 @@ async function openCdp(cdpUrl) {
 /** A `_spawn` seam that records every child (so after() can account for it). */
 function recordingSpawn({ exe = null, prefixArgs = [], onSpawn = null } = {}) {
   return (realExe, args, opts) => {
-    if (onSpawn) onSpawn(args);
+    if (onSpawn) onSpawn(args, opts);
     const child = spawn(exe || realExe, [...prefixArgs, ...args], opts);
     spawnedChildren.push(child);
     return child;
@@ -419,7 +431,13 @@ function fakeSupervisor(profileDir, { mode = "", delay = 0, onSpawn = null, ...o
     ...opts,
   });
   supervisors.push(sup);
-  return { sup, log };
+  const pipes = []; // every 'pipe' the supervisor handed out (one per launch that came up)
+  sup.on("pipe", (p) => pipes.push(p));
+  return { sup, log, pipes };
+}
+/** A CDP disconnect while the process stays up (fake-brave's Fake.drop), on the latest launch's pipe. */
+function dropCdp(pipes) {
+  pipes[pipes.length - 1].call("Fake.drop", null, { timeoutMs: 500 });
 }
 function launchesOf(profileDir) {
   const f = path.join(profileDir, "fake-launches.jsonl");
@@ -427,29 +445,31 @@ function launchesOf(profileDir) {
   return fs.readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
-test("constructor: profileDir is required, port must be a valid TCP port", () => {
+test("constructor: profileDir is required", () => {
   assert.throws(() => new BraveSupervisor({}), /profileDir/);
-  assert.throws(() => new BraveSupervisor({ profileDir: "/p", port: 70000 }), /port/);
-  assert.throws(() => new BraveSupervisor({ profileDir: "/p", port: 1.5 }), /port/);
-  assert.doesNotThrow(() => new BraveSupervisor({ profileDir: "/p", port: 0 }));
+  assert.doesNotThrow(() => new BraveSupervisor({ profileDir: "/p" }));
 });
 
-test("ensure(): launches with the exact flags on an OS-assigned port, returns {cdpUrl, pid}", async () => {
+test("W2G ensure(): launches with the exact flags, CDP on fd 3/4 pipes, returns {pid}; the verified pipe is handed out first", async () => {
   const dir = tmpProfile("fake-ensure");
-  const { sup } = fakeSupervisor(dir, { extensionPath: "C:\\ext\\companion" });
+  let spawnOpts = null;
+  const { sup, pipes } = fakeSupervisor(dir, { extensionPath: "C:\\ext\\companion", onSpawn: (_args, opts) => { spawnOpts = opts; } });
   assert.strictEqual(sup.isUp(), false);
-  const info = await sup.ensure();
-  assert.deepStrictEqual(Object.keys(info).sort(), ["cdpUrl", "pid"]);
-  const port = Number(new URL(info.cdpUrl).port);
-  assert.ok(port > 0);
-  assert.strictEqual(info.cdpUrl, `http://127.0.0.1:${port}`);
+  let pipesAtResolve = null;
+  const info = await sup.ensure().then((i) => { pipesAtResolve = pipes.length; return i; });
+  assert.deepStrictEqual(Object.keys(info), ["pid"], "no cdpUrl: there is no port");
   assert.ok(isAlive(info.pid));
   assert.strictEqual(sup.isUp(), true);
   const [launch] = launchesOf(dir);
   assert.strictEqual(launch.pid, info.pid, "pid is the spawned process");
-  assert.deepStrictEqual(launch.args, buildBraveArgs({ port, profileDir: path.resolve(dir), extensionPath: "C:\\ext\\companion" }));
-  const v = await (await fetch(`${info.cdpUrl}/json/version`)).json();
-  assert.match(v.Browser, /FakeBrave/);
+  assert.deepStrictEqual(launch.args, buildBraveArgs({ profileDir: path.resolve(dir), extensionPath: "C:\\ext\\companion" }));
+  // fd 3: Brave reads (we write), fd 4: Brave writes; stderr ignored (an unread pipe would stall Brave)
+  assert.deepStrictEqual(spawnOpts.stdio, ["ignore", "ignore", "ignore", "pipe", "pipe"]);
+  assert.strictEqual(pipesAtResolve, 1, "'pipe' fires before ensure() resolves (the proxy serves it from then on)");
+  const v = await pipes[0].call("Browser.getVersion");
+  assert.match(v.result.product, /FakeBrave/);
+  // readiness, the PID check and the certificate policy all ran on the pipe's root session
+  assert.deepStrictEqual(cdpCallsOf(dir, "SystemInfo.getProcessInfo").length, 1);
 });
 
 test("ensure(): when already up, returns the same Brave without relaunching", async () => {
@@ -469,26 +489,18 @@ test("ensure(): concurrent calls coalesce into ONE launch", async () => {
   assert.strictEqual(launchesOf(dir).length, 1);
 });
 
-test("ensure(): the caller can choose the CDP port", async () => {
-  const dir = tmpProfile("fake-port");
-  const port = await deadPort();
-  const { sup } = fakeSupervisor(dir, { port });
-  const info = await sup.ensure();
-  assert.strictEqual(info.cdpUrl, `http://127.0.0.1:${port}`);
-});
-
-test("ensure(): a caller-chosen port that is already taken fails before spawning", async () => {
-  const dir = tmpProfile("fake-taken");
-  const s = net.createServer();
-  const port = await listen(s);
-  try {
-    const { sup } = fakeSupervisor(dir, { port });
-    sup.on("fatal", () => assert.fail("a first launch is not a lost port: no 'fatal'"));
-    await assert.rejects(sup.ensure(), /port .*in use/i);
-    assert.strictEqual(launchesOf(dir).length, 0);
-  } finally {
-    s.close();
-  }
+test("W2G ensure(): a call while a launch is finishing (CDP up, certificate policy pending) joins it and resolves only after 'pipe'", async () => {
+  // isUp() is already true in that window, but the proxy has no pipe yet: a
+  // caller handed a Brave then would get 503 from the proxy.
+  const dir = tmpProfile("fake-slow-certs");
+  const { sup, pipes } = fakeSupervisor(dir, { mode: "slow-certs" });
+  const first = sup.ensure();
+  await waitFor(() => cdpCallsOf(dir, IGNORE_CERTS).length === 1, 10000, "the certificate call to be in flight");
+  let pipesWhenSecondResolved = null;
+  const second = await sup.ensure().then((info) => { pipesWhenSecondResolved = pipes.length; return info; });
+  assert.strictEqual(pipesWhenSecondResolved, 1, "resolved before the launch handed its pipe out");
+  assert.strictEqual(second.pid, (await first).pid);
+  assert.strictEqual(launchesOf(dir).length, 1);
 });
 
 test("ensure(): Memory Saver is switched off in Local State before Brave starts", async () => {
@@ -566,9 +578,9 @@ test("ensure() that joined a launch closeGracefully() then tears down → relaun
   assert.ok(sup.isUp());
 });
 
-test("crash: 'down' fires once, next ensure() relaunches on the same port", async () => {
+test("crash: 'down' fires once, the dead launch's pipe is closed, next ensure() relaunches and hands out a new pipe", async () => {
   const dir = tmpProfile("fake-crash");
-  const { sup } = fakeSupervisor(dir);
+  const { sup, pipes } = fakeSupervisor(dir);
   const first = await sup.ensure();
   const downs = [];
   sup.on("down", (reason) => downs.push(reason));
@@ -577,88 +589,14 @@ test("crash: 'down' fires once, next ensure() relaunches on the same port", asyn
   const [reason] = await down;
   assert.match(reason, /cdp disconnected|exited/);
   assert.strictEqual(sup.isUp(), false);
+  assert.strictEqual(pipes[0].closed, true);
   const second = await sup.ensure();
   assert.notStrictEqual(second.pid, first.pid);
-  assert.strictEqual(second.cdpUrl, first.cdpUrl, "auto port stays stable across relaunches");
+  assert.strictEqual(pipes.length, 2);
+  assert.match((await pipes[1].call("Browser.getVersion")).result.product, /FakeBrave/);
   assert.ok(!isAlive(first.pid));
   await sleep(100);
   assert.strictEqual(downs.length, 1, `down fired ${downs.length}x: ${downs}`);
-});
-
-test("crash: a caller-chosen port is kept across relaunches too", async () => {
-  const dir = tmpProfile("fake-port-kept");
-  const port = await deadPort();
-  const { sup } = fakeSupervisor(dir, { port });
-  const first = await sup.ensure();
-  const down = nextEvent(sup, "down");
-  process.kill(first.pid);
-  await down;
-  const second = await sup.ensure();
-  assert.strictEqual(second.cdpUrl, `http://127.0.0.1:${port}`);
-  assert.notStrictEqual(second.pid, first.pid);
-});
-
-test("crash: the port taken while Brave was down → ensure() fails loudly, never switches ports", async () => {
-  // Upstream reads BROWSER_CDP_ENDPOINT_URL once per broker process, so a
-  // relaunch on another port would leave every session pointing at nothing.
-  const dir = tmpProfile("fake-port-stolen");
-  const { sup } = fakeSupervisor(dir, { portFreeWaitMs: 300 });
-  const first = await sup.ensure();
-  const port = Number(new URL(first.cdpUrl).port);
-  const down = nextEvent(sup, "down");
-  process.kill(first.pid);
-  await down;
-  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const thief = net.createServer((sock) => sock.destroy()); // never leave a client hanging (close() waits for open sockets)
-  await listen(thief, port);
-  const fatals = [];
-  sup.on("fatal", (reason) => fatals.push(reason));
-  try {
-    await assert.rejects(sup.ensure(), (e) => e.message.includes(`CDP port ${port}`) && /in use/.test(e.message) && /not switch/.test(e.message));
-    assert.strictEqual(launchesOf(dir).length, 1, "must not spawn onto a taken port");
-    // 'fatal' tells the broker to exit so the shims respawn one on a new port.
-    assert.strictEqual(fatals.length, 1);
-    assert.ok(fatals[0].includes(`CDP port ${port}`), fatals[0]);
-  } finally {
-    await new Promise((r) => thief.close(r));
-  }
-  const again = await sup.ensure();
-  assert.strictEqual(again.cdpUrl, first.cdpUrl, "same port once it is free again");
-});
-
-test("'fatal': a throwing listener is logged, ensure() still rejects with the port error", async () => {
-  const dir = tmpProfile("fake-fatal-listener");
-  const { sup, log } = fakeSupervisor(dir, { portFreeWaitMs: 200 });
-  const first = await sup.ensure();
-  const down = nextEvent(sup, "down");
-  process.kill(first.pid);
-  await down;
-  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const thief = net.createServer((sock) => sock.destroy()); // never leave a client hanging (close() waits for open sockets)
-  await listen(thief, Number(new URL(first.cdpUrl).port));
-  sup.on("fatal", () => { throw new Error("fatal listener bug"); });
-  try {
-    await assert.rejects(sup.ensure(), /not switch/);
-    assert.ok(log.lines.some((l) => l.includes("fatal listener bug")), log.lines.join("\n"));
-  } finally {
-    await new Promise((r) => thief.close(r));
-  }
-});
-
-test("crash: relaunch waits for the port to free (up to portFreeWaitMs) instead of failing at once", async () => {
-  const dir = tmpProfile("fake-port-wait");
-  const { sup } = fakeSupervisor(dir, { portFreeWaitMs: 3000 });
-  sup.on("fatal", () => assert.fail("a port that frees in time is not fatal"));
-  const first = await sup.ensure();
-  const down = nextEvent(sup, "down");
-  process.kill(first.pid);
-  await down;
-  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const holder = net.createServer((sock) => sock.destroy());
-  await listen(holder, Number(new URL(first.cdpUrl).port));
-  setTimeout(() => holder.close(), 500);
-  const second = await sup.ensure();
-  assert.strictEqual(second.cdpUrl, first.cdpUrl);
 });
 
 test("a 'down' listener that throws does not break close or relaunch", async () => {
@@ -674,44 +612,6 @@ test("a 'down' listener that throws does not break close or relaunch", async () 
   const second = await sup.ensure();
   assert.notStrictEqual(second.pid, first.pid);
   assert.ok(log.lines.some((l) => l.includes("listener bug")), log.lines.join("\n"));
-});
-
-test("an auto port is only pinned once a launch came up: failed launches may move it, no 'fatal'", async () => {
-  const dir = tmpProfile("fake-autopin");
-  const { sup } = fakeSupervisor(dir, { mode: "exit-early", portFreeWaitMs: 200 });
-  sup.on("fatal", () => assert.fail("nobody can have pinned a port that never served a Brave"));
-  await assert.rejects(sup.ensure(), /exited during launch/);
-  const usedPort = Number(launchesOf(dir)[0].args.find((a) => a.startsWith("--remote-debugging-port=")).split("=")[1]);
-  const holder = net.createServer((sock) => sock.destroy());
-  await listen(holder, usedPort);
-  try {
-    await assert.rejects(sup.ensure(), /exited during launch/, "should have re-picked a free port and launched");
-    assert.strictEqual(launchesOf(dir).length, 2);
-  } finally {
-    holder.close();
-  }
-});
-
-test("relaunch: the port is (re)checked right before spawn, so a port taken mid-launch fails loudly", async () => {
-  // The proxy probe (non-routable address) holds the launch for ~800 ms between
-  // the start of ensure() and the spawn; the port is stolen inside that window.
-  const dir = tmpProfile("fake-toctou");
-  const { sup } = fakeSupervisor(dir, { proxyUrl: "http://10.255.255.1:8888", proxyProbeTimeoutMs: 800, portFreeWaitMs: 200, launchTimeoutMs: 2000 });
-  const first = await sup.ensure();
-  const down = nextEvent(sup, "down");
-  process.kill(first.pid);
-  await down;
-  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const relaunch = sup.ensure();
-  await sleep(200);
-  const thief = net.createServer((sock) => sock.destroy()); // never leave a client hanging (close() waits for open sockets)
-  await listen(thief, Number(new URL(first.cdpUrl).port));
-  try {
-    await assert.rejects(relaunch, /not switch/);
-    assert.strictEqual(launchesOf(dir).length, 1, "must not spawn onto the stolen port");
-  } finally {
-    await new Promise((r) => thief.close(r));
-  }
 });
 
 test("isUp() is false as soon as the PID is gone, even before any event arrives", async () => {
@@ -749,15 +649,14 @@ test("disconnect: relaunch waits for the old PID to exit first (else Brave hands
   const dir = tmpProfile("fake-linger");
   let oldPid = null;
   let oldAliveAtSpawn = null;
-  const { sup } = fakeSupervisor(dir, {
+  const { sup, pipes } = fakeSupervisor(dir, {
     mode: "linger",
     onSpawn: () => { if (oldPid) oldAliveAtSpawn = isAlive(oldPid); },
   });
   const first = await sup.ensure();
   oldPid = first.pid;
   const down = nextEvent(sup, "down");
-  const cdp = await openCdp(first.cdpUrl);
-  cdp.send("Fake.drop").catch(() => {});
+  dropCdp(pipes);
   const [reason] = await down;
   assert.strictEqual(reason, "cdp disconnected");
   assert.ok(isAlive(oldPid), "fake lingers 1.5 s after the drop");
@@ -768,11 +667,10 @@ test("disconnect: relaunch waits for the old PID to exit first (else Brave hands
 
 test("closeGracefully() on a Brave that dropped CDP but is still exiting lets it finish (no kill)", async () => {
   const dir = tmpProfile("fake-close-linger");
-  const { sup, log } = fakeSupervisor(dir, { mode: "linger" });
+  const { sup, log, pipes } = fakeSupervisor(dir, { mode: "linger" });
   const first = await sup.ensure();
   const down = nextEvent(sup, "down");
-  const cdp = await openCdp(first.cdpUrl);
-  cdp.send("Fake.drop").catch(() => {});
+  dropCdp(pipes);
   await down;
   const res = await sup.closeGracefully();
   assert.strictEqual(res.graceful, true, log.lines.join("\n"));
@@ -782,11 +680,10 @@ test("closeGracefully() on a Brave that dropped CDP but is still exiting lets it
 
 test("disconnect: an old Brave that never exits is killed after exitWaitMs, then relaunched", async () => {
   const dir = tmpProfile("fake-hang");
-  const { sup, log } = fakeSupervisor(dir, { mode: "hang", exitWaitMs: 300 });
+  const { sup, log, pipes } = fakeSupervisor(dir, { mode: "hang", exitWaitMs: 300 });
   const first = await sup.ensure();
   const down = nextEvent(sup, "down");
-  const cdp = await openCdp(first.cdpUrl);
-  cdp.send("Fake.drop").catch(() => {});
+  dropCdp(pipes);
   await down;
   const second = await sup.ensure();
   assert.ok(!isAlive(first.pid), "hung Brave must be killed");
@@ -796,16 +693,15 @@ test("disconnect: an old Brave that never exits is killed after exitWaitMs, then
 
 test("disconnect: the hung PID is reaped even if nobody calls ensure() again", async () => {
   const dir = tmpProfile("fake-reap");
-  const { sup } = fakeSupervisor(dir, { mode: "hang", exitWaitMs: 300 });
+  const { sup, pipes } = fakeSupervisor(dir, { mode: "hang", exitWaitMs: 300 });
   const first = await sup.ensure();
-  const cdp = await openCdp(first.cdpUrl);
-  cdp.send("Fake.drop").catch(() => {});
+  dropCdp(pipes);
   await waitFor(() => !isAlive(first.pid), 5000, "hung fake to be reaped");
 });
 
-test("closeGracefully(): Browser.close, process exits, 'down'('closed'), next ensure() relaunches", async () => {
+test("closeGracefully(): Browser.close on the root pipe, process exits, 'down'('closed'), next ensure() relaunches", async () => {
   const dir = tmpProfile("fake-close");
-  const { sup } = fakeSupervisor(dir);
+  const { sup, pipes } = fakeSupervisor(dir);
   const first = await sup.ensure();
   const downs = [];
   sup.on("down", (r) => downs.push(r));
@@ -817,7 +713,8 @@ test("closeGracefully(): Browser.close, process exits, 'down'('closed'), next en
   assert.deepStrictEqual(downs, ["closed"]);
   const second = await sup.ensure();
   assert.notStrictEqual(second.pid, first.pid);
-  assert.strictEqual(second.cdpUrl, first.cdpUrl, "idle close → relaunch keeps the port");
+  assert.deepStrictEqual(cdpCallsOf(dir, "Browser.close").map((c) => c.pid), [first.pid]);
+  assert.strictEqual(pipes.length, 2, "the relaunch hands out its own pipe");
 });
 
 test("closeGracefully(): Brave ignoring Browser.close (CDP still open) is killed after closeTimeoutMs, no shutdown grace", async () => {
@@ -990,9 +887,10 @@ test("launch failure: CDP never comes up → rejects after launchTimeoutMs and k
 
 test("launch failure: CDP answered by a different browser process → rejects, ours is killed", async () => {
   const dir = tmpProfile("fake-foreign");
-  const { sup } = fakeSupervisor(dir, { mode: "foreign-pid" });
+  const { sup, pipes } = fakeSupervisor(dir, { mode: "foreign-pid" });
   sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), /pid/i);
+  assert.strictEqual(pipes.length, 0, "a browser that is not ours is never handed to the proxy");
   const [{ pid }] = launchesOf(dir);
   await waitFor(() => !isAlive(pid), 5000, "foreign-pid fake to be killed");
 });
@@ -1027,32 +925,44 @@ function hardKill(pid) {
   try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
 }
 
-function realSupervisor(profileDir, { onSpawn = null, ...opts } = {}) {
+/** A real-Brave supervisor wired to a CdpProxy, as the broker wires them: CDP clients use proxy.wsUrl. */
+async function realSupervisor(profileDir, { onSpawn = null, ...opts } = {}) {
   const log = collectLog();
   const sup = new BraveSupervisor({ profileDir, log, _spawn: recordingSpawn({ onSpawn }), ...opts });
   supervisors.push(sup);
-  return { sup, log };
+  const proxy = new CdpProxy({ log });
+  await proxy.listen();
+  proxies.push(proxy);
+  sup.on("pipe", (pipe) => proxy.setPipe(pipe));
+  return { sup, log, proxy };
+}
+async function browserVersion(wsUrl) {
+  const cdp = await openCdp(wsUrl);
+  try {
+    return await cdp.send("Browser.getVersion");
+  } finally {
+    await cdp.close();
+  }
 }
 
 test("real Brave: the spawned PID is the browser and stays up (AutoDeElevate off), exact flags, dead proxy → direct", REAL, async (t) => {
   const dir = tmpProfile("real-launch");
-  const { sup, log } = realSupervisor(dir, { proxyUrl: `http://127.0.0.1:${await deadPort()}` });
+  const { sup, log, proxy } = await realSupervisor(dir, { proxyUrl: `http://127.0.0.1:${await deadPort()}` });
   const t0 = Date.now();
-  const { cdpUrl, pid } = await sup.ensure();
+  const { pid } = await sup.ensure();
   t.diagnostic(`cold launch → CDP ready + pid verified in ${Date.now() - t0} ms`);
   await sleep(1500); // the de-elevation handoff exits the spawned PID within ~150-750 ms
   assert.ok(isAlive(pid), "spawned PID exited: AutoDeElevate handoff?");
   assert.ok(sup.isUp());
   const mains = browserMains(dir);
   assert.deepStrictEqual(mains.map((m) => m.pid), [pid], "exactly one browser process, and it is ours");
-  const port = Number(new URL(cdpUrl).port);
-  for (const flag of buildBraveArgs({ port, profileDir: path.resolve(dir) })) {
+  for (const flag of buildBraveArgs({ profileDir: path.resolve(dir) })) {
     assert.ok(mains[0].cmd.includes(flag), `live command line lacks ${flag}`);
   }
   assert.ok(!mains[0].cmd.includes("--proxy-server"), "dead proxy must not be used");
   assert.ok(log.lines.some((l) => /direct/.test(l)));
-  const v = await (await fetch(`${cdpUrl}/json/version`)).json();
-  assert.match(v.Browser, /Chrome|Brave/);
+  const v = await browserVersion(proxy.wsUrl);
+  assert.match(v.product, /Chrome|Brave/);
 });
 
 test("W2E real Brave: a self-signed HTTPS page fails by default and loads with certificate errors ignored", REAL, async () => {
@@ -1064,9 +974,9 @@ test("W2E real Brave: a self-signed HTTPS page fails by default and loads with c
   try {
     for (const ignoreHttpsErrors of [false, true]) {
       const dir = tmpProfile(`real-tls-${ignoreHttpsErrors}`);
-      const { sup } = realSupervisor(dir, { ignoreHttpsErrors, headless: true });
-      const { cdpUrl } = await sup.ensure();
-      const browser = await chromium.connectOverCDP(cdpUrl);
+      const { sup, proxy } = await realSupervisor(dir, { ignoreHttpsErrors, headless: true });
+      await sup.ensure();
+      const browser = await chromium.connectOverCDP(proxy.wsUrl);
       try {
         const page = await browser.contexts()[0].newPage();
         const outcome = await page.goto(`https://127.0.0.1:${port}/`, { timeout: 15000 }).then(() => page.title(), (e) => e.message);
@@ -1085,7 +995,7 @@ test("W2E real Brave: a self-signed HTTPS page fails by default and loads with c
 test("real Brave: concurrent ensure() → one launch, one Brave on the profile", REAL, async () => {
   const dir = tmpProfile("real-coalesce");
   let spawns = 0;
-  const { sup } = realSupervisor(dir, { onSpawn: () => spawns++ });
+  const { sup } = await realSupervisor(dir, { onSpawn: () => spawns++ });
   const results = await Promise.all([1, 2, 3].map(() => sup.ensure()));
   assert.strictEqual(new Set(results.map((r) => r.pid)).size, 1);
   assert.strictEqual(spawns, 1);
@@ -1093,9 +1003,9 @@ test("real Brave: concurrent ensure() → one launch, one Brave on the profile",
   assert.deepStrictEqual(browserMains(dir).map((m) => m.pid), [results[0].pid]);
 });
 
-test("real Brave: crash → 'down' → next ensure() recovers on the same cdpUrl", REAL, async (t) => {
+test("real Brave: crash → 'down' → next ensure() recovers, served behind the same proxy URL", REAL, async (t) => {
   const dir = tmpProfile("real-crash");
-  const { sup } = realSupervisor(dir);
+  const { sup, proxy } = await realSupervisor(dir);
   const first = await sup.ensure();
   const down = nextEvent(sup, "down");
   const t0 = Date.now();
@@ -1105,20 +1015,18 @@ test("real Brave: crash → 'down' → next ensure() recovers on the same cdpUrl
   const second = await sup.ensure();
   t.diagnostic(`crash (hard kill) → 'down'(${reason}) +${tDown} ms → ensure() recovered +${Date.now() - t0} ms`);
   assert.notStrictEqual(second.pid, first.pid);
-  assert.strictEqual(second.cdpUrl, first.cdpUrl);
   assert.ok(!isAlive(first.pid));
   await sleep(1000);
   assert.ok(isAlive(second.pid), "relaunched Brave exited (handoff to the dying one?)");
   assert.deepStrictEqual(browserMains(dir).map((m) => m.pid), [second.pid]);
-  const v = await (await fetch(`${second.cdpUrl}/json/version`)).json();
-  assert.ok(v.webSocketDebuggerUrl);
+  assert.match((await browserVersion(proxy.wsUrl)).product, /Chrome|Brave/);
 });
 
 test("real Brave: graceful close keeps a cookie set 2 s before close (spike E7a)", REAL, async (t) => {
   const dir = tmpProfile("real-cookie");
-  const { sup } = realSupervisor(dir);
-  const first = await sup.ensure();
-  const cdp = await openCdp(first.cdpUrl);
+  const { sup, proxy } = await realSupervisor(dir);
+  await sup.ensure();
+  const cdp = await openCdp(proxy.wsUrl);
   await cdp.send("Storage.setCookies", {
     cookies: [{ name: "w2c_e7a", value: "graceful-2s", domain: "bmr-w2c.example", path: "/", expires: Math.floor(Date.now() / 1000) + 86400 }],
   });
@@ -1127,9 +1035,8 @@ test("real Brave: graceful close keeps a cookie set 2 s before close (spike E7a)
   const res = await sup.closeGracefully();
   t.diagnostic(`graceful close (Browser.close → exit) took ${res.ms} ms`);
   assert.strictEqual(res.graceful, true);
-  const again = await sup.ensure();
-  assert.strictEqual(again.cdpUrl, first.cdpUrl, "relaunch after an idle close keeps the port");
-  const cdp2 = await openCdp(again.cdpUrl);
+  await sup.ensure();
+  const cdp2 = await openCdp(proxy.wsUrl); // same URL after the relaunch
   const { cookies } = await cdp2.send("Storage.getCookies");
   await cdp2.close();
   assert.ok(cookies.some((c) => c.name === "w2c_e7a" && c.value === "graceful-2s"), `cookie lost; have: ${cookies.map((c) => c.name)}`);
@@ -1139,8 +1046,9 @@ test("real Brave: after a root-only hard kill, the immediate relaunch still read
   // Kill is root-only; the old network-service child may outlive the root by
   // up to ~300 ms while the relaunch opens Default/Network/Cookies.
   const dir = tmpProfile("real-kill-cookies");
-  const { sup } = realSupervisor(dir);
-  const cdp = await openCdp((await sup.ensure()).cdpUrl);
+  const { sup, proxy } = await realSupervisor(dir);
+  await sup.ensure();
+  const cdp = await openCdp(proxy.wsUrl);
   await cdp.send("Storage.setCookies", {
     cookies: [{ name: "w2c_kill", value: "persisted", domain: "bmr-w2c.example", path: "/", expires: Math.floor(Date.now() / 1000) + 86400 }],
   });
@@ -1150,7 +1058,8 @@ test("real Brave: after a root-only hard kill, the immediate relaunch still read
   const down = nextEvent(sup, "down");
   hardKill(second.pid);
   await down;
-  const cdp2 = await openCdp((await sup.ensure()).cdpUrl);
+  await sup.ensure();
+  const cdp2 = await openCdp(proxy.wsUrl);
   const { cookies } = await cdp2.send("Storage.getCookies");
   await cdp2.close();
   assert.ok(cookies.some((c) => c.name === "w2c_kill" && c.value === "persisted"), `cookie store unreadable after relaunch; have: ${cookies.map((c) => c.name)}`);
@@ -1161,14 +1070,14 @@ test("W2P real Brave: a Brave left on our profile is reaped before launch; one o
   const lookalike = `${dir}-2`; // our path is a prefix of its path: the matcher must be exact
   fs.mkdirSync(lookalike);
   const launchStray = async (profileDir) => {
-    const child = recordingSpawn()(SYSTEM_BRAVE, buildBraveArgs({ port: 0, profileDir, headless: true }), { stdio: "ignore" });
+    const child = recordingSpawn()(SYSTEM_BRAVE, buildBraveArgs({ profileDir, headless: true }), { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
     await waitFor(() => profileLockHeld(profileDir), 20000, `a Brave to hold ${profileDir}'s lockfile`);
     return child;
   };
   const stray = await launchStray(dir);
   const bystander = await launchStray(lookalike);
   t.after(() => hardKill(bystander.pid));
-  const { sup, log } = realSupervisor(dir, { headless: true });
+  const { sup, log } = await realSupervisor(dir, { headless: true });
   const info = await sup.ensure();
   assert.ok(log.lines.some((l) => /not started by this broker; killing them/.test(l)), log.lines.join("\n"));
   assert.ok(!isAlive(stray.pid), "the stray is gone");
@@ -1184,8 +1093,9 @@ test("real Brave: --load-extension loads an unpacked MV3 extension", REAL, async
     manifest_version: 3, name: "bmr-w2c probe", version: "1.0", background: { service_worker: "bmr-w2c-probe-sw.js" },
   }));
   fs.writeFileSync(path.join(extDir, "bmr-w2c-probe-sw.js"), "self.addEventListener('install', () => {});\n");
-  const { sup } = realSupervisor(tmpProfile("real-ext"), { extensionPath: extDir });
-  const cdp = await openCdp((await sup.ensure()).cdpUrl);
+  const { sup, proxy } = await realSupervisor(tmpProfile("real-ext"), { extensionPath: extDir });
+  await sup.ensure();
+  const cdp = await openCdp(proxy.wsUrl);
   try {
     await waitFor(async () => {
       const { targetInfos } = await cdp.send("Target.getTargets");
@@ -1199,8 +1109,9 @@ test("real Brave: --load-extension loads an unpacked MV3 extension", REAL, async
 test("real Brave: Memory Saver reads OFF in chrome://settings even when the profile had it ON", REAL, async () => {
   const dir = tmpProfile("real-memsaver");
   fs.writeFileSync(path.join(dir, "Local State"), JSON.stringify({ performance_tuning: { high_efficiency_mode: { state: 2 } } }));
-  const { sup } = realSupervisor(dir);
-  const cdp = await openCdp((await sup.ensure()).cdpUrl);
+  const { sup, proxy } = await realSupervisor(dir);
+  await sup.ensure();
+  const cdp = await openCdp(proxy.wsUrl);
   try {
     // One background window (the only one these tests open).
     const { targetId } = await cdp.send("Target.createTarget", { url: "chrome://settings/performance", newWindow: true, background: true });
@@ -1230,6 +1141,7 @@ test("real Brave: Memory Saver reads OFF in chrome://settings even when the prof
 
 async function shutDownEverything() {
   await Promise.all(supervisors.map((s) => s.closeGracefully().catch(() => {})));
+  await Promise.all(proxies.map((p) => p.close().catch(() => {})));
   for (const child of spawnedChildren) {
     if (child.pid && child.exitCode === null && child.signalCode === null) {
       try { hardKill(child.pid); } catch { /* already gone */ }

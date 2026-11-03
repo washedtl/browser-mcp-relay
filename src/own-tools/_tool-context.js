@@ -13,11 +13,12 @@ function isRouted(tool) {
  * @param {string} connId
  * @param {{ needsBrave?: boolean, needsPage?: boolean }} tool
  * @param {object} args      the call's arguments (args.tabId picks the tab)
- * @param {{ context, cdpUrl, relay }} extras  context is what page-less tools get
+ * @param {{ context, cdpUrl, relay, bridgeManagedMatcher? }} extras  context is what page-less tools get;
+ *   bridgeManagedMatcher (broker + cookie bridge only) is passed through as is
  * Rejects on a malformed or unknown tabId: only tabs_new opens tabs.
  */
-async function toolContext(registry, connId, tool, args, { context, cdpUrl, relay }) {
-  const ctx = { context, registry, connId, cdpUrl, relay };
+async function toolContext(registry, connId, tool, args, { context, cdpUrl, relay, bridgeManagedMatcher = null }) {
+  const ctx = { context, registry, connId, cdpUrl, relay, bridgeManagedMatcher };
   if (!isRouted(tool)) return ctx;
   const tabKey = args.tabId ?? "main";
   if (typeof tabKey !== "string" || tabKey === "") {

@@ -177,6 +177,127 @@ test("W1C2: CDP probe failures give current advice (no Cursor restart / 'call an
   }
 });
 
+// ──────────────────────────────────────────────────────────────────
+// W2G: broker mode has no TCP debugging port. ctx.cdpUrl is the broker's
+// CDP proxy, ws://127.0.0.1:<port>/<secret>/devtools/browser, which serves no
+// /json/version, so Lighthouse's own {hostname, port} connect can't use it.
+// The tool connects puppeteer (Lighthouse's own) to the ws URL and hands
+// Lighthouse a page. The http path above stays for legacy mode.
+// ──────────────────────────────────────────────────────────────────
+
+const WS_CTX = { cdpUrl: `ws://127.0.0.1:41234/${"c".repeat(64)}/devtools/browser` };
+
+function fakePuppeteer({ connectError = null, newPageError = null } = {}) {
+  const log = [];
+  const page = { closed: 0, async close() { this.closed++; log.push("page.close"); } };
+  const browser = {
+    disconnected: 0,
+    async newPage() { log.push("newPage"); if (newPageError) throw newPageError; return page; },
+    async disconnect() { this.disconnected++; log.push("disconnect"); },
+    async close() { log.push("BROWSER.CLOSE"); },
+  };
+  return {
+    log, page, browser,
+    mod: { async connect(opts) { log.push(["connect", opts]); if (connectError) throw connectError; return browser; } },
+  };
+}
+
+async function withWsFakes({ result, lighthouseError, ...pp } = {}, fn) {
+  const prevFetch = globalThis.fetch;
+  const lh = fakeLighthouseModule(result);
+  const run = lh.mod.default;
+  lh.mod = { ...lh.mod, default: async (url, flags, config, page) => { lh.calls.push({ page }); if (lighthouseError) throw lighthouseError; return run(url, flags, config); } };
+  const pptr = fakePuppeteer(pp);
+  const probes = [];
+  globalThis.fetch = async (url) => { probes.push(String(url)); return { ok: true, status: 200 }; };
+  tool._setLighthouseForTest(lh.mod);
+  tool._setPuppeteerForTest(pptr.mod);
+  try {
+    return await fn({ lh, pptr, probes });
+  } finally {
+    tool._setLighthouseForTest(null);
+    tool._setPuppeteerForTest(null);
+    globalThis.fetch = prevFetch;
+  }
+}
+
+test("W2G: a ws:// cdpUrl runs Lighthouse on a page of puppeteer connected to that URL; the page is closed, puppeteer disconnected, Brave never closed", async () => {
+  await withWsFakes({}, async ({ lh, pptr, probes }) => {
+    const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);
+    assert.notStrictEqual(r.isError, true, r.content[0].text);
+    assert.deepStrictEqual(JSON.parse(r.content[0].text).categories.performance.score, 90);
+    assert.deepStrictEqual(pptr.log, [["connect", { browserWSEndpoint: WS_CTX.cdpUrl, defaultViewport: null }], "newPage", "page.close", "disconnect"]);
+    // lighthouse(url, flags, config, page): the page is what it drives
+    const call = lh.calls.find((c) => c.flags);
+    assert.strictEqual(lh.calls.find((c) => "page" in c).page, pptr.page);
+    assert.strictEqual(call.flags.port, undefined, "no {hostname, port}: there is no port to discover");
+    assert.strictEqual(call.flags.hostname, undefined);
+    assert.strictEqual(call.flags.disableStorageReset, true);
+    assert.strictEqual(call.config, lh.desktopConfig, "desktop config, as on the http path");
+    assert.deepStrictEqual(probes, [], "no /json/version probe: the proxy answers none");
+  });
+});
+
+test("W2G ws: mobile uses the default config, as on the http path", async () => {
+  await withWsFakes({}, async ({ lh }) => {
+    const r = await tool.handler({ url: "https://example.com/", formFactor: "mobile" }, WS_CTX);
+    assert.notStrictEqual(r.isError, true, r.content[0].text);
+    assert.strictEqual(lh.calls.find((c) => c.flags).config, undefined);
+    assert.strictEqual(lh.calls.find((c) => c.flags).flags.formFactor, "mobile");
+  });
+});
+
+test("W2G ws: a failed connect (Brave down: 503) is an isError result with retry advice; the tool's own text never prints the URL", async () => {
+  await withWsFakes({ connectError: new Error("Unexpected server response: 503") }, async ({ lh, pptr }) => {
+    const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /^lighthouse_audit: .*503.*retry/is);
+    assert.ok(!r.content[0].text.includes("c".repeat(64)), r.content[0].text);
+    assert.strictEqual(lh.calls.length, 0);
+    assert.ok(!pptr.log.includes("BROWSER.CLOSE"));
+  });
+});
+
+test("W2G ws: puppeteer-core failing to load says so (not 'Brave may have crashed')", async () => {
+  await withWsFakes({}, async ({ lh }) => {
+    tool._setPuppeteerForTest(new Error("Cannot find module 'puppeteer-core'"));
+    const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /^lighthouse_audit: failed to load puppeteer-core .*Cannot find module/);
+    assert.doesNotMatch(r.content[0].text, /crashed/);
+    assert.strictEqual(lh.calls.length, 0);
+  });
+});
+
+test("W2G ws: Lighthouse throwing (or newPage failing) still closes the page and disconnects; isError", async () => {
+  await withWsFakes({ lighthouseError: new Error("PROTOCOL_TIMEOUT") }, async ({ pptr }) => {
+    const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /^lighthouse_audit: PROTOCOL_TIMEOUT/);
+    assert.strictEqual(pptr.page.closed, 1);
+    assert.strictEqual(pptr.browser.disconnected, 1);
+  });
+  await withWsFakes({ newPageError: new Error("Target.createTarget failed") }, async ({ pptr }) => {
+    const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /Target\.createTarget failed/);
+    assert.strictEqual(pptr.browser.disconnected, 1);
+    assert.ok(!pptr.log.includes("BROWSER.CLOSE"));
+  });
+});
+
+test("W2G: puppeteer-core is the one Lighthouse itself imports (resolved from lighthouse, its ESM build)", (t) => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  try { require.resolve("lighthouse/package.json"); } catch { t.skip("lighthouse not installed"); return; }
+  const entry = tool._puppeteerEntry();
+  assert.ok(fs.existsSync(entry), entry);
+  assert.match(entry.split(path.sep).join("/"), /\/puppeteer-core\/lib\/esm\/puppeteer\/puppeteer-core\.js$/);
+  const lhDir = path.dirname(require.resolve("lighthouse/package.json"));
+  const nav = fs.readFileSync(path.join(lhDir, "core", "gather", "navigation-runner.js"), "utf8");
+  assert.match(nav, /import puppeteer from 'puppeteer-core'/, "lighthouse imports puppeteer-core by its package name");
+});
+
 test("W2D: lighthouse_audit description says storage is not reset (warm cache, shared profile)", () => {
   assert.match(tool.description, /does not reset storage/i);
   assert.match(tool.description, /warm/i);

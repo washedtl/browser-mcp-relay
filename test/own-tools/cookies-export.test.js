@@ -166,3 +166,41 @@ test("W1C1: cookies_export outputPath writes all cookies; values never appear in
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── W2F (v0.4.1): cookies the cookie bridge manages never come back with their value ──
+
+test("W2F: cookies_export hides bridge-managed values ([bridge-managed]) inline, keeps name/domain/path/flags, and counts them", async () => {
+  const managed = (c) => c.domain === ".amazon.com" && c.name === "session-id";
+  let matcherCalls = 0;
+  const ctx = { context: { cookies: async () => JAR.map((c) => ({ ...c })) }, bridgeManagedMatcher: () => { matcherCalls++; return managed; } };
+  const r = await tool.handler({}, ctx);
+  const p = JSON.parse(r.content[0].text);
+  assert.strictEqual(matcherCalls, 1, "one matcher per export");
+  assert.strictEqual(p.bridgeManaged, 1);
+  assert.ok(!r.content[0].text.includes("S1"), "the managed value never appears");
+  const masked = p.cookies.find((c) => c.domain === ".amazon.com");
+  assert.deepStrictEqual(masked, { ...JAR[0], value: tool.BRIDGE_MANAGED_VALUE });
+  assert.strictEqual(tool.BRIDGE_MANAGED_VALUE, "[bridge-managed]");
+  assert.deepStrictEqual(p.cookies.filter((c) => c !== masked).map((c) => c.value).sort(), ["E1", "G1", "U1"], "Brave's own cookies are untouched");
+  assert.match(tool.description, /\[bridge-managed\]/);
+  assert.match(tool.description, /execute/, "the description says page scripts can still read values");
+});
+
+test("W2F: cookies_export hides bridge-managed values in outputPath files too; without a matcher (legacy) nothing changes", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-cookies-export-w2f-"));
+  try {
+    const out = path.join(dir, "jar.json");
+    const ctx = { context: { cookies: async () => JAR.map((c) => ({ ...c })) }, bridgeManagedMatcher: () => (c) => c.value === "G1" || c.value === "S1" };
+    const r = await tool.handler({ outputPath: out }, ctx);
+    assert.strictEqual(JSON.parse(r.content[0].text).bridgeManaged, 2);
+    const raw = fs.readFileSync(out, "utf8");
+    assert.ok(!raw.includes('"S1"') && !raw.includes('"G1"'), "the file holds no managed value");
+    assert.strictEqual(JSON.parse(raw).cookies.filter((c) => c.value === "[bridge-managed]").length, 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const legacy = await tool.handler({}, { context: { cookies: async () => JAR.map((c) => ({ ...c })) } });
+  const p = JSON.parse(legacy.content[0].text);
+  assert.strictEqual(p.bridgeManaged, undefined);
+  assert.deepStrictEqual(p.cookies.map((c) => c.value).sort(), ["E1", "G1", "S1", "U1"]);
+});

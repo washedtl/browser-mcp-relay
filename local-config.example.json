@@ -24,6 +24,9 @@
   "BROWSER_RELAY_BROKER_RECYCLE_RSS_MB": "",
   "_BROWSER_RELAY_BROKER_RECYCLE_RSS_MB_doc": "Broker mode: restart an idle broker whose memory exceeds this many MB (never under a session's open browser). Default 1024; '0' turns it off. (BROWSER_RELAY_BROKER_DEELEVATE and BROWSER_RELAY_BROKER_LOG are read from the MCP server's env only, not from this file.)",
 
+  "BROWSER_RELAY_BRIDGE_ALLOW": "",
+  "_BROWSER_RELAY_BRIDGE_ALLOW_doc": "Optional, broker mode + the cookie bridge (npm run bridge:install): your always-allow list, comma-separated domains (each covers its subdomains) or IP addresses, e.g. 'pay.example.com, intranet.example.org'. Broker side only: the broker accepts their cookies even when the keyword guard (bank, pay, tax, health, ...) would hold them. The extension still holds those domains until you turn them on in its review page, so this makes nothing sync on its own. It never lifts a built-in deny category (banking, email/identity, password managers, government/tax/health, cloud consoles). Default: empty.",
+
   "BROWSER_RELAY_BRAVE_PATH": "",
   "_BROWSER_RELAY_BRAVE_PATH_doc": "Absolute path to the Brave executable. Leave empty to auto-detect (Win/Mac/Linux standard install locations + Windows registry probe). Examples: 'C:\\\\Program Files\\\\BraveSoftware\\\\Brave-Browser\\\\Application\\\\brave.exe', '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', '/usr/bin/brave-browser'.",
 

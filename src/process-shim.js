@@ -24,6 +24,18 @@
 const { spawnSync, execFile } = require("node:child_process");
 
 /**
+ * A probe child's env: this process's, minus BROWSER_CDP_ENDPOINT_URL. The
+ * broker puts its secret CDP URL there while upstream imports (upstream reads
+ * it from process.env); a probe spawned in that window must not inherit it.
+ * @param {object} [extra] — added on top (e.g. LC_ALL for ps)
+ */
+function probeEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const k of Object.keys(env)) if (k.toUpperCase() === "BROWSER_CDP_ENDPOINT_URL") delete env[k]; // Windows names ignore case
+  return env;
+}
+
+/**
  * List running processes whose command line contains `needle`.
  *
  * @param {string} needle — substring to match against the command line.
@@ -73,6 +85,7 @@ function listProcessesWin(needle, spawn) {
       // probe and the inspector's status poll would both hang the entire
       // relay.
       timeout: 15000,
+      env: probeEnv(),
     },
   );
   if (!result || result.status !== 0) {
@@ -108,7 +121,7 @@ function listProcessesPosix(needle, spawn) {
     // G1-3: same caps as Windows path — see listProcessesWin.
     maxBuffer: 16 * 1024 * 1024,
     timeout: 15000,
-    env: { ...process.env, LC_ALL: "C" },
+    env: probeEnv({ LC_ALL: "C" }),
   });
   if (!result || result.status !== 0) {
     const stderr = result && result.stderr ? String(result.stderr).trim() : "";
@@ -225,13 +238,13 @@ function getProcessStartTimes(pids, opts = {}) {
       `foreach ($id in @(${ids.join(",")})) { $p = Get-Process -Id $id; ` +
       `if ($p -and $p.StartTime) { ''+$id+'|'+$p.StartTime.ToUniversalTime().ToString('o') } }`;
     result = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript], {
-      encoding: "utf8", windowsHide: true, timeout, maxBuffer: 1024 * 1024,
+      encoding: "utf8", windowsHide: true, timeout, maxBuffer: 1024 * 1024, env: probeEnv(),
     });
   } else {
     // LC_ALL=C pins lstart to the parseable "Tue Nov  3 08:07:46 2026" form.
     result = spawn("ps", ["-o", "pid=,lstart=", "-p", ids.join(",")], {
       encoding: "utf8", timeout, maxBuffer: 1024 * 1024,
-      env: { ...process.env, LC_ALL: "C" },
+      env: probeEnv({ LC_ALL: "C" }),
     });
   }
   // ps exits 1 when some pids are gone; still parse whatever it printed.

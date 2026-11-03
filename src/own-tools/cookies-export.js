@@ -7,10 +7,19 @@
 // hundreds of KB, so inline output is compact + capped (maxBytes) and
 // narrowable (domains / names); outputPath keeps values out of the model's
 // context entirely — pair it with cookies_import inputPath.
+//
+// W2F (v0.4.1): in broker mode, a cookie the cookie bridge copied from the
+// owner's Chrome (the broker's persisted bridge-managed set, asked
+// in-process via ctx.bridgeManagedMatcher) comes back with its name, domain,
+// path and flags but value "[bridge-managed]", inline AND in outputPath.
+// This keeps those values out of tool results; it is not a sandbox: page
+// scripts (execute, document.cookie for non-HttpOnly cookies) still read them.
 
 const { errorResult, intArg, outputPathArg, writeOutputFile } = require("./_tool-args.js");
 
 const DEFAULT_MAX_BYTES = 50_000;
+// What a bridge-managed cookie's value reads as (cookies_import skips it).
+const BRIDGE_MANAGED_VALUE = "[bridge-managed]";
 
 // F1-1: an optional filter must be an array of non-empty strings.
 // Returns an error message or null.
@@ -34,7 +43,8 @@ module.exports = {
   description:
     "Export browser cookies as JSON (the profile's one cookie jar, shared by every tab and session). " +
     "Narrow with urls, domains or names; inline output is capped at maxBytes. " +
-    "To save and restore a session, use outputPath here and cookies_import inputPath so values stay out of the conversation.",
+    "To save and restore a session, use outputPath here and cookies_import inputPath so values stay out of the conversation. " +
+    `Cookies the cookie bridge copied from the user's Chrome have value "${BRIDGE_MANAGED_VALUE}" (name/domain/path/flags only); page scripts (execute) can still read non-HttpOnly values.`,
   inputSchema: {
     type: "object",
     properties: {
@@ -47,7 +57,7 @@ module.exports = {
     },
   },
   needsPage: false,
-  handler: async (_args, { context }) => {
+  handler: async (_args, { context, bridgeManagedMatcher }) => {
     // F0-9: null means "omitted" for every optional argument.
     const args = _args || {};
     const { urls, domains, names } = args;
@@ -85,22 +95,34 @@ module.exports = {
       }
     }
 
+    // W2F: never hand out a bridge-managed cookie's value (inline or file)
+    let bridgeManaged = 0;
+    if (typeof bridgeManagedMatcher === "function" && cookies.length) {
+      const managed = bridgeManagedMatcher();
+      cookies = cookies.map((c) => {
+        if (!managed(c)) return c;
+        bridgeManaged++;
+        return { ...c, value: BRIDGE_MANAGED_VALUE };
+      });
+    }
+    const hidden = bridgeManaged ? { bridgeManaged } : {};
+
     if (out.path) {
       let written;
       try {
-        written = await writeOutputFile(out.path, JSON.stringify({ count: cookies.length, cookies }, null, 2), overwrite);
+        written = await writeOutputFile(out.path, JSON.stringify({ count: cookies.length, ...hidden, cookies }, null, 2), overwrite);
       } catch (e) {
         return errorResult(`cookies_export: writing outputPath failed: ${e.message}`);
       }
-      return { content: [{ type: "text", text: JSON.stringify({ count: cookies.length, savedTo: written.path, fileBytes: written.bytes }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ count: cookies.length, ...hidden, savedTo: written.path, fileBytes: written.bytes }) }] };
     }
 
-    let text = JSON.stringify({ count: cookies.length, cookies });
+    let text = JSON.stringify({ count: cookies.length, ...hidden, cookies });
     if (text.length > maxBytes) {
       // Keep whole cookies in order while they fit; reserve room for the
       // envelope so the final text stays within maxBytes.
       const hint = "narrow with domains/names/urls or use outputPath";
-      const envelope = JSON.stringify({ count: cookies.length, returned: cookies.length, truncated: true, hint, cookies: [] }).length;
+      const envelope = JSON.stringify({ count: cookies.length, ...hidden, returned: cookies.length, truncated: true, hint, cookies: [] }).length;
       const kept = [];
       let used = envelope;
       for (const c of cookies) {
@@ -109,8 +131,9 @@ module.exports = {
         kept.push(c);
         used += size;
       }
-      text = JSON.stringify({ count: cookies.length, returned: kept.length, truncated: true, hint, cookies: kept });
+      text = JSON.stringify({ count: cookies.length, ...hidden, returned: kept.length, truncated: true, hint, cookies: kept });
     }
     return { content: [{ type: "text", text }] };
   },
+  BRIDGE_MANAGED_VALUE,
 };

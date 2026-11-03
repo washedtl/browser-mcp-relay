@@ -154,7 +154,7 @@ Lower-priority items not specifically about stealth.
 
 **What:** Currently pinned at `lighthouse@^11.0.0` (11.7.1 is the last 11.x). v13.6.0 clears the advisories left in its tree: `@puppeteer/browsers` (`extract-zip`, `basic-ftp` via `proxy-agent`), `chromium-bidi`'s `zod@3` and `@sentry/node`'s `cookie<0.7.0`. 12.x is still in the affected range.
 
-**Why deferred:** lighthouse 13 needs Node ≥ 22.19; the relay supports Node ≥ 20. The API `lighthouse_audit` uses (`lighthouse(url, flags, config)`, `desktopConfig`) is unchanged, but the `pwa` category is gone (its `VALID_CATS` still lists it) and puppeteer-core jumps from 22 to 25. None of the flagged code runs here: Lighthouse attaches to the relay's Brave over CDP.
+**Why deferred:** lighthouse 13 needs Node ≥ 22.19; the relay supports Node ≥ 20. The API `lighthouse_audit` uses (`lighthouse(url, flags, config)`, `desktopConfig`) is unchanged, but the `pwa` category is gone (its `VALID_CATS` still lists it) and puppeteer-core jumps from 22 to 25. Broker mode also calls `lighthouse(url, flags, config, page)` with a page of Lighthouse's own puppeteer-core, connected with `puppeteer.connect({browserWSEndpoint})` (the broker has no CDP port): check both against 25. None of the flagged code runs here: Lighthouse attaches to the relay's Brave over CDP.
 
 **Ship gate:** When the relay's Node floor reaches 22.19, OR when one of those advisories becomes reachable.
 

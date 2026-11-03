@@ -20,6 +20,7 @@ The slim README at the root of the repo is for getting up and running. This file
 - [Optional features](#optional-features)
   - [Proxy whitelist](#proxy-whitelist)
   - [Credential vault + autofill](#credential-vault--autofill)
+  - [Cookie bridge](#cookie-bridge)
 - [Stealth model](#stealth-model)
 - [Inspector](#inspector)
 - [Platform support](#platform-support)
@@ -50,7 +51,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `emulate_device` | UA / viewport / network throttling (`reset: true` clears all overrides) | `network.downloadKbps` | Verify a layout on Slow 3G |
+| `emulate_device` | UA / viewport / network throttling (`reset: true` clears all overrides). A `userAgent` also sets Chrome-exact client hints + `navigator.platform` and reaches the tab's cross-origin iframes + dedicated workers (see [Stealth model](#stealth-model) for what it can't reach) | `network.downloadKbps` | Verify a layout on Slow 3G |
 
 #### 📑 Multi-tab control
 
@@ -82,8 +83,8 @@ Tools that act on a page take an optional `tabId` (from `tabs_new`); without it 
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `cookies_export` | Export cookies as JSON (one jar, shared by every tab and session) | `urls`, `domains`, `names` (filters), `outputPath` (keeps values out of the transcript) | Save an authed session for later |
-| `cookies_import` | Import cookies into the shared jar | `cookies` or `inputPath` (a file from `cookies_export`) | Restore an authed session |
+| `cookies_export` | Export cookies as JSON (one jar, shared by every tab and session). Cookies the [cookie bridge](#cookie-bridge) copied from Chrome come back with value `"[bridge-managed]"` (`execute` can still read non-HttpOnly values: it isn't a sandbox) | `urls`, `domains`, `names` (filters), `outputPath` (keeps values out of the transcript) | Save an authed session for later |
+| `cookies_import` | Import cookies into the shared jar (skips `"[bridge-managed]"` placeholders) | `cookies` or `inputPath` (a file from `cookies_export`) | Restore an authed session |
 | `stealth_apply` | Anti-detection patches (Tier 1), all your tabs, never another session's | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
 
 #### 💾 Downloads
@@ -370,8 +371,9 @@ Claude session N ── stdio ──▶ shim ───────────�
       │ SessionRegistry: (connection, tabId) → upstream session context = one window        │
       │ browser-devtools-mcp IN-PROCESS (loaded on the first tools/call) + the 21 own-tools │
       │ BraveSupervisor: launch, PID, crash → relaunch, graceful close                      │
+      │ CdpProxy: CDP for upstream + own-tools, ws://127.0.0.1:<port>/<secret>/…            │
       │ control channel (broker:status / broker:stop) · the one relay Inspector (optional)  │
-      └───────────────────────────────── CDP 127.0.0.1:<port> ─────────────────────────────┘
+      └───────────────── CDP over a pipe (fd 3/4): Brave has no TCP port ──────────────────┘
                                                                              ▼
                                   ONE Brave, ONE persistent profile (logins shared live, kept)
 ```
@@ -389,7 +391,7 @@ Claude session N ── stdio ──▶ shim ───────────�
 
 ### Legacy mode
 
-`BROWSER_RELAY_MODE=legacy` (the default on macOS and Linux): each MCP session runs its own relay, with its own Brave and its own upstream child, as before v0.4.
+`BROWSER_RELAY_MODE=legacy` (the default on macOS and Linux): each MCP session runs its own relay, with its own Brave and its own upstream child, as before v0.4. Its Brave keeps an unauthenticated TCP debugging port (`9333 + slot - 1`) that upstream attaches to; broker mode has none (see *Broker mode: known risks*).
 
 ```
                     stdio JSON-RPC
@@ -468,9 +470,10 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_RELAY_BROKER_DEELEVATE` | on | `off` keeps a broker started from an elevated session elevated, and its Brave with it. Read by the launcher from the **process env only** (the MCP server's `env` block), not from `local-config.json`. |
 | `BROWSER_RELAY_BROKER_WATCHDOG_MS` | `60000` | A watchdog thread kills the broker if its event loop is blocked this long (e.g. a runaway `execute`); the next tool call starts a fresh one. Minimum 10 s; `0` turns it off. It is also off while Node's own debugger is attached. |
 | `BROWSER_RELAY_BROKER_RECYCLE_RSS_MB` | `1024` | A broker whose memory (RSS) is above this restarts itself once no tool call has run for a minute and either no session is connected or Brave has idled out (no session loses an open tab). `0` turns it off. |
+| `BROWSER_RELAY_BRIDGE_ALLOW` | unset | [Cookie bridge](#cookie-bridge), broker side only: comma-separated domains (each with its subdomains) or IPs the broker accepts even when the keyword guard would hold them. The extension still holds them until you turn them on in its review page, so it makes nothing sync on its own. Never lifts a denylisted category. |
 | `BROWSER_RELAY_BROKER_LOG` | `<broker home>/broker.log` | The broker log (rotated once at startup past 1 MB). The launcher also writes its warnings there; it reads this from the process env only. |
 
-The broker home is `%LOCALAPPDATA%\browser-mcp-relay\broker` on Windows, `~/Library/Application Support/browser-mcp-relay/broker` on macOS, and `$XDG_STATE_HOME/browser-mcp-relay/broker` (or `~/.local/state/…`) on Linux. It holds `broker.key`, `broker.log`, `profile/` and `work/` (the broker's working dir: relative output paths and project-scope scenarios land there).
+The broker home is `%LOCALAPPDATA%\browser-mcp-relay\broker` on Windows, `~/Library/Application Support/browser-mcp-relay/broker` on macOS, and `$XDG_STATE_HOME/browser-mcp-relay/broker` (or `~/.local/state/…`) on Linux. It holds `broker.key`, `broker.log`, `profile/` and `work/` (the broker's working dir: relative output paths and project-scope scenarios land there), plus, with the [cookie bridge](#cookie-bridge), `cookie-bridge.log` and `cookie-bridge-<hash>.json`.
 
 **Which settings apply in broker mode.** These work as before: `BROWSER_RELAY_BRAVE_PATH`, `BROWSER_RELAY_UPSTREAM_PATH`, `BROWSER_RELAY_PROXY_URL` (without credentials, see below), `BROWSER_RELAY_IGNORE_HTTPS_ERRORS`, `BROWSER_HEADLESS_ENABLE`, `BROWSER_LOAD_EXTENSIONS`, `BROWSER_RELAY_TOOLSETS` (the broker's starting set; each session then enables toolsets for itself), `BROWSER_RELAY_INSPECTOR_PORT` and `_BIND`, and `BROWSER_RELAY_CATALOG_REFRESH`. Legacy-only: `BROWSER_RELAY_POOL_DIR`, `BROWSER_RELAY_POOL_SLOT`, `BROWSER_MCP_ROLE` and `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` (no pool), and `BROWSER_RELAY_VAULT_FILES` (not wired into the broker yet). TLS works as in legacy mode: certificates are verified unless `BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true` or Brave actually runs through `BROWSER_RELAY_PROXY_URL` (so a debug proxy's MITM certificate works); the broker then turns the checks off after every Brave launch and logs it once.
 
@@ -521,9 +524,9 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 | Event loop blocked ≥ 60 s | The watchdog kills the broker, and the next tool call starts a fresh one. |
 | Memory above 1 GB while idle | The broker restarts itself, but never under a session's open browser. |
 
-**A graceful close** sends Brave `Browser.close` and waits up to 10 s for it to exit. Brave accepts at once (it drops the DevTools connection within ~10 ms) and then writes its cookies and settings, which took 6 s on a machine at 100% CPU. So once it has accepted, it gets up to 30 s in all before it is killed; one that ignores the close is killed at 10 s.
+**A graceful close** sends Brave `Browser.close` and waits up to 10 s for it to exit. Brave accepts at once (it closes its CDP pipe within ~6-55 ms) and then writes its cookies and settings, which took 6 s on a machine at 100% CPU. So once it has accepted, it gets up to 30 s in all before it is killed; one that ignores the close is killed at 10 s.
 
-Brave's CDP port is a random free port in 10000–32000, fixed for the broker's life. That is below every default ephemeral range, so outbound connections can't take it while Brave is down (before its first launch, or after an idle close) and force a broker restart.
+**Brave has no CDP port.** It runs with `--remote-debugging-pipe`: the broker talks to it over two pipes only it holds, and no Brave process listens on TCP (measured: 0 listening sockets on any of its processes). Upstream and the broker's own tools reach it through the broker's CDP proxy at `ws://127.0.0.1:<port>/<secret>/devtools/browser`, where `<secret>` is 256 random bits made at startup. The broker holds that port for its whole life, so a relaunched Brave sits behind the same URL. Without the exact secret path, the proxy refuses every request: all `/json/*` discovery (404), and any websocket upgrade with a wrong path, an `Origin` header (a web page) or a foreign `Host` (DNS rebinding) (403). While Brave is down it answers 503. Clients can't send `Browser.close`, `Browser.crash` or `Browser.crashGpuProcess` to the shared Brave. The old non-flat channel `Target.sendMessageToTarget` (which `emulate_device` uses to resume a tab's paused iframes and workers) works only on a session the client owns, and every message it wraps, however deep, must be JSON and not one of those three. The secret never leaves the broker: the log, `broker:status`, the relay Inspector and tool results show `<redacted>` in its place.
 
 ### Profile: seeded once, then Brave's own
 
@@ -539,7 +542,7 @@ npm run migrate-profile -- --from <profile dir>      # seed from that dir (refus
 ### Control and logs
 
 ```bash
-npm run broker:status   # pid, uptime, pipe, profile, Brave up/pid, each session's tabs (tabId, state, URL), RSS
+npm run broker:status   # pid, uptime, pipe, profile, Brave up/pid, each session's tabs (tabId, state, URL), RSS, cookieBridge counts
 npm run broker:stop     # close Brave gracefully and exit; it stays stopped until a session's next tool call starts a new one
 ```
 
@@ -669,6 +672,60 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 
 > ⚠️ **Security:** Passwords stay in memory only — never logged, never re-written. But anyone with read access to your relay process's memory could read them. Only point this at CSVs you trust. The vault is most useful when scraping authed sites that block Playwright's password manager (e.g. Brave 127+'s App-Bound Encryption).
 
+### Cookie bridge
+
+Copies your everyday **Chrome**'s cookies into the broker's Brave, live and one way (Chrome → Brave), so agents are signed in where you are. Windows and broker mode only; nothing happens until you install it and approve it in Chrome. Chrome's own cookie file can't be copied: Chrome holds it open while it runs, and app-bound encryption means only `chrome.exe` can decrypt it. So the bridge reads cookies through the `chrome.cookies` API in a small extension.
+
+```
+Chrome extension ──native messaging──▶ host.js ──broker pipe (HMAC challenge)──▶ broker ──CDP (secret URL)──▶ Brave
+ (policy + review page)                (no port)                                 (policy again, snapshot)
+```
+
+- **Extension** (`extensions/cookie-bridge/`, MV3, ID `dfcccancdkogdddemhecnffcjllbjmba` from the fixed public `key` in its manifest). After you click **Approve & start sync** on its review page, it sends a full sync, then every `cookies.onChanged` change (additions, rotations, deletions). The review page lists what will sync and what's held back. You can turn any domain on or off there: a re-allowed denylisted or held domain's cookies carry `userOverride: true`. A held domain seen later waits there (badge on the icon). The extension never logs a cookie, and its stored state holds settings, domain names and counts, never values.
+- **Native host** (`src/cookie-bridge/host.js`, started by Chrome through the `.bat` launcher). It opens no TCP port. It checks the broker pipe every ~5 s and never starts a broker. It authenticates with `broker.key`: the broker must prove the key first, then the host answers a fresh challenge (a squatter on the pipe gets no MAC, and a recorded answer can't be replayed). On every (re)connect it asks the extension for a full resync. Changes made while no broker runs are dropped; the next resync covers them. It logs to `<broker home>/cookie-bridge.log`, never a value.
+- **Broker** (`src/cookie-bridge/importer.js`). It classifies every cookie again (its own domain and, for a partitioned cookie, the top-level site; a partition key without a valid top-level site is refused), refuses denylisted and held domains unless they carry `userOverride: true`, and keeps an in-memory snapshot. The snapshot is applied with `Storage.setCookies` over the broker's own CDP connection, the CdpProxy's secret URL handed over in-process (Brave has no debugging port). That happens at once while Brave runs, and again on every Brave launch, before any tool uses it: session cookies don't survive a restart. A deletion in Chrome expires the cookie in Brave, now or at the next launch. A deletion Brave may not have written to disk yet (Chromium writes cookies every ~30 s, so a crash can lose one) is applied again at the relaunch. Only one bridge connects at a time, and a bridge connection never keeps an idle broker alive. Errors sent back to the host go through the same redaction as the broker log.
+
+**The policy** (`extensions/cookie-bridge/policy.js`, shared by the extension and the broker) ships generic categories only, no personal domains:
+
+| Decision | What |
+|---|---|
+| deny | Built-in categories, on the domain and every subdomain: banking, credit unions, payments, crypto, brokerages, insurance and payroll; email and identity (Google incl. country domains, Microsoft, Apple, Proton, Yahoo, SSO providers); password managers; government, tax and health (incl. `*.gov`, `*.mil`, `gov.<cc>`-style suffixes, patient portals); cloud, hosting and registrar consoles. |
+| hold | An unknown domain with a sensitive keyword (`bank`, `credit`, `financ`, `invest`, `wallet`, `pay`, `tax`, `health`, `insur`, `loan`, `crypto`, `password`, `mail`, …, or a label ending in `cu`), an IP address, a single-label host, or `.local` / `.lan` / `.internal` / `.home.arpa`. |
+| allow | Everything else. |
+
+A deny on a subdomain (`aws.amazon.com`) stops cookies set on that host, not cookies set on its parent (`.amazon.com`).
+
+**Your always-allow list.** It's the review page: a domain you turn on there syncs, and stays on (the toggle is per domain, not its subdomains). The broker accepts it because the cookies carry `userOverride: true`. `BROWSER_RELAY_BRIDGE_ALLOW` is a broker-side list only: comma-separated domains (each covers its subdomains) or IP addresses, in the MCP server's `env` or `local-config.json`. For those, the broker skips the keyword hold on cookies that arrive without `userOverride`. The shipped extension never sends a held domain's cookies without that flag, so the setting makes nothing sync on its own. It never lifts a denylisted category, and never lets a Chrome deletion reach a cookie the bridge didn't put into Brave. Entries it can't use (a single label such as `com`, a malformed name) and denylisted entries are named once in the broker log. `broker:status` shows the list it read.
+
+**Install / uninstall.** `npm run bridge:install` writes, under `%LOCALAPPDATA%\browser-mcp-relay\cookie-bridge\`, the host manifest `com.browser_mcp_relay.cookie_bridge.json` (its `allowed_origins` is exactly the extension's ID) and `cookie-bridge-host.bat` (this Node + `host.js`). It registers `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.browser_mcp_relay.cookie_bridge`, then prints the load-unpacked steps: `chrome://extensions` → Developer mode → **Load unpacked** → `<repo>/extensions/cookie-bridge` → check the ID → the options page → **Approve & start sync**. Re-run it after moving the repo or switching Node installs. `npm run bridge:uninstall` removes the registry key and exactly those two files; remove the extension in `chrome://extensions` yourself.
+
+**Stop, undo, purge.** What each control does to the cookies already in Brave:
+
+| You do | Syncing | Bridge cookies already in Brave |
+|---|---|---|
+| **Pause sync** (review page) | stops; un-pausing resyncs | stay |
+| Turn a domain **off** (review page) | stops for that domain | that domain's are removed (while a broker runs) |
+| Remove the extension, or clear its data (resets the approval; there is no separate "revoke approval" button) | stops | stay |
+| `npm run bridge:uninstall` | Chrome can no longer start the host | stay |
+| `npm run bridge:uninstall -- --purge` | as above | **all removed** |
+
+`--purge` sends the running broker the authenticated control request `bridge-purge`. The broker refuses it while the extension is connected (it would sync everything straight back): remove or pause the extension first. Otherwise it expires, in Brave, every cookie the bridge has put there, including ones Chrome already deleted and ones from an earlier broker's state, launching Brave if needed. A Brave started just for the purge is closed again, which writes the deletions to disk; a running one writes them within ~30 s. The broker deletes its `cookie-bridge-<hash>.json`, and the script then deletes `cookie-bridge.log`. With no broker running it deletes nothing (that state file is what a purge needs): make any browser tool call, then run it again.
+
+**Elevated broker.** A broker running elevated (`BROWSER_RELAY_BROKER_DEELEVATE=off`, or de-elevation failed) owns a pipe that the Chrome-started host can't open (EPERM). The host says so in `cookie-bridge.log` and the review page shows the fix: `npm run broker:stop`, then start your session again without `DEELEVATE=off`; `broker.log` says why de-elevation failed. The pipe's access isn't widened for it. `bridge:uninstall -- --purge` then has to run from an elevated terminal.
+
+**Status and files.** `npm run broker:status` → `cookieBridge`: `bridges` (0 or 1), `cookies` and `domains` in the snapshot, `managed` (cookies the bridge put into Brave), `pendingDeletes` (deletions not sent to Brave yet), `lastSyncAt`, `allow`. These are counts only, never values. In the broker home: `cookie-bridge.log` (the host) and `cookie-bridge-<hash of the profile>.json`. That file holds the identities of the bridge-managed cookies and of the deletions not applied yet or not yet on Brave's disk (name, domain, path, flags; never a value; written atomically, user-private), so a full resync after a broker restart still deletes what Chrome no longer has. The broker's own lines in `broker.log` start with `cookie bridge:`.
+
+**Values and tools.** `cookies_export` returns a cookie the bridge has put into Brave (one in that persisted set, or put there during this broker's life) with its name, domain, path and flags, and value `"[bridge-managed]"`, inline and in `outputPath` files (plus a `bridgeManaged` count). `cookies_import` skips that placeholder, so a masked export can't overwrite the real cookie. **This is not a sandbox:** pages run in the same Brave, so `execute`, `document.cookie` and page scripts read any non-HttpOnly cookie, and requests carry all of them.
+
+**Risks you accept.** Installing the bridge means accepting these:
+- Brave stores the synced cookies with DPAPI only (no App-Bound Encryption like Chrome's), so any process running as you can decrypt them from the broker profile on disk.
+- Any process running as you can drive the broker (see *Pipe access is browser access* below), or rewrite the native host's `.bat` launcher or its HKCU registry key and so receive what the extension sends.
+- Page scripts and `execute` can read synced values (non-HttpOnly cookies).
+- Parent-domain cookies (e.g. `.amazon.com`) sync even where a subdomain is denied (`pay.amazon.com`, `aws.amazon.com`).
+- Powerful but allowed domains (code hosting, package registries, AI accounts) sync unless you untick them on the review page.
+
+**Limits.** Cookies only (no localStorage, sessionStorage or IndexedDB: a site that keeps its login token there still needs a login in Brave). Google sign-ins may not transfer (device-bound sessions), and Google accounts are denied anyway. One way: a login made in Brave never goes back to Chrome. One Chrome profile at a time. Chrome only: the host is registered for Google Chrome, not Edge or Brave.
+
 ---
 
 ## Stealth model
@@ -686,6 +743,7 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 | `navigator.languages` override | Mismatched-language flagging |
 | `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
 | `navigator.userAgentData` replaced only when it contradicts the UA | Sec-CH-UA-* JS-side fingerprinting; same generator as `emulate_device`'s HTTP client hints; Brave's native object is kept when no UA override is active |
+| `navigator.platform` replaced only when it contradicts the UA | A Mac / Android UA reporting `Win32`: a UA override set without CDP's `platform` (`emulate_device` sets it). Values are Chromium's reduced ones (`Win32`, `MacIntel`, `Linux x86_64`, `Linux armv81`, `iPhone` / `iPad`); a matching native value is kept. Not reachable in workers (see below) |
 | `toString()` defense on patched getters | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
 | AudioBuffer `getChannelData` / `copyFromChannel` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; one seed per relay process, so every tab of the browser matches (< 1e-7), applied once per channel buffer, never cumulative or random per-call |
 
@@ -693,12 +751,12 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 
 | Patch | What it defeats |
 |---|---|
-| **HTTP-side `Sec-CH-UA-*` headers via `userAgentMetadata`** | The Tier-1 JS-side `userAgentData` paired with HTTP-side `Sec-CH-UA-*` mismatch detection. `emulate_device` now passes a synthesized `userAgentMetadata` to CDP's `Network.setUserAgentOverride`. |
+| **HTTP-side `Sec-CH-UA-*` headers via `userAgentMetadata`** | The Tier-1 JS-side `userAgentData` paired with HTTP-side `Sec-CH-UA-*` mismatch detection. `emulate_device` passes a synthesized `userAgentMetadata` (plus the matching `platform`) to CDP's `Network.setUserAgentOverride`. The brand list is Chromium's own: the GREASE brand, its version and the brand order are seeded by the major exactly as `components/embedder_support/user_agent_utils.cc` does (Chrome 131 → `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`), with `"Google Chrome"` for a Chrome UA (other Chromium browsers such as Edge / Opera get the unbranded Chromium list, never a wrong brand). A reduced UA (`Chrome/131.0.0.0`) gets a real stable build in `fullVersionList` / `uaFullVersion` / `Sec-CH-UA-Full-Version-List` (`131.0.6778.264`; table from chromiumdash, majors 100-157, later majors extrapolated). `fullVersion` and `formFactors` are always sent, since Chromium otherwise reports the host browser's own (Brave's `147.0.0.0`, `Desktop` on an Android UA). The override also reaches the tab's **cross-origin iframes and dedicated workers**: the page session auto-attaches to them (paused until overridden), since Chromium applies overrides per DevTools target. |
 | **`window.chrome` runtime expansion** | Probes for `chrome.loadTimes()` / `chrome.csi()` / `chrome.app` namespace. Real Chrome ships all three; Tier 1's bare `runtime: {}` was a tell. Now populates plausible-shape stubs. |
 | **Full permissions overrides** | Probes for `geolocation` / `clipboard-read` / `clipboard-write` / `camera` / `microphone` / `midi` / `push` / etc. Tier 1 only covered notifications; Tier 2 extends to the canonical 17 permission types with realistic states. |
 | **WebGL renderer + vendor override** | `getParameter(UNMASKED_VENDOR_WEBGL)` / `getParameter(UNMASKED_RENDERER_WEBGL)` returning Playwright signature strings. UA-aware GPU strings on both `WebGLRenderingContext` and `WebGL2RenderingContext`. |
 
-This covers trivial bot checks + the bottom ~85% of common fingerprint surface. **Verified by source-pattern tests** (`test/own-tools/stealth-apply.test.js` T1-A/B/C + T2-B/C/D, plus `test/own-tools/emulate-device.test.js` T2-A).
+This covers trivial bot checks + the bottom ~85% of common fingerprint surface. **Verified by executing the injected script** in a fake-Chromium vm realm (`test/own-tools/stealth-apply.test.js`), client hints against real Chrome headers for several majors (`test/own-tools/client-hints.test.js`), CDP traffic incl. child targets (`test/own-tools/emulate-device.test.js`), and a live check in Brave 147 (2026-11-03: top page, cross-origin iframe, workers, HTTP headers).
 
 ### What it does NOT cover
 
@@ -710,6 +768,7 @@ The relay is honest about these limits — pretending otherwise misleads callers
 | **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. Tier 1's getter-level toString defense doesn't reach this. | Tier 3 (deferred — see BACKLOG): rebrowser-patches at the chromium-binary level. |
 | **`event.isTrusted` detection (press-and-hold, CAPTCHAs)** | Synthetic events from CDP fundamentally have `isTrusted=false`. This is by browser design — there's no JS-level fix. | Don't try to auto-solve press-and-hold CAPTCHAs; route the user through them manually. |
 | **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | Tier 2.5 (deferred — see BACKLOG): `humanlike_click` + `humanlike_type` tools. Has an explicit ship gate (capture the detection signal first; design the humanizer to match the target's tolerance window). |
+| **Where `emulate_device`'s UA override can't reach** | (1) **Service and shared workers** keep the browser's real UA, brands and platform: they are shared by every tab of an origin (other sessions' tabs too), and a service worker's `navigator.userAgent` ignores CDP overrides anyway (live check), so they are excluded from the auto-attach. (2) **`navigator.platform` inside any worker** (dedicated too) is always the host OS: Blink's `WorkerNavigator` has no override hook (`navigator_base.cc`), and `stealth_apply` can't patch workers. (3) **Popups** the tab opens are new tabs: call `emulate_device` on them. (4) In Brave, **`navigator.brave`** still exists (`isBrave()` → true) under an emulated Chrome UA. (5) Brand lists are exact for **Google Chrome 110+**; Chrome ≤ 109 used an earlier GREASE scheme, and an **Edge / Opera** UA gets Chromium's unbranded list (no `"Microsoft Edge"` / `"Opera"` brand, whose own full versions aren't known here). | Fingerprinters that compare a worker's `navigator.platform` (or a service worker's UA) with the page's will see the host OS: emulate a UA of the host's own OS when that matters. |
 
 ### Hard targets
 
@@ -916,7 +975,7 @@ Which pool slots have valid locks vs. stale ones. The relay self-heals stale loc
 
 ### Check whether a relay is actually responding
 
-If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the slot's CDP port (`9333 + slot - 1`).
+If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the slot's CDP port (`9333 + slot - 1`). Legacy mode only: in broker mode Brave has no CDP port, so use `npm run broker:status`.
 
 ```powershell
 Invoke-WebRequest -Uri "http://127.0.0.1:9333/json/version" -UseBasicParsing | Select-Object StatusCode, @{
@@ -981,7 +1040,8 @@ Then `Get-Content <absolute-path>/relay-stderr.log -Tail 50 -Wait` to follow it 
 - **Shared blast radius.** One broker serves every session. A hung tool, a leak or a crash in it affects all sessions at once, where a legacy relay affected one. Mitigations: per-call timeouts on the data-out tools, `uncaughtException` is logged and the broker keeps serving, a watchdog for a blocked event loop, a recycle on high idle memory, and the next call reconnects within seconds.
 - **`execute` runs in-process.** Upstream's `execute` (and `scenario-run`) evaluate agent-written JavaScript inside the broker process, shared by every session. A runaway script blocks all of them until the watchdog restarts the broker.
 - **Pipe access is browser access.** Any process of yours that can open the pipe drives the logged-in Brave. `broker.key` only stops a fake broker from impersonating the real one; it does not keep any client out. That is why the broker de-elevates; when it can't, it says so in the log and in every session.
-- **The CDP port is unauthenticated.** While Brave is up, any local process can connect to its DevTools port, drive the logged-in Brave and read its cookies. Mitigations: the port is random (10000–32000) and bound to 127.0.0.1 only, and Brave idle-closes after 20 min. Legacy mode has the same exposure on its fixed 9333 + slot ports.
+- **CDP port: broker mode: none; legacy: unauthenticated port.** In broker mode Brave has no DevTools port (`--remote-debugging-pipe`), and CDP is served only behind the broker's secret URL (see *Idle, crashes, restarts*). A process that can read the broker's memory can find the secret, but a process running as you can likely read the profile on disk anyway (not measured). Legacy mode keeps an unauthenticated port: while its Brave is up, any local process can connect to the fixed `9333 + slot - 1` port (127.0.0.1 only), drive the logged-in Brave and read its cookies.
+- **Cookie bridge: what it puts in Brave, every session can use.** With the [cookie bridge](#cookie-bridge) installed, your Chrome logins for every non-denylisted domain you approved are in the shared Brave, so any session (and any page script, `execute` included) can act as you there. Tool results hide those values (`cookies_export`), but nothing stops a page script from reading non-HttpOnly cookies. Anything holding `broker.key` can also push cookies into Brave over the pipe, and a cookie flagged `userOverride: true` passes the broker's policy. That adds little: `broker.key` already gives a session, which drives Brave fully.
 - **Tab scoping is a convenience, not a security boundary.** `tabId` keeps parallel agents from stepping on each other's tabs, but all sessions share one browser: `execute` runs in the broker process, and any page's `page.context()` reaches every tab.
 - **Upstream internals.** The broker imports `browser-devtools-mcp`'s bundled chunks by their export names (pinned to 0.6.12, asserted by `test/upstream-contract.test.js`). An upstream bump can break broker mode while legacy mode still works.
 - **Not in broker mode yet:** credential-vault autofill (`BROWSER_RELAY_VAULT_FILES`) and authenticated proxies (a `user:pass@` proxy URL is used without its credentials, with a warning). Use legacy mode if you need these.

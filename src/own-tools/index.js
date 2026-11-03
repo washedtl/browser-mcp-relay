@@ -4,7 +4,7 @@
 //   { name, description, inputSchema, handler, needsBrave?, needsPage? }
 // where handler is async (args, ctx) => mcpToolResult and ctx, built by
 // toolContext() in _tool-context.js, is
-//   { page, context, sessionKey, registry, connId, cdpUrl, relay }:
+//   { page, context, sessionKey, registry, connId, cdpUrl, relay, bridgeManagedMatcher }:
 //   • page / context / sessionKey — the tab the call is routed to (args.tabId,
 //     default "main"; an unknown tabId is an error, only tabs_new opens
 //     tabs), its BrowserContext and "<connId>:<tabKey>". Broker mode: the
@@ -18,13 +18,19 @@
 //     registry.context — stealth_apply patches it, tabs_new/tabs_select say
 //     upstream tools ignore tabId); otherwise per-connection (broker: the
 //     BrowserContext is shared, so only the connection's own tabs are touched).
-//   • cdpUrl — the browser's http:// CDP endpoint (lighthouse_audit).
+//   • cdpUrl — the browser's CDP endpoint (lighthouse_audit). Broker mode: the
+//     broker's proxy, ws://127.0.0.1:<port>/<secret>/devtools/browser (no
+//     /json/*; never print it: the broker redacts results, logs and errors).
+//     Legacy mode: http://127.0.0.1:<port> (cdp-bridge.js).
 //   • relay — an object toolsets can drive: upstreamCatalog(),
 //     enabledToolsets (Set), setToolsetsEnabled(sets, on), askUser(params),
 //     canNotify (the RelayServer has all of these).
+//   • bridgeManagedMatcher — broker mode with the cookie bridge (W2F): () →
+//     (cookie) => boolean, true for a cookie the bridge copied from the
+//     owner's Chrome (cookies_export hides its value). null in legacy mode.
 // needsPage:false — the handler doesn't read ctx.page: no tab is routed or
-//   opened (ctx keeps context / registry / connId / cdpUrl / relay; context
-//   then comes from the provider).
+//   opened (ctx keeps context / registry / connId / cdpUrl / relay /
+//   bridgeManagedMatcher; context then comes from the provider).
 // needsBrave:false — never launches the browser, never routed: ctx has the
 //   registry & co. only while a browser runs, else just { relay }.
 //

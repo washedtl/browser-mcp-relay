@@ -54,7 +54,7 @@ function fakeSupervisor(opts = {}) {
       sup.ensures++;
       if (sup.fail) throw sup.fail;
       if (!sup.up) { sup.up = true; sup.launches++; }
-      return { cdpUrl: `http://127.0.0.1:${opts.port}`, pid: 4242 };
+      return { pid: 4242 };
     },
     isUp() { return sup.up; },
     checkAlive() { return sup.up; },
@@ -92,9 +92,12 @@ function fakeCtx(sessionKey) {
  * W2B's module surface: SESSIONLESS_TOOLS + loadUpstream({cdpUrl}) →
  * {version, tools:[{name, description, inputShape, tool, pageTool}], createContext, execute}.
  * `execute` runs `tool.run(ctx, args)`, recording each call in `state.executed`.
+ * Like the real one, loadUpstream puts cdpUrl in process.env.BROWSER_CDP_ENDPOINT_URL.
+ * navigation_go-to leaks the CDP URL on purpose for url "leak-error://" (in an
+ * error, as Playwright's call log does) and "leak-result://" (in its result).
  */
 function fakeUpstreamModule() {
-  const state = { loads: [], contexts: [], executed: [], order: [] };
+  const state = { loads: [], contexts: [], executed: [], order: [], cdpUrl: null };
   const tabId = z.string().optional();
   const tool = (name, run) => ({ name: () => name, run });
   const tools = [
@@ -118,6 +121,8 @@ function fakeUpstreamModule() {
       pageTool: true,
       tool: tool("navigation_go-to", async (ctx, args) => {
         if (args.url === "boom://") throw new Error("net::ERR_NAME_NOT_RESOLVED");
+        if (args.url === "leak-error://") throw new Error(`browserType.connectOverCDP: connect ECONNREFUSED\nCall log:\n  - <ws connecting> ${state.cdpUrl}`);
+        if (args.url === "leak-result://") return { endpoint: state.cdpUrl };
         return { navigated: args.url, session: ctx.sessionKey };
       }),
     },
@@ -149,6 +154,8 @@ function fakeUpstreamModule() {
     FORCED_UPSTREAM_ENV: { TELEMETRY_ENABLE: "false", BROWSER_CDP_OPEN_INSPECT: "false", TOOL_OUTPUT_SCHEMA_DISABLE: "true" },
     async loadUpstream({ cdpUrl }) {
       state.loads.push(cdpUrl);
+      state.cdpUrl = cdpUrl;
+      process.env.BROWSER_CDP_ENDPOINT_URL = cdpUrl; // as upstream-inproc's forceUpstreamEnv does
       state.order.push("loadUpstream");
       return {
         version: "0.6.12-fake",

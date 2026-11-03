@@ -17,13 +17,14 @@ src/
 │   ├── upstream-inproc.js#   browser-devtools-mcp imported in-process
 │   ├── window-pages.js   #   one Brave window per session tab
 │   ├── brave-supervisor.js#  the one Brave: launch, crash relaunch, graceful close
+│   ├── cdp-proxy.js      #   Brave's CDP pipe, served to clients behind a secret URL (no TCP port)
 │   ├── deelevate.js      #   start the broker without admin rights
 │   ├── profile-seed.js   #   one-time profile seed from a legacy pool slot
 │   └── control.js        #   broker:status / broker:stop over the pipe
 ├── relay-server.js       # tools/list merge + tools/call routing (+ traffic recording)
 ├── inspector-launch.js   # starts the in-process Inspector (relay or broker)
 ├── upstream-client.js    # JSON-RPC over stdio to browser-devtools-mcp
-├── cdp-bridge.js         # launchBrave / closeBrave (Playwright-over-CDP)
+├── cdp-bridge.js         # legacy: launchBrave / closeBrave (Playwright-over-CDP, a TCP debugging port)
 ├── detect-browser.js     # cross-platform Brave + profile-dir detection
 ├── process-shim.js       # cross-platform "is process alive?" + kill
 ├── pool-shared.js        # opt-in pool / standalone slot management

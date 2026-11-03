@@ -2,6 +2,11 @@
 // with a remote-debugging-port that BOTH our relay AND upstream attach to via
 // chromium.connectOverCDP. See docs/probe-cdp-access.js for the standalone
 // probe used to verify this architecture.
+//
+// Legacy mode only, and it keeps that TCP port: it is unauthenticated, so
+// while this Brave runs any local process can drive it and read its cookies.
+// Broker mode has no port (W2G: src/broker/brave-supervisor.js runs Brave on
+// --remote-debugging-pipe, src/broker/cdp-proxy.js serves it behind a secret).
 
 const net = require("node:net");
 const { chromium } = require("playwright-core");

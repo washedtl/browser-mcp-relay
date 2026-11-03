@@ -7,8 +7,12 @@
 // so hidden toolsets, elicitation and tools/list_changed work per session
 // exactly as in the stdio relay. Underneath, all sessions share:
 //
-//   - ONE Brave (W2C BraveSupervisor) on a CDP port chosen here, up front:
-//     upstream reads its CDP URL once per process, so the port never changes;
+//   - ONE Brave (W2C BraveSupervisor) with CDP on a pipe, no TCP port (W2G);
+//   - ONE CDP endpoint, the broker's CdpProxy (cdp-proxy.js): bound here, up
+//     front, for the broker's life, at ws://127.0.0.1:<port>/<secret>/devtools/browser.
+//     Upstream reads its CDP URL once per process, and the URL never changes.
+//     The secret never leaves the process: logs, status and tool results are
+//     redacted;
 //   - upstream browser-devtools-mcp IN-PROCESS (W2B upstream-inproc), loaded
 //     lazily on the first tools/call;
 //   - a SessionRegistry: (connection, tabId) → upstream session context, one
@@ -29,7 +33,6 @@
 "use strict";
 
 const fs = require("node:fs");
-const net = require("node:net");
 const path = require("node:path");
 const { claimPipe, resolveEndpoint, brokerHome, keyFileFor, loadOrCreateKey, restoreKeyFile, verifyPipeOwner, serverHello, settingsHash } = require("./pipe-server.js");
 
@@ -42,8 +45,6 @@ const MIN_WATCHDOG_MS = 10_000; // shorter would kill a healthy broker busy for 
 const KEY_CHECK_MS = 30_000;
 const DEFAULT_RECYCLE_RSS_MB = 1024;
 const RECYCLE_CHECK_MS = 60_000;
-// W2C's message for a CDP port another process holds (it never switches ports)
-const PORT_IN_USE_RE = /CDP port \d+ is (?:already )?in use/i;
 
 /**
  * Watchdog, in a worker thread: one broker serves every session, and code
@@ -118,13 +119,12 @@ const NEEDS_RENDERING_RE =
   /^(?:content_take-screenshot|content_start-recording|content_save-as-pdf|a11y_take-|interaction_|navigation_|execute$|scenario-run$|o11y_get-web-vitals$|form_fill$|file_upload$|download_capture$)/;
 
 const DEFAULT_DEPS = {
-  createSupervisor: ({ profileDir, port, env, log, poolConfig }) => {
+  createSupervisor: ({ profileDir, env, log, poolConfig }) => {
     const { BraveSupervisor } = require("./brave-supervisor.js");
     // as in legacy mode (index.js): env, then the pool wrapper's, then auto-detect
     const pool = poolConfig();
     return new BraveSupervisor({
       profileDir,
-      port,
       executablePath: pool.bravePath || undefined,
       extensionPath: env.BROWSER_LOAD_EXTENSIONS || null,
       proxyUrl: env.BROWSER_RELAY_PROXY_URL || pool.proxyUrl || null,
@@ -140,6 +140,15 @@ const DEFAULT_DEPS = {
   // W2D: the one place an own-tool call is routed to a tab
   toolContext: () => require("../own-tools/_tool-context.js"),
   loadCatalog: ({ env }) => require("../tool-catalog.js").loadUpstreamCatalog({ env }),
+  // W2F: cookies from the owner's Chrome (the cookie bridge), applied to Brave
+  // over a CDP connection the broker hands it: W2G's CdpProxy URL (with its
+  // secret, in-process only; Brave has no debugging port). Managed keys
+  // persist next to the key.
+  cookieBridge: ({ supervisor, cdpUrl, log, stateDir, profileDir, allow }) => {
+    const { CookieImporter, stateFileFor } = require("../cookie-bridge/importer.js");
+    const openCdp = () => require("../cookie-bridge/cdp-client.js").openBrowserCdp(cdpUrl);
+    return new CookieImporter({ supervisor, log, openCdp, allow, stateFile: stateFileFor(stateDir, profileDir) });
+  },
 };
 
 /**
@@ -158,6 +167,7 @@ class IdlePolicy {
     this.connections = 0;
     this.calls = 0;
     this._exit = null;
+    this._exitAt = null; // when the armed exit timer fires (W2F notASession keeps it)
     this._browser = null;
     this._stopped = false;
     this.lastActivity = Date.now();
@@ -167,12 +177,25 @@ class IdlePolicy {
 
   connectionOpened() {
     this.connections++;
+    // W2F: no countdown running (someone is connected): notASession must not
+    // revive an old deadline
+    if (!this._exit) this._exitAt = null;
     this._clear("_exit");
   }
 
   connectionClosed() {
     this.connections = Math.max(0, this.connections - 1);
     if (this.connections === 0) this._armExit();
+  }
+
+  /**
+   * W2F: the connection just opened turned out not to be a session (the
+   * cookie bridge): undo connectionOpened, keeping the exit deadline that
+   * was running, so a bridge (re)connecting never keeps the broker alive.
+   */
+  notASession() {
+    this.connections = Math.max(0, this.connections - 1);
+    if (this.connections === 0) this._armExit(this._exitAt);
   }
 
   callStarted() {
@@ -196,44 +219,18 @@ class IdlePolicy {
     this._clear("_browser");
   }
 
-  _armExit() {
+  _armExit(at = null) {
     if (this._stopped) return;
     this._clear("_exit");
-    this._exit = setTimeout(() => { this._exit = null; this.onExitIdle(); }, this.exitIdleMs);
+    const ms = at === null ? this.exitIdleMs : Math.max(0, at - Date.now());
+    this._exitAt = Date.now() + ms;
+    this._exit = setTimeout(() => { this._exit = null; this.onExitIdle(); }, ms);
   }
 
   _clear(which) {
     if (this[which]) clearTimeout(this[which]);
     this[which] = null;
   }
-}
-
-// Brave's CDP port is pinned for the broker's life (upstream reads it once)
-// while Brave is down before its first launch and after every idle close. An
-// OS-assigned port comes from the ephemeral range, which outbound connections
-// reuse, so it could be taken meanwhile and force a broker restart. Pick it
-// below every default ephemeral range instead (Windows 49152-65535, Linux
-// 32768-60999).
-const CDP_PORT_RANGE = Object.freeze({ min: 10000, max: 32000 });
-const CDP_PORT_TRIES = 20;
-
-/** Can `port` be bound on 127.0.0.1 right now? (released at once) */
-function portIsFree(port) {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.once("error", () => resolve(false));
-    srv.listen({ port, host: "127.0.0.1", exclusive: true }, () => srv.close(() => resolve(true)));
-  });
-}
-
-/** A random free port in CDP_PORT_RANGE (`random`: test seam). */
-async function chooseCdpPort({ random = Math.random } = {}) {
-  const { min, max } = CDP_PORT_RANGE;
-  for (let i = 0; i < CDP_PORT_TRIES; i++) {
-    const port = min + Math.floor(random() * (max - min + 1));
-    if (await portIsFree(port)) return port;
-  }
-  throw new Error(`[broker] no free CDP port in ${min}-${max} after ${CDP_PORT_TRIES} tries`);
 }
 
 /** tabId argument → registry tab key (same rules as W2D's toolContext). */
@@ -249,6 +246,20 @@ function tabKeyOf(tabId) {
 const unknownTabMessage = (tabKey) => `unknown tabId ${JSON.stringify(tabKey)}; call tabs_new or tabs_list`;
 
 const errorResult = (text) => ({ content: [{ type: "text", text }], isError: true });
+
+/**
+ * A tools/call result with the CDP secret taken out, wherever it sits
+ * (Playwright's call log and upstream's "[CDP connect]" errors print the
+ * whole URL). Through JSON, so it doesn't depend on the result's shape: JSON
+ * escaping never splits a hex secret. Results without it come back as they are.
+ */
+function redactResult(result) {
+  const { redact } = require("./cdp-proxy.js");
+  if (result === undefined) return result;
+  const json = JSON.stringify(result);
+  const clean = redact(json);
+  return clean === json ? result : JSON.parse(clean);
+}
 
 const SETTINGS_DIFFER_WARNING =
   "this session's browser settings (BROWSER_*, telemetry, upstream tool options) differ from the ones the running broker " +
@@ -304,7 +315,7 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {object} [opts.env] — local-config-merged env
  * @param {(msg: string) => void} [opts.log]
  * @param {{exitMs?: number, browserMs?: number}} [opts.idle]
- * @param {(reason: string) => void} [opts.onExit] — the broker has shut down by itself (idle, fatal)
+ * @param {(reason: string) => void} [opts.onExit] — the broker has shut down by itself (idle, recycle, broker:stop)
  * @param {string} [opts.keyFile] — this user's broker key (default: keyFileFor(env)); the shim passes its own
  * @param {{timeoutMs: number, logFile?: string}|null} [opts.watchdog] — kill the process if the event loop blocks this long
  * @param {{rssBytes: number, checkMs: number}|null} [opts.recycle] — exit while idle when RSS exceeds rssBytes
@@ -313,14 +324,20 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {{port: number}|null} [opts.relayInspector] — host the relay Inspector web UI on this port
  * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, toolContext, loadCatalog, rss
  */
-async function startBroker({ pipe, profileDir, env = process.env, log = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
+async function startBroker({ pipe, profileDir, env = process.env, log: rawLog = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
+  const { CdpProxy, redact } = require("./cdp-proxy.js");
+  // Every line the broker logs goes through redact(): no log carries the CDP secret.
+  const log = (m) => rawLog(redact(m));
   const keyPath = keyFile || keyFileFor(env);
   const key = loadOrCreateKey(keyPath);
-  // Picked before the claim: from the claim to server.on("connection")
+  // Bound before the claim: from the claim to server.on("connection")
   // nothing may await, or an early connection can be accepted unheard.
-  const port = await chooseCdpPort();
+  // An OS-assigned port is fine: the broker holds it for its whole life.
+  const cdpProxy = new CdpProxy({ log });
+  await cdpProxy.listen();
   const server = await claimPipe(pipe);
   if (!server) {
+    await cdpProxy.close();
     let owner = await verifyPipeOwner(pipe, key);
     if (owner === "bad") {
       // our key may be the stale one (its file was recreated): read it again, once
@@ -332,15 +349,16 @@ async function startBroker({ pipe, profileDir, env = process.env, log = () => {}
     return null;
   }
   try {
-    return serve({ server, port, key, keyFile: keyPath, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
+    return serve({ server, cdpProxy, key, keyFile: keyPath, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
   } catch (e) {
     server.close();
+    cdpProxy.close();
     throw e;
   }
 }
 
 /** Synchronous on purpose (see startBroker). */
-function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
+function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
   // Heavy requires only once we own the pipe: a losing broker exits fast.
   const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
   const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -350,12 +368,19 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   const { SessionRegistry, MAIN_TAB } = require("./sessions.js");
   const PKG = require("../../package.json");
 
-  const cdpUrl = `http://127.0.0.1:${port}`;
+  const { redact } = require("./cdp-proxy.js");
+  // The only CDP endpoint, with its secret: for upstream and own-tools, never for display.
+  const cdpUrl = cdpProxy.wsUrl;
   const startedAt = Date.now();
   // W2E: the relay Inspector's traffic feed (every session's calls), or null
   const traffic = relayInspector ? new (require("../relay-server.js").TrafficEmitter)() : null;
   let relayInspectorCtl = null;
-  const supervisor = d.createSupervisor({ profileDir, port, env, log, poolConfig: d.poolConfig });
+  const supervisor = d.createSupervisor({ profileDir, env, log, poolConfig: d.poolConfig });
+  // each launch's verified pipe is what the proxy serves (503 while Brave is down)
+  if (typeof supervisor.on === "function") supervisor.on("pipe", (p) => cdpProxy.setPipe(p));
+  const cookieBridge = d.cookieBridge({ supervisor, cdpUrl, log, stateDir: path.dirname(keyFile), profileDir, allow: bridgeAllowList(env, log) }); // W2F
+  // W2F: cookies_export hides the values of the cookies the bridge manages (in-process: no new endpoint)
+  const bridgeManagedMatcher = typeof cookieBridge.managedMatcher === "function" ? () => cookieBridge.managedMatcher() : null;
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
   const placement = env.BROWSER_RELAY_BROKER_WINDOWS === "offscreen" ? "offscreen" : "cascade";
@@ -370,7 +395,14 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     if (!upstreamPromise) {
       upstreamPromise = (async () => {
         const t0 = Date.now();
-        const up = await upstreamModule.loadUpstream({ cdpUrl, env });
+        let up;
+        try {
+          up = await upstreamModule.loadUpstream({ cdpUrl, env });
+        } finally {
+          // Upstream read it at import (into a constant): no child process
+          // or env dump of this one should see the secret.
+          delete process.env.BROWSER_CDP_ENDPOINT_URL;
+        }
         if (!uninstallWindows) uninstallWindows = getWindowPages().installWindowPerPage({ placement }) || (() => {});
         log(`upstream ${up.version} in-process: ${up.tools.length} tools in ${Date.now() - t0} ms`);
         return { up, byName: new Map(up.tools.map((e) => [e.name, e])) };
@@ -386,22 +418,11 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     ? Promise.resolve().then(() => seedProfile({ profileDir, log })).catch((e) => log(`profile seed failed (${e.message}); starting with a fresh profile`))
     : null;
 
-  // Our fixed CDP port can be taken before Brave's first launch (W2C then
-  // fails every launch). Exit cleanly: the shims start a broker on a new port.
-  let portLost = false;
   async function ensureBrave() {
     if (seeded) await seeded;
-    try {
-      return await supervisor.ensure();
-    } catch (e) {
-      if (!PORT_IN_USE_RE.test(e.message || "")) throw e;
-      if (!portLost) {
-        portLost = true;
-        // a moment later, so this call's error still reaches its session
-        setTimeout(() => closeAndExit(`CDP port ${port} is taken by another process`), 200);
-      }
-      throw new Error(`${e.message} The broker is restarting on a new port; retry the call.`);
-    }
+    const info = await supervisor.ensure();
+    await cookieBridge.braveReady(info); // W2F: a new Brave gets the synced cookies first (never throws)
+    return info;
   }
 
   const registry = new SessionRegistry({
@@ -501,8 +522,12 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     }
   }
 
-  /** A forwarded (upstream) tools/call, as upstream's own server would answer it. */
+  /** A forwarded (upstream) tools/call, as upstream's own server would answer it; never carries the CDP secret. */
   async function callUpstream(connId, name, rawArgs) {
+    return redactResult(await callUpstreamRaw(connId, name, rawArgs));
+  }
+
+  async function callUpstreamRaw(connId, name, rawArgs) {
     try {
       const { tabId, ...args } = rawArgs || {};
       const tabKey = tabKeyOf(tabId);
@@ -535,38 +560,71 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
    * relay is the connection's RelayServer (per-session toolsets, elicitation,
    * list_changed). Whatever RelayServer passes as the second argument is
    * ignored: its own (legacy) ctx building has no browser here.
+   * cdpUrl carries the secret (the tool connects with it); its result and
+   * error text are redacted before RelayServer (and the Inspector) sees them.
    */
   function brokerOwnTool(tool, connId, relay) {
     const routed = tool.needsBrave !== false && tool.needsPage !== false;
+    async function run(args) {
+      if (tool.needsBrave === false) {
+        if (!supervisor.isUp()) return tool.handler(args, { relay });
+        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay, bridgeManagedMatcher }));
+      }
+      if (!routed) {
+        await ensureBrave(); // e.g. lighthouse_audit drives Brave over cdpUrl
+        checkProxyCredentials();
+        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay, bridgeManagedMatcher }));
+      }
+      const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay, bridgeManagedMatcher });
+      checkProxyCredentials();
+      const tabKey = tabKeyOf(args.tabId); // toolContext validated it
+      const notice = registry.takeResetNotice(connId, tabKey);
+      if (NEEDS_RENDERING_RE.test(tool.name)) await restoreWindow(ctx.page);
+      try {
+        return withNotice(await tool.handler(args, ctx), notice);
+      } catch (e) {
+        if (notice) e.message = `${notice}\n${e.message}`;
+        throw e;
+      }
+    }
     return {
       ...tool,
       async handler(args) {
-        if (tool.needsBrave === false) {
-          if (!supervisor.isUp()) return tool.handler(args, { relay });
-          return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay }));
-        }
-        if (!routed) {
-          await ensureBrave(); // e.g. lighthouse_audit drives Brave over cdpUrl
-          checkProxyCredentials();
-          return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay }));
-        }
-        const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay });
-        checkProxyCredentials();
-        const tabKey = tabKeyOf(args.tabId); // toolContext validated it
-        const notice = registry.takeResetNotice(connId, tabKey);
-        if (NEEDS_RENDERING_RE.test(tool.name)) await restoreWindow(ctx.page);
         try {
-          return withNotice(await tool.handler(args, ctx), notice);
+          return redactResult(await run(args));
         } catch (e) {
-          if (notice) e.message = `${notice}\n${e.message}`;
-          throw e; // RelayServer turns it into its usual isError result
+          // RelayServer turns it into its usual isError result from .message.
+          // A new Error: the thrown one's message may not be writable.
+          throw new Error(redact(e && e.message !== undefined ? e.message : e));
         }
       },
     };
   }
 
+  /**
+   * W2F: npm run bridge:uninstall -- --purge. Expires every bridge cookie in
+   * Brave (launching it if needed) and deletes the bridge state. A Brave
+   * launched only for this is closed gracefully again, which writes the
+   * deletions to disk; a running one writes them within ~30 s.
+   */
+  async function bridgePurge() {
+    if (typeof cookieBridge.purge !== "function") throw new Error("this broker has no cookie bridge");
+    const st = cookieBridge.status();
+    if (st.bridges) throw Object.assign(new Error("the cookie bridge extension is still connected, and would sync the cookies straight back: remove it in chrome://extensions (or turn on Pause sync on its review page), then purge again"), { code: "EBUSY" });
+    const wasUp = supervisor.isUp();
+    await ensureBrave();
+    try {
+      const r = await cookieBridge.purge();
+      log(`cookie bridge purge: ${r.expired} cookie(s) expired${wasUp ? "" : "; closing the Brave started for it"}`);
+      return { ...r, braveClosed: !wasUp };
+    } finally {
+      if (!wasUp) await supervisor.closeGracefully().catch((e) => log(`closing Brave after the purge failed: ${e.message}`));
+    }
+  }
+
   // ── connections ──
   const sockets = new Set();
+  const bridgeSockets = new Set(); // W2F cookie-bridge connections: never sessions
   const sessions = new Map(); // connId → opened at (MCP sessions; not control connections)
   let connSeq = 0; // connIds: never reused within a broker (the registry remembers closed ones)
   let closing = null;
@@ -596,9 +654,11 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
 
     let mcp = null;
     let done = false;
+    let bridgeDone = null; // W2F: set when this is a cookie-bridge connection
     const onClose = () => {
       if (done) return;
       done = true;
+      if (bridgeDone) { bridgeDone(); return; }
       sockets.delete(sock);
       sessions.delete(connId);
       policy.connectionClosed();
@@ -613,9 +673,20 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     // nobody else), learn whether it lost an earlier broker and its settings.
     serverHello(sock, key, { warning: helloWarning }).then(({ hello, rest }) => {
       if (done) return undefined;
+      if (hello && hello.bridge === true) {
+        // W2F: the cookie bridge's native host. Not a session: it never keeps
+        // the broker up. Its handlers exist only once it answered the challenge;
+        // bridgeSockets is only so a shutdown closes it.
+        sockets.delete(sock);
+        bridgeSockets.add(sock);
+        policy.notASession();
+        let handlers = null;
+        bridgeDone = () => { bridgeSockets.delete(sock); if (handlers) handlers.close(); };
+        return require("./control.js").serveBridge(sock, hello, rest, key, () => (handlers = cookieBridge.handlers(connId)));
+      }
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
-        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)") }, rest);
+        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)"), bridgePurge }, rest);
         return undefined;
       }
       sessions.set(connId, Date.now());
@@ -708,7 +779,9 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       clearInterval(rssTimer);
       clearInterval(keyTimer);
       for (const s of sockets) s.destroy();
+      for (const s of bridgeSockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
+      await cdpProxy.close();
       if (relayInspectorCtl) await relayInspectorCtl.close().catch((e) => log(`closing the relay Inspector failed: ${e.message}`));
       if (uninstallWindows) uninstallWindows();
       log("bye");
@@ -739,15 +812,6 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       }
     },
   });
-
-  // W2C: Brave can't come back (e.g. our fixed CDP port is taken). Exit so
-  // the shims start a fresh broker on a new port.
-  if (typeof supervisor.on === "function") {
-    supervisor.on("fatal", (why) => {
-      log(`supervisor fatal: ${why}`);
-      closeAndExit(`supervisor fatal: ${why}`);
-    });
-  }
 
   const stopWatchdog = watchdog && watchdog.timeoutMs ? startWatchdog(watchdog, log) : () => {};
   // if our key file vanishes while we run, put it back, so new sessions still match us
@@ -787,7 +851,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       uptimeS: Math.round((Date.now() - startedAt) / 1000),
       pipe,
       profileDir,
-      cdpUrl,
+      cdpUrl: redact(cdpUrl),
       brave: { up, pid: up ? supervisor.pid : null },
       connections: [...sessions].map(([id, openedAt]) => ({
         id,
@@ -796,6 +860,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       })),
       rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
       relayInspector: inspector ? `http://${inspector.bind}:${inspector.port}` : null,
+      cookieBridge: cookieBridge.status(), // W2F: counts only, never values
     };
   }
 
@@ -878,6 +943,21 @@ function watchdogSetting(raw) {
 }
 
 /**
+ * W2F: the owner's always-allow list for the cookie bridge
+ * (BROWSER_RELAY_BRIDGE_ALLOW, env or local-config.json; comma-separated).
+ * It lifts the keyword guard for those domains; it never lifts a built-in
+ * deny category (those need the extension's review page).
+ */
+function bridgeAllowList(env, log = () => {}) {
+  const policy = require("../../extensions/cookie-bridge/policy.js");
+  const { allow, invalid } = policy.parseAllowList(env.BROWSER_RELAY_BRIDGE_ALLOW);
+  if (invalid.length) log(`cookie bridge: ignoring BROWSER_RELAY_BRIDGE_ALLOW entries that are not a domain of two or more labels or an IP: ${invalid.map((x) => JSON.stringify(x)).join(", ")}`);
+  const denied = allow.filter((d) => policy.classify(d).decision === "deny");
+  if (denied.length) log(`cookie bridge: BROWSER_RELAY_BRIDGE_ALLOW never lifts the built-in denylist (${denied.join(", ")}); re-allow those on the extension's review page`);
+  return allow;
+}
+
+/**
  * The broker's env: process.env + local-config.json. Keys only in
  * local-config are also copied into processEnv, because the in-process
  * upstream (W2B) reads process.env only: the catalog (built from this env)
@@ -905,8 +985,9 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   // One broker serves every session: a stray throw must not take them all down.
-  process.on("uncaughtException", (e) => log(`uncaughtException (still serving): ${e.stack || e.message}`));
-  process.on("unhandledRejection", (e) => log(`unhandledRejection (still serving): ${(e && e.stack) || e}`));
+  const { redact } = require("./cdp-proxy.js");
+  process.on("uncaughtException", (e) => log(redact(`uncaughtException (still serving): ${e.stack || e.message}`)));
+  process.on("unhandledRejection", (e) => log(redact(`unhandledRejection (still serving): ${(e && e.stack) || e}`)));
 
   // the relay Inspector web UI (not Node's debugger), hosted by the broker
   const inspectorPort = require("../inspector-launch.js").inspectorPortFromEnv(env, log);
@@ -931,7 +1012,7 @@ async function main(argv = process.argv.slice(2)) {
       onExit: () => process.exit(0),
     });
   } catch (e) {
-    log(`fatal: ${e.stack || e.message}`);
+    log(redact(`fatal: ${e.stack || e.message}`));
     process.exit(1);
   }
   if (!handle) process.exit(0);
@@ -944,12 +1025,11 @@ if (require.main === module) main();
 
 module.exports = {
   startBroker,
-  chooseCdpPort,
-  CDP_PORT_RANGE,
   IdlePolicy,
   main,
   parseArgs,
   brokerEnv,
+  bridgeAllowList,
   watchdogSetting,
   startWatchdog,
   prepareWorkDir,

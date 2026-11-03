@@ -5,6 +5,11 @@
 // before a relaunch, and graceful close. Every number quoted below was
 // measured while building the broker (Brave 147, Windows 11, elevated
 // Claude Code).
+//
+// W2G: CDP runs over --remote-debugging-pipe (fd 3/4), not a TCP port, so no
+// other local process can reach Brave. The supervisor keeps the pipe's root
+// session; each verified launch's pipe is handed out ('pipe') to the
+// broker's CdpProxy, which serves every other CDP client (cdp-proxy.js).
 
 const { EventEmitter } = require("node:events");
 const { spawn } = require("node:child_process");
@@ -12,40 +17,45 @@ const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const WebSocket = require("ws");
+const { PipeConnection } = require("./cdp-proxy.js");
 const { detectBravePath } = require("../detect-browser.js");
 
 const PREFIX = "[mcp-relay] brave-supervisor:";
-const KILL_WAIT_MS = 5000;
+// After TerminateProcess, a large Brave can take several seconds to report
+// its exit on a saturated machine (seen right after a Lighthouse run, 100%
+// CPU). Too short a wait reported "survived a kill" for a dying process.
+const KILL_WAIT_MS = 15000;
 const CLOSE_TIMEOUT_MS = 10000;
 const SHUTDOWN_GRACE_MS = 20000;
+// An unexpected pipe EOF → the process exit, then a kill. EOF comes first:
+// measured, Brave exited 3.9 s after closing its pipe (graceful close, young
+// profile), so a Brave shutting down on its own gets time to flush cookies.
+const EXIT_WAIT_MS = 10000;
+// fd 3: Brave reads (we write), fd 4: Brave writes. stderr is ignored: an
+// unread pipe would fill and stall Brave.
+const STDIO = Object.freeze(["ignore", "ignore", "ignore", "pipe", "pipe"]);
 // Chromium's exit code when another browser process holds the profile
 const RESULT_CODE_PROFILE_IN_USE = 21;
 
 /**
  * Supervises one Brave on one persistent profile.
  *
- *   ensure()          → {cdpUrl, pid}; launches if needed, concurrent calls share one launch
+ *   ensure()          → {pid}; launches if needed, concurrent calls share one launch
  *   closeGracefully() → Browser.close over CDP, kill fallback (see _close)
- *   isUp()            → launched, CDP connected, PID alive
+ *   isUp()            → launched, CDP pipe connected, PID alive
  *   checkAlive()      → isUp(), after a PID found gone has gone 'down' at once
  *   pid               → the running Brave's PID, or null
  *   proxyCredentials  → {username, password} of the proxy the last launched Brave uses, or null
+ *   'pipe' (pipe)     → once per launch that came up, before ensure() resolves:
+ *                       its PipeConnection, verified (PID check) and with the
+ *                       certificate policy set. Give it to the CdpProxy.
  *   'down' (reason)   → once per launch that came up: "closed" | "cdp disconnected" | "exited (code=N)" | "exited (pid gone)"
- *   'fatal' (reason)  → a relaunch cannot get back the CDP port a Brave of
- *                       ours already served cdpUrl on (still taken after
- *                       portFreeWaitMs); ensure() rejects as well. The port
- *                       is fixed for the supervisor's life, so a later
- *                       ensure() only succeeds if that port frees again.
- *                       Policy: the broker exits on 'fatal' so the shims
- *                       start a fresh broker on a new port. Not emitted for
- *                       a port that never served a launch that came up.
  *
- * Death is detected on our own browser-level CDP websocket (its close fires
- * at once; the process exit lags 20 ms-2 s) and on the process exit. After
- * an unexpected 'down' the PID gets exitWaitMs to exit, then is killed, and a
- * relaunch always waits for it: a new brave.exe on a profile whose old
- * Brave is still exiting hands off to it and exits.
+ * Death is detected on the CDP pipe (EOF 26 ms after a kill; the process
+ * exit came at 84 ms) and on the process exit. After an unexpected 'down'
+ * the PID gets exitWaitMs to exit, then is killed, and a relaunch always
+ * waits for it: a new brave.exe on a profile whose old Brave is still
+ * exiting hands off to it and exits.
  *
  * A Brave this supervisor did not start (left by an earlier broker) is
  * reaped before a launch on the same profile: see _reapStrays.
@@ -54,11 +64,6 @@ class BraveSupervisor extends EventEmitter {
   /**
    * @param {object} opts
    * @param {string} opts.profileDir — persistent --user-data-dir (created if missing)
-   * @param {number} [opts.port=0] — CDP port, fixed for the supervisor's whole
-   *   life: caller-chosen, or (0) OS-assigned at the first launch. Every
-   *   relaunch reuses it, because upstream reads BROWSER_CDP_ENDPOINT_URL once
-   *   per broker process. If it is still taken after portFreeWaitMs, the
-   *   launch fails; it never switches ports.
    * @param {string} [opts.executablePath] — default: detectBravePath() at first launch
    * @param {string|null} [opts.extensionPath] — unpacked extension for --load-extension
    * @param {boolean} [opts.headless=false] — --headless=new (BROWSER_HEADLESS_ENABLE, as in legacy mode)
@@ -68,13 +73,12 @@ class BraveSupervisor extends EventEmitter {
    * @param {string|null} [opts.proxyUrl] — --proxy-server (scheme://host:port only);
    *   policy in resolveProxy(); credentials go to `proxyCredentials`
    * @param {(msg: string) => void} [opts.log] — default: stderr
-   * @param {number} [opts.launchTimeoutMs=20000] — spawn → CDP ready
+   * @param {number} [opts.launchTimeoutMs=20000] — spawn → CDP ready (first reply on the pipe)
    * @param {number} [opts.closeTimeoutMs=10000] — Browser.close → exit, then kill
    *   (unless Brave accepted the close: see shutdownGraceMs)
    * @param {number} [opts.shutdownGraceMs=20000] — extra wait after closeTimeoutMs
    *   for a Brave that accepted Browser.close (dropped CDP) and is still shutting down
-   * @param {number} [opts.exitWaitMs=5000] — unexpected 'down' → exit, then kill
-   * @param {number} [opts.portFreeWaitMs=3000] — relaunch: wait for our port to free
+   * @param {number} [opts.exitWaitMs=10000] — unexpected 'down' → exit, then kill
    * @param {number} [opts.proxyProbeTimeoutMs=1500]
    * @param {number} [opts.strayExitWaitMs=10000] — a reaped stray Brave → its profile lock freed
    * @param {typeof spawn} [opts._spawn] — test seam
@@ -84,12 +88,7 @@ class BraveSupervisor extends EventEmitter {
   constructor(opts = {}) {
     super();
     if (!opts.profileDir) throw new Error(`${PREFIX} profileDir is required`);
-    const port = opts.port || 0;
-    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`${PREFIX} invalid CDP port ${opts.port}`);
     this.profileDir = path.resolve(opts.profileDir);
-    this._callerPort = port; // 0 = OS-assigned
-    this._port = port;
-    this._portUsed = false; // true once a launch on it came up (cdpUrl handed out)
     this._executablePath = opts.executablePath || null;
     this._extensionPath = opts.extensionPath || null;
     this._headless = Boolean(opts.headless);
@@ -101,8 +100,7 @@ class BraveSupervisor extends EventEmitter {
       launchTimeoutMs: opts.launchTimeoutMs || 20000,
       closeTimeoutMs: opts.closeTimeoutMs || CLOSE_TIMEOUT_MS,
       shutdownGraceMs: opts.shutdownGraceMs || SHUTDOWN_GRACE_MS,
-      exitWaitMs: opts.exitWaitMs || 5000,
-      portFreeWaitMs: opts.portFreeWaitMs || 3000,
+      exitWaitMs: opts.exitWaitMs || EXIT_WAIT_MS,
       proxyProbeTimeoutMs: opts.proxyProbeTimeoutMs || 1500,
       strayExitWaitMs: opts.strayExitWaitMs || 10000,
     };
@@ -159,12 +157,14 @@ class BraveSupervisor extends EventEmitter {
     return this._proxyCredentials ? { ...this._proxyCredentials } : null;
   }
 
-  /** @returns {Promise<{cdpUrl: string, pid: number}>} */
+  /** @returns {Promise<{pid: number}>} */
   async ensure() {
     for (;;) {
       // Never race a relaunch against a planned close of the same profile.
       while (this._closing) await this._closing;
-      if (this.isUp()) return cdpInfo(this._proc);
+      // A launch in flight may already be up (CDP answers) but not done
+      // (certificate policy, 'pipe' to the proxy): join it, never pass it.
+      if (!this._launching && this.isUp()) return { pid: this._proc.pid };
       if (!this._launching) {
         this._launching = this._launch().finally(() => { this._launching = null; });
       }
@@ -198,19 +198,17 @@ class BraveSupervisor extends EventEmitter {
     const t0 = Date.now();
     proc.closing = true;
     // A Brave whose CDP already dropped may be mid-shutdown (exit lags the
-    // disconnect by up to ~2 s): let it finish its flush. Its background
+    // pipe EOF by up to ~4 s): let it finish its flush. Its background
     // reap still kills it after exitWaitMs, so that case waits
     // min(exitWaitMs, closeTimeoutMs).
-    if (proc.up && proc.ws.readyState === WebSocket.OPEN) {
-      proc.ws.send(JSON.stringify({ id: proc.nextId++, method: "Browser.close" }));
-    }
+    if (proc.up && !proc.pipe.closed) proc.pipe.call("Browser.close", null, { timeoutMs: this._t.closeTimeoutMs });
     let exited = await waitExit(proc, this._t.closeTimeoutMs);
-    // Measured: Brave answers Browser.close and drops CDP within ~10 ms, then
-    // shuts down (flushing cookies and prefs), which took 6 s on a machine at
-    // 100% CPU. A Brave that dropped CDP has accepted the close: give it more
-    // time before a kill that could lose those writes. One whose CDP is still
-    // open ignored the close: kill it now.
-    if (!exited && proc.ws && proc.ws.readyState !== WebSocket.OPEN) {
+    // Measured: Brave answers Browser.close and closes its pipe within
+    // ~6-55 ms, then shuts down (flushing cookies and prefs), which took 6 s
+    // on a machine at 100% CPU. A Brave that closed the pipe has accepted the
+    // close: give it more time before a kill that could lose those writes.
+    // One whose pipe is still open ignored the close: kill it now.
+    if (!exited && proc.pipe && proc.pipe.closed) {
       this._log(`brave pid=${proc.pid} accepted the close but is still shutting down after ${this._t.closeTimeoutMs} ms (busy machine?); waiting up to ${this._t.shutdownGraceMs} ms more`);
       exited = await waitExit(proc, this._t.shutdownGraceMs);
     }
@@ -234,12 +232,9 @@ class BraveSupervisor extends EventEmitter {
     disableMemorySaver(this.profileDir, this._log);
     const proxy = await resolveProxy(this._proxyUrl, { log: this._log, timeoutMs: this._t.proxyProbeTimeoutMs });
     const proxyServer = proxy ? proxy.server : null;
-    // Last step before the spawn: the proxy probe can take 1.5 s, and a port
-    // taken in that window must fail loudly here, not as a 20 s CDP timeout.
-    const port = await this._choosePort();
-    const args = buildBraveArgs({ port, profileDir: this.profileDir, extensionPath: this._extensionPath, proxyServer, headless: this._headless });
+    const args = buildBraveArgs({ profileDir: this.profileDir, extensionPath: this._extensionPath, proxyServer, headless: this._headless });
     const t0 = Date.now();
-    const proc = this._spawnBrave(exe, args, port);
+    const proc = this._spawnBrave(exe, args);
     this._proc = proc;
     try {
       await this._waitUntilUp(proc, exe, t0);
@@ -247,13 +242,14 @@ class BraveSupervisor extends EventEmitter {
       await this._kill(proc);
       throw e;
     }
-    this._portUsed = true; // from here on cdpUrl is out there: the port is pinned
     await this._setCertificateChecks(proc, this._certificateChecksOffReason(proxyServer));
     this._proxyCredentials = proxy ? proxy.credentials : null;
     this._launches++;
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
-    this._log(`brave pid=${proc.pid} up on :${port} in ${Date.now() - t0} ms (launch #${this._launches}${via})`);
-    return cdpInfo(proc);
+    this._log(`brave pid=${proc.pid} up (CDP over a pipe, no port) in ${Date.now() - t0} ms (launch #${this._launches}${via})`);
+    // Before ensure() resolves, so the proxy serves this Brave from then on.
+    this._emitSafe("pipe", proc.pipe);
+    return { pid: proc.pid };
   }
 
   /**
@@ -290,36 +286,16 @@ class BraveSupervisor extends EventEmitter {
     }
   }
 
-  async _choosePort() {
-    // An OS-assigned port is only pinned once a launch came up (ensure() has
-    // handed out the cdpUrl); until then nobody can depend on it.
-    if (!this._callerPort && !this._portUsed) {
-      this._port = await pickFreePort();
-      return this._port;
-    }
-    // A relaunch waits briefly for our old Brave's port to free; a first
-    // launch on a caller-chosen port fails at once.
-    const deadline = Date.now() + (this._portUsed ? this._t.portFreeWaitMs : 0);
-    while (!(await portIsFree(this._port))) {
-      if (Date.now() >= deadline) {
-        const reason =
-          `CDP port ${this._port} is in use by another process. This broker keeps one port ` +
-          `for its whole life (upstream pins BROWSER_CDP_ENDPOINT_URL), so it will not switch; free the port or restart the broker.`;
-        // Lost the port our Brave already used: only a new broker (new port) recovers.
-        if (this._portUsed) this._emitSafe("fatal", reason);
-        throw new Error(`${PREFIX} ${reason}`);
-      }
-      await sleep(100);
-    }
-    return this._port;
-  }
-
-  _spawnBrave(exe, args, port) {
-    const child = this._spawn(exe, args, { stdio: "ignore", env: braveEnv(process.env) });
+  _spawnBrave(exe, args) {
+    const child = this._spawn(exe, args, { stdio: [...STDIO], env: braveEnv(process.env) });
     const proc = {
-      child, pid: child.pid, port, ws: null, nextId: 1,
+      child, pid: child.pid, pipe: null,
       up: false, down: false, closing: false, killed: false, exited: false, exitCode: null, spawnError: null, reaping: null,
     };
+    if (child.stdio && child.stdio[3] && child.stdio[4]) {
+      proc.pipe = new PipeConnection(child.stdio[3], child.stdio[4]);
+      proc.pipe.on("close", () => this._onDown(proc, proc.closing ? "closed" : "cdp disconnected"));
+    }
     proc.exitPromise = new Promise((resolve) => {
       const onExit = (code, signal) => {
         if (proc.exited) return;
@@ -338,38 +314,43 @@ class BraveSupervisor extends EventEmitter {
   }
 
   async _waitUntilUp(proc, exe, t0) {
-    let version = null;
+    // Brave answers on the pipe once DevTools is up (208 ms warm, ~3 s on a
+    // fresh profile, measured). Each poll writes another Browser.getVersion;
+    // the first reply wins, late ones are dropped.
+    const exitedError = () => {
+      if (proc.spawnError) return new Error(`${PREFIX} could not start ${exe}: ${proc.spawnError.message}`);
+      if (!proc.exited) return null;
+      const inUse = proc.exitCode === RESULT_CODE_PROFILE_IN_USE ? ": the profile is in use" : "";
+      return new Error(
+        `${PREFIX} Brave exited during launch (code=${proc.exitCode}${inUse}) after ${Date.now() - t0} ms. ` +
+        `If another Brave already runs on ${this.profileDir}, a new one hands off to it and exits; close that Brave first.`,
+      );
+    };
     for (;;) {
-      if (proc.spawnError) throw new Error(`${PREFIX} could not start ${exe}: ${proc.spawnError.message}`);
-      if (proc.exited) {
-        const inUse = proc.exitCode === RESULT_CODE_PROFILE_IN_USE ? ": the profile is in use" : "";
-        throw new Error(
-          `${PREFIX} Brave exited during launch (code=${proc.exitCode}${inUse}) after ${Date.now() - t0} ms. ` +
-          `If another Brave already runs on ${this.profileDir}, a new one hands off to it and exits; close that Brave first.`,
-        );
+      if (exitedError()) throw exitedError();
+      if (!proc.pipe || proc.pipe.closed) {
+        // The pipe closes just before the process exits: wait for the exit code.
+        await waitExit(proc, 2000);
+        throw exitedError() || new Error(`${PREFIX} Brave pid ${proc.pid} closed its CDP pipe during launch (after ${Date.now() - t0} ms)`);
       }
-      version = await fetchVersion(proc.port);
-      if (version && version.webSocketDebuggerUrl) break;
-      if (Date.now() - t0 > this._t.launchTimeoutMs) {
-        throw new Error(`${PREFIX} Brave CDP on :${proc.port} not ready after ${this._t.launchTimeoutMs} ms`);
-      }
-      await sleep(100);
+      const left = this._t.launchTimeoutMs - (Date.now() - t0);
+      if (left <= 0) throw new Error(`${PREFIX} Brave CDP (pipe) not ready after ${this._t.launchTimeoutMs} ms`);
+      const reply = await proc.pipe.call("Browser.getVersion", null, { timeoutMs: Math.min(1000, left) });
+      if (reply && reply.result) break;
+      if (reply) await sleep(100); // an error reply: not ready yet
     }
-    proc.ws = await openWebSocket(version.webSocketDebuggerUrl, 5000);
-    proc.ws.on("error", () => { /* 'close' follows */ });
-    proc.ws.on("close", () => this._onDown(proc, proc.closing ? "closed" : "cdp disconnected"));
-    // Only adopt the CDP endpoint if it is OUR process behind it: after an
-    // AutoDeElevate-style handoff, or with a foreign browser on the port,
-    // /json/version answers but the PID we track is not the browser.
+    // Only adopt the pipe if it is OUR process behind it (an AutoDeElevate-
+    // style handoff would leave the PID we track pointing elsewhere). A pipe
+    // can't be served by a foreign browser, so this is defence in depth now.
     // Deliberately fail-OPEN (V2-6): if getProcessInfo itself errors or times
-    // out we only warn and adopt the endpoint, so a Brave that drops or
-    // changes this method can't brick every launch. A PID mismatch fails.
+    // out we only warn and adopt it, so a Brave that drops or changes this
+    // method can't brick every launch. A PID mismatch fails.
     const browserPid = await cdpBrowserPid(proc);
     if (proc.down || proc.exited) throw new Error(`${PREFIX} Brave pid ${proc.pid} went away during launch`);
     if (browserPid === null) {
-      this._log(`warning: could not confirm that CDP on :${proc.port} is pid ${proc.pid} (SystemInfo.getProcessInfo failed)`);
+      this._log(`warning: could not confirm that the CDP pipe is served by pid ${proc.pid} (SystemInfo.getProcessInfo failed)`);
     } else if (browserPid !== proc.pid) {
-      throw new Error(`${PREFIX} CDP on :${proc.port} is served by browser pid ${browserPid}, not the Brave we launched (pid ${proc.pid})`);
+      throw new Error(`${PREFIX} the CDP pipe is served by browser pid ${browserPid}, not the Brave we launched (pid ${proc.pid})`);
     }
     proc.up = true;
   }
@@ -389,13 +370,13 @@ class BraveSupervisor extends EventEmitter {
   }
 
   /**
-   * Security.setIgnoreCertificateErrors on our browser-level CDP session, set
+   * Security.setIgnoreCertificateErrors on the pipe's root session, set
    * explicitly on every launch (re-applied after a relaunch, or cleared):
    * browser-wide, for as long as that session (this launch) lives. A failure
    * to turn checks off leaves certificates verified.
    */
   async _setCertificateChecks(proc, why) {
-    const r = await cdpCall(proc, "Security.setIgnoreCertificateErrors", { ignore: Boolean(why) });
+    const r = await proc.pipe.call("Security.setIgnoreCertificateErrors", { ignore: Boolean(why) });
     if (!why) return;
     if (!r || r.error) {
       this._log(`warning: could not turn off TLS certificate checks (${why}): ${r ? r.error.message : "no CDP answer"}; certificates stay verified`);
@@ -412,7 +393,7 @@ class BraveSupervisor extends EventEmitter {
     proc.down = true;
     const wasUp = proc.up;
     proc.up = false;
-    if (proc.ws) proc.ws.terminate();
+    if (proc.pipe) proc.pipe.close(); // the proxy stops serving it (503) at once
     if (!wasUp) return;
     if (!proc.exited && !proc.closing) this._reap(proc).catch((e) => this._log(e.message));
     this._log(`brave pid=${proc.pid} down: ${reason}`);
@@ -464,10 +445,6 @@ class BraveSupervisor extends EventEmitter {
     proc.child.kill("SIGKILL");
     return waitExit(proc, KILL_WAIT_MS);
   }
-}
-
-function cdpInfo(proc) {
-  return { cdpUrl: `http://127.0.0.1:${proc.port}`, pid: proc.pid };
 }
 
 /**
@@ -539,90 +516,28 @@ function waitExit(proc, ms) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchVersion(port) {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) });
-    return res.ok ? await res.json() : null;
-  } catch {
-    return null;
-  }
-}
-
-function openWebSocket(url, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url, { perMessageDeflate: false });
-    const timer = setTimeout(() => {
-      ws.terminate();
-      reject(new Error(`${PREFIX} CDP websocket did not open within ${timeoutMs} ms`));
-    }, timeoutMs);
-    ws.once("open", () => { clearTimeout(timer); resolve(ws); });
-    ws.once("error", (e) => { clearTimeout(timer); reject(e); });
-  });
-}
-
-/** One CDP call on our browser websocket: resolves its reply ({result} or {error}), or null on close / timeout. */
-function cdpCall(proc, method, params, timeoutMs = 5000) {
-  return new Promise((resolve) => {
-    const id = proc.nextId++;
-    const done = (reply) => {
-      clearTimeout(timer);
-      proc.ws.off("message", onMessage);
-      proc.ws.off("close", onClose);
-      resolve(reply);
-    };
-    const onMessage = (data) => {
-      let msg;
-      try { msg = JSON.parse(data); } catch { return; }
-      if (msg.id === id) done(msg);
-    };
-    const onClose = () => done(null);
-    const timer = setTimeout(() => done(null), timeoutMs);
-    proc.ws.on("message", onMessage);
-    proc.ws.on("close", onClose);
-    proc.ws.send(JSON.stringify({ id, method, ...(params ? { params } : {}) }));
-  });
-}
-
 /** The browser process id CDP reports, or null if it can't be read. */
 async function cdpBrowserPid(proc) {
-  const reply = await cdpCall(proc, "SystemInfo.getProcessInfo");
+  const reply = await proc.pipe.call("SystemInfo.getProcessInfo");
   const browser = reply && reply.result && (reply.result.processInfo || []).find((p) => p.type === "browser");
   return browser ? browser.id : null;
-}
-
-function portIsFree(port) {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.once("error", () => resolve(false));
-    srv.listen({ port, host: "127.0.0.1", exclusive: true }, () => srv.close(() => resolve(true)));
-  });
-}
-
-function pickFreePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.once("error", reject);
-    srv.listen({ port: 0, host: "127.0.0.1", exclusive: true }, () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
 }
 
 /**
  * Brave's command line: the broker's flag set, plus the optional extras.
  *
  * @param {object} opts
- * @param {number} opts.port — CDP port
  * @param {string} opts.profileDir — persistent --user-data-dir
  * @param {string|null} [opts.extensionPath] — unpacked extension dir
  * @param {string|null} [opts.proxyServer] — already-probed proxy server string
  * @param {boolean} [opts.headless]
  * @returns {string[]}
  */
-function buildBraveArgs({ port, profileDir, extensionPath = null, proxyServer = null, headless = false }) {
+function buildBraveArgs({ profileDir, extensionPath = null, proxyServer = null, headless = false }) {
   const args = [
-    `--remote-debugging-port=${port}`,
+    // CDP on fd 3/4 only (spawn with STDIO): never a TCP port, which any
+    // local process could use to drive this logged-in Brave.
+    "--remote-debugging-pipe",
     `--user-data-dir=${profileDir}`,
     "--no-first-run",
     "--no-default-browser-check",
@@ -631,7 +546,8 @@ function buildBraveArgs({ port, profileDir, extensionPath = null, proxyServer = 
     "--no-startup-window",
     // AutoDeElevate: spawned from an elevated process, brave.exe relaunches
     // itself de-elevated and the PID we spawned exits in ~150-750 ms, so
-    // kills and crash detection hit nothing. Keep this ONE switch: Chromium
+    // kills and crash detection hit nothing, and the relaunched Brave has no
+    // pipe (measured: exit 0 at 393 ms, pipe EOF, no CDP). Keep this ONE switch: Chromium
     // reads only the last copy of a repeated switch (measured: adding a second
     // --disable-features dropped AutoDeElevate and Brave exited, code 0, 183 ms).
     "--disable-features=AutoDeElevate,CalculateNativeWinOcclusion",
@@ -804,8 +720,10 @@ function tcpAccepts(host, port, timeoutMs) {
 
 /**
  * Brave's environment: the broker's, minus relay-internal BROWSER_RELAY_*
- * vars (same rule as cdp-bridge.js) and minus HTTP(S)_PROXY / ALL_PROXY, so
- * `--proxy-server` is the only proxy decision and "direct" means direct.
+ * vars (same rule as cdp-bridge.js), minus BROWSER_CDP_ENDPOINT_URL (the
+ * broker's secret CDP URL while upstream imports), and minus HTTP(S)_PROXY /
+ * ALL_PROXY, so `--proxy-server` is the only proxy decision and "direct"
+ * means direct.
  *
  * @param {NodeJS.ProcessEnv} env
  * @returns {NodeJS.ProcessEnv}
@@ -813,7 +731,7 @@ function tcpAccepts(host, port, timeoutMs) {
 function braveEnv(env) {
   const out = {};
   for (const [k, v] of Object.entries(env)) {
-    if (k.startsWith("BROWSER_RELAY_")) continue;
+    if (k.startsWith("BROWSER_RELAY_") || k.toUpperCase() === "BROWSER_CDP_ENDPOINT_URL") continue; // Windows names ignore case
     if (/^(http|https|all)_proxy$/i.test(k)) continue;
     out[k] = v;
   }

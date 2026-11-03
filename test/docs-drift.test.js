@@ -244,3 +244,32 @@ test("W2E: no control characters in the docs (a mangled \\b once became a backsp
   }
   assert.deepStrictEqual(bad, [], "control characters (below 0x20, except tab/CR/LF)");
 });
+
+test("v0.4.1: the cookie bridge's docs match the code: npm scripts, the allow-list key, the extension ID", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8"));
+  for (const script of ["bridge:install", "bridge:uninstall"]) {
+    assert.ok(pkg.scripts[script], `package.json lacks "${script}"`);
+    assert.ok(fs.existsSync(path.join(REPO, pkg.scripts[script].split(" ")[1])), `${script} points at a missing file`);
+    assert.ok(README.includes(`npm run ${script}`) && REFERENCE.includes(`npm run ${script}`), `README / REFERENCE don't show npm run ${script}`);
+  }
+  const example = JSON.parse(fs.readFileSync(path.join(REPO, "local-config.example.json"), "utf8"));
+  assert.ok("BROWSER_RELAY_BRIDGE_ALLOW" in example && "_BROWSER_RELAY_BRIDGE_ALLOW_doc" in example);
+  assert.ok(README.includes("BROWSER_RELAY_BRIDGE_ALLOW") && REFERENCE.includes("| `BROWSER_RELAY_BRIDGE_ALLOW` |"));
+  const { extensionIdFromKey } = require("../scripts/bridge-install.js");
+  const manifest = JSON.parse(fs.readFileSync(path.join(REPO, "extensions", "cookie-bridge", "manifest.json"), "utf8"));
+  const id = extensionIdFromKey(manifest.key);
+  assert.ok(README.includes(id) && REFERENCE.includes(id) && CHANGELOG_TEXT().includes(id), `the docs must name the extension ID ${id}`);
+  assert.strictEqual(manifest.version, pkg.version, "the extension's version follows package.json");
+});
+
+function CHANGELOG_TEXT() { return fs.readFileSync(path.join(REPO, "CHANGELOG.md"), "utf8"); }
+
+test("v0.4.1: README + REFERENCE document --purge, what Pause / removal leave in Brave, and the risks you accept", () => {
+  for (const [name, doc] of [["README", README], ["REFERENCE", REFERENCE]]) {
+    assert.ok(doc.includes("npm run bridge:uninstall -- --purge"), `${name}: --purge`);
+    assert.ok(doc.includes("Risks you accept"), `${name}: risks`);
+    assert.ok(/DPAPI only/.test(doc) && /App-Bound Encryption/.test(doc), `${name}: DPAPI risk`);
+    assert.ok(/revoke approval/.test(doc), `${name}: what revoking does`);
+  }
+  assert.match(fs.readFileSync(path.join(REPO, "scripts", "bridge-install.js"), "utf8"), /argv\.includes\("--purge"\)/);
+});

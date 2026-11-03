@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cookie bridge — review</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="wrap">
+    <header class="page-head">
+      <div class="mark" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2a10 10 0 1 0 10 10 4 4 0 0 1-5-5 4 4 0 0 1-5-5Z"></path>
+          <circle cx="9.5" cy="10" r="1"></circle>
+          <circle cx="14.5" cy="14" r="1"></circle>
+          <circle cx="9" cy="15.5" r="1"></circle>
+        </svg>
+      </div>
+      <div>
+        <h1>Cookie bridge</h1>
+        <p>
+          Review which browser logins get copied into the relay's broker browser and kept in sync.
+          Nothing leaves this browser until you approve. Banking, email, and other sensitive sites are
+          blocked by default, and cookie values are never shown here or sent to the model.
+        </p>
+      </div>
+    </header>
+
+    <section class="status" id="status" aria-label="Bridge status"></section>
+    <p class="host-line" id="host-line" aria-live="polite"></p>
+    <div class="rejections" id="rejections" aria-live="polite"></div>
+
+    <div class="actions" id="actions"></div>
+
+    <div id="groups"></div>
+
+    <p class="footnote">
+      Toggles take effect immediately once sync is approved. Un-ticking a domain tells the broker to drop
+      its cookies; newly seen keyword-flagged domains appear under "Held for review" with a badge on the
+      extension icon until you decide.
+    </p>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

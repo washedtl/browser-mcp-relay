@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "browser-mcp-relay cookie bridge",
+  "version": "0.4.1",
+  "minimum_chrome_version": "119",
+  "description": "Syncs your allowed browser logins into the relay's broker browser. Banking, email and other sensitive sites are never synced.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuGO+cW4PClyCRP/8Q396In9UQ9NiTiGk7b2fU4qPjFo/tpo+KOCmSSLZx+9V8og/Fpo5ZxUdTQzaht4AmuBBtqNPeEWbP8cp4wF5BL88gokAGC8b5PyUwKpmwaIS6XsNeefLoTr/wiIBt3BktsIU4m6f4SV2HvY0fRktr4pu8PsFouYdBZQRkZYvBpBK/ZRaY9qOsELOztFiQfP5loAFUMCiCIRfyovG+FBFYwObM7Idq/qrfjH1sIaeSIAi+CqpM1KB7gNlEkyClK6db9XG8FmvybMD/gOOFv2MdBZ+Ioo9myL57fb1727TxurHnm1fZ0VeeF9zm7K7+yw4xlxOsQIDAQAB",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["cookies", "storage", "nativeMessaging", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "Cookie bridge"
+  }
+}
