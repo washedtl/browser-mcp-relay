@@ -3,7 +3,8 @@
 // Speaks just enough CDP for BraveSupervisor: GET /json/version, browser
 // websockets, Browser.close, SystemInfo.getProcessInfo. Every start appends
 // {pid, args, t} to <user-data-dir>/fake-launches.jsonl so tests can count
-// launches and read the exact command line.
+// launches and read the exact command line; every CDP call is appended to
+// <user-data-dir>/fake-cdp.jsonl as {pid, method, params}.
 //
 //   node fake-brave.js [--fake-mode=a,b] [--fake-delay=ms] <brave args...>
 //
@@ -55,6 +56,7 @@ function serve() {
   wss.on("connection", (ws) => {
     ws.on("message", (data) => {
       const msg = JSON.parse(data);
+      fs.appendFileSync(path.join(userDataDir, "fake-cdp.jsonl"), JSON.stringify({ pid: process.pid, method: msg.method, params: msg.params || null }) + "\n");
       const reply = (result) => ws.send(JSON.stringify({ id: msg.id, result }));
       if (msg.method === "Browser.close") {
         reply({});

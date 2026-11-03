@@ -130,7 +130,7 @@ For the full architecture deep-dive, configuration env vars, modes, optional fea
 - 📜 Upstream `browser-devtools-mcp` is **Elastic-2.0** licensed — permissive but not OSI-open-source. See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 - 🦁 Requires Brave installed locally. Other Chromium browsers may work via `BROWSER_RELAY_BRAVE_PATH` but are untested.
 - 🤝 **One broker serves every session** (broker mode): a hung tool or a crash affects all of them for a moment, and `execute` runs agent JavaScript inside that shared broker process. See [the known risks](docs/REFERENCE.md#broker-mode-known-risks).
-- 🚧 Not in broker mode yet: the credential vault's autofill, authenticated proxies (`user:pass@`), `BROWSER_RELAY_IGNORE_HTTPS_ERRORS`. Use `BROWSER_RELAY_MODE=legacy` if you need them.
+- 🚧 Not in broker mode yet: the credential vault's autofill and authenticated proxies (`user:pass@`). Use `BROWSER_RELAY_MODE=legacy` if you need them.
 
 ## Contributing
 

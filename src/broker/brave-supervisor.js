@@ -54,6 +54,8 @@ class BraveSupervisor extends EventEmitter {
    * @param {string} [opts.executablePath] — default: detectBravePath() at first launch
    * @param {string|null} [opts.extensionPath] — unpacked extension for --load-extension
    * @param {boolean} [opts.headless=false] — --headless=new (BROWSER_HEADLESS_ENABLE, as in legacy mode)
+   * @param {boolean} [opts.ignoreHttpsErrors=false] — accept any TLS certificate
+   *   (BROWSER_RELAY_IGNORE_HTTPS_ERRORS). Also on, per launch, while Brave uses a proxy.
    * @param {string|null} [opts.proxyUrl] — --proxy-server (scheme://host:port only);
    *   policy in resolveProxy(); credentials go to `proxyCredentials`
    * @param {(msg: string) => void} [opts.log] — default: stderr
@@ -76,6 +78,8 @@ class BraveSupervisor extends EventEmitter {
     this._executablePath = opts.executablePath || null;
     this._extensionPath = opts.extensionPath || null;
     this._headless = Boolean(opts.headless);
+    this._ignoreHttpsErrors = Boolean(opts.ignoreHttpsErrors);
+    this._loggedCertsIgnored = false;
     this._proxyUrl = opts.proxyUrl || null;
     this._log = opts.log || ((m) => process.stderr.write(`${PREFIX} ${m}\n`));
     this._t = {
@@ -214,6 +218,11 @@ class BraveSupervisor extends EventEmitter {
       throw e;
     }
     this._portUsed = true; // from here on cdpUrl is out there: the port is pinned
+    // TLS is verified by default (as in legacy mode, W1E): only the opt-in or
+    // a proxy actually in use (its MITM certificate) turns the checks off
+    if (this._ignoreHttpsErrors || proxyServer) {
+      await this._ignoreCertificateErrors(proc, this._ignoreHttpsErrors ? "BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true" : `traffic goes through proxy ${proxyServer}`);
+    }
     this._proxyCredentials = proxy ? proxy.credentials : null;
     this._launches++;
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
@@ -302,6 +311,23 @@ class BraveSupervisor extends EventEmitter {
       throw new Error(`${PREFIX} CDP on :${proc.port} is served by browser pid ${browserPid}, not the Brave we launched (pid ${proc.pid})`);
     }
     proc.up = true;
+  }
+
+  /**
+   * Security.setIgnoreCertificateErrors on our browser-level CDP session:
+   * browser-wide, for as long as that session (this launch) lives. A failure
+   * leaves certificates verified.
+   */
+  async _ignoreCertificateErrors(proc, why) {
+    const r = await cdpCall(proc, "Security.setIgnoreCertificateErrors", { ignore: true });
+    if (!r || r.error) {
+      this._log(`warning: could not turn off TLS certificate checks (${why}): ${r ? r.error.message : "no CDP answer"}; certificates stay verified`);
+      return;
+    }
+    if (!this._loggedCertsIgnored) {
+      this._loggedCertsIgnored = true;
+      this._log(`TLS certificate errors are ignored in this Brave (${why})`);
+    }
   }
 
   _onDown(proc, reason) {
@@ -411,29 +437,34 @@ function openWebSocket(url, timeoutMs) {
   });
 }
 
-/** The browser process id CDP reports, or null if it can't be read. */
-function cdpBrowserPid(proc, timeoutMs = 5000) {
+/** One CDP call on our browser websocket: resolves its reply ({result} or {error}), or null on close / timeout. */
+function cdpCall(proc, method, params, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const id = proc.nextId++;
-    const done = (pid) => {
+    const done = (reply) => {
       clearTimeout(timer);
       proc.ws.off("message", onMessage);
       proc.ws.off("close", onClose);
-      resolve(pid);
+      resolve(reply);
     };
     const onMessage = (data) => {
       let msg;
       try { msg = JSON.parse(data); } catch { return; }
-      if (msg.id !== id) return;
-      const browser = msg.result && (msg.result.processInfo || []).find((p) => p.type === "browser");
-      done(browser ? browser.id : null);
+      if (msg.id === id) done(msg);
     };
     const onClose = () => done(null);
     const timer = setTimeout(() => done(null), timeoutMs);
     proc.ws.on("message", onMessage);
     proc.ws.on("close", onClose);
-    proc.ws.send(JSON.stringify({ id, method: "SystemInfo.getProcessInfo" }));
+    proc.ws.send(JSON.stringify({ id, method, ...(params ? { params } : {}) }));
   });
+}
+
+/** The browser process id CDP reports, or null if it can't be read. */
+async function cdpBrowserPid(proc) {
+  const reply = await cdpCall(proc, "SystemInfo.getProcessInfo");
+  const browser = reply && reply.result && (reply.result.processInfo || []).find((p) => p.type === "browser");
+  return browser ? browser.id : null;
 }
 
 function portIsFree(port) {

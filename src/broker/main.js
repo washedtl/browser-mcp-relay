@@ -128,6 +128,7 @@ const DEFAULT_DEPS = {
       extensionPath: env.BROWSER_LOAD_EXTENSIONS || null,
       proxyUrl: env.BROWSER_RELAY_PROXY_URL || null,
       headless: env.BROWSER_HEADLESS_ENABLE === "true",
+      ignoreHttpsErrors: env.BROWSER_RELAY_IGNORE_HTTPS_ERRORS === "true",
       log: (m) => log(`supervisor: ${m}`),
     });
   },

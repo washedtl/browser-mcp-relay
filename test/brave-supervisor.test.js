@@ -103,6 +103,56 @@ test("buildBraveArgs: --load-extension and --proxy-server only when given", () =
   assert.ok(extra.includes("--proxy-server=http://127.0.0.1:8888"));
 });
 
+// ── W2E: TLS secure by default; opt-in or a proxy in use turns certificate checks off ──
+
+function cdpCallsOf(profileDir, method) {
+  const f = path.join(profileDir, "fake-cdp.jsonl");
+  if (!fs.existsSync(f)) return [];
+  return fs.readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((c) => c.method === method);
+}
+const IGNORE_CERTS = "Security.setIgnoreCertificateErrors";
+
+test("W2E TLS: by default (no proxy, no opt-in) certificates stay verified", async () => {
+  const dir = tmpProfile("fake-tls-default");
+  const { sup, log } = fakeSupervisor(dir);
+  await sup.ensure();
+  assert.deepStrictEqual(cdpCallsOf(dir, IGNORE_CERTS), []);
+  assert.ok(!log.lines.some((l) => /certificate/i.test(l)), log.lines.join("\n"));
+});
+
+test("W2E TLS: ignoreHttpsErrors (BROWSER_RELAY_IGNORE_HTTPS_ERRORS) → ignored after every launch, relaunches too; logged once", async () => {
+  const dir = tmpProfile("fake-tls-optin");
+  const { sup, log } = fakeSupervisor(dir, { ignoreHttpsErrors: true });
+  const first = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  process.kill(first.pid);
+  await down;
+  const second = await sup.ensure();
+  assert.notStrictEqual(second.pid, first.pid);
+  assert.deepStrictEqual(cdpCallsOf(dir, IGNORE_CERTS).map((c) => [c.pid, c.params]), [[first.pid, { ignore: true }], [second.pid, { ignore: true }]]);
+  assert.strictEqual(log.lines.filter((l) => /certificate errors are ignored/.test(l)).length, 1, log.lines.join("\n"));
+  assert.ok(log.lines.some((l) => /BROWSER_RELAY_IGNORE_HTTPS_ERRORS/.test(l)));
+});
+
+test("W2E TLS: a proxy in use → ignored (its MITM certificate works); a dead loopback proxy (launched direct) → verified", async () => {
+  const deadDir = tmpProfile("fake-tls-proxy-dead");
+  const { sup: s1 } = fakeSupervisor(deadDir, { proxyUrl: `http://127.0.0.1:${await deadPort()}` });
+  await s1.ensure();
+  assert.deepStrictEqual(cdpCallsOf(deadDir, IGNORE_CERTS), []);
+
+  const proxy = net.createServer((sock) => sock.destroy());
+  const live = await listen(proxy);
+  try {
+    const liveDir = tmpProfile("fake-tls-proxy-live");
+    const { sup: s2, log } = fakeSupervisor(liveDir, { proxyUrl: `http://127.0.0.1:${live}` });
+    await s2.ensure();
+    assert.deepStrictEqual(cdpCallsOf(liveDir, IGNORE_CERTS).map((c) => c.params), [{ ignore: true }]);
+    assert.ok(log.lines.some((l) => /certificate errors are ignored/.test(l) && l.includes(`127.0.0.1:${live}`)), log.lines.join("\n"));
+  } finally {
+    proxy.close();
+  }
+});
+
 test("W2E buildBraveArgs: --headless=new only when asked (BROWSER_HEADLESS_ENABLE, as in legacy mode)", () => {
   assert.ok(!buildBraveArgs({ port: 1, profileDir: "/p" }).some((a) => a.startsWith("--headless")));
   const args = buildBraveArgs({ port: 1, profileDir: "/p", headless: true });
@@ -870,6 +920,33 @@ test("real Brave: the spawned PID is the browser and stays up (AutoDeElevate off
   assert.ok(log.lines.some((l) => /direct/.test(l)));
   const v = await (await fetch(`${cdpUrl}/json/version`)).json();
   assert.match(v.Browser, /Chrome|Brave/);
+});
+
+test("W2E real Brave: a self-signed HTTPS page fails by default and loads with certificate errors ignored", REAL, async () => {
+  const https = require("node:https");
+  const { chromium } = require("playwright-core");
+  const tls = { key: fs.readFileSync(path.join(__dirname, "fixtures", "tls-localhost.key")), cert: fs.readFileSync(path.join(__dirname, "fixtures", "tls-localhost.crt")) };
+  const server = https.createServer(tls, (req, res) => { res.setHeader("Content-Type", "text/html"); res.end("<title>tls-ok</title>tls-ok"); });
+  const port = await listen(server);
+  try {
+    for (const ignoreHttpsErrors of [false, true]) {
+      const dir = tmpProfile(`real-tls-${ignoreHttpsErrors}`);
+      const { sup } = realSupervisor(dir, { ignoreHttpsErrors, headless: true });
+      const { cdpUrl } = await sup.ensure();
+      const browser = await chromium.connectOverCDP(cdpUrl);
+      try {
+        const page = await browser.contexts()[0].newPage();
+        const outcome = await page.goto(`https://127.0.0.1:${port}/`, { timeout: 15000 }).then(() => page.title(), (e) => e.message);
+        if (ignoreHttpsErrors) assert.strictEqual(outcome, "tls-ok");
+        else assert.match(outcome, /ERR_CERT/);
+      } finally {
+        await browser.close().catch(() => {});
+        await sup.closeGracefully();
+      }
+    }
+  } finally {
+    server.close();
+  }
 });
 
 test("real Brave: concurrent ensure() → one launch, one Brave on the profile", REAL, async () => {

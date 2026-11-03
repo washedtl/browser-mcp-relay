@@ -225,19 +225,19 @@ test("relay Inspector: off unless asked; RelayServers then record nothing", asyn
 
 // ───────────────────────────── BROWSER_HEADLESS_ENABLE ─────────────────────────────
 
-test("BROWSER_HEADLESS_ENABLE=true reaches the real supervisor (legacy mode honours it too)", async (t) => {
+test("BROWSER_HEADLESS_ENABLE / BROWSER_RELAY_IGNORE_HTTPS_ERRORS (broker env) reach the real supervisor, as legacy mode honours them; both off by default", async (t) => {
   const real = {};
-  for (const headless of ["true", undefined]) {
+  for (const [label, env] of [["on", { BROWSER_HEADLESS_ENABLE: "true", BROWSER_RELAY_IGNORE_HTTPS_ERRORS: "true" }], ["off", {}]]) {
     const pipe = testPipe();
     const handle = await startBroker({
-      pipe, profileDir: path.join(HOME, "profile-headless"), env: headless ? { BROWSER_HEADLESS_ENABLE: headless } : {},
+      pipe, profileDir: path.join(HOME, "profile-headless"), env,
       keyFile: KEY_FILE, log: () => {},
       deps: { upstreamModule: () => fakes.fakeUpstreamModule(), loadCatalog: async () => fakes.FAKE_CATALOG, ownTools: () => [], toolContext: fakes.fakeToolContextModule },
     });
-    real[String(headless)] = handle.supervisor._headless;
+    real[label] = [handle.supervisor._headless, handle.supervisor._ignoreHttpsErrors];
     await handle.close("test done");
   }
-  assert.deepStrictEqual(real, { true: true, undefined: false });
+  assert.deepStrictEqual(real, { on: [true, true], off: [false, false] });
 });
 
 test("control: a status bigger than a handshake line (4 KB cap) still arrives whole", async (t) => {
