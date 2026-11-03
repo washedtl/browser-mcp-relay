@@ -42,27 +42,29 @@ test("one @modelcontextprotocol/sdk in the tree: the relay and upstream (in-proc
 });
 
 // Transitive packages, floored at the first release that fixes every advisory
-// npm audit reported for them. A package is checked while it is in the tree.
-// Not floored: browser-devtools-mcp's own zod@3 and sharp@0.34, @hono/node-server's
-// serveStatic advisory (no 1.x fix), and lighthouse@11's tree (needs lighthouse@13).
+// npm audit reported for them. Every locked copy in the floor's major is checked.
+// Not floored (no compatible fix): browser-devtools-mcp's own zod@3 and
+// sharp@0.34, @hono/node-server's serveStatic advisory (fixed only in 2.x), and
+// the rest of lighthouse@11's tree (needs lighthouse@13).
 const LOCKED_FLOORS = [
-  ["node_modules/proxy-addr", [2, 0, 8], "GHSA-jqcg-44mw-7w3h"],
-  ["node_modules/hono", [4, 13, 11], "GHSA-5r4p-p66f-jhc7 and 20 more"],
-  ["node_modules/@hono/node-server", [1, 19, 15], "GHSA-frvp-7c67-39w9"],
-  ["node_modules/body-parser", [2, 4, 0], "GHSA-27r3-jxmh-p828, GHSA-v422-hmwv-36x6"],
-  ["node_modules/qs", [6, 16, 1], "GHSA-6pq8-jhm2-2vcw and 3 more"],
-  ["node_modules/fast-uri", [3, 1, 9], "GHSA-w74x-v6f9-j3xg and 10 more"],
-  ["node_modules/ip-address", [10, 7, 4], "GHSA-rxp7-6hxx-x8q5 and 7 more"],
-  ["node_modules/zod", [4, 6, 6], "GHSA-mrhx-c7xc-m3w5"],
-  ["node_modules/@opentelemetry/core", [2, 8, 0], "GHSA-8988-4f7v-96qf"],
-  ["node_modules/lighthouse/node_modules/ws", [7, 5, 11], "GHSA-96hv-2xvq-fx4p"],
+  ["proxy-addr", [2, 0, 8], "GHSA-jqcg-44mw-7w3h"],
+  ["hono", [4, 13, 11], "GHSA-5r4p-p66f-jhc7 and 20 more"],
+  ["@hono/node-server", [1, 19, 15], "GHSA-frvp-7c67-39w9"],
+  ["body-parser", [2, 4, 0], "GHSA-27r3-jxmh-p828, GHSA-v422-hmwv-36x6"],
+  ["qs", [6, 16, 1], "GHSA-6pq8-jhm2-2vcw and 3 more"],
+  ["fast-uri", [3, 1, 9], "GHSA-w74x-v6f9-j3xg and 10 more"],
+  ["ip-address", [10, 7, 4], "GHSA-rxp7-6hxx-x8q5 and 7 more"],
+  ["zod", [4, 6, 6], "GHSA-mrhx-c7xc-m3w5"],
+  ["@opentelemetry/core", [2, 8, 0], "GHSA-8988-4f7v-96qf"],
+  ["ws", [7, 5, 11], "GHSA-96hv-2xvq-fx4p"],
 ];
 
 test("locked transitive packages are at or above their advisory fixes", () => {
-  for (const [key, min, advisories] of LOCKED_FLOORS) {
-    const entry = lock.packages[key];
-    if (!entry) continue;
-    assert.ok(gte(floor(entry.version), min), `${key} ${entry.version} < ${min.join(".")} (${advisories})`);
+  for (const [name, min, advisories] of LOCKED_FLOORS) {
+    for (const [key, entry] of Object.entries(lock.packages)) {
+      if (!key.endsWith(`node_modules/${name}`) || floor(entry.version)[0] !== min[0]) continue;
+      assert.ok(gte(floor(entry.version), min), `${key} ${entry.version} < ${min.join(".")} (${advisories})`);
+    }
   }
 });
 

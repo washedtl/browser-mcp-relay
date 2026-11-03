@@ -840,3 +840,38 @@ test("relay process: answers initialize without claiming a slot, exits 0 when st
     fs.rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("relay process: a client message over the SDK's 10 MB stdio limit makes it exit 1 instead of going deaf", async () => {
+  const poolDir = path.join(os.tmpdir(), `bmr-overflow-${process.pid}-${Date.now()}`);
+  // the in-process inspector keeps the event loop busy (as upstream + Brave
+  // do), so a relay that stopped reading stdin would linger, not exit
+  const probe = net.createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  const inspectorPort = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  const env = {
+    ...process.env,
+    BROWSER_RELAY_MODE: "legacy",
+    BROWSER_RELAY_POOL_DIR: poolDir,
+    BROWSER_RELAY_INSPECTOR_PORT: String(inspectorPort),
+    BROWSER_RELAY_INSPECTOR_BIND: "127.0.0.1",
+  };
+  const child = spawn(process.execPath, [ENTRY], { stdio: ["pipe", "pipe", "pipe"], env });
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr += d; });
+  child.stdin.on("error", () => {}); // EPIPE once the relay exits mid-write
+  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  try {
+    await waitFor(() => /inspector running at/.test(stderr), 10000);
+    child.stdin.write(Buffer.alloc(11 * 1024 * 1024, 0x61));
+    const code = await Promise.race([
+      exited,
+      new Promise((r) => setTimeout(() => r("timeout"), 15000)),
+    ]);
+    assert.strictEqual(code, 1, `relay should exit 1 after an oversized message; stderr:\n${stderr}`);
+    assert.match(stderr, /10 MB stdio limit/);
+  } finally {
+    if (child.exitCode === null) child.kill();
+    fs.rmSync(poolDir, { recursive: true, force: true });
+  }
+});
