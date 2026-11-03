@@ -453,6 +453,8 @@ All paths the relay needs are auto-detected by default. Override them with these
 
 **Precedence:** environment variable ▸ `local-config.json` ▸ auto-detect ▸ reasonable hard-coded defaults.
 
+**Telemetry:** upstream `browser-devtools-mcp` reports usage to PostHog unless `TELEMETRY_ENABLE=false`. The relay sets that for every upstream it runs, in both modes, whatever the env says.
+
 ### Broker settings
 
 | Env var | Default | Purpose |
@@ -515,15 +517,17 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 | No tool call for 20 min | Brave closes gracefully (cookies flushed). The next call relaunches it, and each tab's next result starts with a one-line *"This tab was reset because …"* notice. |
 | No session for 10 min | The broker closes Brave gracefully and exits. The next session starts a new one. |
 | Brave crashes or is killed | The broker sees the PID gone, drops every tab, and the next call relaunches Brave (measured ≈ 1.5 s) and answers with the reset notice. A hard kill can lose the last ~30 s of cookie changes; a graceful close loses nothing. |
-| The broker dies | Its Brave dies with it. A request that was in flight gets *"browser broker restarted; please retry the call"*. Each shim reconnects on its session's next message (not before, so a stopped broker stays stopped), restarting the broker if needed, and replays the session's `initialize`; the next call works (measured ≈ 4.5 s, including that retry). |
+| The broker dies | On Windows its Brave goes with it: Node keeps the processes it starts in a job object that is killed when the broker is (measured: Brave gone ≈ 30 ms after a hard kill of the broker). Should a Brave still be left on the broker profile, the next broker finds it by the profile's `lockfile` before launching, kills the processes whose `--user-data-dir` is exactly that profile (nothing else) and launches its own. A request that was in flight gets *"browser broker restarted; please retry the call"*. Each shim reconnects on its session's next message (not before, so a stopped broker stays stopped), restarting the broker if needed, and replays the session's `initialize`; the next call works (measured ≈ 4.5 s, including that retry). |
 | Event loop blocked ≥ 60 s | The watchdog kills the broker, and the next tool call starts a fresh one. |
 | Memory above 1 GB while idle | The broker restarts itself, but never under a session's open browser. |
+
+**A graceful close** sends Brave `Browser.close` and waits up to 10 s for it to exit. Brave accepts at once (it drops the DevTools connection within ~10 ms) and then writes its cookies and settings, which took 6 s on a machine at 100% CPU. So once it has accepted, it gets up to 30 s in all before it is killed; one that ignores the close is killed at 10 s.
 
 Brave's CDP port is a random free port in 10000–32000, fixed for the broker's life. That is below every default ephemeral range, so outbound connections can't take it while Brave is down (before its first launch, or after an idle close) and force a broker restart.
 
 ### Profile: seeded once, then Brave's own
 
-On its first start, when the profile dir doesn't exist yet, the broker seeds it **once** from the legacy pool slot whose `Default/Network/Cookies` was written most recently. It skips slots Brave runs on or a legacy relay holds. It copies `Default/` minus caches (`Cache`, `Code Cache`, `GPUCache`, `*ShaderCache`, `Dawn*Cache`, `Service Worker/CacheStorage` and `ScriptCache`, `*_crx_cache`) and old session tabs, plus `Local State` (the cookie key). The source is never modified. Brave's first launch waits for the copy, and the log names the source. Without a pool, the profile starts fresh: log in once in a session window (`browser_show` brings it forward), and the login sticks.
+On its first start, when the profile dir doesn't exist yet, the broker seeds it **once** from the legacy profile whose `Default/Network/Cookies` was written most recently: a pool slot, or, for a v0.3 standalone install, its `<repo>/.browser-data`. It skips profiles Brave runs on or a legacy relay holds. It copies `Default/` minus caches (`Cache`, `Code Cache`, `GPUCache`, `*ShaderCache`, `Dawn*Cache`, `Service Worker/CacheStorage` and `ScriptCache`, `*_crx_cache`) and old session tabs, plus `Local State` (the cookie key). The source is never modified. Brave's first launch waits for the copy, and the log names the source. Without a legacy profile that has cookies, the profile starts fresh: log in once in a session window (`browser_show` brings it forward), and the login sticks.
 
 To pick the source yourself, or to see what would be copied:
 
@@ -629,7 +633,7 @@ Cursor's bundled `cursor-browser-devtools-mcp-vscode-0.6.3-universal` extension 
 
 | Process | Identifier in `Get-CimInstance Win32_Process` |
 |---|---|
-| **Your relay** | `node ...\.claude\scripts\browser-mcp-relay\src\index.js` — uses `.browser-data-mcp-pool-N` dirs |
+| **Your relay** | `node ...\browser-mcp-relay\src\index.js` — uses `.browser-data-mcp-pool-N` dirs |
 | **Cursor's bundled MCP** | `node ...\.cursor\extensions\serkan-ozal.browser-devtools-mcp-vscode-...\node_modules\browser-devtools-mcp\dist\index.js --cursor-mcp-server` — uses `.browser-data-mcp` (no `-pool-` suffix) |
 
 Both can be alive simultaneously. The relay's safety net (claim-time + pre-launch reap) only protects YOUR relay's pool dirs — Cursor's bundled MCP has its own lifecycle. If you only ever see Brave processes pinned to `.browser-data-mcp` (no `-pool-`), that's the bundled extension, not your relay.
@@ -711,7 +715,7 @@ The relay is honest about these limits — pretending otherwise misleads callers
 
 For sites with sophisticated detection (Akamai, DataDome, advanced PerimeterX deployments), `stealth_apply` is **insufficient** — it's a starting point, not a finish line. Real wins for hard targets are:
 
-- **Real-Brave-attach** (Tier 3, deferred — see BACKLOG): connect to a Brave instance the user is already running interactively, never spawn one. Eliminates the entire "Playwright launched it" fingerprint surface. Already used in the maintainer's Walmart sidecar.
+- **Real-Brave-attach** (Tier 3, deferred — see BACKLOG): connect to a Brave instance the user is already running interactively, never spawn one. Eliminates the entire "Playwright launched it" fingerprint surface.
 - **Residential proxies** (Bright Data, IPRoyal): TLS handshake from a residential IP gets a much higher trust score than data-center IPs. Set `BROWSER_RELAY_PROXY_URL`.
 - **Warm session reuse** (`cookies_export` / `cookies_import` + the credential vault): a session with N days of authentic browsing history scores higher than a fresh login.
 
@@ -729,7 +733,7 @@ A small web dashboard for peeking at the relay's runtime state — pool slot sta
 
 #### Standalone (no live traffic)
 
-Start the Inspector separately. It still serves Pool / Tools / Activity / Settings / per-slot pages, but the **Activity feed on `/slot/N` will be empty** — there's no relay process to subscribe to.
+Start the Inspector separately. It still serves Pool / Tools / Activity / Settings / per-slot pages, but the **Activity feed on `/slot/N` will be empty** — there's no relay process to subscribe to. When the relay runs in broker mode (the Windows default), it reports mode `broker` and probes no legacy pool; for the broker's sessions and live traffic, let the broker host the Inspector (below), or run `npm run broker:status`.
 
 ```bash
 npm run inspector
@@ -806,9 +810,10 @@ For code that imports `src/inspector-server.js` (or `scripts/inspector.js`) dire
 - **"browser broker restarted; please retry the call"**: the broker died while that call was in flight. Retry it: the retry reconnects, starting a new broker if needed.
 - **"This tab was reset because …"**: Brave was relaunched (crash, idle close, broker restart). The tab's URL, console and network buffers, element refs, stubs and emulation are gone. Navigate again.
 - **"the pipe's owner failed authentication … the broker key changed or is missing"**: something other than your broker holds the pipe name: close it, or set `BROWSER_RELAY_BROKER_PIPE`. (Rarely, `broker.key` was replaced by hand while a broker runs: the broker restores only a *missing* key, so end that broker process and retry.)
+- **"… is still locked by another browser … not launching on it"**: a browser the broker could not end holds its profile (an elevated one under a de-elevated broker, or one whose executable isn't the configured Brave). Close it, then retry the call. A Brave left by an earlier broker is ended automatically.
 - **"the browser broker runs elevated"** warning: de-elevation failed (no desktop shell, or UAC off), so the broker and its Brave run as administrator. A process at medium integrity can then reach an elevated Brave through the pipe.
 - **A session's settings are ignored**: the broker keeps the settings it started with (the session is told so). Run `npm run broker:stop`; the next tool call, from any session, starts a broker with that session's settings.
-- **Logins missing after the switch**: the seed picks the freshest idle pool slot, and the log says which. Log in once in a session window, or stop the broker, move `profile/` away and run `npm run migrate-profile -- --from <slot>`.
+- **Logins missing after the switch**: the seed picks the freshest idle legacy profile (pool slot or `<repo>/.browser-data`), and the log says which. Log in once in a session window, or stop the broker, move `profile/` away and run `npm run migrate-profile -- --from <slot>`.
 - **Back to the old model**: set `BROWSER_RELAY_MODE=legacy` and restart the MCP client.
 
 ### "Brave not found"
@@ -831,6 +836,10 @@ npm install
 ### `o11y_get-http-requests` rejects responses with "ping" / "prefetch" resourceType
 
 **Fixed in v0.3.6.** Upstream `browser-devtools-mcp`'s bundled `HttpResourceType` enum is missing `ping` / `prefetch` / `signedexchange` / `cspviolationreport` / `preflight` / `fedcm`. Playwright's `request.resourceType()` does return those (Amazon affiliate links fire `<a ping="...">` beacons → `resourceType="ping"` → upstream's zod schema rejects). The relay now patches the upstream bundle file at startup via `scripts/patch-bdmcp-bundle.js` (idempotent, on-disk, survives ESM/CJS module systems). Look for a stderr line `[mcp-relay] patched browser-devtools-mcp HttpResourceType enum...` on first relay startup after `npm install`. Filed as F1-20 — see `docs/BACKLOG.md` for the upstream-issue tracking.
+
+### Smoke test fails: "Brave not found"
+
+`npm run smoke` resolves Brave the way the relay does (`BROWSER_RELAY_BRAVE_PATH` in the env or `local-config.json`, then auto-detect) before it checks anything else, because no tool call can work without it. Install Brave or set the path (see ["Brave not found"](#brave-not-found)). `npm run smoke -- --without-brave` checks the tool catalog alone (CI does this: its runner has no Brave).
 
 ### Smoke test fails: "tool count too low"
 
@@ -950,7 +959,7 @@ The relay writes diagnostic stderr lines (autofill events, CDP errors, shutdown 
 }
 ```
 
-Then `Get-Content $env:USERPROFILE/.claude/scripts/browser-mcp-relay/relay-stderr.log -Tail 50 -Wait` to follow it live.
+Then `Get-Content <absolute-path>/relay-stderr.log -Tail 50 -Wait` to follow it live.
 
 ---
 

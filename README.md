@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-1100%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-1149%20passing-brightgreen.svg)](#)
 [![Tools](https://img.shields.io/badge/tools-72%20%2851%20forwarded%20%2B%2021%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](docs/REFERENCE.md#platform-support)
 
@@ -44,16 +44,19 @@ For the full 72-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 ```bash
 git clone https://github.com/washedtl/browser-mcp-relay.git
 cd browser-mcp-relay
-npm install
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install   # PowerShell: $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1; npm install
 npm run setup
 ```
+
+The relay drives your installed Brave. `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` stops a dependency from downloading ~1.2 GB of Playwright browsers (Chromium, Firefox, WebKit) that the relay never uses. Without it, `npm install` takes much longer, and fails where that download is blocked.
 
 The setup wizard:
 
 1. Auto-detects your Brave install + profile dir
-2. Writes a gitignored `local-config.json`
-3. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools; on Windows in broker mode, on a private pipe, and in legacy mode)
-4. Prints a paste-ready snippet for your MCP client config
+2. Asks for the mode: broker (the Windows default) or legacy standalone / pool
+3. Writes a gitignored `local-config.json`
+4. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools; on Windows in broker mode, on a private pipe, and in legacy mode)
+5. Prints a paste-ready snippet for your MCP client config
 
 Paste the printed snippet into your MCP client's config file (`~/.claude.json` for Claude Code; `mcp.json` for Cursor) and restart the client. **Under two minutes on a clean machine.**
 
@@ -63,13 +66,14 @@ To re-verify anytime:
 
 ```bash
 npm run smoke
+# → [smoke] Brave: C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe
 # → ✓ Relay healthy. 72 tools available (≥60). [broker, 3.5s]
 # → ✓ Relay healthy. 72 tools available (≥60). [legacy, 2.2s]
 ```
 
 ## The Inspector
 
-Optional read-only web UI at `localhost:9091` showing the live state of pool slots, the tool catalog, and a real-time feed of every `tools/call` your AI makes.
+Optional read-only web UI at `localhost:9090` showing the relay's live state (legacy pool slots, or the broker's sessions and tabs), the tool catalog, and a real-time feed of every `tools/call` your AI makes.
 
 ```bash
 npm run inspector
@@ -105,7 +109,7 @@ For inspector details (in-process vs standalone modes, security defenses, screen
 4. Each session gets its own window. Parallel subagents call `tabs_new` and pass the returned `tabId` so they don't share a tab.
 5. If Brave crashes, the next call relaunches it. If the broker dies, the next call starts a new one. Both happen without restarting the client. Brave closes after 20 idle minutes, and the broker exits 10 minutes after its last session.
 
-On first start, the broker profile is seeded once from your freshest legacy pool profile, when you have one.
+**Upgrading from v0.3:** nothing to change in your MCP config. On first start, the broker profile is seeded once from your freshest legacy profile (a pool slot, or v0.3's standalone `.browser-data`), so your logins carry over.
 
 **Recovery:**
 - `npm run broker:status` shows sessions, tabs and Brave.

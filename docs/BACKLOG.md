@@ -72,9 +72,7 @@ Big lifts. Different scope from JS patches.
 - New mode in `index.js` that skips `launchBrave` and just connects via CDP
 - User must launch Brave themselves with the right flags + a fresh user-data-dir (or accept profile-lock contention with their main browsing session)
 - New documentation explaining the trade-off (no auto-launch convenience, no auto-cleanup on shutdown)
-- The Walmart sidecar already does this — code patterns exist to copy
-
-**Already exists where:** `~/Documents/GitHub/Washed-Command-Center/washed-web-app-v2-test/walmart_search.py` — uses CloakBrowser to attach to a manually-launched Brave with Walmart+ session auth. Pattern is proven.
+- The attach pattern itself is proven: CloakBrowser-style tools attach to a manually launched Brave with an authed session
 
 **Ship gate:** A specific use case where Tier 1+2 stealth is provably insufficient AND attached-mode provides relief. Walmart B2C-authed scraping is the canonical example.
 
@@ -210,7 +208,7 @@ The honest meta-thing: **most items in this backlog should not be shipped withou
 
 Specific signal to watch for:
 
-- **Inspector traffic logs** — which of the 70 tools are actually called? If 50 of them have zero invocations after 2 weeks, the right move is deprecation, not more polish.
+- **Inspector traffic logs** — which tools are actually called? If 50 of them have zero invocations after 2 weeks, the right move is deprecation, not more polish.
 - **Issue reports** — what breaks for friends? The `windows-only CI + clean-clone smoke` setup catches install-time regressions; only friends running real workflows surface in-flight bugs.
 - **Performance** — does relay startup feel slow? Does Brave-launch latency matter? `npm run smoke` reports timing; a week of real use generates the distribution.
 - **Stealth wins/losses** — are friends scraping sites that flag them? Concrete failure cases are 100x more useful for prioritizing Tier 2/3 stealth work than speculative planning.

@@ -2,18 +2,25 @@
 #
 # Runs the full friend-onboarding path on a fresh Windows runner:
 #   1. Checkout (clean clone — no leftover state)
-#   2. npm install (no cache — proves the lock works from scratch)
-#   3. npm test (unit suite, ~441 tests)
-#   4. npm run smoke (spawns the relay, sends MCP handshake + tools/list,
-#      asserts ≥60 tools)
+#   2. npm install (no cache — proves the lock works from scratch), with
+#      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 as the README's quick start says
+#   3. npm test (unit files in parallel, then the real-Brave/e2e files one
+#      at a time; those skip here: the runner has no Brave)
+#   4. npm run smoke -- --without-brave (spawns the relay, sends MCP
+#      handshake + tools/list, asserts ≥60 tools; no Brave on the runner,
+#      so the Brave check is skipped)
 #
 # Catches the class of regression where unit tests pass but onboarding
 # silently breaks — broken setup wizard, missing dependency, MCP SDK
 # import path drift, etc.
 #
-# Windows-only by design (per maintainer's daily-driver platform).
+# Windows-only by design (the maintainer's daily-driver platform).
 # macOS + Linux deferred — code is written portably but not yet
 # maintainer-verified end-to-end.
+#
+# Runs on pushes to main and on PRs into main: land a release branch
+# through a PR so this runs on it first (or start it by hand:
+# workflow_dispatch on that branch).
 
 name: Clean-clone friend flow
 
@@ -28,6 +35,9 @@ jobs:
   windows-smoke:
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      # the relay drives an installed Brave; never download Playwright's browsers (~1.2 GB)
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
 
     steps:
       - name: Checkout
@@ -49,7 +59,7 @@ jobs:
         run: npm test
 
       - name: Smoke test — spawn relay + tools/list
-        run: npm run smoke
+        run: npm run smoke -- --without-brave
         # Smoke spawns the relay, sends initialize + tools/list over stdio,
         # asserts ≥60 tools, then kills the relay's process tree (V0-5
         # taskkill /F /T). Exit non-zero on any failure mode.
