@@ -251,3 +251,19 @@ test("BROWSER_HEADLESS_ENABLE=true reaches the real supervisor (legacy mode hono
   }
   assert.deepStrictEqual(real, { true: true, undefined: false });
 });
+
+test("control: a status bigger than a handshake line (4 KB cap) still arrives whole", async (t) => {
+  const { claimPipe, serverHello } = require("../src/broker/pipe-server.js");
+  const { serveControl } = require("../src/broker/control.js");
+  const pipe = testPipe();
+  const server = await claimPipe(pipe);
+  t.after(() => new Promise((r) => server.close(() => r())));
+  const big = { connections: Array.from({ length: 200 }, (_, i) => ({ id: `c${i}`, url: `https://example.com/${"x".repeat(200)}` })) };
+  server.on("connection", async (sock) => {
+    const { hello } = await serverHello(sock, KEY);
+    serveControl(sock, hello, KEY, { status: () => big, stop: () => {} });
+  });
+  const r = await requestControl({ pipe, key: KEY, cmd: "status" });
+  assert.ok(JSON.stringify(r).length > 40_000);
+  assert.deepStrictEqual(r.status, big);
+});

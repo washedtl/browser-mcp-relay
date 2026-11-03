@@ -6,22 +6,17 @@
 // so it proves it holds this user's broker key, and the broker proves the
 // same back with its usual hello reply. The broker then sends one line,
 // {"bmr":"ctl","ok":...}, and closes. A control connection is never an MCP
-// session. Node built-ins only.
+// session.
 
 "use strict";
 
-const net = require("node:net");
 const crypto = require("node:crypto");
-const { helloMac } = require("./pipe-server.js");
+const { macEquals, connectPipe, clientHello, readLine, HELLO_TIMEOUT_MS } = require("./pipe-server.js");
 
-const CONTROL_TIMEOUT_MS = 10_000;
+// a status lists every session's tabs and URLs: more than a handshake line
+const MAX_ANSWER_BYTES = 1024 * 1024;
 
 const ctlMac = (key, cmd, nonce) => crypto.createHmac("sha256", key).update(`ctl:${cmd}:${nonce}`).digest("hex");
-
-function macMatches(got, want) {
-  if (typeof got !== "string" || !/^[0-9a-f]{64}$/.test(got)) return false;
-  return crypto.timingSafeEqual(Buffer.from(got, "hex"), Buffer.from(want, "hex"));
-}
 
 /**
  * Broker side: answer the control request in `hello` on `sock`, then close it.
@@ -29,7 +24,7 @@ function macMatches(got, want) {
  */
 function serveControl(sock, hello, key, { status, stop }) {
   const reply = (obj, then) => sock.end(`${JSON.stringify({ bmr: "ctl", ...obj })}\n`, then);
-  if (!macMatches(hello.ctlMac, ctlMac(key, String(hello.ctl), String(hello.nonce)))) {
+  if (!macEquals(hello.ctlMac, ctlMac(key, String(hello.ctl), String(hello.nonce)))) {
     reply({ ok: false, error: "control request not authenticated" });
   } else if (hello.ctl === "status") {
     try {
@@ -44,51 +39,23 @@ function serveControl(sock, hello, key, { status, stop }) {
   }
 }
 
-/** Resolve the first `n` lines `sock` sends; reject on close or timeout before that. */
-function readLines(sock, n, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    const timer = setTimeout(() => reject(Object.assign(new Error(`no answer within ${timeoutMs} ms`), { code: "ETIMEDOUT" })), timeoutMs);
-    sock.setEncoding("utf8");
-    sock.on("data", (d) => {
-      buf += d;
-      const lines = buf.split("\n");
-      if (lines.length > n) {
-        clearTimeout(timer);
-        resolve(lines.slice(0, n));
-      }
-    });
-    sock.on("close", () => {
-      clearTimeout(timer);
-      reject(Object.assign(new Error("the broker closed the connection without answering"), { code: "ECONNRESET" }));
-    });
-  });
-}
-
 /**
  * Client side: send one control command and return the broker's answer
  * ({bmr:"ctl", ok, ...}). Rejects with the connect error's code (ENOENT /
- * ECONNREFUSED: no broker), EAUTH (the pipe's owner doesn't know the key) or
- * ETIMEDOUT.
+ * ECONNREFUSED: no broker), EAUTH (the pipe's owner doesn't know the key),
+ * ECONNRESET or ETIMEDOUT.
  */
-async function requestControl({ pipe, key, cmd, timeoutMs = CONTROL_TIMEOUT_MS }) {
-  const sock = net.connect(pipe);
+async function requestControl({ pipe, key, cmd, timeoutMs = HELLO_TIMEOUT_MS }) {
+  const sock = await connectPipe(pipe);
   try {
-    await new Promise((resolve, reject) => { sock.once("connect", resolve); sock.once("error", reject); });
-    sock.on("error", () => { /* 'close' follows */ });
-    const nonce = crypto.randomBytes(16).toString("hex");
-    const answer = readLines(sock, 2, timeoutMs);
-    sock.write(`${JSON.stringify({ bmr: "hello", v: 1, nonce, ctl: cmd, ctlMac: ctlMac(key, cmd, nonce) })}\n`);
-    const [helloLine, ctlLine] = await answer;
-    let hello = null;
-    try { hello = JSON.parse(helloLine); } catch { /* not ours */ }
-    if (!hello || hello.bmr !== "hello" || !macMatches(hello.mac, helloMac(key, nonce))) {
-      throw Object.assign(new Error("the pipe's owner failed authentication (not this user's broker)"), { code: "EAUTH" });
-    }
-    return JSON.parse(ctlLine);
+    const { rest } = await clientHello(sock, key, { timeoutMs, fields: (nonce) => ({ ctl: cmd, ctlMac: ctlMac(key, cmd, nonce) }) });
+    if (rest.length) sock.unshift(rest);
+    const answer = readLine(sock, timeoutMs, MAX_ANSWER_BYTES);
+    sock.resume(); // the handshake left it paused
+    return JSON.parse((await answer).line);
   } finally {
     sock.destroy();
   }
 }
 
-module.exports = { serveControl, requestControl, ctlMac, CONTROL_TIMEOUT_MS };
+module.exports = { serveControl, requestControl, ctlMac };

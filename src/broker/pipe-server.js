@@ -268,11 +268,28 @@ function loadOrCreateKey(file) {
 
 const helloMac = (key, nonce) => crypto.createHmac("sha256", key).update(`broker:${nonce}`).digest("hex");
 
+/** Timing-safe: is `got` (untrusted) the 64-hex-digit MAC `want`? */
+function macEquals(got, want) {
+  if (typeof got !== "string" || !/^[0-9a-f]{64}$/.test(got)) return false;
+  return crypto.timingSafeEqual(Buffer.from(got, "hex"), Buffer.from(want, "hex"));
+}
+
+/** Connect to `pipe`; rejects with the connect error (ENOENT / ECONNREFUSED: nobody listens). */
+function connectPipe(pipe) {
+  const sock = net.connect(pipe);
+  return new Promise((resolve, reject) => {
+    sock.once("error", reject);
+    sock.once("connect", () => { sock.removeListener("error", reject); resolve(sock); });
+  });
+}
+
 /**
- * Read one line from `sock` (the first message of a handshake). Resolves
- * { line, rest } with any bytes after it, or rejects on close / timeout.
+ * Read one line from `sock` (the first message of a handshake; a control
+ * answer passes a larger maxBytes). Resolves { line, rest } with any bytes
+ * after it, or rejects on close / timeout / a line over maxBytes. A paused
+ * socket must be resumed by the caller.
  */
-function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
+function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS, maxBytes = HELLO_MAX_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -290,11 +307,11 @@ function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
       if (i < 0) {
         chunks.push(buf);
         size += buf.length;
-        if (size > HELLO_MAX_BYTES) done(Object.assign(new Error(`handshake line over ${HELLO_MAX_BYTES} bytes`), { code: "EPROTO" }));
+        if (size > maxBytes) done(Object.assign(new Error(`handshake line over ${maxBytes} bytes`), { code: "EPROTO" }));
         return;
       }
-      if (size + i > HELLO_MAX_BYTES) {
-        done(Object.assign(new Error(`handshake line over ${HELLO_MAX_BYTES} bytes`), { code: "EPROTO" }));
+      if (size + i > maxBytes) {
+        done(Object.assign(new Error(`handshake line over ${maxBytes} bytes`), { code: "EPROTO" }));
         return;
       }
       sock.pause();
@@ -315,16 +332,15 @@ function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
  * the bytes that followed the reply (normally none) and the broker's warning,
  * if any (trusted only once the mac checked out). Rejects with code EAUTH on
  * a wrong answer; ECONNRESET / ETIMEDOUT / EPROTO when there was none.
+ * `fields(nonce)` adds fields to the hello (control.js: the control request).
  */
-async function clientHello(sock, key, { settings = null, reconnect = false, timeoutMs = HELLO_TIMEOUT_MS } = {}) {
+async function clientHello(sock, key, { settings = null, reconnect = false, timeoutMs = HELLO_TIMEOUT_MS, fields = null } = {}) {
   const nonce = crypto.randomBytes(16).toString("hex");
-  sock.write(JSON.stringify({ bmr: "hello", v: 1, nonce, settings, reconnect }) + "\n");
+  sock.write(JSON.stringify({ ...(fields ? fields(nonce) : {}), bmr: "hello", v: 1, nonce, settings, reconnect }) + "\n");
   const { line, rest } = await readLine(sock, timeoutMs);
   let reply = null;
   try { reply = JSON.parse(line); } catch { /* not ours */ }
-  const want = Buffer.from(helloMac(key, nonce), "hex");
-  const got = reply && reply.bmr === "hello" && typeof reply.mac === "string" && /^[0-9a-f]{64}$/.test(reply.mac) ? Buffer.from(reply.mac, "hex") : null;
-  if (!got || !crypto.timingSafeEqual(got, want)) {
+  if (!reply || reply.bmr !== "hello" || !macEquals(reply.mac, helloMac(key, nonce))) {
     throw Object.assign(new Error("the pipe's owner failed authentication (not this user's broker)"), { code: "EAUTH" });
   }
   const warning = typeof reply.warning === "string" && reply.warning ? reply.warning.slice(0, MAX_WARNING_CHARS) : null;
@@ -336,15 +352,15 @@ async function clientHello(sock, key, { settings = null, reconnect = false, time
  * wrong: not ours, squatted) or the error code when it could not be asked.
  */
 async function verifyPipeOwner(pipe, key, timeoutMs = HELLO_TIMEOUT_MS) {
-  const sock = net.connect(pipe);
+  let sock = null;
   try {
-    await new Promise((resolve, reject) => { sock.once("connect", resolve); sock.once("error", reject); });
+    sock = await connectPipe(pipe);
     await clientHello(sock, key, { timeoutMs });
     return "ok";
   } catch (e) {
     return e.code === "EAUTH" ? "bad" : e.code || "error";
   } finally {
-    sock.destroy();
+    if (sock) sock.destroy();
   }
 }
 
@@ -385,5 +401,5 @@ function settingsHash(env, key) {
 
 module.exports = {
   pipeNameFor, resolveEndpoint, brokerHome, claimPipe, privateDirProblem, PIPE_PREFIX,
-  keyFileFor, loadOrCreateKey, restoreKeyFile, helloMac, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS, HELLO_MAX_BYTES,
+  keyFileFor, loadOrCreateKey, restoreKeyFile, helloMac, macEquals, connectPipe, readLine, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS, HELLO_MAX_BYTES,
 };
