@@ -12,6 +12,7 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
+const { removeDir } = require("../fixtures/remove-dir.js");
 const installer = require("../../scripts/bridge-install.js");
 const { extensionIdFromKey, install, uninstall, HOST_NAME, REGISTRY_KEY } = installer;
 
@@ -19,7 +20,8 @@ const REPO = path.join(__dirname, "..", "..");
 
 function tmp(t, tag) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `bmr-w2f-${tag}-`));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // waits out Windows file locks (a just-exited node.exe copy stays locked briefly)
+  t.after(() => removeDir(dir));
   return dir;
 }
 
