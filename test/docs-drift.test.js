@@ -169,23 +169,26 @@ test("W1B: README + REFERENCE state the live hidden-by-default count", () => {
   }
 });
 
-test("W2E: smoke + setup run the relay in legacy mode (a broker-mode check would leave a detached broker running)", () => {
-  for (const script of ["smoke.js", "setup.js"]) {
-    const src = fs.readFileSync(path.join(REPO, "scripts", script), "utf8");
-    assert.match(src, /BROWSER_RELAY_MODE:\s*"legacy"/, `${script} must spawn the relay with BROWSER_RELAY_MODE=legacy`);
-  }
+test("W2E: smoke checks broker mode (Windows) on a private pipe + temp profile with a short idle exit, and legacy; setup runs the same checks", () => {
+  const smoke = require("../scripts/smoke.js");
+  const env = smoke.modeEnv("broker", "/tmp/x");
+  assert.strictEqual(env.BROWSER_RELAY_MODE, "broker");
+  assert.match(env.BROWSER_RELAY_BROKER_PIPE, /smoke/, "a private pipe, never the real broker's");
+  assert.ok(env.BROWSER_RELAY_BROKER_PROFILE_DIR.startsWith(path.normalize("/tmp/x")), "a temp profile, never the real one");
+  assert.ok(Number(env.BROWSER_RELAY_BROKER_IDLE_EXIT_MS) <= 5000, "the smoke broker exits on its own right after");
+  assert.strictEqual(smoke.modeEnv("legacy", "/tmp/x").BROWSER_RELAY_MODE, "legacy");
+  const setup = fs.readFileSync(path.join(REPO, "scripts", "setup.js"), "utf8");
+  assert.ok(setup.includes("smoke.smokeModes("), "setup runs smoke.js's checks");
 });
 
-test("W1B: smoke + setup count the full catalog (all toolsets) against MIN_TOOLS", () => {
-  for (const script of ["smoke.js", "setup.js"]) {
-    const src = fs.readFileSync(path.join(REPO, "scripts", script), "utf8");
-    assert.match(src, /BROWSER_RELAY_TOOLSETS:\s*"all"/,
-      `${script} must spawn the relay with BROWSER_RELAY_TOOLSETS=all — hidden toolsets would drop tools/list below MIN_TOOLS`);
-    assert.match(src, /BROWSER_RELAY_CATALOG_REFRESH:\s*"true"/,
-      `${script} must force a catalog refresh so it exercises the real upstream, not just the cache file`);
-    const min = parseInt(src.match(/const MIN_TOOLS = (\d+)/)[1], 10);
-    assert.ok(liveTotal >= min, `${script} MIN_TOOLS=${min} exceeds the live catalog (${liveTotal})`);
+test("W1B: smoke counts the full catalog (all toolsets, refreshed cache) against MIN_TOOLS, in every mode", () => {
+  const smoke = require("../scripts/smoke.js");
+  for (const mode of ["broker", "legacy"]) {
+    const env = smoke.modeEnv(mode, "/tmp/x");
+    assert.strictEqual(env.BROWSER_RELAY_TOOLSETS, "all", "hidden toolsets would drop tools/list below MIN_TOOLS");
+    assert.strictEqual(env.BROWSER_RELAY_CATALOG_REFRESH, "true", "exercise the real upstream, not just the cache file");
   }
+  assert.ok(liveTotal >= smoke.MIN_TOOLS, `smoke MIN_TOOLS=${smoke.MIN_TOOLS} exceeds the live catalog (${liveTotal})`);
 });
 
 // ── W2E: broker mode ──

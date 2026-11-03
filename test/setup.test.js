@@ -160,12 +160,11 @@ test("V0-5: smoke.js source uses taskkill /F /T on win32", () => {
     "smoke.js must branch on process.platform === 'win32'");
 });
 
-test("V0-5: setup.js source uses taskkill /F /T on win32", () => {
-  const src = fs.readFileSync(SETUP_PATH, "utf8");
-  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID/.test(src),
-    "setup.js must call taskkill /F /T /PID on win32");
-  assert.ok(/process\.platform\s*===\s*['"]win32['"]/.test(src),
-    "setup.js must branch on process.platform === 'win32'");
+test("V0-5: setup.js kills the relay tree the way smoke.js does (W2E: it runs smoke.js's checks)", () => {
+  assert.strictEqual(require("../scripts/setup.js").killTree, require("../scripts/smoke.js").killTree);
+  const src = fs.readFileSync(SMOKE_PATH, "utf8");
+  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID/.test(src), "smoke.js must call taskkill /F /T /PID on win32");
+  assert.ok(/process\.platform\s*===\s*['"]win32['"]/.test(src), "smoke.js must branch on process.platform === 'win32'");
 });
 
 test("V0-5: killTree on win32 invokes taskkill (mocked execSync)", () => {

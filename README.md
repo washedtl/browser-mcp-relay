@@ -52,7 +52,7 @@ The setup wizard:
 
 1. Auto-detects your Brave install + profile dir
 2. Writes a gitignored `local-config.json`
-3. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools)
+3. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools; on Windows in broker mode, on a private pipe, and in legacy mode)
 4. Prints a paste-ready snippet for your MCP client config
 
 Paste the printed snippet into your MCP client's config file (`~/.claude.json` for Claude Code; `mcp.json` for Cursor) and restart the client. **Under two minutes on a clean machine.**
@@ -63,7 +63,8 @@ To re-verify anytime:
 
 ```bash
 npm run smoke
-# → ✓ Relay healthy. 72 tools available (≥60). 3.2s
+# → ✓ Relay healthy. 72 tools available (≥60). [broker, 3.5s]
+# → ✓ Relay healthy. 72 tools available (≥60). [legacy, 2.2s]
 ```
 
 ## The Inspector

@@ -831,7 +831,7 @@ npm install
 
 ### Smoke test fails: "tool count too low"
 
-The relay started but returned fewer than 60 tools (smoke and setup run it with `BROWSER_RELAY_TOOLSETS=all`, so hidden toolsets count). Check the relay's stderr output for upstream catalog-fetch errors (`[mcp-relay] upstream catalog fetch failed`), or the smoke script's stderr tail.
+The relay started but returned fewer than 60 tools (smoke and setup run it with `BROWSER_RELAY_TOOLSETS=all`, so hidden toolsets count; on Windows they check broker mode, on a private pipe and an empty temp profile whose broker exits 2 s later, and legacy mode). Check the relay's stderr output for upstream catalog-fetch errors (`[mcp-relay] upstream catalog fetch failed`), or the smoke script's stderr tail.
 
 ### "Tools appear in `tools/list` but `tools/call` hangs"
 

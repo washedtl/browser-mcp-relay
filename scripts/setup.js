@@ -24,26 +24,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
-const { spawn, execSync } = require("node:child_process");
-
-/**
- * V0-5: cross-platform process-tree kill (mirrors smoke.js's killTree).
- * On Windows, `child.kill()` orphans the relay's spawned upstream BDMCP
- * + Brave subprocess. `taskkill /F /T /PID <pid>` takes the whole tree.
- */
-function killTree(child) {
-  if (!child || !child.pid) return;
-  if (process.platform === "win32") {
-    try {
-      execSync(`taskkill /F /T /PID ${child.pid}`, { stdio: "ignore" });
-    } catch {
-      try { child.kill(); } catch { /* already gone */ }
-    }
-  } else {
-    try { child.kill("SIGTERM"); } catch { /* already gone */ }
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
-  }
-}
+// The smoke check is smoke.js's (broker mode on Windows, then legacy).
+const smoke = require("./smoke.js");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const LOCAL_CONFIG_PATH = path.join(REPO_ROOT, "local-config.json");
@@ -298,116 +280,11 @@ function step8_printMcpSnippet() {
 
 // ─────────────────────────── smoke test ─────────────────────────────────
 
-/**
- * Spawn `node src/index.js`, send a single tools/list JSON-RPC request over
- * stdin, and wait for a reply. Verify the tool count clears MIN_TOOLS (run with
- * BROWSER_RELAY_TOOLSETS=all so hidden toolsets are counted).
- * Kill the relay regardless of outcome. Returns { ok, count, reason }.
- *
- * Self-contained — does NOT require any of the relay's modules itself, so
- * a parse error in the relay won't take this script down.
- */
-function step9_smokeTest({ timeoutMs = 30000 } = {}) {
-  return new Promise((resolve) => {
-    process.stdout.write("[setup] Running smoke test (spawning relay, calling tools/list)...\n");
-    const child = spawn(process.execPath, [RELAY_ENTRY], {
-      stdio: ["pipe", "pipe", "pipe"],
-      // Count the whole catalog, including the hidden-by-default toolsets,
-      // and refresh the cached upstream catalog so the upstream really starts.
-      // Legacy mode: same catalog as the broker, without leaving a detached
-      // broker running after the check.
-      env: { ...process.env, BROWSER_RELAY_MODE: "legacy", BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
-    });
-
-    let resolved = false;
-    let stdout = "";
-    let stderr = "";
-
-    function settle(result) {
-      if (resolved) return;
-      resolved = true;
-      killTree(child);
-      resolve(result);
-    }
-
-    const timer = setTimeout(() => {
-      settle({
-        ok: false,
-        count: 0,
-        reason: `timeout after ${timeoutMs}ms (stderr tail: ${stderr.slice(-300) || "<empty>"})`,
-      });
-    }, timeoutMs);
-
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      settle({ ok: false, count: 0, reason: `spawn error: ${e.message}` });
-    });
-
-    child.on("exit", (code, signal) => {
-      clearTimeout(timer);
-      if (!resolved) {
-        settle({
-          ok: false,
-          count: 0,
-          reason: `relay exited prematurely (code=${code} signal=${signal}, stderr tail: ${stderr.slice(-300) || "<empty>"})`,
-        });
-      }
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-      // Try to parse line-delimited JSON-RPC responses.
-      const lines = stdout.split("\n");
-      // Keep the last (possibly incomplete) line in the buffer.
-      stdout = lines.pop();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-          if (msg && msg.id === 1 && msg.result && Array.isArray(msg.result.tools)) {
-            clearTimeout(timer);
-            settle({ ok: true, count: msg.result.tools.length, reason: "" });
-            return;
-          }
-        } catch { /* not JSON yet — keep buffering */ }
-      }
-    });
-
-    // MCP handshake: initialize, then tools/list. The MCP SDK requires
-    // initialization before regular requests. We send both immediately.
-    const initialize = {
-      jsonrpc: "2.0",
-      id: 0,
-      method: "initialize",
-      params: {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "browser-mcp-relay-setup", version: "0.0.0" },
-      },
-    };
-    const toolsList = { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} };
-    try {
-      child.stdin.write(JSON.stringify(initialize) + "\n");
-      // Send tools/list a tick later so initialize has a chance to be processed.
-      setTimeout(() => {
-        try {
-          child.stdin.write(JSON.stringify(toolsList) + "\n");
-        } catch (e) {
-          settle({ ok: false, count: 0, reason: `stdin write failed: ${e.message}` });
-        }
-      }, 100);
-    } catch (e) {
-      settle({ ok: false, count: 0, reason: `stdin write failed: ${e.message}` });
-    }
-  });
+/** `npm run smoke`'s checks. Resolves [{ mode, ok, count, reason, seconds }]. */
+function step9_smokeTest() {
+  process.stdout.write("[setup] Running smoke test (spawning the relay, calling tools/list)...\n");
+  return smoke.smokeModes({ log: (m) => process.stdout.write(m) });
 }
-
-// ─────────────────────────── main ───────────────────────────────────────
 
 async function main() {
   step1_welcome();
@@ -433,20 +310,10 @@ async function main() {
 
   step8_printMcpSnippet();
 
-  const smoke = await step9_smokeTest();
-  // W1-3 (2026-05-09): match smoke.js's MIN_TOOLS gate. Previously, ANY
-  // tools/list response was "healthy", even `tools: []` from a broken
-  // upstream — a friend running setup against an unconfigured environment
-  // would see a green checkmark with 0 tools. Mirror smoke.js's threshold.
-  const MIN_TOOLS = 60;
-  if (smoke.ok && smoke.count >= MIN_TOOLS) {
-    process.stdout.write(`✓ Relay healthy. ${smoke.count} tools available (≥${MIN_TOOLS}).\n`);
-  } else if (smoke.ok && smoke.count < MIN_TOOLS) {
-    process.stdout.write(`✗ Smoke test FAILED: only ${smoke.count} tools returned (expected ≥${MIN_TOOLS}). Likely upstream BDMCP not installed or environment misconfigured.\n`);
-    process.stdout.write("[setup] Re-run with `npm run smoke` after fixing.\n");
-  } else {
-    process.stdout.write(`✗ Smoke test failed: ${smoke.reason}\n`);
-    process.stdout.write("[setup] You can re-run the smoke test anytime with `npm run smoke`.\n");
+  // W1-3 (2026-05-09): a tools/list with too few tools (e.g. `tools: []`
+  // from a broken upstream) is a failure, not a green checkmark.
+  if (!smoke.report(await step9_smokeTest())) {
+    process.stdout.write("[setup] Re-run the smoke test anytime with `npm run smoke` after fixing.\n");
   }
 
   process.stdout.write([
@@ -470,5 +337,5 @@ if (require.main === module) {
 module.exports = {
   // Exported for tests.
   step9_smokeTest,
-  killTree,
+  killTree: smoke.killTree,
 };

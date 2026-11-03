@@ -2,14 +2,18 @@
 // scripts/smoke.js — non-interactive smoke test.
 //
 // Spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
-// waits for the response, verifies ≥60 tools (51 forwarded + 20 own = 71),
-// kills the relay, exits 0 on success / non-zero on failure.
+// waits for the response, verifies ≥60 tools (51 forwarded + 21 own = 72),
+// kills the relay, exits 0 on success / non-zero on failure. Checks broker
+// mode (the Windows default) and legacy mode; see smokeModes.
 //
 // For CI / sanity checks. <60 seconds. No prompts. Reads local-config.json
 // (via the relay itself) and falls through to env vars + auto-detect
 // otherwise — same precedence as a real run.
 
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { spawn, execSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -50,16 +54,55 @@ function killTree(child) {
   }
 }
 
-function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+/**
+ * The relay's env for one check. Every check counts the whole catalog (all
+ * toolsets) from a refreshed catalog cache, so the upstream really starts.
+ * Broker mode runs on a private pipe and an empty temp profile, and that
+ * broker exits 2 s after the check: nothing is left running, and the real
+ * broker (its pipe, its profile) is never touched.
+ */
+function modeEnv(mode, scratchDir) {
+  const env = { BROWSER_RELAY_MODE: mode, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" };
+  if (mode === "broker") {
+    Object.assign(env, {
+      BROWSER_RELAY_BROKER_PIPE: process.platform === "win32"
+        ? `\\\\.\\pipe\\browser-mcp-relay-smoke-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+        : path.join(scratchDir, "smoke.sock"),
+      BROWSER_RELAY_BROKER_PROFILE_DIR: path.join(scratchDir, "profile"),
+      BROWSER_RELAY_BROKER_LOG: path.join(scratchDir, "broker.log"),
+      BROWSER_RELAY_BROKER_IDLE_EXIT_MS: "2000",
+    });
+  }
+  return env;
+}
+
+// Broker mode is only the default (and only checked) on Windows.
+const SMOKE_MODES = process.platform === "win32" ? ["broker", "legacy"] : ["legacy"];
+
+/** smokeTest for each mode, in order. Resolves [{ mode, ok, count, reason, seconds }]. */
+async function smokeModes({ modes = SMOKE_MODES, log = () => {} } = {}) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-smoke-"));
+  fs.mkdirSync(path.join(scratch, "profile")); // exists, so the smoke broker seeds nothing into it
+  const results = [];
+  try {
+    for (const mode of modes) {
+      log(`[smoke] ${mode} mode: spawning the relay, sending tools/list...\n`);
+      const t0 = Date.now();
+      const r = await smokeTest({ env: modeEnv(mode, scratch) });
+      results.push({ mode, ...r, seconds: (Date.now() - t0) / 1000 });
+    }
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+  return results;
+}
+
+/** One check: legacy mode unless `env` says otherwise (see modeEnv). */
+function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS, env = { BROWSER_RELAY_MODE: "legacy", BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" } } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [RELAY_ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
-      // Count the whole catalog, including the hidden-by-default toolsets,
-      // and refresh the cached upstream catalog so the upstream really starts.
-      // Legacy mode: the catalog is the same in both modes, and a broker-mode
-      // check would leave a detached broker running (`npm run broker:status`
-      // checks the broker).
-      env: { ...process.env, BROWSER_RELAY_MODE: "legacy", BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
+      env: { ...process.env, ...env },
     });
 
     let resolved = false;
@@ -148,22 +191,20 @@ function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   });
 }
 
-async function main() {
-  process.stderr.write("[smoke] spawning relay, sending tools/list...\n");
-  const t0 = Date.now();
-  const result = await smokeTest();
-  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+/** One line per checked mode; true when every mode is healthy. */
+function report(results, write = (s) => process.stdout.write(s)) {
+  for (const r of results) {
+    const t = `[${r.mode}, ${r.seconds.toFixed(1)}s]`;
+    if (r.ok && r.count >= MIN_TOOLS) write(`✓ Relay healthy. ${r.count} tools available (≥${MIN_TOOLS}). ${t}\n`);
+    else if (r.ok) write(`✗ Smoke test FAILED: only ${r.count} tools returned (expected ≥${MIN_TOOLS}). ${t}\n`);
+    else write(`✗ Smoke test FAILED: ${r.reason} ${t}\n`);
+  }
+  return results.every((r) => r.ok && r.count >= MIN_TOOLS);
+}
 
-  if (result.ok && result.count >= MIN_TOOLS) {
-    process.stdout.write(`✓ Relay healthy. ${result.count} tools available (≥${MIN_TOOLS}). [${elapsed}s]\n`);
-    process.exit(0);
-  }
-  if (result.ok) {
-    process.stdout.write(`✗ Smoke test FAILED: only ${result.count} tools returned (expected ≥${MIN_TOOLS}). [${elapsed}s]\n`);
-    process.exit(1);
-  }
-  process.stdout.write(`✗ Smoke test FAILED: ${result.reason} [${elapsed}s]\n`);
-  process.exit(1);
+async function main() {
+  const results = await smokeModes({ log: (m) => process.stderr.write(m) });
+  process.exit(report(results) ? 0 : 1);
 }
 
 if (require.main === module) {
@@ -173,4 +214,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { smokeTest, killTree };
+module.exports = { smokeTest, smokeModes, modeEnv, report, killTree, MIN_TOOLS };

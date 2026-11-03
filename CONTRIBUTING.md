@@ -34,7 +34,7 @@ test/                     # node --test runner; mirrors src/ layout
 └── own-tools/            # tests for each own-tool (shape + acts on ctx.page only)
 scripts/
 ├── setup.js              # interactive `npm run setup` wizard
-├── smoke.js              # `npm run smoke` — spawn relay (legacy) + tools/list check
+├── smoke.js              # `npm run smoke` — tools/list check: broker (Windows, private pipe) + legacy
 ├── broker-ctl.js         # `npm run broker:status` / `broker:stop`
 └── migrate-profile.js    # `npm run migrate-profile` — seed the broker profile by hand
 ```
