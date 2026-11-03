@@ -610,11 +610,27 @@ test("tools/call: invalid args are an isError result naming the tool; nothing ru
     const r = await c.callTool({ name: "navigation_go-to", arguments: args });
     assert.strictEqual(r.isError, true);
     assert.match(textOf(r), /^MCP error -32602: Input validation error: Invalid arguments for tool navigation_go-to: /);
+    assert.match(textOf(r), / at url$/m, "SDK >= 1.30 names the failing argument's path");
   }
   const bad = await c.callTool({ name: "content_take-screenshot", arguments: { type: "GIF" } });
   assert.strictEqual(bad.isError, true);
   assert.strictEqual(b.up.executed.length, 0);
   assert.strictEqual(b.sup.ensures, 0);
+});
+
+test("a message over the SDK's 10 MB stdio limit drops that connection (the shim reconnects); the broker keeps serving", async (t) => {
+  const b = await startTestBroker(t);
+  const c = await connectTo(b.pipe);
+  t.after(() => c.destroy());
+  c.on("error", () => {}); // EPIPE once the broker drops us mid-write
+  let closed = false;
+  c.once("close", () => { closed = true; });
+  await clientHello(c, KEY, {});
+  c.write(Buffer.alloc(11 * 1024 * 1024, 0x61));
+  await until(() => closed, 5000, "the broker to drop the connection");
+  assert.ok(b.logs.some((l) => /ReadBuffer exceeded maximum size/.test(l)), b.logs.join("\n"));
+  const client = await connectClient(t, b.pipe);
+  assert.ok((await client.listTools()).tools.length > 0);
 });
 
 test("tools/call: an upstream throw becomes upstream's 'Error: …' isError result", async (t) => {

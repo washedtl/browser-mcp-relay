@@ -628,6 +628,10 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       }
       if (rest.length) sock.unshift(rest);
       mcp = buildConnectionServer(connId);
+      // The SDK closes the transport on a message over its 10 MB stdio limit
+      // and only pauses the socket: drop it, so the shim answers the call and
+      // reconnects instead of waiting forever. (A no-op after a normal close.)
+      mcp.onclose = () => sock.destroy();
       return mcp.connect(new StdioServerTransport(sock, sock)).then(() => sock.resume());
     }).catch((e) => {
       log(`conn ${connId}: ${e.message}`);

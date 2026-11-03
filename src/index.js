@@ -683,6 +683,13 @@ async function main() {
   };
   process.stdin.once("end", onStdinGone);
   process.stdin.once("close", onStdinGone);
+  // The SDK closes the transport on a message over its 10 MB stdio limit and
+  // only pauses stdin, so neither handler above fires: exit instead of going deaf.
+  server.onclose = async () => {
+    logStderr("[mcp-relay] MCP transport closed (a client message over the SDK's 10 MB stdio limit); shutting down");
+    try { await shutdownAsync(); } catch {}
+    process.exit(1);
+  };
 }
 
 if (require.main === module) {
