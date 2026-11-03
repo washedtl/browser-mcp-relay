@@ -6,7 +6,7 @@
 //   <markerDir>/started-<pid>, then winner-<pid> (owns the pipe) or loser-<pid>.
 //
 // usage: node broker-entry.js --pipe <p> --marker-dir <d> --key-file <k>
-//          [--exit-ms <n>] [--watchdog-ms <n>] [--env-file <f>]
+//          [--exit-ms <n>] [--watchdog-ms <n>]
 
 "use strict";
 
@@ -23,14 +23,11 @@ const markerDir = arg("--marker-dir");
 const keyFile = arg("--key-file");
 const exitMs = Number(arg("--exit-ms", "60000"));
 const watchdogMs = Number(arg("--watchdog-ms", "0"));
-const envFile = arg("--env-file");
 const mark = (kind) => fs.writeFileSync(path.join(markerDir, `${kind}-${process.pid}`), String(Date.now()));
 mark("started");
 
-const { startBroker, applyEnvFile } = require("../../src/broker/main.js");
+const { startBroker } = require("../../src/broker/main.js");
 const fakes = require("./broker-fakes.js");
-
-if (envFile) applyEnvFile(envFile);
 
 const logFile = path.join(markerDir, "broker.log");
 const log = (m) => { try { fs.appendFileSync(logFile, `${process.pid} ${m}\n`); } catch { /* ignore */ } };
@@ -63,7 +60,14 @@ const fixtureTools = [
         const out = execFileSync(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "whoami.exe"), ["/groups"], { encoding: "utf8", windowsHide: true });
         integrity = (out.match(/Mandatory Label\\(\S+) Mandatory Level/) || [])[1] || null;
       }
-      return text({ pid: process.pid, integrity, mark: process.env.BROWSER_RELAY_TEST_MARK || null, secret: process.env.NOT_ALLOWLISTED_SECRET || null });
+      return text({
+        pid: process.pid,
+        integrity,
+        mark: process.env.BROWSER_RELAY_TEST_MARK || null,
+        secret: process.env.NOT_ALLOWLISTED_SECRET || null,
+        // set by Windows' user-profile environment, never by our allowlist
+        profileOnly: ["ALLUSERSPROFILE", "PUBLIC"].filter((k) => process.env[k] !== undefined),
+      });
     },
   },
 ];

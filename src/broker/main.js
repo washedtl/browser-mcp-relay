@@ -31,13 +31,16 @@
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
-const { claimPipe, resolveEndpoint, brokerHome, keyFileFor, loadOrCreateKey, verifyPipeOwner, serverHello, settingsHash } = require("./pipe-server.js");
+const { claimPipe, resolveEndpoint, brokerHome, keyFileFor, loadOrCreateKey, restoreKeyFile, verifyPipeOwner, serverHello, settingsHash } = require("./pipe-server.js");
 
 const MINUTE = 60_000;
 const DEFAULT_EXIT_IDLE_MS = 10 * MINUTE;
 const DEFAULT_BROWSER_IDLE_MS = 20 * MINUTE;
 const LOG_ROTATE_BYTES = 1024 * 1024;
 const DEFAULT_WATCHDOG_MS = 60_000;
+const MIN_WATCHDOG_MS = 10_000; // shorter would kill a healthy broker busy for a few seconds
+const KEY_CHECK_MS = 30_000;
+const STALE_LAUNCH_FILE_MS = 5 * 60_000;
 const DEFAULT_RECYCLE_RSS_MB = 1024;
 const RECYCLE_CHECK_MS = 60_000;
 // W2C's message for a CDP port another process holds (it never switches ports)
@@ -50,12 +53,14 @@ const PORT_IN_USE_RE = /CDP port \d+ is (?:already )?in use/i;
  * thread stamps a shared clock every second; if it stops for timeoutMs, the
  * worker logs and kills the process, and the shims start a fresh broker.
  * A gap in the worker's own ticks means the machine slept: skip that check.
+ * While an inspector is attached (a debugger may hold the thread at a
+ * breakpoint), the main thread raises a flag and the worker stands down.
  */
 const WATCHDOG_SOURCE = `
 "use strict";
 const { workerData } = require("node:worker_threads");
 const fs = require("node:fs");
-const beat = new BigInt64Array(workerData.sab);
+const beat = new BigInt64Array(workerData.sab); // [0] heartbeat ms, [1] inspector attached
 const { timeoutMs, logFile, pid } = workerData;
 const every = Math.max(50, Math.min(1000, Math.floor(timeoutMs / 4)));
 let lastTick = Date.now();
@@ -63,7 +68,7 @@ setInterval(() => {
   const now = Date.now();
   const slept = now - lastTick > every * 5;
   lastTick = now;
-  if (slept) return;
+  if (slept || Atomics.load(beat, 1) !== 0n) return;
   const silent = now - Number(Atomics.load(beat, 0));
   if (silent < timeoutMs) return;
   if (logFile) {
@@ -78,9 +83,13 @@ setInterval(() => {
 /** Start the watchdog; returns stop(). */
 function startWatchdog({ timeoutMs, logFile = null, heartbeatMs = 1000 }, log) {
   const { Worker } = require("node:worker_threads");
-  const sab = new SharedArrayBuffer(8);
+  const inspector = require("node:inspector");
+  const sab = new SharedArrayBuffer(16);
   const beat = new BigInt64Array(sab);
-  const tick = () => Atomics.store(beat, 0, BigInt(Date.now()));
+  const tick = () => {
+    Atomics.store(beat, 1, inspector.url() ? 1n : 0n);
+    Atomics.store(beat, 0, BigInt(Date.now()));
+  };
   tick();
   const hb = setInterval(tick, heartbeatMs);
   hb.unref();
@@ -281,19 +290,25 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, toolContext, loadCatalog, rss
  */
 async function startBroker({ pipe, profileDir, env = process.env, log = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
-  const key = loadOrCreateKey(keyFile || keyFileFor(env));
+  const keyPath = keyFile || keyFileFor(env);
+  const key = loadOrCreateKey(keyPath);
   // Picked before the claim: from the claim to server.on("connection")
   // nothing may await, or an early connection can be accepted unheard.
   const port = await pickFreePort();
   const server = await claimPipe(pipe);
   if (!server) {
-    const owner = await verifyPipeOwner(pipe, key);
+    let owner = await verifyPipeOwner(pipe, key);
+    if (owner === "bad") {
+      // our key may be the stale one (its file was recreated): read it again, once
+      const fresh = loadOrCreateKey(keyPath);
+      if (!fresh.equals(key)) owner = await verifyPipeOwner(pipe, fresh);
+    }
     if (owner === "bad") log(`WARNING: ${pipe} is held by something that is not this user's broker (squatted?); sessions will refuse to talk to it. Exiting.`);
     else log(`${pipe} is owned by another broker${owner === "ok" ? "" : ` (not verified: ${owner})`}; exiting`);
     return null;
   }
   try {
-    return serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
+    return serve({ server, port, key, keyFile: keyPath, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
   } catch (e) {
     server.close();
     throw e;
@@ -301,7 +316,7 @@ async function startBroker({ pipe, profileDir, env = process.env, log = () => {}
 }
 
 /** Synchronous on purpose (see startBroker). */
-function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
+function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
   // Heavy requires only once we own the pipe: a losing broker exits fast.
   const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
   const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -532,7 +547,10 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
   let closing = null;
   let accepting = true; // false once a shutdown is committed
 
-  const ownSettings = settingsHash(env);
+  const ownSettings = settingsHash(env, key);
+  // set by the launcher when de-elevation failed: every session hears it
+  const launchWarning = env.BROWSER_RELAY_BROKER_LAUNCH_WARNING || null;
+  if (launchWarning) log(`WARNING: ${launchWarning}`);
   let warnedSettings = false;
 
   function serveConnection(sock) {
@@ -559,7 +577,7 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
 
     // A shim opens with a hello: prove we hold this user's key (it talks to
     // nobody else), learn whether it lost an earlier broker and its settings.
-    serverHello(sock, key).then(({ hello, rest }) => {
+    serverHello(sock, key, { warning: launchWarning }).then(({ hello, rest }) => {
       if (done) return undefined;
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
@@ -656,6 +674,7 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
       policy.stop();
       stopWatchdog();
       clearInterval(rssTimer);
+      clearInterval(keyTimer);
       for (const s of sockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
       if (relayInspectorCtl) await relayInspectorCtl.close().catch((e) => log(`closing the relay Inspector failed: ${e.message}`));
@@ -699,12 +718,23 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
   }
 
   const stopWatchdog = watchdog && watchdog.timeoutMs ? startWatchdog(watchdog, log) : () => {};
+  // if our key file vanishes while we run, put it back, so new sessions still match us
+  const keyTimer = setInterval(() => {
+    try {
+      if (restoreKeyFile(keyFile, key)) log(`restored the missing key file ${keyFile}`);
+    } catch (e) {
+      log(`could not restore the key file ${keyFile}: ${e.message}`);
+    }
+  }, KEY_CHECK_MS);
+  keyTimer.unref();
   // §4: recycle a broker whose memory grew past the limit, while it is idle
   let rssTimer = null;
   if (recycle && recycle.rssBytes) {
     const rss = d.rss || (() => process.memoryUsage().rss);
     rssTimer = setInterval(() => {
       if (closing || policy.calls > 0 || Date.now() - policy.lastActivity < recycle.checkMs) return;
+      // a session with an open browser would lose its tabs: wait until none is connected or Brave idled out
+      if (sockets.size > 0 && supervisor.isUp()) return;
       const bytes = rss();
       if (bytes > recycle.rssBytes) {
         const mb = (n) => Math.round(n / 1024 / 1024);
@@ -779,7 +809,7 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
-    const key = { "--pipe": "pipe", "--profile-dir": "profileDir", "--log": "logFile", "--key-file": "keyFile", "--env-file": "envFile" }[argv[i]];
+    const key = { "--pipe": "pipe", "--profile-dir": "profileDir", "--log": "logFile", "--key-file": "keyFile" }[argv[i]];
     if (key && argv[i + 1] !== undefined) out[key] = argv[++i];
   }
   return out;
@@ -821,17 +851,29 @@ function limitSetting(raw, fallback) {
   return raw !== undefined && raw !== "" && Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
+/** Watchdog timeout from its env setting: 0 = off, else at least MIN_WATCHDOG_MS. */
+function watchdogSetting(raw) {
+  const ms = limitSetting(raw, DEFAULT_WATCHDOG_MS);
+  return ms === 0 ? 0 : Math.max(ms, MIN_WATCHDOG_MS);
+}
+
 /**
- * A de-elevated launch can't pass an env (it gets the user's defaults), so
- * the launcher wrote the broker's settings to a private file: apply, delete.
+ * Delete launch-*.json files older than 5 min from `dir`: an earlier
+ * launcher passed settings that way, and a broker that never started left
+ * them behind (they may hold settings such as a proxy URL).
  */
-function applyEnvFile(file, processEnv = process.env) {
-  try {
-    const { env } = JSON.parse(fs.readFileSync(file, "utf8"));
-    for (const [k, v] of Object.entries(env || {})) if (typeof v === "string") processEnv[k] = v;
-  } finally {
-    fs.rmSync(file, { force: true });
+function sweepLaunchFiles(dir, { now = Date.now(), maxAgeMs = STALE_LAUNCH_FILE_MS } = {}) {
+  let removed = 0;
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  for (const name of names) {
+    if (!/^launch-.*\.json$/.test(name)) continue;
+    const file = path.join(dir, name);
+    try {
+      if (now - fs.statSync(file).mtimeMs > maxAgeMs) { fs.rmSync(file, { force: true }); removed++; }
+    } catch { /* gone meanwhile */ }
   }
+  return removed;
 }
 
 /**
@@ -849,17 +891,14 @@ function brokerEnv(processEnv = process.env, applyLocalConfig = require("../loca
 
 async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
-  let envFileError = null;
-  if (args.envFile) {
-    try { applyEnvFile(args.envFile); } catch (e) { envFileError = e; }
-  }
   const env = brokerEnv();
   const endpoint = resolveEndpoint(env);
   const pipe = args.pipe || endpoint.pipe;
   const profileDir = args.profileDir || endpoint.profileDir;
   const logFile = args.logFile || env.BROWSER_RELAY_BROKER_LOG || path.join(brokerHome(env), "broker.log");
   const log = fileLogger(logFile);
-  if (envFileError) log(`could not read the launch settings file ${args.envFile}: ${envFileError.message}`);
+  const swept = sweepLaunchFiles(brokerHome(env));
+  if (swept) log(`removed ${swept} stale launch settings file(s)`);
   try {
     prepareWorkDir(env);
   } catch (e) {
@@ -890,7 +929,7 @@ async function main(argv = process.argv.slice(2)) {
         browserMs: positiveInt(env.BROWSER_RELAY_BROKER_BROWSER_IDLE_MS, DEFAULT_BROWSER_IDLE_MS),
       },
       keyFile: args.keyFile,
-      watchdog: { timeoutMs: limitSetting(env.BROWSER_RELAY_BROKER_WATCHDOG_MS, DEFAULT_WATCHDOG_MS), logFile },
+      watchdog: { timeoutMs: watchdogSetting(env.BROWSER_RELAY_BROKER_WATCHDOG_MS), logFile },
       recycle: { rssBytes: limitSetting(env.BROWSER_RELAY_BROKER_RECYCLE_RSS_MB, DEFAULT_RECYCLE_RSS_MB) * 1024 * 1024, checkMs: RECYCLE_CHECK_MS },
       onExit: () => process.exit(0),
     });
@@ -912,7 +951,8 @@ module.exports = {
   main,
   parseArgs,
   brokerEnv,
-  applyEnvFile,
+  watchdogSetting,
+  sweepLaunchFiles,
   startWatchdog,
   prepareWorkDir,
   toCallToolResult,

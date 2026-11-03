@@ -10,8 +10,10 @@
 //     launcher gone, the broker has no live parent, so a tree-kill of the
 //     shim (taskkill /T, Claude Code closing the session) can't reach it.
 //     Several shims racing a cold start each launch one; the pipe lets one
-//     broker win and the rest exit (EADDRINUSE). An elevated launcher starts
-//     the broker de-elevated (broker/deelevate.js), with an allowlisted env.
+//     broker win and the rest exit (EADDRINUSE). The broker gets an
+//     allowlisted env; an elevated launcher starts it de-elevated
+//     (broker/deelevate.js), and if that fails, elevated with a warning the
+//     broker passes on to every session (stderr + its first tool result).
 //   - Before forwarding anything, the shim checks that the pipe's owner knows
 //     this user's broker key (HMAC over a nonce, broker/pipe-server.js): a
 //     squatter on the predictable pipe name gets nothing.
@@ -97,8 +99,9 @@ function appendLog(file, msg) {
 /**
  * Launcher process: start the broker detached and hidden, then exit. When
  * this process is elevated (Windows), the broker starts de-elevated through
- * the desktop shell's token, its env in a private file; if that fails it
- * starts elevated as before, with one warning in the broker log.
+ * the desktop shell's token with exactly the allowlisted env; if that fails
+ * it starts elevated as before, and the warning goes to the broker log and
+ * (BROWSER_RELAY_BROKER_LAUNCH_WARNING) to every session it serves.
  * BROWSER_RELAY_BROKER_DEELEVATE=off keeps an elevated launch elevated.
  */
 function runLauncher(argv, {
@@ -107,22 +110,21 @@ function runLauncher(argv, {
   env = process.env,
   isElevated = () => require("./broker/deelevate.js").isElevated(env),
   launchDeelevated = (opts) => require("./broker/deelevate.js").launchDeelevated(opts),
-  writeEnvFile = (dir, e) => require("./broker/deelevate.js").writeEnvFile(dir, e),
   log = (msg) => appendLog(brokerLogFile(env), msg),
 } = {}) {
   const [brokerEntry, ...brokerArgs] = argv;
   const childEnv = launchEnv(env);
   if (String(env.BROWSER_RELAY_BROKER_DEELEVATE || "").toLowerCase() !== "off" && isElevated()) {
-    let file = null;
     try {
       const home = pipeServer.brokerHome(env);
-      file = writeEnvFile(home, childEnv);
-      launchDeelevated({ args: [brokerEntry, ...brokerArgs, "--env-file", file], cwd: home, env });
+      fs.mkdirSync(home, { recursive: true }); // its working dir
+      launchDeelevated({ args: [brokerEntry, ...brokerArgs], cwd: home, childEnv, env });
       exit(0);
       return;
     } catch (e) {
-      if (file) fs.rmSync(file, { force: true });
-      log(`WARNING: could not start the broker de-elevated (${e.message}); starting it elevated, so its Brave runs as administrator too`);
+      const warning = `the browser broker runs elevated (as administrator), and so does its Brave: starting it de-elevated failed (${e.message})`;
+      log(`WARNING: ${warning}`);
+      childEnv.BROWSER_RELAY_BROKER_LAUNCH_WARNING = warning;
     }
   }
   spawnFn(process.execPath, [brokerEntry, ...brokerArgs], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv }).unref();
@@ -152,7 +154,7 @@ class Shim {
    * @param {string} opts.brokerEntry — script the launcher starts
    * @param {string[]} [opts.brokerArgs]
    * @param {string} opts.keyFile — this user's broker key (created if missing)
-   * @param {string|null} [opts.settings] — settingsHash() of this session's env
+   * @param {object|null} [opts.settingsEnv] — this session's env; its keyed settingsHash goes in the hello
    * @param {import("stream").Readable} [opts.input] — client → shim (stdin)
    * @param {import("stream").Writable} [opts.output] — shim → client (stdout)
    * @param {(msg: string) => void} [opts.log] — default: stderr
@@ -164,7 +166,7 @@ class Shim {
    * @param {number} [opts.respawnAfterMs]
    */
   constructor({
-    pipe, brokerEntry, brokerArgs = [], keyFile, settings = null,
+    pipe, brokerEntry, brokerArgs = [], keyFile, settingsEnv = null,
     input = process.stdin, output = process.stdout,
     log = (m) => { try { process.stderr.write(`[mcp-relay shim] ${m}\n`); } catch { /* stderr gone */ } },
     exit = (code) => process.exit(code),
@@ -175,10 +177,12 @@ class Shim {
     respawnAfterMs = RESPAWN_AFTER_MS,
   }) {
     Object.assign(this, {
-      pipe, brokerEntry, brokerArgs, keyFile, settings, input, output, log, exitFn: exit, connectFn: connect,
+      pipe, brokerEntry, brokerArgs, keyFile, settingsEnv, input, output, log, exitFn: exit, connectFn: connect,
       spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs,
     });
     this.key = null;
+    this.warning = null; // from the broker's hello: shown once (stderr + first tool result)
+    this.warningShown = false;
     this.sock = null;
     this.connecting = null;
     this.queue = []; // client lines waiting for a broker connection
@@ -246,7 +250,13 @@ class Shim {
         this.replayId = null; // our replayed initialize: the client already has its reply
         return;
       }
+      const method = this.inflight.get(msg.id);
       this.inflight.delete(msg.id);
+      if (method === "tools/call" && this.warning && !this.warningShown && msg.result && Array.isArray(msg.result.content)) {
+        this.warningShown = true;
+        msg.result.content.unshift({ type: "text", text: `[browser-mcp-relay] WARNING: ${this.warning}` });
+        line = JSON.stringify(msg);
+      }
     }
     try { this.output.write(line + "\n"); } catch { /* client gone */ }
   }
@@ -272,6 +282,7 @@ class Shim {
     const t0 = Date.now();
     let lastLaunch = 0;
     let lastErr = null;
+    let keyReloaded = false;
     for (let attempt = 0; Date.now() - t0 < this.connectTimeoutMs; attempt++) {
       if (this.closed) throw new Error("shim closed");
       // waiting won't fix it, and launching a broker there would be refused too
@@ -281,6 +292,12 @@ class Shim {
         return await this._connectOnce();
       } catch (e) {
         if (e.code === "EKEY") throw e;
+        if (e.code === "EAUTH" && !keyReloaded) {
+          // our cached key may be stale (the key file was recreated): read it again, once
+          keyReloaded = true;
+          this.key = null;
+          continue;
+        }
         if (e.code === "EAUTH") {
           throw new Error(`refusing ${this.pipe}: ${e.message}; another program may be squatting the pipe name (close it, or set BROWSER_RELAY_BROKER_PIPE)`);
         }
@@ -322,8 +339,13 @@ class Shim {
     });
     try {
       // nothing of the session's goes out before the owner proves it is ours
-      const rest = await pipeServer.clientHello(s, key, { settings: this.settings, reconnect: this.everAttached });
+      const settings = this.settingsEnv ? pipeServer.settingsHash(this.settingsEnv, key) : null;
+      const { rest, warning } = await pipeServer.clientHello(s, key, { settings, reconnect: this.everAttached });
       if (rest.length) s.unshift(rest);
+      if (warning && warning !== this.warning) {
+        this.warning = warning;
+        this.log(`WARNING: ${warning}`);
+      }
       return s;
     } catch (e) {
       s.destroy();
@@ -425,7 +447,7 @@ function resolveShimOptions(env) {
   return {
     pipe,
     keyFile,
-    settings: pipeServer.settingsHash(env),
+    settingsEnv: env,
     brokerEntry: BROKER_MAIN,
     brokerArgs: ["--pipe", pipe, "--profile-dir", profileDir, "--key-file", keyFile],
   };
