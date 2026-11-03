@@ -11,7 +11,6 @@
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
-const { withActivePage } = require("./_active-page.js");
 const { errorResult, intArg, outputPathArg, writeExclusive } = require("./_tool-args.js");
 
 const noop = () => {};
@@ -74,7 +73,7 @@ module.exports = {
       timeoutMs: { type: "integer", default: 30000, minimum: 1, description: "Max wait for the download to start." },
     },
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     // F0-9: null means "omitted".
     const args = _args || {};
     const { clickSelector } = args;
@@ -180,7 +179,7 @@ module.exports = {
         text: JSON.stringify({ savedTo: target, suggestedFilename: suggested, url: download.url() }),
       }],
     };
-  }),
+  },
   // F1-14: exported as a test seam.
   sanitizeDownloadFilename,
 };

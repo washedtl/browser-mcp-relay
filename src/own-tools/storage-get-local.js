@@ -10,7 +10,6 @@
 // is capped (maxBytes) and narrowable (keyFilter). Values that don't fit are
 // omitted whole (a cut-off token is worse than none) and listed by key.
 
-const { withActivePage } = require("./_active-page.js");
 const { parseStore, pageOrigin } = require("./_storage-common.js");
 const { errorResult, intArg } = require("./_tool-args.js");
 
@@ -34,7 +33,7 @@ module.exports = {
       },
     },
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     // F0-9: null means "omitted" for every optional argument.
     const args = _args || {};
     const parsed = parseStore("storage_get-local", args.store);
@@ -99,5 +98,5 @@ module.exports = {
       payload.omittedKeys = result.omittedKeys;
     }
     return { content: [{ type: "text", text: JSON.stringify(payload) }] };
-  }),
+  },
 };

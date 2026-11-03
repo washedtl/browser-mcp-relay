@@ -10,7 +10,6 @@
 //   • description corrected: "auto-dismissed" was wrong (default is `accept`,
 //     and the action parameter controls accept-vs-dismiss)
 
-const { withActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "dialog_handle",
@@ -29,7 +28,7 @@ module.exports = {
       timeoutMs: { type: "integer", default: 30000, description: "Max wait for the dialog to appear" },
     },
   },
-  handler: async ({ action, promptText, timeoutMs } = {}) => withActivePage(async ({ page }) => {
+  handler: async ({ action, promptText, timeoutMs } = {}, { page }) => {
     // F0-9 + F0-6 (2026-05-10): defaults treat both `undefined` and `null`
     // as "missing" (JSON-RPC clients commonly send null for unset optionals;
     // JS destructure defaults only fire on undefined). Action runtime-validated
@@ -132,5 +131,5 @@ module.exports = {
       page.once("dialog", onDialog);
       page.once("close", onClose);
     });
-  }),
+  },
 };

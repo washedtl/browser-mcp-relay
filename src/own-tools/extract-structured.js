@@ -7,7 +7,6 @@
 // a maxBytes budget shared fairly across fields (cut fields are listed in
 // `truncated`).
 
-const { withActivePage } = require("./_active-page.js");
 const { errorResult, intArg, fitJson } = require("./_tool-args.js");
 
 const DEFAULT_MAX_ITEMS = 100;
@@ -103,7 +102,7 @@ module.exports = {
     },
     required: ["schema"],
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     const args = _args || {};
     const { navigateToUrl, waitForSelector, schema } = args;
     // T0-5: validate schema before passing to page.evaluate. Object.entries(null)
@@ -186,5 +185,5 @@ module.exports = {
     const payload = { url: page.url(), data: result.data };
     if (Object.keys(result.truncated).length > 0) payload.truncated = result.truncated;
     return { content: [{ type: "text", text: JSON.stringify(payload) }] };
-  }),
+  },
 };

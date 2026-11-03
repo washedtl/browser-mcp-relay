@@ -1,5 +1,7 @@
-// cookies_export — return cookies in the active context as JSON.
+// cookies_export — return the browser's cookies as JSON.
 // Useful for saving authenticated session state, debugging cookie issues.
+// Context-wide by design: one browser profile, so every tab and session
+// shares one cookie jar (needsPage:false — no tab is opened for it).
 //
 // W1C1 (2026-11-03): cookie values are secrets and a full jar can be
 // hundreds of KB, so inline output is compact + capped (maxBytes) and
@@ -30,7 +32,8 @@ function domainMatches(cookieDomain, wanted) {
 module.exports = {
   name: "cookies_export",
   description:
-    "Export browser cookies as JSON. Narrow with urls, domains or names; inline output is capped at maxBytes. " +
+    "Export browser cookies as JSON (the profile's one cookie jar, shared by every tab and session). " +
+    "Narrow with urls, domains or names; inline output is capped at maxBytes. " +
     "To save and restore a session, use outputPath here and cookies_import inputPath so values stay out of the conversation.",
   inputSchema: {
     type: "object",
@@ -43,12 +46,11 @@ module.exports = {
       overwrite: { type: "boolean", default: false, description: "Allow replacing an existing outputPath." },
     },
   },
-  handler: async (_args) => {
+  needsPage: false,
+  handler: async (_args, { context }) => {
     // F0-9: null means "omitted" for every optional argument.
     const args = _args || {};
     const { urls, domains, names } = args;
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) return errorResult("bridge missing");
     for (const [name, v] of [["urls", urls], ["domains", domains], ["names", names]]) {
       const err = stringArrayError(name, v);
       if (err) return errorResult(err);
@@ -69,7 +71,7 @@ module.exports = {
       cookies = [];
     } else {
       try {
-        cookies = await bridge.context.cookies(urls ?? undefined);
+        cookies = await context.cookies(urls ?? undefined);
       } catch (e) {
         return errorResult(`cookies_export: ${e.message || e}`);
       }

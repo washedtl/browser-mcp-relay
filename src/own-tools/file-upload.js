@@ -1,7 +1,6 @@
 // file_upload — sets file input via Playwright's setInputFiles.
 // Bypasses the OS file picker dialog entirely.
 
-const { withActivePage } = require("./_active-page.js");
 
 module.exports = {
   name: "file_upload",
@@ -20,7 +19,7 @@ module.exports = {
     },
     required: ["selector", "files"],
   },
-  handler: async ({ selector, files }) => withActivePage(async ({ page }) => {
+  handler: async ({ selector, files }, { page }) => {
     // F0-4 (2026-05-10): validate selector + files upfront. Without this,
     // `files: null` crashes Playwright with "Cannot read properties of null",
     // `files: "string"` produces a confusing "expected array" error,
@@ -75,5 +74,5 @@ module.exports = {
         { type: "text", text: JSON.stringify({ ok: true, selector, uploaded: files }, null, 2) },
       ],
     };
-  }),
+  },
 };

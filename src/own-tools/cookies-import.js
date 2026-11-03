@@ -1,4 +1,5 @@
-// cookies_import — load cookies into the active context.
+// cookies_import — load cookies into the browser's cookie jar. Context-wide
+// like cookies_export: every tab and session shares the jar (needsPage:false).
 // Inverse of cookies_export. For restoring saved sessions or testing flows.
 //
 // W1C1 (2026-11-03): `inputPath` reads a file written by cookies_export
@@ -32,7 +33,7 @@ async function readCookieFile(p) {
 module.exports = {
   name: "cookies_import",
   description:
-    "Import cookies into the browser context; same name/domain/path cookies are replaced. " +
+    "Import cookies into the browser's cookie jar (shared by every tab and session); same name/domain/path cookies are replaced. " +
     "Pass cookies (Playwright format, as cookies_export returns) or inputPath (a file from cookies_export outputPath).",
   inputSchema: {
     type: "object",
@@ -54,11 +55,10 @@ module.exports = {
       inputPath: { type: "string", description: "Absolute path to a cookies_export outputPath file." },
     },
   },
-  handler: async (_args) => {
+  needsPage: false,
+  handler: async (_args, { context }) => {
     // F0-9: null means "omitted".
     const args = _args || {};
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) return errorResult("bridge missing");
     const input = absolutePathArg("cookies_import", "inputPath", args.inputPath);
     if (input.error) return errorResult(input.error);
     if (args.cookies != null && input.path) return errorResult("cookies_import: pass cookies or inputPath, not both");
@@ -119,7 +119,7 @@ module.exports = {
       }
     }
     try {
-      await bridge.context.addCookies(cookies);
+      await context.addCookies(cookies);
     } catch (e) {
       // Playwright throws on malformed cookies (missing domain+path or url,
       // invalid sameSite, etc.). Return structured error instead of letting

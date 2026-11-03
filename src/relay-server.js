@@ -6,10 +6,10 @@
 //   - getUpstream(): returns the upstream MCP client. Called ONLY by
 //     tools/call for forwarded tools (~50MB node process once spawned).
 //   - ensureBrave(): launches our Brave instance via Playwright. Slow
-//     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools need the
-//     globalThis.__relayBridge handle; forwarded tools need Brave running
-//     so upstream's lazy `chromium.connectOverCDP` succeeds when its tool
-//     handler runs).
+//     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools get their
+//     { page, context } ctx from the bridge it resolves; forwarded tools
+//     need Brave running so upstream's lazy `chromium.connectOverCDP`
+//     succeeds when its tool handler runs).
 //
 // tools/list (every client's first call at MCP connect) is answered from
 // the cached upstream catalog (tool-catalog.js) + own-tool definitions, so
@@ -28,6 +28,7 @@ const { EventEmitter } = require("node:events");
 const toolCatalog = require("./tool-catalog.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { toolsetOf, parseToolsets, hiddenToolMessage } = require("./own-tools/toolsets.js");
+const { legacyToolContext } = require("./own-tools/_legacy-context.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -158,7 +159,7 @@ class RelayServer {
     const { sets, unknown } = parseToolsets(this.env.BROWSER_RELAY_TOOLSETS);
     if (unknown.length) logStderr(`[mcp-relay] BROWSER_RELAY_TOOLSETS: ignoring unknown toolset(s) ${unknown.join(", ")}`);
     this.enabledToolsets = new Set(sets);
-    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
+    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave, needsPage }
     // The emitter always exists (callers subscribe to it unconditionally);
     // recordTraffic decides whether handleToolsCall feeds it at all.
     this.trafficEmitter = trafficEmitter || new TrafficEmitter();
@@ -166,14 +167,15 @@ class RelayServer {
   }
 
   // needsBrave=false: relay-local tool (e.g. toolsets) — skip ensureBrave.
-  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true }) {
+  // needsPage=false: the handler never reads ctx.page — don't open a tab for it.
+  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true, needsPage = true }) {
     if (this.ownTools.has(name)) {
       throw new Error(`relay: tool "${name}" already registered`);
     }
     if (typeof handler !== "function") {
       throw new Error(`relay: tool "${name}" handler must be a function`);
     }
-    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave });
+    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave, needsPage });
   }
 
   /** Name of the disabled toolset `toolName` belongs to, or null if it's visible. */
@@ -307,11 +309,13 @@ class RelayServer {
         // Owner rule: the agent asks the user before enabling a toolset.
         response = { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
       } else if (isOwn) {
-        // Own-tool handlers read globalThis.__relayBridge. ensureBrave
-        // populates that. Call it before invoking the handler.
-        if (own.needsBrave && this.ensureBrave) await this.ensureBrave();
+        // Legacy mode: handler(args, ctx) with ctx built from this relay's
+        // own Brave (ensureBrave's bridge). The broker builds ctx from its
+        // SessionRegistry instead.
+        const bridge = own.needsBrave && this.ensureBrave ? await this.ensureBrave() : null;
         try {
-          response = await own.handler(args || {}, this);
+          const ctx = bridge ? await legacyToolContext(bridge, own, args || {}) : {};
+          response = await own.handler(args || {}, { ...ctx, relay: this });
         } catch (e) {
           response = {
             content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],

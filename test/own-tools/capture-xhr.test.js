@@ -9,16 +9,18 @@ test("capture_xhr has required tool shape", () => {
   assert.strictEqual(typeof tool.handler, "function");
 });
 
-test("capture_xhr returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({});
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|initialized|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+// W2D: replaces the "bridge missing" / "targets the active page" tests. The
+// handler gets its page in ctx; other pages of the shared context (another
+// session's tab) are never listened to.
+test("W2D: capture_xhr captures on ctx.page only, not on the context's other pages", async () => {
+  const mine = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/mine" })]);
+  const other = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/other" })]);
+  const ctx = { page: mine, context: { pages: () => [other, mine] } };
+  const promise = tool.handler({ durationMs: 100, includeBody: false }, ctx);
+  other._respondAll();
+  mine._respondAll();
+  const parsed = JSON.parse((await promise).content[0].text);
+  assert.deepStrictEqual(parsed.responses.map((r) => r.url), ["https://api/mine"]);
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -75,9 +77,7 @@ function makeFakeResponse({ url, status = 200, method = "GET", body = "{}", body
 }
 
 function withPage(fakePage, fn) {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  return Promise.resolve().then(fn).finally(() => { globalThis.__relayBridge = prev; });
+  return Promise.resolve().then(() => fn({ page: fakePage, context: { pages: () => [fakePage] } }));
 }
 
 function hangGuard(promise, ms, label) {
@@ -89,30 +89,24 @@ function hangGuard(promise, ms, label) {
 }
 
 test("T0-3: capture_xhr enforces maxResponses cap and sets truncated", async () => {
-  const prev = globalThis.__relayBridge;
   // 10 fake xhr responses; cap at 3 → truncated should fire and only 3 captured.
   const responses = [];
   for (let i = 0; i < 10; i++) {
     responses.push(makeFakeResponse({ url: `https://api.example/${i}`, body: `{"i":${i}}` }));
   }
   const fakePage = makeFakePageWithResponses(responses);
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    // Kick off the handler with a short window so we don't actually wait 5s.
-    const promise = tool.handler({ durationMs: 200, maxResponses: 3, includeBody: false });
-    // Emit responses synchronously then wait for the duration.
-    fakePage._respondAll();
-    const result = await promise;
-    const parsed = JSON.parse(result.content[0].text);
-    assert.strictEqual(parsed.count, 3, "expected exactly maxResponses captured");
-    assert.strictEqual(parsed.truncated, true, "truncated flag should fire when cap hit");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  // Kick off the handler with a short window so we don't actually wait 5s.
+  const promise = tool.handler({ durationMs: 200, maxResponses: 3, includeBody: false }, ctx);
+  // Emit responses synchronously then wait for the duration.
+  fakePage._respondAll();
+  const result = await promise;
+  const parsed = JSON.parse(result.content[0].text);
+  assert.strictEqual(parsed.count, 3, "expected exactly maxResponses captured");
+  assert.strictEqual(parsed.truncated, true, "truncated flag should fire when cap hit");
 });
 
 test("T0-2: capture_xhr body fetches run in parallel, not serialized", async () => {
-  const prev = globalThis.__relayBridge;
   // Body 0 is slow (150ms); body 1 is fast (10ms). If serialized, body 1 waits
   // for body 0. If parallel, both finish before the duration ends.
   const responses = [
@@ -120,21 +114,17 @@ test("T0-2: capture_xhr body fetches run in parallel, not serialized", async () 
     makeFakeResponse({ url: "https://api/fast", body: "FAST", bodyDelay: 10 }),
   ];
   const fakePage = makeFakePageWithResponses(responses);
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const promise = tool.handler({ durationMs: 250, includeBody: true });
-    fakePage._respondAll();
-    const result = await promise;
-    const parsed = JSON.parse(result.content[0].text);
-    assert.strictEqual(parsed.count, 2);
-    // Both bodies must be present (parallel) — if serialized + slow first, body 1 might still race the duration but parallel always succeeds.
-    const slow = parsed.responses.find((r) => r.url.endsWith("/slow"));
-    const fast = parsed.responses.find((r) => r.url.endsWith("/fast"));
-    assert.ok(slow && slow.body === "SLOW", "slow body must be captured (parallel fetch)");
-    assert.ok(fast && fast.body === "FAST", "fast body must be captured");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const promise = tool.handler({ durationMs: 250, includeBody: true }, ctx);
+  fakePage._respondAll();
+  const result = await promise;
+  const parsed = JSON.parse(result.content[0].text);
+  assert.strictEqual(parsed.count, 2);
+  // Both bodies must be present (parallel) — if serialized + slow first, body 1 might still race the duration but parallel always succeeds.
+  const slow = parsed.responses.find((r) => r.url.endsWith("/slow"));
+  const fast = parsed.responses.find((r) => r.url.endsWith("/fast"));
+  assert.ok(slow && slow.body === "SLOW", "slow body must be captured (parallel fetch)");
+  assert.ok(fast && fast.body === "FAST", "fast body must be captured");
 });
 
 test("T0-1: capture_xhr navTimeoutMs separates nav timeout from capture window (source-level guard)", () => {
@@ -153,12 +143,11 @@ test("T0-1: capture_xhr navTimeoutMs separates nav timeout from capture window (
 });
 
 test("T0-9 (capture-xhr leg): pageClosedEarly flag set when page closes during capture", async () => {
-  const prev = globalThis.__relayBridge;
   const responses = [makeFakeResponse({ url: "https://api/x", body: "{}" })];
   const fakePage = makeFakePageWithResponses(responses);
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
   try {
-    const promise = tool.handler({ durationMs: 5000, includeBody: false });
+    const promise = tool.handler({ durationMs: 5000, includeBody: false }, ctx);
     fakePage._emit("response", responses[0]);
     // Simulate page closing 50ms in.
     setTimeout(() => fakePage._emit("close"), 50);
@@ -175,8 +164,6 @@ test("T0-9 (capture-xhr leg): pageClosedEarly flag set when page closes during c
   } catch (e) {
     // If the test times out (>1s), that's a real failure of the close-listener wiring.
     if (/handler hung/.test(e.message)) throw e;
-  } finally {
-    globalThis.__relayBridge = prev;
   }
 });
 
@@ -197,9 +184,9 @@ test("W1C1: a streaming/long-poll body does not hang the tool (drain deadline)",
   const stream = makeFakeResponse({ url: "https://api/stream", streaming: true });
   const normal = makeFakeResponse({ url: "https://api/normal", body: "OK" });
   const fakePage = makeFakePageWithResponses([stream, normal]);
-  await withPage(fakePage, async () => {
+  await withPage(fakePage, async (ctx) => {
     const started = Date.now();
-    const promise = tool.handler({ durationMs: 100 });
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll();
     const result = await hangGuard(promise, 4000, "capture_xhr with a streaming body");
     const elapsed = Date.now() - started;
@@ -221,8 +208,8 @@ test("W1C1: urlFilter / resource type are applied before the maxResponses cap", 
     makeFakeResponse({ url: "https://api/other/2" }),
   ];
   const fakePage = makeFakePageWithResponses(responses);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100, maxResponses: 1, urlFilter: "/match/", includeBody: false });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100, maxResponses: 1, urlFilter: "/match/", includeBody: false }, ctx);
     fakePage._respondAll();
     const parsed = JSON.parse((await promise).content[0].text);
     assert.strictEqual(parsed.count, 1);
@@ -233,8 +220,8 @@ test("W1C1: urlFilter / resource type are applied before the maxResponses cap", 
 test("W1C1: default output is compact — no headers, 2KB bodies, single-line JSON", async () => {
   const big = "x".repeat(5000);
   const fakePage = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/big", body: big, headers: { "set-cookie": "s=1" } })]);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll();
     const text = (await promise).content[0].text;
     assert.ok(!text.includes("\n"), "inline JSON must be compact");
@@ -247,8 +234,8 @@ test("W1C1: default output is compact — no headers, 2KB bodies, single-line JS
 
 test("W1C1: includeHeaders: true returns response headers", async () => {
   const fakePage = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/h", headers: { "x-test": "1" } })]);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100, includeHeaders: true, includeBody: false });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100, includeHeaders: true, includeBody: false }, ctx);
     fakePage._respondAll();
     const r = JSON.parse((await promise).content[0].text).responses[0];
     assert.strictEqual(r.headers["x-test"], "1");
@@ -259,8 +246,8 @@ test("W1C1: default inline output is capped near 100KB total", async () => {
   const responses = [];
   for (let i = 0; i < 200; i++) responses.push(makeFakeResponse({ url: `https://api/${i}`, body: "y".repeat(2000) }));
   const fakePage = makeFakePageWithResponses(responses);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll();
     const text = (await promise).content[0].text;
     assert.ok(text.length < 120_000, `inline output must stay near 100KB (got ${text.length})`);
@@ -289,8 +276,8 @@ test("W1C1: body fetches are capped at 32 in flight and stop once the budget is 
   for (let i = 0; i < 200; i++) responses.push(makeFakeResponse({ url: `https://api/${i}`, body: "b".repeat(5000), bodyDelay: 30 }));
   const stats = trackBodies(responses);
   const fakePage = makeFakePageWithResponses(responses);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll(); // all 200 arrive before any body finishes
     const parsed = JSON.parse((await promise).content[0].text);
     assert.ok(stats.maxInFlight <= 32, `at most 32 concurrent body() calls, saw ${stats.maxInFlight}`);
@@ -303,8 +290,8 @@ test("W1C1: a burst of many SMALL bodies keeps every body (budget is charged at 
   const responses = [];
   for (let i = 0; i < 60; i++) responses.push(makeFakeResponse({ url: `https://api/s${i}`, body: "s".repeat(300), bodyDelay: 30 }));
   const fakePage = makeFakePageWithResponses(responses);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll();
     const parsed = JSON.parse((await promise).content[0].text);
     const missing = parsed.responses.filter((r) => r.body !== "s".repeat(300));
@@ -317,16 +304,16 @@ test("W1C1: caps count JSON-escaped size (quotes / control bytes), not raw lengt
   const responses = [];
   for (let i = 0; i < 100; i++) responses.push(makeFakeResponse({ url: `https://api/q${i}`, body: '"'.repeat(5000) }));
   const fakePage = makeFakePageWithResponses(responses);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll();
     const text = (await promise).content[0].text;
     assert.ok(text.length < 120_000, `escaped output must stay near 100KB (got ${text.length})`);
   });
   const ctrl = makeFakeResponse({ url: "https://api/bin", body: String.fromCharCode(1).repeat(3000) });
   const binPage = makeFakePageWithResponses([ctrl]);
-  await withPage(binPage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(binPage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     binPage._respondAll();
     const body = JSON.parse((await promise).content[0].text).responses[0].body;
     assert.ok(JSON.stringify(body).length <= 2000 + 20, `escaped body must fit maxBodyBytes (got ${JSON.stringify(body).length})`);
@@ -336,8 +323,8 @@ test("W1C1: caps count JSON-escaped size (quotes / control bytes), not raw lengt
 test("W1C1 V2-1: a body with front-loaded escapes is charged its real escaped size", async () => {
   const body = String.fromCharCode(1).repeat(500) + "a".repeat(1500);
   const fakePage = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/front", body })]);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100 }, ctx);
     fakePage._respondAll();
     const parsed = JSON.parse((await promise).content[0].text);
     const kept = parsed.responses[0].body;
@@ -349,13 +336,13 @@ test("W1C1 V2-1: a body with front-loaded escapes is charged its real escaped si
 
 test("W1C1: schema maxima/minima are enforced (out-of-range → isError, no capture)", async () => {
   const fakePage = makeFakePageWithResponses([]);
-  await withPage(fakePage, async () => {
+  await withPage(fakePage, async (ctx) => {
     for (const bad of [
       { durationMs: 300001 }, { durationMs: 50 }, { navTimeoutMs: 400000 },
       { maxResponses: 5001 }, { maxResponses: 0 }, { maxTotalBytes: 100 }, { maxBodyBytes: 0 },
       { durationMs: 1.5 },
     ]) {
-      const r = await hangGuard(tool.handler(bad), 1000, JSON.stringify(bad));
+      const r = await hangGuard(tool.handler(bad, ctx), 1000, JSON.stringify(bad));
       assert.strictEqual(r.isError, true, `expected isError for ${JSON.stringify(bad)}`);
       assert.match(r.content[0].text, new RegExp(Object.keys(bad)[0]));
     }
@@ -364,8 +351,8 @@ test("W1C1: schema maxima/minima are enforced (out-of-range → isError, no capt
 
 test("W1C1: null args are treated as missing (defaults apply)", async () => {
   const fakePage = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/n", body: "B" })]);
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ durationMs: 100, maxResponses: null, maxBodyBytes: null, includeBody: null, includeHeaders: null, outputPath: null });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ durationMs: 100, maxResponses: null, maxBodyBytes: null, includeBody: null, includeHeaders: null, outputPath: null }, ctx);
     fakePage._respondAll();
     const r = await promise;
     assert.ok(!r.isError, r.content[0].text);
@@ -381,8 +368,8 @@ test("W1C1: after a navigation TIMEOUT the tool keeps listening for the rest of 
     e.name = "TimeoutError";
     throw e;
   };
-  await withPage(fakePage, async () => {
-    const promise = tool.handler({ navigateToUrl: "https://slow.example/", navTimeoutMs: 100, durationMs: 400 });
+  await withPage(fakePage, async (ctx) => {
+    const promise = tool.handler({ navigateToUrl: "https://slow.example/", navTimeoutMs: 100, durationMs: 400 }, ctx);
     setTimeout(() => fakePage._emit("response", late), 200); // fires after goto failed
     const parsed = JSON.parse((await hangGuard(promise, 3000, "nav timeout")).content[0].text);
     assert.match(parsed.navError, /Timeout/);
@@ -394,8 +381,8 @@ test("W1C1: after a navigation TIMEOUT the tool keeps listening for the rest of 
 test("W1C1: a non-timeout navigation failure returns without waiting out durationMs", async () => {
   const fakePage = makeFakePageWithResponses([]);
   fakePage.goto = async () => { throw new Error("net::ERR_NAME_NOT_RESOLVED"); };
-  await withPage(fakePage, async () => {
-    const r = await hangGuard(tool.handler({ navigateToUrl: "https://nope.invalid/", durationMs: 60000 }), 1000, "hard nav failure");
+  await withPage(fakePage, async (ctx) => {
+    const r = await hangGuard(tool.handler({ navigateToUrl: "https://nope.invalid/", durationMs: 60000 }, ctx), 1000, "hard nav failure");
     assert.strictEqual(r.isError, true, "nav failure with nothing captured is an error");
     assert.match(r.content[0].text, /ERR_NAME_NOT_RESOLVED/);
   });
@@ -406,8 +393,8 @@ test("W1C1: outputPath writes the full capture (headers + bodies) and returns a 
   try {
     const out = path.join(dir, "cap.json");
     const fakePage = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/f", body: "z".repeat(5000), headers: { "x-h": "v" } })]);
-    await withPage(fakePage, async () => {
-      const promise = tool.handler({ durationMs: 100, outputPath: out });
+    await withPage(fakePage, async (ctx) => {
+      const promise = tool.handler({ durationMs: 100, outputPath: out }, ctx);
       fakePage._respondAll();
       const r = await promise;
       assert.ok(!r.isError, r.content[0].text);
@@ -430,8 +417,8 @@ test("W1C1 V2-3: an outputPath that appears mid-capture gets a sibling file, not
   try {
     const out = path.join(dir, "cap.json");
     const fakePage = makeFakePageWithResponses([makeFakeResponse({ url: "https://api/v", body: "V" })]);
-    await withPage(fakePage, async () => {
-      const promise = tool.handler({ durationMs: 150, outputPath: out });
+    await withPage(fakePage, async (ctx) => {
+      const promise = tool.handler({ durationMs: 150, outputPath: out }, ctx);
       fakePage._respondAll();
       setTimeout(() => fs.writeFileSync(out, "someone else's"), 30); // appears during the window
       const r = await promise;
@@ -452,15 +439,15 @@ test("W1C1: outputPath rules — relative rejected, existing file needs overwrit
     const existing = path.join(dir, "exists.json");
     fs.writeFileSync(existing, "keep");
     const fakePage = makeFakePageWithResponses([]);
-    await withPage(fakePage, async () => {
-      const rel = await hangGuard(tool.handler({ durationMs: 60000, outputPath: "cap.json" }), 1000, "relative outputPath");
+    await withPage(fakePage, async (ctx) => {
+      const rel = await hangGuard(tool.handler({ durationMs: 60000, outputPath: "cap.json" }, ctx), 1000, "relative outputPath");
       assert.strictEqual(rel.isError, true);
       assert.match(rel.content[0].text, /absolute/);
-      const ex = await hangGuard(tool.handler({ durationMs: 60000, outputPath: existing }), 1000, "existing outputPath");
+      const ex = await hangGuard(tool.handler({ durationMs: 60000, outputPath: existing }, ctx), 1000, "existing outputPath");
       assert.strictEqual(ex.isError, true);
       assert.match(ex.content[0].text, /exists/);
       assert.strictEqual(fs.readFileSync(existing, "utf8"), "keep");
-      const ok = await tool.handler({ durationMs: 100, outputPath: existing, overwrite: true });
+      const ok = await tool.handler({ durationMs: 100, outputPath: existing, overwrite: true }, ctx);
       assert.ok(!ok.isError, ok.content[0].text);
       assert.notStrictEqual(fs.readFileSync(existing, "utf8"), "keep");
     });

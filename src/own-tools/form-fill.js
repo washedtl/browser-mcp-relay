@@ -2,7 +2,6 @@
 // Each field calls page.fill(selector, value) sequentially. Stops on first failure
 // (returning the partial-fill state for diagnosis).
 
-const { withActivePage } = require("./_active-page.js");
 
 // W1C2: Playwright appends a call log to fill errors (ANSI-dimmed line by
 // line, even with piped stdio). It holds the raw `fill("<value>")` (a
@@ -72,7 +71,7 @@ module.exports = {
     },
     required: ["fields"],
   },
-  handler: async (_args = {}) => withActivePage(async ({ page }) => {
+  handler: async (_args = {}, { page }) => {
     // F0-9 reviewer V1 (2026-05-10): treat null/undefined as missing for
     // every defaulted parameter. JSON-RPC clients sending {"timeoutMs":null}
     // would otherwise propagate `null` to page.fill which throws cryptically.
@@ -148,5 +147,5 @@ module.exports = {
       }],
       ...(allOk ? {} : { isError: true }),
     };
-  }),
+  },
 };

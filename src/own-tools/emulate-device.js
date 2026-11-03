@@ -10,7 +10,6 @@
 // Auto-cleanup on page close.
 
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
-const { withActivePage } = require("./_active-page.js");
 // T2-A (v0.3.5) → W1D: CDP's `Network.setUserAgentOverride` takes a
 // `userAgentMetadata` arg that Chromium uses for BOTH the HTTP Sec-CH-UA-*
 // headers and the page's navigator.userAgentData. Overriding the UA without
@@ -55,7 +54,7 @@ module.exports = {
       },
     },
   },
-  handler: async ({ reset, userAgent, viewport, network }) => withActivePage(async ({ bridge, page }) => {
+  handler: async ({ reset, userAgent, viewport, network }, { page, context }) => {
     // W1D-4: reset is all-or-nothing. Mixing it with overrides would race
     // "clear" against "set" across CDP domains, so reject the combination.
     if (reset && (userAgent || viewport || network)) {
@@ -77,7 +76,7 @@ module.exports = {
 
     // V0-3: do NOT detach after applying — Emulation overrides revert on
     // detach. The session stays alive for the page's lifetime.
-    const cdp = await getOrCreatePageCdp(page, bridge.context);
+    const cdp = await getOrCreatePageCdp(page, context);
     const applied = {};
 
     // T1-2: build the list of CDP commands and dispatch in parallel.
@@ -170,7 +169,7 @@ module.exports = {
     };
     if (failed.length) result.isError = true;
     return result;
-  }),
+  },
   // T2-A: test seam, kept under its old name (docs/BACKLOG.md cites it).
   // Same function stealth_apply runs in-page.
   synthesizeUserAgentMetadata: clientHintsFromUA,

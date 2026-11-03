@@ -134,11 +134,6 @@ async function waitFor(pred, ms = 2000) {
   }
 }
 
-test.afterEach(() => {
-  // ensureBrave publishes the bridge for own-tools; don't leak it across tests.
-  globalThis.__relayBridge = null;
-});
-
 // ─────────────────────── lazy slot claim (item 2) ───────────────────────
 
 test("lazy: creating the lifecycle claims no slot, loads no cdp-bridge, spawns nothing", () => {
@@ -159,7 +154,10 @@ test("lazy: first ensureBrave claims the slot once and derives the CDP port from
   // Claimed dir is poolDirs[1] → slot 2 → port 9333 + 2 - 1.
   assert.strictEqual(h.calls.launch[0].port, 9334);
   assert.strictEqual(h.calls.launch[0].userDataDir, "/fake/pool-2");
-  assert.strictEqual(globalThis.__relayBridge.port, 9334);
+  // W2D: own-tools get { context, cdpUrl } from this bridge (relay ctx); no globals.
+  assert.strictEqual(a.cdpConnectUrl, "http://127.0.0.1:9334");
+  assert.strictEqual(a.context, h.contexts[0]);
+  assert.strictEqual(globalThis.__relayBridge, undefined);
   assert.ok(h.logs.some((l) => /slot=2\/2/.test(l)), "banner logged at claim time");
 });
 
@@ -217,7 +215,7 @@ for (const [label, kill] of [
     t.mock.method(process, "exit", () => {});
     const h = makeHarness();
     const lc = createLifecycle(h.deps);
-    await lc.ensureBrave();
+    const bridge1 = await lc.ensureBrave();
     const client1 = await lc.getUpstream();
     const child1 = h.children[0];
 
@@ -225,11 +223,11 @@ for (const [label, kill] of [
 
     assert.deepStrictEqual(h.calls.killTree, [child1.pid], "stale upstream killed (it caches the dead CDP session)");
     assert.strictEqual(client1.closed, true, "stale client closed");
-    assert.strictEqual(globalThis.__relayBridge, null);
 
-    await lc.ensureBrave();
+    const bridge2 = await lc.ensureBrave();
     const client2 = await lc.getUpstream();
     assert.strictEqual(h.calls.launch.length, 2, "Brave relaunched");
+    assert.notStrictEqual(bridge2, bridge1, "own-tools get the relaunched Brave, not the dead one");
     assert.notStrictEqual(client2, client1, "fresh upstream client");
     assert.strictEqual(h.children.length, 2);
     assert.strictEqual(h.calls.claim, 1, "same slot reused");

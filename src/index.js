@@ -447,10 +447,8 @@ function createLifecycle({
           // event fires for them too — autofill works for both relay-driven
           // and BDMCP-driven navigations. No-op when the vault is empty.
           attachAutofill(l.context, vault, log);
-          // Make the bridge available to own-tool handlers via globalThis.
-          // Shape: { context, cdpConnectUrl, port } — Phase C tool handlers
-          // read globalThis.__relayBridge to drive CDP operations.
-          globalThis.__relayBridge = { ...l, port };
+          // Own-tools get { page, context, cdpUrl } built from this bridge by
+          // RelayServer (own-tools/_legacy-context.js).
           bridge = l;
           // V1-5 (2026-06-01): invalidate the cached `bridge` when the
           // underlying Brave context/process dies. Without this listener, a
@@ -474,9 +472,6 @@ function createLifecycle({
             );
             bridge = null;
             braveLaunchPromise = null;
-            if (globalThis.__relayBridge && globalThis.__relayBridge.context === l.context) {
-              globalThis.__relayBridge = null;
-            }
             teardownUpstream();
           };
           l.context.on("close", () => invalidateBridge("context closed"));
@@ -646,16 +641,6 @@ function startInspectorWithRetry({ start, port, bind, retryMs = INSPECTOR_RETRY_
 
 async function main() {
   const lifecycle = createLifecycle();
-
-  // Expose getUpstream to own-tool handlers via globalThis. The tabs_new /
-  // tabs_select handlers use this to call upstream's `navigation_go-to` so
-  // upstream's tracked `_page` follows our intended active tab. Upstream's
-  // session captures one specific Playwright Page reference at CDP-attach
-  // time and never re-evaluates it from CDP `Target.*` events; calls like
-  // `bringToFront` or creating new Playwright pages do NOT update that
-  // reference. The only externally observable lever is to navigate
-  // upstream's existing page via its own forwarded tools.
-  globalThis.__relayUpstream = lifecycle.getUpstream;
 
   // Optional in-process Inspector. When BROWSER_RELAY_INSPECTOR_PORT is set
   // on the relay process, we boot the Inspector in this same Node process

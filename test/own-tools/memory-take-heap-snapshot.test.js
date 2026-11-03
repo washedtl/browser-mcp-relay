@@ -10,16 +10,14 @@ test("memory_take-heap-snapshot has required tool shape", () => {
   assert.strictEqual(tool.inputSchema.type, "object");
 });
 
-test("memory_take-heap-snapshot returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({});
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|initialized/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+test("W2D: memory_take-heap-snapshot attaches CDP to ctx.page, not to the context's other pages", async () => {
+  const fx = makeSnapshotFixture();
+  const other = { url: () => "https://other", isClosed: () => false, once: () => {} };
+  const attached = [];
+  const context = { pages: () => [other, fx.page], newCDPSession: (p) => { attached.push(p); return fx.context.newCDPSession(p); } };
+  const r = await tool.handler({ outputPath: tmpOut("mine.heapsnapshot") }, { page: fx.page, context });
+  assert.notStrictEqual(r.isError, true, r.content[0].text);
+  assert.deepStrictEqual(attached, [fx.page]);
 });
 
 // V1-1: source-level guard for the two known issues —
@@ -110,19 +108,17 @@ test.after(() => {
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
-async function withBridge(context, fn) {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { context };
-  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+async function withCtx(context, fn) {
+  return fn({ page: context.pages()[0], context });
 }
 
 test("W1C2: concurrent snapshots on one page write uncorrupted files and never overlap", async () => {
   const fx = makeSnapshotFixture();
   const out1 = tmpOut("one.heapsnapshot");
   const out2 = tmpOut("two.heapsnapshot");
-  const [r1, r2] = await withBridge(fx.context, () => Promise.all([
-    tool.handler({ outputPath: out1 }),
-    tool.handler({ outputPath: out2 }),
+  const [r1, r2] = await withCtx(fx.context, (ctx) => Promise.all([
+    tool.handler({ outputPath: out1 }, ctx),
+    tool.handler({ outputPath: out2 }, ctx),
   ]));
   assert.notStrictEqual(r1.isError, true, r1.content[0].text);
   assert.notStrictEqual(r2.isError, true, r2.content[0].text);
@@ -133,14 +129,14 @@ test("W1C2: concurrent snapshots on one page write uncorrupted files and never o
 
 test("W1C2: snapshot session is detached after success and after a CDP failure", async () => {
   const ok = makeSnapshotFixture();
-  const r = await withBridge(ok.context, () => tool.handler({ outputPath: tmpOut("ok.heapsnapshot"), timeoutMs: null }));
+  const r = await withCtx(ok.context, (ctx) => tool.handler({ outputPath: tmpOut("ok.heapsnapshot"), timeoutMs: null }, ctx));
   assert.notStrictEqual(r.isError, true, r.content[0].text);
   assert.strictEqual(ok.sessions.length, 1);
   assert.strictEqual(ok.sessions[0].detachCalls, 1, "session must be detached after a successful snapshot");
 
   const bad = makeSnapshotFixture({ snapshotImpl: async () => { throw new Error("Target crashed"); } });
   const out = tmpOut("bad.heapsnapshot");
-  const r2 = await withBridge(bad.context, () => tool.handler({ outputPath: out }));
+  const r2 = await withCtx(bad.context, (ctx) => tool.handler({ outputPath: out }, ctx));
   assert.strictEqual(r2.isError, true);
   assert.match(r2.content[0].text, /Target crashed/);
   assert.strictEqual(bad.sessions[0].detachCalls, 1, "session must be detached when takeHeapSnapshot throws");
@@ -157,21 +153,21 @@ test("W1C2: hung snapshot times out, detaches, removes the partial file, and rel
     },
   });
   const out = tmpOut("hung.heapsnapshot");
-  const r = await withBridge(fx.context, () => tool.handler({ outputPath: out, timeoutMs: 1000 }));
+  const r = await withCtx(fx.context, (ctx) => tool.handler({ outputPath: out, timeoutMs: 1000 }, ctx));
   assert.strictEqual(r.isError, true);
   assert.match(r.content[0].text, /timed out after 1000ms/);
   assert.strictEqual(fx.sessions[0].detachCalls, 1, "timed-out session must be detached");
   assert.ok(!fs.existsSync(out), "partial file must be removed after a timeout");
 
   // Lock released: the next snapshot on the same page runs on a fresh session.
-  const r2 = await withBridge(fx.context, () => tool.handler({ outputPath: tmpOut("next.heapsnapshot"), timeoutMs: 1000 }));
+  const r2 = await withCtx(fx.context, (ctx) => tool.handler({ outputPath: tmpOut("next.heapsnapshot"), timeoutMs: 1000 }, ctx));
   assert.notStrictEqual(r2.isError, true, r2.content[0].text);
 });
 
 test("W1C2: timeoutMs is validated", async () => {
   const fx = makeSnapshotFixture();
   for (const bad of [0, -5, "abc", Number.NaN, 1800001]) {
-    const r = await withBridge(fx.context, () => tool.handler({ timeoutMs: bad }));
+    const r = await withCtx(fx.context, (ctx) => tool.handler({ timeoutMs: bad }, ctx));
     assert.strictEqual(r.isError, true, `timeoutMs=${bad} must be rejected`);
     assert.match(r.content[0].text, /timeoutMs/);
   }
@@ -181,7 +177,7 @@ test("W1C2: timeoutMs is validated", async () => {
 test("W1C2: concurrent default-path snapshots in the same millisecond get distinct files", async (t) => {
   t.mock.method(Date, "now", () => 1700000000000);
   const fx = makeSnapshotFixture();
-  const results = await withBridge(fx.context, () => Promise.all([tool.handler({}), tool.handler({})]));
+  const results = await withCtx(fx.context, (ctx) => Promise.all([tool.handler({}, ctx), tool.handler({}, ctx)]));
   const outs = results.map((r) => {
     assert.notStrictEqual(r.isError, true, r.content[0].text);
     return JSON.parse(r.content[0].text).outputPath;

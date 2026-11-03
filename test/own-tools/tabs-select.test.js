@@ -1,160 +1,71 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-select.js");
+const { fakeRegistry } = require("../fixtures/fake-registry.js");
+
+const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
+
+async function twoTabs() {
+  const registry = fakeRegistry();
+  await registry.getCtx("c1", "main");
+  await registry.getCtx("c1", "t1");
+  return registry;
+}
 
 test("tabs_select has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_select");
   assert.strictEqual(typeof tool.description, "string");
   assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
-  assert.strictEqual(tool.inputSchema.required[0], "index");
+  assert.strictEqual(tool.needsPage, false);
+  assert.ok(tool.inputSchema.properties.tabId && tool.inputSchema.properties.index);
 });
 
-test("tabs_select returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
+test("W2D: tabs_select brings the tab named by tabId to the front and navigates nothing", async () => {
+  const registry = await twoTabs();
+  const r = await run({ tabId: "t1" }, registry);
+  assert.notStrictEqual(r.isError, true, r.content[0].text);
+  const b = JSON.parse(r.content[0].text);
+  assert.strictEqual(b.selected, "t1");
+  assert.match(b.note, /tabId/, "says routing is by tabId, not by selection");
+  assert.strictEqual(registry.pageOf("c1", "t1").fronted, 1);
+  assert.strictEqual(registry.pageOf("c1", "main").fronted, 0);
+  assert.deepStrictEqual(registry.pageOf("c1", "t1").gotos, []);
+});
+
+test("W2D: tabs_select by index uses tabs_list order", async () => {
+  const registry = await twoTabs();
+  assert.strictEqual(JSON.parse((await run({ index: 0 }, registry)).content[0].text).selected, "main");
+  assert.strictEqual(registry.pageOf("c1", "main").fronted, 1);
+});
+
+test("W2D: tabs_select cannot reach another connection's tab", async () => {
+  const registry = await twoTabs();
+  await registry.getCtx("other", "t9");
+  const r = await run({ tabId: "t9" }, registry);
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /^tabs_select: no tab "t9"/);
+  assert.strictEqual(registry.pageOf("other", "t9").fronted, 0);
+});
+
+test("V1-5: tabs_select rejects out-of-range / negative / non-integer index with the tab count", async () => {
+  const registry = await twoTabs();
+  for (const index of [2, -1, 1.5, "abc"]) {
+    const r = await run({ index }, registry);
+    assert.strictEqual(r.isError, true, `index ${index}`);
+    assert.match(r.content[0].text, /^tabs_select: index out of range: .* \(have 2 tabs\)/);
   }
 });
 
-// Mock helper: bridge with a fixed list of pages, each with a recordable
-// bringToFront() and a fixed url.
-function makeFakeBridge(pageUrls) {
-  const pages = pageUrls.map((u) => ({
-    _bringCalled: 0,
-    url() { return u; },
-    async bringToFront() { this._bringCalled++; },
-  }));
-  return { context: { pages: () => pages }, _pages: pages };
-}
-
-test("tabs_select: out-of-range index returns isError", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank"]);
-  try {
-    const result = await tool.handler({ index: 5 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
+test("W2D: tabs_select needs tabId or index", async () => {
+  const r = await run({}, await twoTabs());
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /^tabs_select: pass tabId/);
 });
 
-// V1-5: JSON-Schema `minimum: 0` is not enforced by the MCP SDK at handler
-// entry. Negative / non-integer / huge index must all produce isError, not
-// an undefined-property TypeError.
-test("V1-5: tabs_select with negative index returns isError (not crash)", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
-  try {
-    const result = await tool.handler({ index: -1 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-    // bringToFront must NOT have been called on any page.
-    for (const page of globalThis.__relayBridge._pages) {
-      assert.strictEqual(page._bringCalled, 0);
-    }
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
-});
-
-test("V1-5: tabs_select with non-integer index returns isError", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank"]);
-  try {
-    const result = await tool.handler({ index: "abc" });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
-});
-
-test("V1-5: tabs_select error message includes pages-count for actionability", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
-  try {
-    const result = await tool.handler({ index: 999 });
-    assert.match(result.content[0].text, /have 2 pages/);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
-});
-
-test("tabs_select: about:blank target skips upstream propagation", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "about:blank"]);
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.selected, 0);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false);
-    // bringToFront still called (Playwright-side focus)
-    assert.strictEqual(globalThis.__relayBridge._pages[0]._bringCalled, 1);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
-});
-
-test("tabs_select: real URL triggers upstream navigation_go-to", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let calledWith = null;
-  globalThis.__relayBridge = makeFakeBridge([
-    "about:blank",
-    "file:///c/tmp/test.html",
-  ]);
-  globalThis.__relayUpstream = async () => ({
-    request: async (method, params) => {
-      calledWith = { method, params };
-      return {};
-    },
-  });
-  try {
-    const result = await tool.handler({ index: 1 });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.selected, 1);
-    assert.strictEqual(payload.url, "file:///c/tmp/test.html");
-    assert.strictEqual(payload.upstreamPropagated, true);
-    assert.ok(calledWith, "upstream.request must be invoked");
-    assert.strictEqual(calledWith.params.name, "navigation_go-to");
-    assert.strictEqual(calledWith.params.arguments.url, "file:///c/tmp/test.html");
-    assert.strictEqual(globalThis.__relayBridge._pages[1]._bringCalled, 1);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
-});
-
-test("tabs_select: upstream failure does NOT fail the tool call", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  globalThis.__relayBridge = makeFakeBridge(["https://example.com/"]);
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { throw new Error("upstream blew up"); },
-  });
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
+test("tabs_select: a bringToFront failure does not fail the call (it's cosmetic)", async () => {
+  const registry = await twoTabs();
+  registry.pageOf("c1", "t1").bringToFront = async () => { throw new Error("Target closed"); };
+  const r = await run({ tabId: "t1" }, registry);
+  assert.notStrictEqual(r.isError, true);
 });

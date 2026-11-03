@@ -241,9 +241,9 @@ test("RelayServer.handleToolsCall calls ensureBrave on EVERY invocation (no inte
 });
 
 test("RelayServer.handleToolsCall calls ensureBrave BEFORE own-tool handler (ordering matters)", async () => {
-  // Own-tool handlers read globalThis.__relayBridge, which is populated INSIDE
-  // ensureBrave. If a future refactor moves ensureBrave to fire after the
-  // handler, own-tools would see an empty bridge. Pin the ordering.
+  // The own-tool ctx (page, context) is built from the bridge ensureBrave
+  // resolves. If a future refactor moves ensureBrave to fire after the
+  // handler, own-tools would get no page. Pin the ordering.
   const order = [];
   const relay = new RelayServer({
     getUpstream: async () => new FakeUpstream(),
@@ -280,6 +280,86 @@ test("RelayServer.handleToolsCall calls ensureBrave BEFORE forwarding to upstrea
   });
   await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
   assert.deepStrictEqual(order, ["ensureBrave", "upstream.tools/call"], "ensureBrave must complete before forwarding");
+});
+
+// ─── W2D: own-tool handlers get a ctx (legacy mode) ─────────────────────
+
+function fakeBridge() {
+  const pages = [];
+  const page = () => {
+    let closed = false;
+    return { url: () => "about:blank", isClosed: () => closed, close: async () => { closed = true; } };
+  };
+  const context = {
+    pages: () => pages.filter((p) => !p.isClosed()),
+    newPage: async () => { const p = page(); pages.push(p); return p; },
+  };
+  pages.push(page()); // upstream's page
+  return { context, cdpConnectUrl: "http://127.0.0.1:9339" };
+}
+
+function relayWithCtxSpy(bridge, tool = {}) {
+  const relay = new RelayServer({ getUpstream: async () => new FakeUpstream(), ensureBrave: async () => bridge, env: {} });
+  const seen = [];
+  relay.registerOwnTool({
+    name: "ours", description: "", inputSchema: {},
+    handler: async (args, ctx) => { seen.push({ args, ctx }); return { content: [{ type: "text", text: "ok" }] }; },
+    ...tool,
+  });
+  return { relay, seen };
+}
+
+test("W2D: an own-tool handler gets (args, ctx): the legacy bridge's main page, its context, registry, cdpUrl and the relay", async () => {
+  const bridge = fakeBridge();
+  const { relay, seen } = relayWithCtxSpy(bridge);
+  await relay.handleToolsCall({ name: "ours", arguments: { a: 1 } });
+  const { args, ctx } = seen[0];
+  assert.deepStrictEqual(args, { a: 1 });
+  assert.strictEqual(ctx.page, bridge.context.pages()[0]);
+  assert.strictEqual(ctx.context, bridge.context);
+  assert.strictEqual(ctx.connId, "legacy");
+  assert.strictEqual(ctx.sessionKey, "legacy:main");
+  assert.strictEqual(ctx.cdpUrl, "http://127.0.0.1:9339");
+  assert.strictEqual(typeof ctx.registry.getCtx, "function");
+  assert.strictEqual(ctx.relay, relay);
+});
+
+test("W2D: tabId routes an own-tool call to that tab; main stays put", async () => {
+  const bridge = fakeBridge();
+  const { relay, seen } = relayWithCtxSpy(bridge);
+  await relay.handleToolsCall({ name: "ours", arguments: { tabId: "t1" } });
+  await relay.handleToolsCall({ name: "ours", arguments: {} });
+  assert.notStrictEqual(seen[0].ctx.page, seen[1].ctx.page);
+  assert.strictEqual(seen[0].ctx.sessionKey, "legacy:t1");
+  assert.strictEqual(seen[1].ctx.page, bridge.context.pages()[0]);
+});
+
+test("W2D: needsPage:false tools get no page and open no tab", async () => {
+  const bridge = fakeBridge();
+  const { relay, seen } = relayWithCtxSpy(bridge, { needsPage: false });
+  await relay.handleToolsCall({ name: "ours", arguments: { tabId: "t1" } });
+  assert.strictEqual(seen[0].ctx.page, undefined);
+  assert.strictEqual(seen[0].ctx.context, bridge.context);
+  assert.strictEqual(bridge.context.pages().length, 1, "no page opened");
+});
+
+test("W2D: needsBrave:false tools skip ensureBrave and get just the relay", async () => {
+  let ensured = 0;
+  const relay = new RelayServer({ getUpstream: async () => new FakeUpstream(), ensureBrave: async () => { ensured++; return fakeBridge(); }, env: {} });
+  let ctx = null;
+  relay.registerOwnTool({ name: "local", description: "", inputSchema: {}, needsBrave: false, handler: async (_a, c) => { ctx = c; return { content: [] }; } });
+  await relay.handleToolsCall({ name: "local", arguments: {} });
+  assert.strictEqual(ensured, 0);
+  assert.deepStrictEqual(Object.keys(ctx), ["relay"]);
+  assert.strictEqual(ctx.relay, relay);
+});
+
+test("W2D: a bad tabId is an isError tool result, not a thrown caller error", async () => {
+  const { relay, seen } = relayWithCtxSpy(fakeBridge());
+  const r = await relay.handleToolsCall({ name: "ours", arguments: { tabId: 7 } });
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /tabId must be a non-empty string/);
+  assert.strictEqual(seen.length, 0, "handler not called");
 });
 
 // ─── W10: trafficEmitter tests ─────────────────────────────────────────

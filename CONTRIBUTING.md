@@ -20,7 +20,7 @@ src/
     ├── index.js          # registry — add new tools here
     └── <tool>.js         # one file per tool (name + schema + handler)
 test/                     # node --test runner; mirrors src/ layout
-└── own-tools/            # tests for each own-tool (shape + bridge-missing)
+└── own-tools/            # tests for each own-tool (shape + acts on ctx.page only)
 scripts/
 ├── setup.js              # interactive `npm run setup` wizard
 └── smoke.js              # `npm run smoke` — spawn relay + tools/list check
@@ -42,22 +42,17 @@ scripts/
        },
        required: ["someArg"],
      },
-     async handler(args) {
-       const bridge = globalThis.__relayBridge;
-       if (!bridge) {
-         return {
-           isError: true,
-           content: [{ type: "text", text: "Relay bridge not initialized." }],
-         };
-       }
-       // bridge.context is a Playwright BrowserContext attached to the same
-       // Brave instance the upstream uses.
-       const page = (await bridge.context.pages())[0] || await bridge.context.newPage();
+     // ctx.page is the caller's tab (args.tabId, default "main") and
+     // ctx.context its BrowserContext, which every session shares: never
+     // touch other pages. Tools that don't need a page set needsPage: false.
+     async handler(args, { page }) {
        // ... do the thing ...
-       return { content: [{ type: "text", text: JSON.stringify({ ok: true }) }] };
+       return { content: [{ type: "text", text: JSON.stringify({ ok: true, url: page.url() }) }] };
      },
    };
    ```
+
+   The full ctx contract is at the top of `src/own-tools/index.js`.
 
 2. **Register it.** Add the require to `src/own-tools/index.js`:
 
@@ -82,15 +77,10 @@ scripts/
      assert.strictEqual(typeof tool.handler, "function");
    });
 
-   test("my_tool returns isError when bridge missing", async () => {
-     const prev = globalThis.__relayBridge;
-     globalThis.__relayBridge = undefined;
-     try {
-       const result = await tool.handler({ someArg: "x" });
-       assert.strictEqual(result.isError, true);
-     } finally {
-       globalThis.__relayBridge = prev;
-     }
+   test("my_tool acts on ctx.page", async () => {
+     const page = { url: () => "https://example.com/" };
+     const result = await tool.handler({ someArg: "x" }, { page, context: { pages: () => [page] } });
+     assert.strictEqual(JSON.parse(result.content[0].text).url, "https://example.com/");
    });
    ```
 

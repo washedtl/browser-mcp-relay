@@ -18,7 +18,6 @@
 // URL/type filter runs before the cap, a nav timeout keeps listening, and
 // numeric arguments are range-checked against the schema.
 
-const { withActivePage } = require("./_active-page.js");
 const { errorResult, intArg, fitJson, outputPathArg, writeOutputFile } = require("./_tool-args.js");
 
 // Playwright's response.body() resolves only when the request FINISHES, so a
@@ -68,7 +67,7 @@ module.exports = {
       overwrite: { type: "boolean", default: false, description: "Allow replacing an existing outputPath." },
     },
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     // F0-9: null means "omitted" for every optional argument.
     const args = _args || {};
     const overwrite = !!args.overwrite;
@@ -284,5 +283,5 @@ module.exports = {
       content: [{ type: "text", text: JSON.stringify({ savedTo: written.path, fileBytes: written.bytes, ...summary, preview }) }],
       isError,
     };
-  }),
+  },
 };

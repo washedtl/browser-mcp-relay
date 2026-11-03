@@ -50,12 +50,23 @@
 //     addInitScript returns a Disposable (playwright-core 1.59.1 does).
 //   • audio jitter used to be re-added to the LIVE buffer on every
 //     getChannelData call (cumulative drift) with a per-page seed.
+//
+// W2D (2026-11-03): stealth_apply patches only the calling tab (ctx.page).
+// In broker mode one BrowserContext holds every session's tabs, so a
+// context-wide init script would patch other agents' pages too.
+// applyStealth(context) is the browser-wide form, for a broker-level option.
 
 const { CLIENT_HINTS_SOURCE } = require("./_client-hints.js");
 
-// WeakMap so contexts get garbage-collected normally — no leak when the
-// relay's BrowserContext closes.
-const APPLIED_CONTEXTS = new WeakMap();
+// Page | BrowserContext → { languages, initScript }. WeakMap so closed tabs
+// and contexts are garbage-collected normally.
+const APPLIED = new WeakMap();
+
+// W1D-2 → W2D: one audio seed per relay/broker process, i.e. per browser,
+// kept across force re-applies: every tab shows the same perturbation, like
+// one real device. In [5e-8, 1e-7): imperceptible, yet more than half a
+// float32 ulp for any sample in (-1, 1), so it never rounds away.
+const AUDIO_SEED = (1 + Math.random()) * 5e-8;
 
 // W1D-1: each apply gets a newer generation than any before it. Date-based so
 // a restarted relay still outranks an install an older relay process left in
@@ -69,11 +80,12 @@ function nextGeneration() {
 module.exports = {
   name: "stealth_apply",
   description:
-    "Inject anti-fingerprinting patches into every future page load in the " +
-    "active context, and best-effort into open pages: hides navigator.webdriver; " +
+    "Inject anti-fingerprinting patches into this tab: every future page load " +
+    "and, best-effort, its current document (other tabs and sessions are never " +
+    "touched; popups it opens are not patched): hides navigator.webdriver; " +
     "fakes plugins, languages, permission states and window.chrome; UA-matched " +
     "WebGL vendor; stable audio jitter; replaces navigator.userAgentData only " +
-    "when it contradicts the UA. Once per context; force=true re-applies with " +
+    "when it contradicts the UA. Once per tab; force=true re-applies with " +
     "new languages. Pair with emulate_device so Sec-CH-UA headers match. Won't " +
     "beat TLS fingerprinting, deep toString checks, isTrusted or behavioral detection.",
   inputSchema: {
@@ -88,11 +100,11 @@ module.exports = {
       force: {
         type: "boolean",
         default: false,
-        description: "If true, re-apply even if already applied to this context (changes the languages override). Default false: subsequent calls are no-ops.",
+        description: "If true, re-apply even if already applied to this tab (changes the languages override). Default false: subsequent calls are no-ops.",
       },
     },
   },
-  handler: async (_args = {}) => {
+  handler: async (_args = {}, { page }) => {
     // F0-9 (2026-05-10): treat null as missing (JSON-RPC clients commonly
     // send null for unset optionals; JS destructure defaults only fire on
     // undefined). Languages: must be a non-empty string-array.
@@ -100,13 +112,18 @@ module.exports = {
     if (!Array.isArray(languages) || languages.length === 0 || !languages.every((s) => typeof s === "string" && s.length > 0)) {
       languages = ["en-US", "en"];
     }
-    const force = !!_args.force;
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-
-    // T1-7: per-context applied-flag. Without `force`, calling stealth_apply
+    return module.exports.applyStealth(page, { languages, force: !!_args.force });
+  },
+  /**
+   * Patch `target`: a Page (stealth_apply: that tab only) or a BrowserContext
+   * (browser-wide: every page). Future loads via addInitScript; open
+   * documents via evaluate. Once per target unless force.
+   */
+  async applyStealth(target, { languages, force }) {
+    const scope = typeof target.pages === "function" ? "context" : "tab";
+    // T1-7: per-target applied-flag. Without `force`, calling stealth_apply
     // twice no-ops on the second call — preventing init-script accumulation.
-    const prior = APPLIED_CONTEXTS.get(bridge.context);
+    const prior = APPLIED.get(target);
     if (prior && !force) {
       return {
         content: [{
@@ -115,19 +132,15 @@ module.exports = {
             applied: false,
             alreadyApplied: true,
             languages: prior.languages,
-            note: "stealth_apply was already applied to this context. Pass force=true to re-apply with new languages.",
+            note: `stealth_apply was already applied to this ${scope}. Pass force=true to re-apply with new languages.`,
           }, null, 2),
         }],
       };
     }
-    // W1D-2: one audio seed per session (context), kept across force
-    // re-applies. In [5e-8, 1e-7): imperceptible, yet more than half a
-    // float32 ulp for any sample in (-1, 1), so it never rounds away.
-    const audioSeed = prior ? prior.audioSeed : (1 + Math.random()) * 5e-8;
-    // Claim the context synchronously so a concurrent first call no-ops
-    // instead of registering a second script with a second seed.
-    const entry = { languages, audioSeed, initScript: null };
-    APPLIED_CONTEXTS.set(bridge.context, entry);
+    // Claim the target synchronously so a concurrent first call no-ops
+    // instead of registering a second script.
+    const entry = { languages, initScript: null };
+    APPLIED.set(target, entry);
 
     // T0-4 → W1D-1: page-level sentinel inside the injected script. Patches
     // install once per document, so `navigator.permissions.query` (and the
@@ -137,7 +150,7 @@ module.exports = {
     const stealthScript = `
       (function() {
         var GEN = ${nextGeneration()};
-        var CFG = ${JSON.stringify({ languages, audioSeed })};
+        var CFG = ${JSON.stringify({ languages, audioSeed: AUDIO_SEED })};
         Object.freeze(CFG.languages);
         var installed = window.__relayStealthApplied;
         if (installed) {
@@ -467,12 +480,12 @@ module.exports = {
     `;
 
     try {
-      entry.initScript = await bridge.context.addInitScript(stealthScript);
+      entry.initScript = await target.addInitScript(stealthScript);
     } catch (e) {
-      // Un-claim so the caller can retry (e.g. after the context recovers).
-      if (APPLIED_CONTEXTS.get(bridge.context) === entry) {
-        if (prior) APPLIED_CONTEXTS.set(bridge.context, prior);
-        else APPLIED_CONTEXTS.delete(bridge.context);
+      // Un-claim so the caller can retry (e.g. after the page recovers).
+      if (APPLIED.get(target) === entry) {
+        if (prior) APPLIED.set(target, prior);
+        else APPLIED.delete(target);
       }
       throw e;
     }
@@ -484,8 +497,9 @@ module.exports = {
       try { await prior.initScript.dispose(); } catch { /* the newer generation still wins */ }
     }
 
-    // Also apply to currently-open pages (addInitScript only affects future loads).
-    const openPages = bridge.context.pages();
+    // Also patch open documents (addInitScript only affects future loads):
+    // the tab's own, or every page of a context.
+    const openPages = scope === "context" ? target.pages() : [target];
     let patchedOpenPages = 0;
     let skippedOpenPages = 0;
     for (const page of openPages) {
@@ -505,12 +519,10 @@ module.exports = {
           languages,
           patchedOpenPages,
           skippedOpenPages,
-          note: "Patches active for all future page loads in this context. " +
-                "Currently-open pages also patched (best-effort — see skippedOpenPages count).",
+          note: `Patches active for all future page loads in this ${scope}. ` +
+                "Open pages also patched (best-effort — see skippedOpenPages count).",
         }, null, 2),
       }],
     };
   },
-  // Test seam — exposed so unit tests can reset the WeakMap between runs.
-  _APPLIED_CONTEXTS: APPLIED_CONTEXTS,
 };
