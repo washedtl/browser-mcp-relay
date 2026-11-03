@@ -6,7 +6,9 @@
 // talks to it on stdio with native-messaging framing (framing.js):
 //
 //   extension → host  {t:"hello",v:1} · {t:"full",seq,cookies,last} · {t:"delta",seq,changes}
-//   host → extension  {t:"status",broker:"up"|"down"} (on every change, and in answer to hello)
+//   host → extension  {t:"status",broker:"up"|"down"[,reason:"elevated"]} (on every change, and in
+//                       answer to hello; reason: the pipe refused us with EPERM/EACCES, i.e. an
+//                       elevated broker's pipe, which a Chrome-started host can't open)
 //                     {t:"resync"} (after every authenticated broker (re)connect: the extension
 //                       sends cookies only then)
 //                     {t:"ack",seq,applied,rejected:[{domain,reason,count}][,rejectedTruncated]
@@ -34,6 +36,13 @@ const DEFAULT_POLL_MS = 5000;
 const AUTH_RETRY_MS = 30_000; // the pipe's owner refused us: not worth asking every 5 s
 const MAX_REJECTED = 500; // keeps an ack far under Chrome's 1 MB
 const LOG_ROTATE_BYTES = 1024 * 1024;
+// A broker started elevated (BROWSER_RELAY_BROKER_DEELEVATE=off, or de-elevation
+// failed) owns a pipe a normal-integrity process gets EPERM / EACCES on. The
+// pipe's access is left as it is: this only says why and what to do.
+const ELEVATED_CODES = new Set(["EPERM", "EACCES"]);
+const ELEVATED_HELP = "the broker is running elevated (as administrator), so the cookie bridge can't connect to it from Chrome. " +
+  "Run npm run broker:stop, then start your agent session again without BROWSER_RELAY_BROKER_DEELEVATE=off; " +
+  "if the broker still runs elevated, its broker.log says why de-elevation failed";
 
 class NativeHost {
   /**
@@ -93,10 +102,11 @@ class NativeHost {
     }
   }
 
-  _status(broker, force = false) {
-    if (!force && broker === this._lastStatus) return;
-    this._lastStatus = broker;
-    this._send({ t: "status", broker });
+  _status(broker, force = false, reason = null) {
+    const key = `${broker}|${reason || ""}`;
+    if (!force && key === this._lastStatus) return;
+    this._lastStatus = key;
+    this._send(reason ? { t: "status", broker, reason } : { t: "status", broker });
   }
 
   _schedule(ms) {
@@ -117,10 +127,11 @@ class NativeHost {
         this._lastFailure = code;
         const every = `retrying every ${Math.round(this._pollMs / 1000)} s`;
         if (code === "EAUTH") this._log(`the broker pipe refused the bridge: ${e.message}`);
+        else if (ELEVATED_CODES.has(code)) this._log(`${ELEVATED_HELP} (${code}); ${every}`);
         else if (code === "EBUSY") this._log(`another cookie bridge is already connected to the broker (one Chrome profile syncs at a time); ${every}`);
         else this._log(`no broker (${code}); ${every}`);
       }
-      this._status("down");
+      this._status("down", false, ELEVATED_CODES.has(code) ? "elevated" : null);
       this._schedule(code === "EAUTH" ? Math.max(AUTH_RETRY_MS, this._pollMs) : this._pollMs);
       return;
     }
@@ -146,7 +157,7 @@ class NativeHost {
   _onMessage(msg) {
     if (this._stopped || !msg || typeof msg !== "object") return;
     if (msg.t === "hello") {
-      this._status(this._bridge ? "up" : "down", true);
+      this._status(this._bridge ? "up" : "down", true, !this._bridge && ELEVATED_CODES.has(this._lastFailure) ? "elevated" : null);
     } else if (msg.t === "full") {
       this._forward(msg.seq, { ctl: "cookies.full", cookies: msg.cookies, last: msg.last !== false }, `full sync batch (${Array.isArray(msg.cookies) ? msg.cookies.length : 0} cookie(s))`);
     } else if (msg.t === "delta") {
@@ -217,4 +228,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) main();
 
-module.exports = { NativeHost, main };
+module.exports = { NativeHost, main, ELEVATED_HELP };

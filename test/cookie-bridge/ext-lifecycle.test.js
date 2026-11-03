@@ -288,3 +288,18 @@ test("stop() disconnects, cancels timers and ignores later events (used on revok
   await env.clock.advance(60_000);
   assert.strictEqual(env.ports.length, 1);
 });
+
+test("V2-2: the host's status reason 'elevated' lands in status.error ('broker elevated'); a later 'up' clears it", async () => {
+  const env = makeEnv({ cookies: [cookie(".amazon.com")], storage: APPROVED });
+  await connected(env);
+  env.port.emit({ t: "status", broker: "down", reason: "elevated" });
+  await env.clock.advance(10);
+  assert.deepStrictEqual([env.store.data.status.broker, env.store.data.status.error], ["down", "broker elevated"]);
+  env.port.emit({ t: "status", broker: "down", reason: "something else" });
+  await env.clock.advance(10);
+  assert.strictEqual(env.store.data.status.error, null, "only the known reason is shown");
+  env.port.emit({ t: "status", broker: "down", reason: "elevated" });
+  env.port.emit({ t: "status", broker: "up" });
+  await env.clock.advance(10);
+  assert.deepStrictEqual([env.store.data.status.broker, env.store.data.status.error], ["up", null]);
+});

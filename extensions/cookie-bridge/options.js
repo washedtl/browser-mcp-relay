@@ -47,6 +47,7 @@ export function hostHint(error) {
   if (/not found/i.test(e)) return "Native host not installed: run `npm run bridge:install`, then reload this extension.";
   if (/forbidden/i.test(e)) return "The native host doesn't allow this extension: re-run `npm run bridge:install` (it registers this extension's ID).";
   if (/policy/i.test(e)) return "policy.js failed to load, so nothing will sync. Reload the extension; if it persists, check `extensions/cookie-bridge/policy.js`.";
+  if (/broker elevated/i.test(e)) return "The broker is running elevated (as administrator), so the bridge can't connect to it from Chrome. Run `npm run broker:stop`, then start your agent session again without `BROWSER_RELAY_BROKER_DEELEVATE=off`. If it still runs elevated, its `broker.log` says why de-elevation failed.";
   return e;
 }
 
@@ -61,7 +62,7 @@ export function statusView(settings, status) {
     if (st.broker === "up") return { dot: "up", broker: "broker up", host, hint: "" };
     if (st.broker === "down") {
       return { dot: "down", broker: "broker down", host,
-        hint: "The broker isn't running. It starts with an agent's browser session; the host resyncs then." };
+        hint: st.error ? hostHint(st.error) : "The broker isn't running. It starts with an agent's browser session; the host resyncs then." };
     }
     return { dot: "", broker: "broker unknown", host, hint: "" };
   }

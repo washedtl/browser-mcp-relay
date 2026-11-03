@@ -157,3 +157,12 @@ test("options.html provides every mount point the script renders into", () => {
   assert.match(html, /id="host-line"[^>]*aria-live="polite"|aria-live="polite"[^>]*id="host-line"/);
   assert.ok(!/id="status"[^>]*aria-live/.test(html), "the stats strip is not a live region (it would re-announce counts)");
 });
+
+test("V2-2: an elevated broker (status reason) shows its fix on the review page", async (t) => {
+  const { mod } = await loadOptions(t);
+  const hint = mod.statusView({ approved: true }, { host: "connected", broker: "down", error: "broker elevated" }).hint;
+  assert.match(hint, /running elevated/);
+  assert.match(hint, /npm run broker:stop/);
+  assert.match(hint, /BROWSER_RELAY_BROKER_DEELEVATE=off/);
+  assert.match(mod.statusView({ approved: true }, { host: "connected", broker: "down" }).hint, /isn't running/, "a plain down broker keeps its hint");
+});

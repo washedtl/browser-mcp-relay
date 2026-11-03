@@ -410,7 +410,8 @@
       if (msg.t === "status" || msg.t === "resync") clearRetryAlarm(); // the host is alive
       switch (msg.t) {
         case "status":
-          setStatus({ host: "connected", broker: msg.broker === "up" ? "up" : "down", error: null });
+          // reason "elevated": the broker runs as administrator; its pipe refuses this host
+          setStatus({ host: "connected", broker: msg.broker === "up" ? "up" : "down", error: msg.broker !== "up" && msg.reason === "elevated" ? "broker elevated" : null });
           break;
         case "resync":
           if (status.host !== "connected") setStatus({ host: "connected", error: null });

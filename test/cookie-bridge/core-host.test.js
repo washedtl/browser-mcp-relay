@@ -321,3 +321,29 @@ test("host source: no TCP listener anywhere in the host's code path", () => {
     assert.ok(!/createServer|\.listen\(|require\("node:(?:http|https|dgram)"\)/.test(src), `${f} opens a server`);
   }
 });
+
+test("host (V2-2): an elevated broker's pipe (EPERM / EACCES) gets its own log line and status reason; it clears once the broker is reachable", async (t) => {
+  for (const code of ["EPERM", "EACCES"]) {
+    const b = fakeBroker();
+    let refuse = true;
+    const inner = b.connectBroker;
+    const connectBroker = async () => {
+      if (refuse) { b.state.attempts++; throw Object.assign(new Error(`connect ${code} (test pipe)`), { code }); }
+      b.state.up = true;
+      return inner();
+    };
+    const { chrome, logs } = startHost(t, { ...b, connectBroker });
+    await until(() => ofType(chrome.got, "status").length >= 1, 2000, "a status");
+    assert.deepStrictEqual(ofType(chrome.got, "status")[0], { t: "status", broker: "down", reason: "elevated" }, code);
+    await until(() => b.state.attempts >= 3, 2000, "a few retries");
+    assert.strictEqual(logs.filter((l) => l.includes("the broker is running elevated")).length, 1, "logged once, not every poll");
+    assert.ok(logs.some((l) => l.includes("npm run broker:stop") && l.includes(code)), logs.join("\n"));
+    // hello while still refused: answered with the reason too
+    chrome.send({ t: "hello", v: 1 });
+    await until(() => ofType(chrome.got, "status").length >= 2, 2000, "the hello answer");
+    assert.deepStrictEqual(ofType(chrome.got, "status").at(-1), { t: "status", broker: "down", reason: "elevated" });
+    refuse = false;
+    await until(() => ofType(chrome.got, "status").some((m) => m.broker === "up"), 2000, "up");
+    assert.deepStrictEqual(ofType(chrome.got, "status").at(-1), { t: "status", broker: "up" });
+  }
+});
