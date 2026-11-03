@@ -7,7 +7,7 @@
 // needsBrave:false — never creates a tab or launches the browser.
 
 const { errorResult } = require("./_tool-args.js");
-const { pickTab, safeUrl } = require("./_tabs.js");
+const { pickTab, legacyNote, safeUrl } = require("./_tabs.js");
 
 module.exports = {
   name: "tabs_select",
@@ -23,6 +23,9 @@ module.exports = {
   handler: async (args, ctx) => {
     const { tab, error } = await pickTab("tabs_select", args, ctx);
     if (error) return errorResult(error);
+    if (!tab.page) {
+      return errorResult(`tabs_select: tab "${tab.tabKey}" has no page right now (still opening, or its browser restarted); retry or call tabs_list`);
+    }
     try {
       await tab.page.bringToFront();
     } catch (e) {
@@ -34,6 +37,7 @@ module.exports = {
         selected: tab.tabKey,
         url: safeUrl(tab.page),
         note: `Brought to the front. To act on it, pass tabId "${tab.tabKey}" on each call.`,
+        legacyMode: legacyNote(ctx.registry),
       }, null, 2) }],
     };
   },

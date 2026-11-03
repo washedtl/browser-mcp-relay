@@ -52,11 +52,12 @@
 //     getChannelData call (cumulative drift) with a per-page seed.
 //
 // W2D (2026-11-03): stealth_apply patches the calling session, never another
-// one. Broker mode: one BrowserContext holds every session's tabs, so each of
-// the calling connection's tabs is patched (scope "tab"). Legacy mode: the
-// whole BrowserContext is this session's (registry.sessionContext), so it is
-// patched (scope "context"), which also covers the page upstream opens
-// after the call (the usual "stealth, then navigate" order).
+// one, so it takes no tabId (needsPage:false). Broker mode (per-connection
+// registry): one BrowserContext holds every session's tabs, so each of the
+// connection's tabs is patched (scope "tab"). Legacy mode (registry.scope
+// "context"): the whole registry.context is this session's, so it is patched
+// (scope "context"), which also covers the page upstream opens after the
+// call (the usual "stealth, then navigate" order).
 
 const { CLIENT_HINTS_SOURCE } = require("./_client-hints.js");
 
@@ -493,7 +494,7 @@ module.exports = {
       },
     },
   },
-  // Routed (not needsPage:false) so the caller's tab exists before patching.
+  needsPage: false,
   handler: async (_args = {}, { registry, connId }) => {
     // F0-9 (2026-05-10): treat null as missing (JSON-RPC clients commonly
     // send null for unset optionals; JS destructure defaults only fire on
@@ -503,10 +504,16 @@ module.exports = {
       languages = ["en-US", "en"];
     }
     const opts = { languages, force: !!_args.force };
-    const whole = registry.sessionContext;
-    const targets = whole
-      ? [{ tabKey: "all tabs", target: whole, scope: "context" }]
-      : (await registry.listTabs(connId)).filter((t) => t.page).map((t) => ({ tabKey: t.tabKey, target: t.page, scope: "tab" }));
+    const whole = registry.scope === "context";
+    let targets;
+    if (whole) {
+      targets = [{ tabKey: "all tabs", target: registry.context, scope: "context" }];
+    } else {
+      let tabs = (await registry.listTabs(connId)).filter((t) => t.page);
+      // A connection with no tab yet: open its main tab, as any page tool would.
+      if (!tabs.length) tabs = [{ tabKey: "main", page: (await registry.getCtx(connId, "main")).page }];
+      targets = tabs.map((t) => ({ tabKey: t.tabKey, target: t.page, scope: "tab" }));
+    }
     const results = await Promise.all(targets.map(async (t) => ({ tabKey: t.tabKey, ...(await applyStealth(t.target, t.scope, opts)) })));
     const applied = results.filter((r) => r.applied).map((r) => r.tabKey);
     const alreadyApplied = results.filter((r) => !r.applied).map((r) => r.tabKey);

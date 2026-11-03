@@ -1,7 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-select.js");
-const { fakeRegistry } = require("../fixtures/fake-registry.js");
+const { fakePage, fakeContext, fakeRegistry } = require("../fixtures/fake-registry.js");
+const { LegacyTabs } = require("../../src/own-tools/_legacy-context.js");
 
 const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
 
@@ -54,6 +55,21 @@ test("W2D: tabs_select rejects an unknown tabId, another connection's, or none",
 test("W2D: with no browser running (no registry) every tabId is unknown", async () => {
   const r = await tool.handler({ tabId: "t1" }, {});
   assert.match(r.content[0].text, /^tabs_select: unknown tabId "t1"/);
+});
+
+test("W2D: tabs_select says so in legacy mode, where only relay tools take tabId (broker: no note)", async () => {
+  const legacy = new LegacyTabs(fakeContext([fakePage("https://up/")]));
+  const r = JSON.parse((await run({ tabId: "main" }, legacy, "legacy")).content[0].text);
+  assert.match(r.legacyMode, /upstream navigation_\/content_\/a11y_\/interaction_ tools act on main/);
+  assert.ok(!("legacyMode" in JSON.parse((await run({ tabId: "t1" }, await twoTabs())).content[0].text)));
+});
+
+// V2-6: a listed tab can have no page (being created, or its browser restarted).
+test("W2D: tabs_select on a tab without a page is an isError", async () => {
+  const registry = { listTabs: async () => [{ tabKey: "t1", page: null }] };
+  const r = await run({ tabId: "t1" }, registry);
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /^tabs_select: tab "t1" has no page right now/);
 });
 
 test("tabs_select: a bringToFront failure does not fail the call (it's cosmetic)", async () => {

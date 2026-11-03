@@ -149,9 +149,16 @@ function makeContext({ pages = [], disposable = true } = {}) {
   return { ...initScriptRecorder(disposable), pages: () => pages };
 }
 
-/** Broker-style registry: connId → [tab pages]; listTabs → [{ tabKey, page }]. */
+/** Broker-style (per-connection) registry: connId → [tab pages]; getCtx opens main. */
 function tabsRegistry(byConn) {
-  return { listTabs: async (connId) => (byConn[connId] || []).map((page, i) => ({ tabKey: i ? `t${i}` : "main", page })) };
+  return {
+    listTabs: async (connId) => (byConn[connId] || []).map((page, i) => ({ tabKey: i ? `t${i}` : "main", page })),
+    getCtx: async (connId, tabKey) => {
+      assert.strictEqual(tabKey, "main");
+      byConn[connId] = [makePage()];
+      return { page: byConn[connId][0] };
+    },
+  };
 }
 
 /** Run a page "load": every still-registered init script, in registration order. */
@@ -180,6 +187,8 @@ test("stealth_apply has required tool shape", () => {
   assert.strictEqual(typeof tool.description, "string");
   assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
+  // V2-3: it patches the whole session, so it takes no tabId.
+  assert.strictEqual(tool.needsPage, false);
 });
 
 test("stealth_apply description stays compact (model-visible catalog weight)", () => {
@@ -191,7 +200,7 @@ test("stealth_apply description stays compact (model-visible catalog weight)", (
 
 // W2D: stealth patches the calling session only. Broker: each of the
 // connection's tabs (the shared context holds other sessions' tabs).
-// Legacy: the session's whole BrowserContext (registry.sessionContext).
+// Legacy: the session's whole BrowserContext (registry.scope "context").
 test("W2D: stealth_apply patches every tab of the calling connection — never another connection's tab or the shared context", async () => {
   const docs = [makeDoc(), makeDoc()];
   const [main, t1] = docs.map((doc) => makePage({ doc }));
@@ -210,6 +219,13 @@ test("W2D: stealth_apply patches every tab of the calling connection — never a
   assert.deepStrictEqual(plain(otherDoc.get("navigator.languages")), ["en-US"], "another session's document is untouched");
 });
 
+test("W2D: a connection with no tab yet gets its main tab opened and patched", async () => {
+  const byConn = {};
+  const body = JSON.parse((await tool.handler({}, { registry: tabsRegistry(byConn), connId: "c1" })).content[0].text);
+  assert.deepStrictEqual(body.applied, ["main"]);
+  assert.strictEqual(byConn.c1[0].scripts.length, 1);
+});
+
 test("W2D: a tab opened after stealth_apply is patched by the next call; patched tabs report alreadyApplied", async () => {
   const tabs = [makePage()];
   const ctx = { registry: tabsRegistry({ c1: tabs }), connId: "c1" };
@@ -226,7 +242,7 @@ test("W2D: a tab opened after stealth_apply is patched by the next call; patched
 test("W2D legacy: the session's whole BrowserContext is patched, covering pages opened later", async () => {
   const openDoc = makeDoc();
   const context = makeContext({ pages: [makePage({ doc: openDoc })] });
-  const registry = { sessionContext: context, listTabs: async () => { throw new Error("not used in legacy"); } };
+  const registry = { scope: "context", context, listTabs: async () => { throw new Error("not used in legacy"); } };
   const body = JSON.parse((await tool.handler({ languages: ["de-DE"] }, { registry, connId: "legacy" })).content[0].text);
   assert.deepStrictEqual(body.applied, ["all tabs"]);
   assert.strictEqual(body.patchedOpenPages, 1);

@@ -387,6 +387,19 @@ test("W2D: legacy forwarded calls with a tabId are rejected before Brave or upst
   assert.notStrictEqual(ok.isError, true);
 });
 
+// V2-5: tabId "main" is what upstream acts on anyway: strip it, forward the call.
+test("W2D: legacy forwarded calls with tabId \"main\" are forwarded without the tabId", async () => {
+  const sent = [];
+  const relay = new RelayServer({
+    getUpstream: async () => ({ request: async (m, p) => { sent.push(p); return { content: [{ type: "text", text: "ok" }] }; } }),
+    ensureBrave: async () => fakeBridge(),
+    env: {},
+  });
+  const r = await relay.handleToolsCall({ name: "navigation_go-to", arguments: { url: "https://x/", tabId: "main" } });
+  assert.notStrictEqual(r.isError, true);
+  assert.deepStrictEqual(sent, [{ name: "navigation_go-to", arguments: { url: "https://x/" } }]);
+});
+
 // ─── W10: trafficEmitter tests ─────────────────────────────────────────
 
 test("RelayServer exposes a trafficEmitter by default", () => {

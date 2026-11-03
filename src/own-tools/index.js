@@ -10,11 +10,18 @@
 //     tabs), its BrowserContext and "<connId>:<tabKey>". Broker mode: the
 //     page upstream's tools use for that tab. Legacy mode: LegacyTabs.
 //   • registry / connId — the caller's tabs: getCtx(connId, tabKey) →
-//     { page, browserContext }, listTabs(connId) → [{ tabKey, page }] (never
-//     creates anything), closeTab(connId, tabKey). Another connection's tabs
-//     are never reachable.
+//     { page, browserContext } with an OPEN page (broker: upstream's session
+//     context after ensureSessionPageOpen, which re-creates a closed page),
+//     listTabs(connId) → [{ tabKey, page|null }] (never creates anything),
+//     closeTab(connId, tabKey). Another connection's tabs are never reachable.
+//     registry.scope: "context" (legacy: the caller's session owns the whole
+//     registry.context — stealth_apply patches it, tabs_new/tabs_select say
+//     upstream tools ignore tabId); otherwise per-connection (broker: the
+//     BrowserContext is shared, so only the connection's own tabs are touched).
 //   • cdpUrl — the browser's http:// CDP endpoint (lighthouse_audit).
-//   • relay — the RelayServer (toolsets).
+//   • relay — an object toolsets can drive: upstreamCatalog(),
+//     enabledToolsets (Set), setToolsetsEnabled(sets, on), askUser(params),
+//     canNotify (the RelayServer has all of these).
 // needsPage:false — the handler doesn't read ctx.page: no tab is routed or
 //   opened (ctx keeps context / registry / connId / cdpUrl / relay; context
 //   then comes from the provider).

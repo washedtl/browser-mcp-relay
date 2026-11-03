@@ -12,6 +12,7 @@
 // accepted for SPA-heavy sites.
 
 const { errorResult } = require("./_tool-args.js");
+const { legacyNote } = require("./_tabs.js");
 
 const WAIT_UNTIL = ["load", "domcontentloaded", "networkidle", "commit"];
 
@@ -79,6 +80,7 @@ module.exports = {
           waitUntil,
           navError,
           note: "Pass this tabId to act on this tab; calls without tabId act on your main tab.",
+          legacyMode: legacyNote(registry),
         }, null, 2),
       }],
     };

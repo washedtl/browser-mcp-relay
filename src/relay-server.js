@@ -329,7 +329,7 @@ class RelayServer {
             isError: true,
           };
         }
-      } else if (callArgs.tabId != null) {
+      } else if (callArgs.tabId != null && callArgs.tabId !== "main") {
         // Upstream runs in its own process here and its schemas drop tabId,
         // so the call would silently act on the main tab.
         response = {
@@ -340,7 +340,13 @@ class RelayServer {
         // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
         if (this.ensureBrave) await this.ensureBrave();
         const upstream = await this.getUpstream();
-        response = await upstream.request("tools/call", { name, arguments: args });
+        // tabId "main" is where upstream acts anyway; don't pass it on.
+        let forwardArgs = args;
+        if (callArgs.tabId != null) {
+          forwardArgs = { ...callArgs };
+          delete forwardArgs.tabId;
+        }
+        response = await upstream.request("tools/call", { name, arguments: forwardArgs });
       }
     } catch (e) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.

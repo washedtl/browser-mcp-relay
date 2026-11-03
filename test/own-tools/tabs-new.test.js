@@ -1,7 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-new.js");
-const { fakeRegistry } = require("../fixtures/fake-registry.js");
+const { fakePage, fakeContext, fakeRegistry } = require("../fixtures/fake-registry.js");
+const { LegacyTabs } = require("../../src/own-tools/_legacy-context.js");
 
 const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
 const body = (r) => JSON.parse(r.content[0].text);
@@ -32,6 +33,13 @@ test("W2D: tabs_new loads the URL exactly once, in a new registry tab, and retur
   assert.strictEqual(b.navError, null);
   assert.ok(!("upstreamPropagated" in b) && !("index" in b), "no propagation / index fields");
   assert.match(b.note, /tabId/);
+});
+
+// V1-1: in legacy mode upstream tools can't take tabId, so say so.
+test("W2D: tabs_new says so in legacy mode, where only relay tools take tabId (broker: no note)", async () => {
+  const legacy = body(await run({}, new LegacyTabs(fakeContext([fakePage("https://up/")])), "legacy"));
+  assert.match(legacy.legacyMode, /only relay tools take tabId; upstream navigation_\/content_\/a11y_\/interaction_ tools act on main/);
+  assert.ok(!("legacyMode" in body(await run({}, fakeRegistry()))));
 });
 
 test("W2D: each tabs_new gets its own fresh tabId and page", async () => {

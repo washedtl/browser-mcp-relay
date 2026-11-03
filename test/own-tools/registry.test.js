@@ -15,7 +15,7 @@ test("W2D: browser_show is registered", () => {
 
 test("W2D: every page-routed own-tool advertises an optional string tabId", () => {
   const names = tools.filter(routed).map((t) => t.name);
-  assert.ok(names.includes("capture_xhr") && names.includes("browser_show") && names.includes("stealth_apply"));
+  assert.ok(names.includes("capture_xhr") && names.includes("browser_show"));
   for (const t of tools.filter(routed)) {
     assert.strictEqual(t.inputSchema.properties.tabId.type, "string", t.name);
     assert.match(t.inputSchema.properties.tabId.description, /tabs_new/, t.name);
@@ -26,7 +26,7 @@ test("W2D: every page-routed own-tool advertises an optional string tabId", () =
 });
 
 test("W2D: page-less tools don't get the routing tabId (tabs_select / tabs_close keep their own selector)", () => {
-  for (const name of ["toolsets", "tabs_new", "tabs_list", "cookies_export", "cookies_import", "lighthouse_audit"]) {
+  for (const name of ["toolsets", "tabs_new", "tabs_list", "cookies_export", "cookies_import", "lighthouse_audit", "stealth_apply"]) {
     assert.ok(!("tabId" in byName[name].inputSchema.properties), name);
   }
   for (const name of ["tabs_select", "tabs_close"]) {

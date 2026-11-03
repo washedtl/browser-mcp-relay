@@ -56,7 +56,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 | `tabs_close` | Close one of your tabs | `tabId` | Tear down workflow tabs |
 | `browser_show` | Bring your window on-screen and to the front (restores a minimized window, moves an off-screen one into view) | `tabId` | Let the user log in or pass 2FA by hand |
 
-Tools that act on a page take an optional `tabId` (from `tabs_new`); without it they act on your main tab. Only `tabs_new` opens tabs: an unknown `tabId` is an error. Tabs belong to one MCP connection: another session's tabs are never listed, selected or closed, and `tabs_list` / `tabs_select` / `tabs_close` never open a tab or launch the browser. In legacy (per-session pool) mode only the relay's own tools take `tabId`; a forwarded upstream tool called with one returns an error (it would act on your main tab).
+Tools that act on a page take an optional `tabId` (from `tabs_new`); without it they act on your main tab. Only `tabs_new` opens tabs: an unknown `tabId` is an error. Tabs belong to one MCP connection: another session's tabs are never listed, selected or closed, and `tabs_list` / `tabs_select` / `tabs_close` never open a tab or launch the browser. In legacy (per-session pool) mode only the relay's own tools take `tabId` (the `tabs_new` / `tabs_select` results say so); a forwarded upstream tool called with a `tabId` other than `"main"` returns an error (it would act on your main tab). Popups never become your main tab.
 
 #### 📤 Forms, dialogs, files
 

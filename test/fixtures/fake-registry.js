@@ -14,6 +14,7 @@ function fakePage(url = "about:blank", props = {}) {
     titleText: "",
     failGoto: null, // set to an error message to make goto reject
     url: () => url,
+    opener: async () => null, // a popup's opener page (Playwright: async)
     title: async () => page.titleText,
     isClosed: () => page.closed,
     goto: async (u, opts) => {

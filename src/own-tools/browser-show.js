@@ -9,12 +9,14 @@
 //
 // TODO(W2E): route the restore / on-screen move through W2B's
 // src/broker/window-pages.js (ensureNotMinimized, placement bounds) instead
-// of this page-session + in-page screen.avail* math; the page.evaluate
-// below also has no timeout of its own.
+// of this page-session + in-page screen.avail* math.
 
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
 
 const ONSCREEN_MARGIN = 40;
+// Reading the display runs page JS, which an open alert() blocks: give up
+// after this and leave the window where it is.
+const DISPLAY_READ_TIMEOUT_MS = 2000;
 
 /** Do two screen rectangles overlap? */
 function overlaps(a, b) {
@@ -43,10 +45,14 @@ module.exports = {
     let movedOnScreen = false;
     if (bounds.windowState === "normal") {
       // The display the window is on; for a window off every display,
-      // Chromium reports the nearest one. Unreadable (no JS) → leave it.
-      const display = await page.evaluate(() => ({
-        left: screen.availLeft, top: screen.availTop, width: screen.availWidth, height: screen.availHeight,
-      })).catch(() => null);
+      // Chromium reports the nearest one. Unreadable (no JS, or blocked) → leave it.
+      let timer;
+      const display = await Promise.race([
+        page.evaluate(() => ({
+          left: screen.availLeft, top: screen.availTop, width: screen.availWidth, height: screen.availHeight,
+        })).catch(() => null),
+        new Promise((resolve) => { timer = setTimeout(resolve, DISPLAY_READ_TIMEOUT_MS, null); }),
+      ]).finally(() => clearTimeout(timer));
       if (display && !overlaps(bounds, display)) {
         await cdp.send("Browser.setWindowBounds", {
           windowId,

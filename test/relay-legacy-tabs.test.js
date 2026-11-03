@@ -45,6 +45,7 @@ test("W2D legacy: tabs_new → tabId → own-tool on that tab → tabs_list → 
 
   const opened = await call("tabs_new", { url: "https://a.example/" });
   assert.match(opened.tabId, /^t\d+$/);
+  assert.match(opened.legacyMode, /only relay tools take tabId/, "V1-1: legacy mode is called out");
   const tab = context.pages().at(-1);
   assert.deepStrictEqual(tab.gotos.map((g) => g.url), ["https://a.example/"], "loaded once, in the new tab");
   assert.deepStrictEqual(upstreamPage.gotos, [], "upstream's page is not navigated");

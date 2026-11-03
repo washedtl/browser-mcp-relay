@@ -8,7 +8,7 @@ const PRIMARY = { left: 0, top: 0, width: 1920, height: 1040 };
 
 // A page whose window starts with `bounds` (states: minimized → normal on
 // restore) on a display reported by window.screen.
-function makeWindow({ bounds, display = PRIMARY, evaluateFails = false }) {
+function makeWindow({ bounds, display = PRIMARY, evaluateFails = false, evaluateHangs = false }) {
   const sent = [];
   let current = { ...bounds };
   const cdp = {
@@ -28,7 +28,11 @@ function makeWindow({ bounds, display = PRIMARY, evaluateFails = false }) {
     url: () => "https://login.example/",
     once() {},
     bringToFront: async () => { page.fronted++; },
-    evaluate: async () => { if (evaluateFails) throw new Error("no JS here"); return display; },
+    evaluate: async () => {
+      if (evaluateHangs) return new Promise(() => {}); // e.g. an open alert()
+      if (evaluateFails) throw new Error("no JS here");
+      return display;
+    },
   };
   const attached = [];
   const context = { newCDPSession: async (p) => { attached.push(p); return cdp; } };
@@ -89,6 +93,16 @@ test("W2D: when the display can't be read (no JS on the page), the window is not
   const w = makeWindow({ bounds: { ...VISIBLE, left: -10000 }, evaluateFails: true });
   const b = await show(w);
   assert.deepStrictEqual(setBounds(w), []);
+  assert.strictEqual(b.movedOnScreen, false);
+  assert.strictEqual(w.page.fronted, 1);
+});
+
+// V2-4: an open alert() blocks page JS; the window must still come forward.
+test("W2D: a page whose JS is blocked doesn't stall browser_show (display read times out)", async () => {
+  const w = makeWindow({ bounds: { ...VISIBLE, left: -10000 }, evaluateHangs: true });
+  const started = Date.now();
+  const b = await show(w);
+  assert.ok(Date.now() - started < 4000);
   assert.strictEqual(b.movedOnScreen, false);
   assert.strictEqual(w.page.fronted, 1);
 });
