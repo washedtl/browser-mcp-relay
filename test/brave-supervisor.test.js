@@ -212,10 +212,11 @@ test("resolveProxyServer: credentials in the URL are warned about (--proxy-serve
 });
 
 test("resolveProxyServer: unusable URL → null + warning", async () => {
-  for (const bad of ["ftp://127.0.0.1:21", "http://", "::::"]) {
+  for (const bad of ["ftp://127.0.0.1:21", "http://", "::::", "ftp://user:secret@127.0.0.1:21", "htp://user:secret@h:1"]) {
     const log = collectLog();
     assert.strictEqual(await resolveProxyServer(bad, { log }), null, bad);
     assert.ok(log.lines.length > 0, `no warning for ${bad}`);
+    assert.ok(!log.lines.some((l) => l.includes("secret")), `password logged for ${bad}: ${log.lines}`);
   }
 });
 
@@ -451,7 +452,7 @@ test("crash: the port taken while Brave was down → ensure() fails loudly, neve
   process.kill(first.pid);
   await down;
   await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const thief = net.createServer();
+  const thief = net.createServer((sock) => sock.destroy()); // never leave a client hanging (close() waits for open sockets)
   await listen(thief, port);
   const fatals = [];
   sup.on("fatal", (reason) => fatals.push(reason));
@@ -476,7 +477,7 @@ test("'fatal': a throwing listener is logged, ensure() still rejects with the po
   process.kill(first.pid);
   await down;
   await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const thief = net.createServer();
+  const thief = net.createServer((sock) => sock.destroy()); // never leave a client hanging (close() waits for open sockets)
   await listen(thief, Number(new URL(first.cdpUrl).port));
   sup.on("fatal", () => { throw new Error("fatal listener bug"); });
   try {
@@ -496,7 +497,7 @@ test("crash: relaunch waits for the port to free (up to portFreeWaitMs) instead 
   process.kill(first.pid);
   await down;
   await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
-  const holder = net.createServer();
+  const holder = net.createServer((sock) => sock.destroy());
   await listen(holder, Number(new URL(first.cdpUrl).port));
   setTimeout(() => holder.close(), 500);
   const second = await sup.ensure();
@@ -507,12 +508,53 @@ test("a 'down' listener that throws does not break close or relaunch", async () 
   const dir = tmpProfile("fake-bad-listener");
   const { sup, log } = fakeSupervisor(dir);
   sup.on("down", () => { throw new Error("listener bug"); });
+  const later = [];
+  sup.on("down", (r) => later.push(r)); // e.g. SessionRegistry.invalidateAll, registered after a buggy one
   const first = await sup.ensure();
   const res = await sup.closeGracefully();
   assert.strictEqual(res.graceful, true);
+  assert.deepStrictEqual(later, ["closed"], "a throwing listener must not starve the ones after it");
   const second = await sup.ensure();
   assert.notStrictEqual(second.pid, first.pid);
   assert.ok(log.lines.some((l) => l.includes("listener bug")), log.lines.join("\n"));
+});
+
+test("an auto port is only pinned once a launch came up: failed launches may move it, no 'fatal'", async () => {
+  const dir = tmpProfile("fake-autopin");
+  const { sup } = fakeSupervisor(dir, { mode: "exit-early", portFreeWaitMs: 200 });
+  sup.on("fatal", () => assert.fail("nobody can have pinned a port that never served a Brave"));
+  await assert.rejects(sup.ensure(), /exited during launch/);
+  const usedPort = Number(launchesOf(dir)[0].args.find((a) => a.startsWith("--remote-debugging-port=")).split("=")[1]);
+  const holder = net.createServer((sock) => sock.destroy());
+  await listen(holder, usedPort);
+  try {
+    await assert.rejects(sup.ensure(), /exited during launch/, "should have re-picked a free port and launched");
+    assert.strictEqual(launchesOf(dir).length, 2);
+  } finally {
+    holder.close();
+  }
+});
+
+test("relaunch: the port is (re)checked right before spawn, so a port taken mid-launch fails loudly", async () => {
+  // The proxy probe (non-routable address) holds the launch for ~800 ms between
+  // the start of ensure() and the spawn; the port is stolen inside that window.
+  const dir = tmpProfile("fake-toctou");
+  const { sup } = fakeSupervisor(dir, { proxyUrl: "http://10.255.255.1:8888", proxyProbeTimeoutMs: 800, portFreeWaitMs: 200, launchTimeoutMs: 2000 });
+  const first = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  process.kill(first.pid);
+  await down;
+  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
+  const relaunch = sup.ensure();
+  await sleep(200);
+  const thief = net.createServer((sock) => sock.destroy()); // never leave a client hanging (close() waits for open sockets)
+  await listen(thief, Number(new URL(first.cdpUrl).port));
+  try {
+    await assert.rejects(relaunch, /not switch/);
+    assert.strictEqual(launchesOf(dir).length, 1, "must not spawn onto the stolen port");
+  } finally {
+    await new Promise((r) => thief.close(r));
+  }
 });
 
 test("isUp() is false as soon as the PID is gone, even before any event arrives", async () => {
@@ -778,6 +820,27 @@ test("real Brave: graceful close keeps a cookie set 2 s before close (spike E7a)
   const { cookies } = await cdp2.send("Storage.getCookies");
   await cdp2.close();
   assert.ok(cookies.some((c) => c.name === "w2c_e7a" && c.value === "graceful-2s"), `cookie lost; have: ${cookies.map((c) => c.name)}`);
+});
+
+test("real Brave: after a root-only hard kill, the immediate relaunch still reads the persisted cookies", REAL, async () => {
+  // Kill is root-only; the old network-service child may outlive the root by
+  // up to ~300 ms while the relaunch opens Default/Network/Cookies.
+  const dir = tmpProfile("real-kill-cookies");
+  const { sup } = realSupervisor(dir);
+  const cdp = await openCdp((await sup.ensure()).cdpUrl);
+  await cdp.send("Storage.setCookies", {
+    cookies: [{ name: "w2c_kill", value: "persisted", domain: "bmr-w2c.example", path: "/", expires: Math.floor(Date.now() / 1000) + 86400 }],
+  });
+  await cdp.close();
+  assert.strictEqual((await sup.closeGracefully()).graceful, true); // now on disk
+  const second = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  hardKill(second.pid);
+  await down;
+  const cdp2 = await openCdp((await sup.ensure()).cdpUrl);
+  const { cookies } = await cdp2.send("Storage.getCookies");
+  await cdp2.close();
+  assert.ok(cookies.some((c) => c.name === "w2c_kill" && c.value === "persisted"), `cookie store unreadable after relaunch; have: ${cookies.map((c) => c.name)}`);
 });
 
 test("real Brave: --load-extension loads an unpacked MV3 extension", REAL, async () => {

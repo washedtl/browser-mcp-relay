@@ -24,13 +24,14 @@ const KILL_WAIT_MS = 5000;
  *   closeGracefully() → Browser.close over CDP, kill fallback after closeTimeoutMs
  *   isUp()            → launched, CDP connected, PID alive
  *   'down' (reason)   → once per launch that came up: "closed" | "cdp disconnected" | "exited (code=N)"
- *   'fatal' (reason)  → a relaunch cannot get back the CDP port its Brave
- *                       already used (still taken after portFreeWaitMs). The
- *                       port is fixed for the supervisor's life, so it never
- *                       recovers on its own: the broker should exit so the
- *                       shims start a fresh broker on a new port. ensure()
- *                       rejects as well. A caller-chosen port taken at the
- *                       FIRST launch only rejects.
+ *   'fatal' (reason)  → a relaunch cannot get back the CDP port a Brave of
+ *                       ours already served cdpUrl on (still taken after
+ *                       portFreeWaitMs); ensure() rejects as well. The port
+ *                       is fixed for the supervisor's life, so a later
+ *                       ensure() only succeeds if that port frees again.
+ *                       Policy: the broker exits on 'fatal' so the shims
+ *                       start a fresh broker on a new port. Not emitted for
+ *                       a port that never served a launch that came up.
  *
  * Death is detected on our own browser-level CDP websocket (its close fires
  * at once; the process exit lags 20 ms-2 s) and on the process exit. After
@@ -64,8 +65,9 @@ class BraveSupervisor extends EventEmitter {
     const port = opts.port || 0;
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`${PREFIX} invalid CDP port ${opts.port}`);
     this.profileDir = path.resolve(opts.profileDir);
-    this._port = port; // 0 until the first launch picks one
-    this._portUsed = false; // true once a Brave of ours has listened on it
+    this._callerPort = port; // 0 = OS-assigned
+    this._port = port;
+    this._portUsed = false; // true once a launch on it came up (cdpUrl handed out)
     this._executablePath = opts.executablePath || null;
     this._extensionPath = opts.extensionPath || null;
     this._proxyUrl = opts.proxyUrl || null;
@@ -122,7 +124,9 @@ class BraveSupervisor extends EventEmitter {
     const t0 = Date.now();
     proc.closing = true;
     // A Brave whose CDP already dropped may be mid-shutdown (exit lags the
-    // disconnect by up to ~2 s): give it the same time to finish its flush.
+    // disconnect by up to ~2 s): let it finish its flush. Its background
+    // reap still kills it after exitWaitMs, so that case waits
+    // min(exitWaitMs, closeTimeoutMs).
     if (proc.up && proc.ws.readyState === WebSocket.OPEN) {
       proc.ws.send(JSON.stringify({ id: proc.nextId++, method: "Browser.close" }));
     }
@@ -141,21 +145,23 @@ class BraveSupervisor extends EventEmitter {
     const prev = this._proc;
     if (prev && !prev.exited) await this._reap(prev);
     const exe = this._executablePath || (this._executablePath = detectBravePath());
-    const port = await this._choosePort();
     fs.mkdirSync(this.profileDir, { recursive: true });
     disableMemorySaver(this.profileDir, this._log);
     const proxyServer = await resolveProxyServer(this._proxyUrl, { log: this._log, timeoutMs: this._t.proxyProbeTimeoutMs });
+    // Last step before the spawn: the proxy probe can take 1.5 s, and a port
+    // taken in that window must fail loudly here, not as a 20 s CDP timeout.
+    const port = await this._choosePort();
     const args = buildBraveArgs({ port, profileDir: this.profileDir, extensionPath: this._extensionPath, proxyServer });
     const t0 = Date.now();
     const proc = this._spawnBrave(exe, args, port);
     this._proc = proc;
-    this._portUsed = true;
     try {
       await this._waitUntilUp(proc, exe, t0);
     } catch (e) {
       await this._kill(proc);
       throw e;
     }
+    this._portUsed = true; // from here on cdpUrl is out there: the port is pinned
     this._launches++;
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
     this._log(`brave pid=${proc.pid} up on :${port} in ${Date.now() - t0} ms (launch #${this._launches}${via})`);
@@ -163,7 +169,9 @@ class BraveSupervisor extends EventEmitter {
   }
 
   async _choosePort() {
-    if (!this._port) {
+    // An OS-assigned port is only pinned once a launch came up (ensure() has
+    // handed out the cdpUrl); until then nobody can depend on it.
+    if (!this._callerPort && !this._portUsed) {
       this._port = await pickFreePort();
       return this._port;
     }
@@ -258,10 +266,14 @@ class BraveSupervisor extends EventEmitter {
    * the supervisor does next.
    */
   _emitSafe(event, reason) {
-    try {
-      this.emit(event, reason);
-    } catch (e) {
-      this._log(`a '${event}' listener threw: ${e.message}`);
+    // Each listener on its own: emit() stops at the first one that throws,
+    // and the ones after it (e.g. the session registry) must still hear it.
+    for (const listener of this.listeners(event)) {
+      try {
+        listener.call(this, reason);
+      } catch (e) {
+        this._log(`a '${event}' listener threw: ${e.message}`);
+      }
     }
   }
 
@@ -504,7 +516,8 @@ async function resolveProxyServer(proxyUrl, { log = () => {}, timeoutMs = 1500 }
   if (!proxyUrl) return null;
   const target = parseProxyUrl(proxyUrl);
   if (!target) {
-    log(`warning: proxy URL "${proxyUrl}" is not usable (want http|https|socks4|socks5://host:port); launching Brave direct`);
+    const shown = String(proxyUrl).replace(/\/\/[^@/]*@/, "//***@"); // never log a password
+    log(`warning: proxy URL "${shown}" is not usable (want http|https|socks4|socks5://host:port); launching Brave direct`);
     return null;
   }
   if (!(await tcpAccepts(target.host, target.port, timeoutMs))) {
