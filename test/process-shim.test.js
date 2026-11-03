@@ -365,3 +365,32 @@ test("getProcessStartTimes resolves the current process's real start time (no te
   const expected = Date.now() - process.uptime() * 1000;
   assert.ok(Math.abs(t - expected) < 10_000, `start time ${new Date(t).toISOString()} should be ~${new Date(expected).toISOString()}`);
 });
+
+// W2G: while upstream imports, the broker's process.env holds its secret CDP
+// URL (BROWSER_CDP_ENDPOINT_URL). A probe spawned in that window (the stray-
+// Brave check, the profile seed) must not inherit it.
+test("W2G: every probe child gets an explicit env without BROWSER_CDP_ENDPOINT_URL (and keeps the rest)", async () => {
+  const shim = require("../src/process-shim.js");
+  const secretUrl = `ws://127.0.0.1:1/${"d".repeat(64)}/devtools/browser`;
+  const prev = process.env.BROWSER_CDP_ENDPOINT_URL;
+  process.env.BROWSER_CDP_ENDPOINT_URL = secretUrl;
+  try {
+    const seen = [];
+    const capture = (cmd, args, opts) => { seen.push({ cmd, env: opts && opts.env }); return { status: 0, stdout: "", stderr: "" }; };
+    for (const platform of ["win32", "linux"]) {
+      shim.listProcessesByCommand("brave", { _platform: platform, _spawnSync: capture });
+      shim.getProcessStartTimes([process.pid], { _platform: platform, _spawnSync: capture });
+    }
+    assert.strictEqual(seen.length, 4);
+    for (const { cmd, env } of seen) {
+      assert.ok(env, `${cmd}: no explicit env (it would inherit process.env)`);
+      assert.strictEqual(env.BROWSER_CDP_ENDPOINT_URL, undefined, cmd);
+      assert.ok(!JSON.stringify(env).includes("d".repeat(64)), cmd);
+      assert.strictEqual(env.PATH ?? env.Path, process.env.PATH ?? process.env.Path, `${cmd} keeps PATH`);
+    }
+    assert.ok(seen.filter((x) => x.cmd === "ps").every((x) => x.env.LC_ALL === "C"), "ps keeps LC_ALL=C");
+    assert.strictEqual(process.env.BROWSER_CDP_ENDPOINT_URL, secretUrl, "the broker's own env is untouched");
+  } finally {
+    if (prev === undefined) delete process.env.BROWSER_CDP_ENDPOINT_URL; else process.env.BROWSER_CDP_ENDPOINT_URL = prev;
+  }
+});

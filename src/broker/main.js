@@ -223,14 +223,17 @@ const unknownTabMessage = (tabKey) => `unknown tabId ${JSON.stringify(tabKey)}; 
 const errorResult = (text) => ({ content: [{ type: "text", text }], isError: true });
 
 /**
- * A tools/call result with the CDP secret taken out of its text items
+ * A tools/call result with the CDP secret taken out, wherever it sits
  * (Playwright's call log and upstream's "[CDP connect]" errors print the
- * whole URL). Images and other items pass as they are.
+ * whole URL). Through JSON, so it doesn't depend on the result's shape: JSON
+ * escaping never splits a hex secret. Results without it come back as they are.
  */
 function redactResult(result) {
   const { redact } = require("./cdp-proxy.js");
-  if (!result || !Array.isArray(result.content)) return result;
-  return { ...result, content: result.content.map((c) => (c && typeof c.text === "string" ? { ...c, text: redact(c.text) } : c)) };
+  if (result === undefined) return result;
+  const json = JSON.stringify(result);
+  const clean = redact(json);
+  return clean === json ? result : JSON.parse(clean);
 }
 
 const SETTINGS_DIFFER_WARNING =
@@ -560,9 +563,9 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
         try {
           return redactResult(await run(args));
         } catch (e) {
-          if (e && typeof e.message === "string") e.message = redact(e.message);
-          if (e && typeof e.stack === "string") e.stack = redact(e.stack);
-          throw e; // RelayServer turns it into its usual isError result
+          // RelayServer turns it into its usual isError result from .message.
+          // A new Error: the thrown one's message may not be writable.
+          throw new Error(redact(e && e.message !== undefined ? e.message : e));
         }
       },
     };

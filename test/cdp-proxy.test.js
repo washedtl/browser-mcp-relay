@@ -87,11 +87,11 @@ function collectLog() {
 }
 
 /** A listening proxy (+ a fake Brave unless browser:false); closed after the test. */
-async function served(t, { browser = true, ...opts } = {}) {
+async function served(t, { browser = true, fakeOpts = {}, ...opts } = {}) {
   const log = collectLog();
   const proxy = new CdpProxy({ log, ...opts });
   const { wsUrl, port } = await proxy.listen();
-  const fake = browser ? fakeBrowser() : null;
+  const fake = browser ? fakeBrowser(fakeOpts) : null;
   if (fake) proxy.setPipe(fake.pipe);
   t.after(() => proxy.close());
   return { proxy, wsUrl, port, fake, log };
@@ -165,6 +165,26 @@ test("PipeConnection.call(): a reply that never comes resolves null after timeou
   const t0 = Date.now();
   assert.strictEqual(await pipe.call("Slow", null, { timeoutMs: 60 }), null);
   assert.ok(Date.now() - t0 >= 50);
+});
+
+test("PipeConnection.call(): with onLate, a reply after the timeout goes to onLate, not 'message'; without it, it is an unmatched message (the proxy ignores unknown ids)", async () => {
+  const toBrowser = new PassThrough();
+  const fromBrowser = new PassThrough();
+  const pipe = new PipeConnection(toBrowser, fromBrowser);
+  const emitted = [];
+  pipe.on("message", (m) => emitted.push(m));
+  const late = [];
+  const ids = [];
+  toBrowser.setEncoding("utf8");
+  toBrowser.on("data", (d) => { for (const f of d.split("\0").filter(Boolean)) ids.push(JSON.parse(f).id); });
+  assert.strictEqual(await pipe.call("Slow.withOnLate", null, { timeoutMs: 20, onLate: (m) => late.push(m) }), null);
+  assert.strictEqual(await pipe.call("Slow.plain", null, { timeoutMs: 20 }), null);
+  await until(() => ids.length === 2, 1000, "both calls written");
+  for (const id of ids) fromBrowser.write(JSON.stringify({ id, result: { id } }) + "\0");
+  await until(() => late.length === 1, 1000, "onLate");
+  await sleep(20);
+  assert.deepStrictEqual(late, [{ id: ids[0], result: { id: ids[0] } }]);
+  assert.deepStrictEqual(emitted, [{ id: ids[1], result: { id: ids[1] } }], "only the reply nobody handles");
 });
 
 test("PipeConnection.close(): ends our side, fires 'close', pending calls resolve null", async () => {
@@ -310,7 +330,7 @@ test("sessions announced by a Target.attachedToTarget event belong to the client
 });
 
 test("Browser.close, Browser.crash, Browser.crashGpuProcess and non-flat sendMessageToTarget are refused for clients, on any session", async (t) => {
-  const { wsUrl, fake, proxy } = await served(t);
+  const { wsUrl, fake } = await served(t);
   assert.deepStrictEqual([...BLOCKED_CLIENT_METHODS].sort(), ["Browser.close", "Browser.crash", "Browser.crashGpuProcess", "Target.sendMessageToTarget"]);
   const c = await cdpClient(wsUrl);
   const { result: { sessionId: nested } } = await c.send("Target.attachToBrowserTarget");
@@ -323,7 +343,6 @@ test("Browser.close, Browser.crash, Browser.crashGpuProcess and non-flat sendMes
   }
   assert.strictEqual((await c.send("Browser.getVersion")).result.echo, "Browser.getVersion", "the client still works");
   // the broker itself (root session) can still close Brave
-  void proxy;
   assert.ok(await fake.pipe.call("Browser.close"));
   assert.strictEqual(fake.sent("Browser.close").length, 1);
 });
@@ -392,6 +411,74 @@ test("Brave going down closes every client (1011), then 503; a relaunch is serve
   assert.deepStrictEqual(fake.sent("Target.detachFromTarget"), [], "no detach is sent to a dead Brave");
 });
 
+test("a browser-session attach that times out is detached when its late reply comes (no session leaks in Brave)", async (t) => {
+  const { wsUrl, fake } = await served(t, { attachTimeoutMs: 50, fakeOpts: { attachDelayMs: 200 } });
+  const c = await cdpClient(wsUrl);
+  assert.strictEqual((await c.closedP).code, 1011, "the client is told");
+  await until(() => fake.sent("Target.detachFromTarget").length === 1, 2000, "the late session's detach");
+  const [detach] = fake.sent("Target.detachFromTarget");
+  assert.match(detach.params.sessionId, /^B\d+$/);
+  assert.strictEqual(detach.sessionId, undefined, "on the root session");
+});
+
+test("a client that leaves while its browser session is still attaching gets that session detached", async (t) => {
+  const { wsUrl, fake } = await served(t, { fakeOpts: { attachDelayMs: 100 } });
+  const c = await cdpClient(wsUrl);
+  c.ws.close();
+  await c.closedP;
+  await until(() => fake.sent("Target.detachFromTarget").length === 1, 2000, "the detach");
+  assert.match(fake.sent("Target.detachFromTarget")[0].params.sessionId, /^B\d+$/);
+});
+
+test("a session Brave detached is forgotten: the client can no longer send on it", async (t) => {
+  const { wsUrl, fake } = await served(t);
+  const c = await cdpClient(wsUrl);
+  const browserSession = (await c.send("Browser.getVersion")).result.on;
+  const { result: { sessionId: page } } = await c.send("Target.attachToTarget", { targetId: "T1", flatten: true });
+  assert.strictEqual((await c.send("DOM.enable", {}, page)).result.on, page);
+  fake.send({ method: "Target.detachedFromTarget", params: { sessionId: page }, sessionId: browserSession });
+  await until(() => c.events.some((e) => e.method === "Target.detachedFromTarget"), 1000, "the detach event");
+  const before = fake.received.length;
+  assert.strictEqual((await c.send("DOM.enable", {}, page)).error.code, -32001);
+  assert.strictEqual(fake.received.length, before);
+});
+
+test("setPipe() over a pipe that is still open drops that Brave's clients first (no stale sessions on the new one)", async (t) => {
+  const { proxy, wsUrl } = await served(t);
+  const a = await cdpClient(wsUrl);
+  await a.send("Browser.getVersion");
+  const next = fakeBrowser();
+  proxy.setPipe(next.pipe);
+  assert.strictEqual((await a.closedP).code, 1011);
+  const b = await cdpClient(wsUrl);
+  assert.strictEqual((await b.send("Browser.getVersion")).result.echo, "Browser.getVersion");
+  assert.deepStrictEqual(next.sent("Browser.getVersion").length, 1);
+});
+
+test("close() doesn't wait for a half-sent request (a local process could otherwise hold the broker's exit for ~60 s)", async (t) => {
+  const { proxy, port } = await served(t, { browser: false });
+  const sock = require("node:net").connect(port, "127.0.0.1");
+  sock.on("error", () => {});
+  await new Promise((r) => sock.once("connect", r));
+  sock.write("GET /json/vers"); // never finished
+  await sleep(50);
+  const t0 = Date.now();
+  await proxy.close();
+  assert.ok(Date.now() - t0 < 2000, `close() took ${Date.now() - t0} ms`);
+  sock.destroy();
+});
+
+test("refusal logging is capped per window, and the next window says how many were not logged", async (t) => {
+  const { port, log } = await served(t, { browser: false, refusalWindowMs: 300 });
+  for (let i = 0; i < 30; i++) await httpGet(port, "/json/version");
+  const firstWindow = log.lines.length;
+  assert.ok(firstWindow <= 21, `${firstWindow} lines`);
+  await sleep(350);
+  await httpGet(port, "/json/list");
+  assert.ok(log.lines.some((l) => /\b10 more refusal\(s\) were not logged/.test(l)), log.lines.join("\n"));
+  assert.match(log.lines[log.lines.length - 1], /refused GET "\/json\/list"/);
+});
+
 test("close(): clients are dropped and the port stops listening", async (t) => {
   const { proxy, wsUrl, port } = await served(t);
   const c = await cdpClient(wsUrl);
@@ -403,7 +490,7 @@ test("close(): clients are dropped and the port stops listening", async (t) => {
 
 // ─────────────── redaction ───────────────
 
-test("redact(): every live proxy's secret becomes <redacted>, wherever it appears; a closed proxy's is forgotten", async (t) => {
+test("redact(): every proxy's secret becomes <redacted>, wherever it appears, also after the proxy closed", async (t) => {
   const { proxy, wsUrl } = await served(t, { browser: false });
   const other = new CdpProxy();
   await other.listen();
@@ -415,7 +502,7 @@ test("redact(): every live proxy's secret becomes <redacted>, wherever it appear
   assert.strictEqual(redact("nothing secret"), "nothing secret");
   assert.strictEqual(redact(undefined), "undefined");
   await other.close();
-  assert.ok(redact(other.secret).includes(other.secret), "unregistered on close");
+  assert.strictEqual(redact(`late error ${other.wsUrl}`), `late error ws://127.0.0.1:${other.port}/<redacted>/devtools/browser`, "a late error after close is still redacted");
 });
 
 test("redactCdpUrl(): a CDP URL without its secret path; other URLs unchanged", () => {

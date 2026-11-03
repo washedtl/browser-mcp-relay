@@ -7,7 +7,7 @@
 //   - none of the profile's brave.exe processes has a TCP LISTEN socket, and
 //     there is no DevToolsActivePort file; the only listener is the proxy, in
 //     this node process;
-//   - the reviewer's attack (a raw websocket, no secret, Storage.getCookies)
+//   - a raw-websocket cookie read without the secret (Storage.getCookies)
 //     and every /json/* discovery request are refused;
 //   - Playwright connectOverCDP, upstream browser-devtools-mcp in-process and
 //     the real lighthouse_audit tool all work through the proxy URL;
@@ -64,7 +64,7 @@ function upgrade(url, headers = {}) {
   });
 }
 
-/** The reviewer's attack: a raw websocket client reading every cookie. Resolves the cookie names, or how it was refused. */
+/** A raw-websocket cookie read: a plain ws client asking for every cookie. Resolves the cookie names, or how it was refused. */
 function rawGetCookies(url) {
   return new Promise((resolve) => {
     const ws = new WebSocket(url, { perMessageDeflate: false });

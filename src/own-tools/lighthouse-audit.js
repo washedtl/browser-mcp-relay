@@ -184,9 +184,15 @@ module.exports = {
     let result;
     if (/^wss?:\/\//i.test(cdpUrl)) {
       // W2G broker mode. Messages never print cdpUrl: it holds the secret.
+      let puppeteer;
+      try {
+        puppeteer = await getPuppeteer();
+      } catch (e) {
+        return errorResult(`lighthouse_audit: failed to load puppeteer-core (Lighthouse's dependency): ${e.message || e}`);
+      }
       let browser;
       try {
-        browser = await (await getPuppeteer()).connect({ browserWSEndpoint: cdpUrl, defaultViewport: null });
+        browser = await puppeteer.connect({ browserWSEndpoint: cdpUrl, defaultViewport: null });
       } catch (e) {
         return errorResult(`lighthouse_audit: cannot reach the relay's Brave over CDP: ${e.message || e}. ${PROBE_ADVICE}`);
       }
@@ -250,8 +256,14 @@ module.exports = {
   _setLighthouseForTest(mod) {
     _lhPromise = mod ? Promise.resolve(mod) : null;
   },
-  // Test seam: substitute puppeteer-core ({connect}); null restores the lazy import.
+  // Test seam: substitute puppeteer-core ({connect}), or an Error its import
+  // fails with; null restores the lazy import.
   _setPuppeteerForTest(mod) {
+    if (mod instanceof Error) {
+      _pptrPromise = Promise.reject(mod);
+      _pptrPromise.catch(() => {}); // handled when the tool awaits it
+      return;
+    }
     _pptrPromise = mod ? Promise.resolve(mod) : null;
   },
   _puppeteerEntry: puppeteerEntry,

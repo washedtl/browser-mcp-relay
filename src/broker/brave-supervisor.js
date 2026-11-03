@@ -159,7 +159,9 @@ class BraveSupervisor extends EventEmitter {
     for (;;) {
       // Never race a relaunch against a planned close of the same profile.
       while (this._closing) await this._closing;
-      if (this.isUp()) return { pid: this._proc.pid };
+      // A launch in flight may already be up (CDP answers) but not done
+      // (certificate policy, 'pipe' to the proxy): join it, never pass it.
+      if (!this._launching && this.isUp()) return { pid: this._proc.pid };
       if (!this._launching) {
         this._launching = this._launch().finally(() => { this._launching = null; });
       }
@@ -726,7 +728,7 @@ function tcpAccepts(host, port, timeoutMs) {
 function braveEnv(env) {
   const out = {};
   for (const [k, v] of Object.entries(env)) {
-    if (k.startsWith("BROWSER_RELAY_") || k === "BROWSER_CDP_ENDPOINT_URL") continue;
+    if (k.startsWith("BROWSER_RELAY_") || k.toUpperCase() === "BROWSER_CDP_ENDPOINT_URL") continue; // Windows names ignore case
     if (/^(http|https|all)_proxy$/i.test(k)) continue;
     out[k] = v;
   }
@@ -744,5 +746,4 @@ module.exports = {
   findBraveOnProfile,
   CLOSE_TIMEOUT_MS,
   SHUTDOWN_GRACE_MS,
-  EXIT_WAIT_MS,
 };

@@ -4,9 +4,9 @@
 
 ### Security
 
-- **Broker mode: no unauthenticated CDP port.** Brave used to listen on a TCP DevTools port (random, 127.0.0.1), and any local process could drive the shared, logged-in Brave and read its cookies through it. Brave now runs with `--remote-debugging-pipe` and opens no port (measured: 0 listening sockets on any of its processes). The broker serves CDP to upstream and its own tools at `ws://127.0.0.1:<port>/<secret>/devtools/browser` (a 256-bit secret, one browser session per client). Without the secret every request is refused: `/json/*` discovery (404), a wrong path, an `Origin` header or a foreign `Host` (403); 503 while Brave is down. Clients can't `Browser.close` or `Browser.crash` the shared Brave.
+- **Broker mode: no unauthenticated CDP port.** Brave used to listen on a TCP DevTools port (random, 127.0.0.1), and any local process could drive the shared, logged-in Brave and read its cookies through it. Brave now runs with `--remote-debugging-pipe` and opens no port (measured: 0 listening sockets on any of its processes). The broker serves CDP to upstream and its own tools at `ws://127.0.0.1:<port>/<secret>/devtools/browser` (a 256-bit secret, one browser session per client). Without the secret every request is refused: `/json/*` discovery (404), a wrong path, an `Origin` header or a foreign `Host` (403); 503 while Brave is down. Clients can't send `Browser.close`, `Browser.crash`, `Browser.crashGpuProcess` or `Target.sendMessageToTarget` (the non-flat channel that could carry them) to the shared Brave.
 - **The secret stays in the broker.** It is redacted from the broker log, `broker:status`, the relay Inspector and tool results (Playwright's and upstream's connect errors print the whole URL), and removed from the broker's environment once upstream is loaded.
-- `lighthouse_audit` connects over that URL in broker mode (puppeteer, a tab it closes after). Legacy mode is unchanged and keeps its unauthenticated `9333 + slot` port.
+- `lighthouse_audit` connects over that URL in broker mode (puppeteer, a tab it closes after). Legacy mode is unchanged and keeps its unauthenticated `9333 + slot - 1` port.
 - The broker no longer picks or restarts for a CDP port: the "CDP port is taken by another process" restart is gone.
 
 ## v0.4.0 — shared broker

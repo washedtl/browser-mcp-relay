@@ -351,6 +351,7 @@ test("braveEnv: strips relay-internal, proxy and CDP-endpoint env vars (the brok
     BROWSER_RELAY_PROXY_URL: "http://x:1",
     BROWSER_RELAY_INSPECTOR_PORT: "9",
     BROWSER_CDP_ENDPOINT_URL: `ws://127.0.0.1:1/${"a".repeat(64)}/devtools/browser`,
+    browser_cdp_endpoint_url: "ws://127.0.0.1:1/x", // Windows env names ignore case
     HTTP_PROXY: "http://dead:1",
     https_proxy: "http://dead:1",
     ALL_PROXY: "socks5://dead:1",
@@ -485,6 +486,20 @@ test("ensure(): concurrent calls coalesce into ONE launch", async () => {
   const { sup } = fakeSupervisor(dir, { delay: 300 });
   const results = await Promise.all([1, 2, 3, 4, 5].map(() => sup.ensure()));
   assert.strictEqual(new Set(results.map((r) => r.pid)).size, 1);
+  assert.strictEqual(launchesOf(dir).length, 1);
+});
+
+test("W2G ensure(): a call while a launch is finishing (CDP up, certificate policy pending) joins it and resolves only after 'pipe'", async () => {
+  // isUp() is already true in that window, but the proxy has no pipe yet: a
+  // caller handed a Brave then would get 503 from the proxy.
+  const dir = tmpProfile("fake-slow-certs");
+  const { sup, pipes } = fakeSupervisor(dir, { mode: "slow-certs" });
+  const first = sup.ensure();
+  await waitFor(() => cdpCallsOf(dir, IGNORE_CERTS).length === 1, 10000, "the certificate call to be in flight");
+  let pipesWhenSecondResolved = null;
+  const second = await sup.ensure().then((info) => { pipesWhenSecondResolved = pipes.length; return info; });
+  assert.strictEqual(pipesWhenSecondResolved, 1, "resolved before the launch handed its pipe out");
+  assert.strictEqual(second.pid, (await first).pid);
   assert.strictEqual(launchesOf(dir).length, 1);
 });
 

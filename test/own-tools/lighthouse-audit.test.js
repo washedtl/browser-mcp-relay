@@ -258,6 +258,17 @@ test("W2G ws: a failed connect (Brave down: 503) is an isError result with retry
   });
 });
 
+test("W2G ws: puppeteer-core failing to load says so (not 'Brave may have crashed')", async () => {
+  await withWsFakes({}, async ({ lh }) => {
+    tool._setPuppeteerForTest(new Error("Cannot find module 'puppeteer-core'"));
+    const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /^lighthouse_audit: failed to load puppeteer-core .*Cannot find module/);
+    assert.doesNotMatch(r.content[0].text, /crashed/);
+    assert.strictEqual(lh.calls.length, 0);
+  });
+});
+
 test("W2G ws: Lighthouse throwing (or newPage failing) still closes the page and disconnects; isError", async () => {
   await withWsFakes({ lighthouseError: new Error("PROTOCOL_TIMEOUT") }, async ({ pptr }) => {
     const r = await tool.handler({ url: "https://example.com/" }, WS_CTX);

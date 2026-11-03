@@ -36,8 +36,10 @@
 //   client → browser  ids remapped to the pipe's counter; no sessionId → the
 //                     client's browser session; a sessionId must be owned by
 //                     that client, else -32001 and nothing is sent.
-//   browser → client  replies: id mapped back, sessionId dropped when it is
-//                     the client's browser session. Events: by sessionId owner.
+//   browser → client  replies: id mapped back, with exactly the sessionId the
+//                     client sent (none if it sent none). Events: to the
+//                     sessionId's owner, without it when it is the client's
+//                     browser session.
 //   ownership         a session belongs to the client whose Target.attachTo*
 //                     reply or Target.attachedToTarget event announced it.
 
@@ -62,12 +64,17 @@ const BLOCKED_CLIENT_METHODS = Object.freeze(new Set(["Browser.close", "Browser.
 // Runtime.evaluate. Replies from Brave are not limited (a 64 MB one was
 // measured through the proxy).
 const MAX_CLIENT_MESSAGE_BYTES = 256 * 1024 * 1024;
+// Refusals logged per window; the next window says how many were not.
 const LOGGED_REFUSALS = 20;
+const REFUSAL_WINDOW_MS = 10 * 60_000;
+// Playwright's connectOverCDP waits 30 s by default; the attach is part of that.
+const ATTACH_TIMEOUT_MS = 30_000;
 
-// Secrets of the proxies listening in this process (redact() removes them all).
+// Secrets of every proxy this process has listened with. Kept for the
+// process's life: an error printed after a proxy closed is still redacted.
 const liveSecrets = new Set();
 
-/** `text` with every live proxy's secret replaced by REDACTED. */
+/** `text` with every proxy's secret replaced by REDACTED. */
 function redact(text) {
   let out = String(text);
   for (const s of liveSecrets) if (out.includes(s)) out = out.split(s).join(REDACTED);
@@ -114,16 +121,22 @@ class PipeConnection extends EventEmitter {
 
   /**
    * One CDP call on the root session (or `sessionId`): resolves its reply
-   * ({result} or {error}), or null on timeout / close.
+   * ({result} or {error}), or null on timeout / close. With onLate, a reply
+   * that comes after the timeout is handed to onLate(reply) instead of being
+   * dropped (e.g. to detach a session nobody waits for any more).
    */
-  call(method, params, { timeoutMs = 5000, sessionId } = {}) {
+  call(method, params, { timeoutMs = 5000, sessionId, onLate } = {}) {
     return new Promise((resolve) => {
       const id = this.allocId();
-      const timer = setTimeout(() => { this._calls.delete(id); resolve(null); }, timeoutMs);
-      this._calls.set(id, { resolve, timer });
+      const entry = { resolve, onLate, late: false };
+      entry.timer = setTimeout(() => {
+        if (onLate) entry.late = true; else this._calls.delete(id);
+        resolve(null);
+      }, timeoutMs);
+      this._calls.set(id, entry);
       const msg = { id, method, ...(params ? { params } : {}), ...(sessionId ? { sessionId } : {}) };
       if (!this.send(msg)) {
-        clearTimeout(timer);
+        clearTimeout(entry.timer);
         this._calls.delete(id);
         resolve(null);
       }
@@ -157,7 +170,8 @@ class PipeConnection extends EventEmitter {
     if (call) {
       this._calls.delete(msg.id);
       clearTimeout(call.timer);
-      call.resolve(msg);
+      if (call.late) call.onLate(msg);
+      else call.resolve(msg);
       return;
     }
     this.emit("message", msg);
@@ -175,16 +189,21 @@ class PipeConnection extends EventEmitter {
   }
 }
 
-class CdpProxy extends EventEmitter {
+class CdpProxy {
   /**
    * @param {object} [opts]
    * @param {(msg: string) => void} [opts.log]
    * @param {number} [opts.maxPayload] — largest client message (test seam)
+   * @param {number} [opts.attachTimeoutMs] — test seam
+   * @param {number} [opts.refusalWindowMs] — test seam
    */
-  constructor({ log = () => {}, maxPayload = MAX_CLIENT_MESSAGE_BYTES } = {}) {
-    super();
+  constructor({ log = () => {}, maxPayload = MAX_CLIENT_MESSAGE_BYTES, attachTimeoutMs = ATTACH_TIMEOUT_MS, refusalWindowMs = REFUSAL_WINDOW_MS } = {}) {
     this._log = log;
     this._maxPayload = maxPayload;
+    this._attachTimeoutMs = attachTimeoutMs;
+    this._refusalWindowMs = refusalWindowMs;
+    this._refusalWindowStart = 0;
+    this._suppressed = 0;
     this._pipe = null;
     this._pending = new Map(); // pipe id → {client, origId, method, routed}
     this._owner = new Map(); // sessionId → client
@@ -243,6 +262,8 @@ class CdpProxy extends EventEmitter {
    * @param {PipeConnection} pipe
    */
   setPipe(pipe) {
+    // Never route an earlier Brave's clients (and their session ids) to this one.
+    if (this._pipe && this._pipe !== pipe && !this._pipe.closed) this._onPipeClose();
     this._pipe = pipe;
     pipe.on("message", (m) => { if (this._pipe === pipe) this._fromBrowser(m); });
     pipe.on("close", () => { if (this._pipe === pipe) this._onPipeClose(); });
@@ -250,13 +271,16 @@ class CdpProxy extends EventEmitter {
   }
 
   close() {
-    liveSecrets.delete(this.secret);
     for (const c of [...this._clients]) c.ws.terminate();
     this._clients.clear();
     if (!this._server) return Promise.resolve();
     const server = this._server;
     this._server = null;
-    return new Promise((resolve) => server.close(() => resolve()));
+    const closed = new Promise((resolve) => server.close(() => resolve()));
+    // A half-sent request (any local process can open one) would otherwise
+    // hold close() until Node's headersTimeout, ~60 s.
+    server.closeAllConnections();
+    return closed;
   }
 
   _checkUpgrade(req) {
@@ -269,10 +293,17 @@ class CdpProxy extends EventEmitter {
   }
 
   _refuse(req, why) {
+    const now = Date.now();
+    if (now - this._refusalWindowStart >= this._refusalWindowMs) {
+      if (this._suppressed) this._log(`cdp proxy: ${this._suppressed} more refusal(s) were not logged`);
+      this._refusalWindowStart = now;
+      this._refusals = 0;
+      this._suppressed = 0;
+    }
     const n = ++this._refusals;
-    if (n > LOGGED_REFUSALS + 1) return;
-    if (n === LOGGED_REFUSALS + 1) {
-      this._log(`cdp proxy: further refusals are not logged`);
+    if (n > LOGGED_REFUSALS) {
+      if (n === LOGGED_REFUSALS + 1) this._log("cdp proxy: further refusals are not logged for now");
+      this._suppressed++;
       return;
     }
     const url = redact(String(req.url || "")).slice(0, 200);
@@ -290,7 +321,14 @@ class CdpProxy extends EventEmitter {
     });
     ws.on("close", () => this._onClientClose(client));
     ws.on("error", () => { /* 'close' follows */ });
-    const r = await pipe.call("Target.attachToBrowserTarget");
+    const r = await pipe.call("Target.attachToBrowserTarget", null, {
+      timeoutMs: this._attachTimeoutMs,
+      // No client waits for a session attached after the timeout: detach it.
+      onLate: (late) => {
+        const sid = late.result && late.result.sessionId;
+        if (sid && !pipe.closed) pipe.call("Target.detachFromTarget", { sessionId: sid });
+      },
+    });
     if (!r || !r.result || !r.result.sessionId) {
       if (!client.closed) this._log(`cdp proxy: Target.attachToBrowserTarget failed: ${JSON.stringify(r && r.error)}`);
       this._dropClient(client, 1011, "browser session attach failed");
@@ -414,4 +452,4 @@ class CdpProxy extends EventEmitter {
   }
 }
 
-module.exports = { PipeConnection, CdpProxy, redact, redactCdpUrl, BLOCKED_CLIENT_METHODS, MAX_CLIENT_MESSAGE_BYTES, REDACTED };
+module.exports = { PipeConnection, CdpProxy, redact, redactCdpUrl, BLOCKED_CLIENT_METHODS, REDACTED };

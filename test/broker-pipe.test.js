@@ -592,10 +592,12 @@ test("W2G redaction: an upstream error or result carrying the CDP URL (Playwrigh
 test("W2G redaction: own tools get the real CDP URL (they connect with it); their results and errors are redacted", async (t) => {
   let seen = null;
   const leaky = {
-    name: "own_leaky", description: "returns / throws its cdpUrl", inputSchema: { type: "object", properties: { fail: { type: "boolean" } } }, needsPage: false,
+    name: "own_leaky", description: "returns / throws its cdpUrl", inputSchema: { type: "object", properties: { fail: { type: "boolean" }, nested: { type: "boolean" } } }, needsPage: false,
     async handler(args, ctx) {
       seen = ctx.cdpUrl;
       if (args.fail) throw new Error(`connect failed: ${ctx.cdpUrl}`);
+      // not a top-level text item: redaction must not depend on the result's shape
+      if (args.nested) return { content: [{ type: "resource", resource: { uri: "bmr-test://endpoint", mimeType: "text/plain", text: ctx.cdpUrl } }] };
       return { content: [{ type: "text", text: `endpoint ${ctx.cdpUrl}` }] };
     },
   };
@@ -608,7 +610,9 @@ test("W2G redaction: own tools get the real CDP URL (they connect with it); thei
   const err = await c.callTool({ name: "own_leaky", arguments: { fail: true } });
   assert.strictEqual(err.isError, true);
   assert.ok(textOf(err).includes(`connect failed: ${redactedUrl(b)}`), textOf(err));
-  for (const r of [ok, err]) assert.ok(!JSON.stringify(r).includes(secret), JSON.stringify(r));
+  const nested = await c.callTool({ name: "own_leaky", arguments: { nested: true } });
+  assert.strictEqual(nested.content[0].resource.text, redactedUrl(b));
+  for (const r of [ok, err, nested]) assert.ok(!JSON.stringify(r).includes(secret), JSON.stringify(r));
 });
 
 test("W2G redaction: broker log lines never carry the secret (the startup line, a context close error with the URL)", async (t) => {

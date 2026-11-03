@@ -18,6 +18,8 @@
 //   exit-early    exit 0 after 100 ms without answering CDP (a profile handoff)
 //   no-cdp        run without ever answering CDP
 //   foreign-pid   getProcessInfo reports a browser pid that is not ours
+//   slow-certs    answer Security.setIgnoreCertificateErrors after --fake-exit-ms (the
+//                 window between "CDP up" and "launch done")
 //   linger        after Fake.drop, keep running 1500 ms, then exit 0
 //   hang          after Fake.drop, keep running until killed
 // Test-only CDP method: Fake.drop closes the pipe (a CDP disconnect while the
@@ -71,6 +73,8 @@ function serve() {
         drop();
         if (modes.has("slow-close")) setTimeout(() => process.exit(0), exitMs);
       } else if (!modes.has("ignore-close")) setTimeout(() => process.exit(0), 50);
+    } else if (msg.method === "Security.setIgnoreCertificateErrors" && modes.has("slow-certs")) {
+      setTimeout(() => reply({}), exitMs);
     } else if (msg.method === "Browser.getVersion") {
       reply({ product: "FakeBrave/1.0", protocolVersion: "1.3" });
     } else if (msg.method === "SystemInfo.getProcessInfo") {
