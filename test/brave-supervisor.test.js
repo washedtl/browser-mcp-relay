@@ -198,6 +198,19 @@ test("resolveProxyServer: a proxy that never answers the handshake is cut off at
   assert.ok(Date.now() - t0 < 1500);
 });
 
+test("resolveProxyServer: credentials in the URL are warned about (--proxy-server can't carry them)", async () => {
+  const s = net.createServer((sock) => sock.destroy());
+  const port = await listen(s);
+  try {
+    const log = collectLog();
+    assert.strictEqual(await resolveProxyServer(`http://user:secret@127.0.0.1:${port}`, { log }), `http://127.0.0.1:${port}`);
+    assert.ok(log.lines.some((l) => /credentials/i.test(l)), log.lines.join("\n"));
+    assert.ok(!log.lines.some((l) => l.includes("secret")), "never log the password");
+  } finally {
+    s.close();
+  }
+});
+
 test("resolveProxyServer: unusable URL → null + warning", async () => {
   for (const bad of ["ftp://127.0.0.1:21", "http://", "::::"]) {
     const log = collectLog();
@@ -413,23 +426,67 @@ test("crash: 'down' fires once, next ensure() relaunches on the same port", asyn
   assert.strictEqual(downs.length, 1, `down fired ${downs.length}x: ${downs}`);
 });
 
-test("crash: an auto-assigned port taken while Brave was down → relaunch on a new free port", async () => {
-  const dir = tmpProfile("fake-port-stolen");
-  const { sup, log } = fakeSupervisor(dir);
+test("crash: a caller-chosen port is kept across relaunches too", async () => {
+  const dir = tmpProfile("fake-port-kept");
+  const port = await deadPort();
+  const { sup } = fakeSupervisor(dir, { port });
   const first = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  process.kill(first.pid);
+  await down;
+  const second = await sup.ensure();
+  assert.strictEqual(second.cdpUrl, `http://127.0.0.1:${port}`);
+  assert.notStrictEqual(second.pid, first.pid);
+});
+
+test("crash: the port taken while Brave was down → ensure() fails loudly, never switches ports", async () => {
+  // Upstream reads BROWSER_CDP_ENDPOINT_URL once per broker process, so a
+  // relaunch on another port would leave every session pointing at nothing.
+  const dir = tmpProfile("fake-port-stolen");
+  const { sup } = fakeSupervisor(dir, { portFreeWaitMs: 300 });
+  const first = await sup.ensure();
+  const port = Number(new URL(first.cdpUrl).port);
   const down = nextEvent(sup, "down");
   process.kill(first.pid);
   await down;
   await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
   const thief = net.createServer();
-  await listen(thief, Number(new URL(first.cdpUrl).port));
+  await listen(thief, port);
   try {
-    const second = await sup.ensure();
-    assert.notStrictEqual(second.cdpUrl, first.cdpUrl);
-    assert.ok(log.lines.some((l) => /taken/.test(l)), log.lines.join("\n"));
+    await assert.rejects(sup.ensure(), (e) => e.message.includes(`CDP port ${port}`) && /in use/.test(e.message) && /not switch/.test(e.message));
+    assert.strictEqual(launchesOf(dir).length, 1, "must not spawn onto a taken port");
   } finally {
-    thief.close();
+    await new Promise((r) => thief.close(r));
   }
+  const again = await sup.ensure();
+  assert.strictEqual(again.cdpUrl, first.cdpUrl, "same port once it is free again");
+});
+
+test("crash: relaunch waits for the port to free (up to portFreeWaitMs) instead of failing at once", async () => {
+  const dir = tmpProfile("fake-port-wait");
+  const { sup } = fakeSupervisor(dir, { portFreeWaitMs: 3000 });
+  const first = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  process.kill(first.pid);
+  await down;
+  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
+  const holder = net.createServer();
+  await listen(holder, Number(new URL(first.cdpUrl).port));
+  setTimeout(() => holder.close(), 500);
+  const second = await sup.ensure();
+  assert.strictEqual(second.cdpUrl, first.cdpUrl);
+});
+
+test("a 'down' listener that throws does not break close or relaunch", async () => {
+  const dir = tmpProfile("fake-bad-listener");
+  const { sup, log } = fakeSupervisor(dir);
+  sup.on("down", () => { throw new Error("listener bug"); });
+  const first = await sup.ensure();
+  const res = await sup.closeGracefully();
+  assert.strictEqual(res.graceful, true);
+  const second = await sup.ensure();
+  assert.notStrictEqual(second.pid, first.pid);
+  assert.ok(log.lines.some((l) => l.includes("listener bug")), log.lines.join("\n"));
 });
 
 test("isUp() is false as soon as the PID is gone, even before any event arrives", async () => {
@@ -457,11 +514,23 @@ test("disconnect: relaunch waits for the old PID to exit first (else Brave hands
   const [reason] = await down;
   assert.strictEqual(reason, "cdp disconnected");
   assert.ok(isAlive(oldPid), "fake lingers 1.5 s after the drop");
-  const t0 = Date.now();
   const second = await sup.ensure();
   assert.strictEqual(oldAliveAtSpawn, false, "spawned while the old Brave was still running");
-  assert.ok(Date.now() - t0 >= 1000, "should have waited for the lingering PID");
   assert.ok(isAlive(second.pid));
+});
+
+test("closeGracefully() on a Brave that dropped CDP but is still exiting lets it finish (no kill)", async () => {
+  const dir = tmpProfile("fake-close-linger");
+  const { sup, log } = fakeSupervisor(dir, { mode: "linger" });
+  const first = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  const cdp = await openCdp(first.cdpUrl);
+  cdp.send("Fake.drop").catch(() => {});
+  await down;
+  const res = await sup.closeGracefully();
+  assert.strictEqual(res.graceful, true, log.lines.join("\n"));
+  assert.ok(!isAlive(first.pid));
+  assert.ok(!log.lines.some((l) => /kill/i.test(l)), log.lines.join("\n"));
 });
 
 test("disconnect: an old Brave that never exits is killed after exitWaitMs, then relaunched", async () => {
@@ -501,6 +570,7 @@ test("closeGracefully(): Browser.close, process exits, 'down'('closed'), next en
   assert.deepStrictEqual(downs, ["closed"]);
   const second = await sup.ensure();
   assert.notStrictEqual(second.pid, first.pid);
+  assert.strictEqual(second.cdpUrl, first.cdpUrl, "idle close → relaunch keeps the port");
 });
 
 test("closeGracefully(): Brave ignoring Browser.close is killed after closeTimeoutMs", async () => {
@@ -541,6 +611,7 @@ test("ensure() during closeGracefully() waits for the close, then relaunches", a
 test("launch failure: a Brave that exits during launch (profile handoff) rejects, and the next ensure() retries", async () => {
   const dir = tmpProfile("fake-exit-early");
   const { sup } = fakeSupervisor(dir, { mode: "exit-early" });
+  sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), (e) => /exited during launch/.test(e.message) && e.message.includes(path.resolve(dir)));
   await assert.rejects(sup.ensure(), /exited during launch/);
   assert.strictEqual(launchesOf(dir).length, 2);
@@ -557,6 +628,7 @@ test("launch failure: a missing executable rejects with a clear error", async ()
 test("launch failure: CDP never comes up → rejects after launchTimeoutMs and kills the process", async () => {
   const dir = tmpProfile("fake-no-cdp");
   const { sup } = fakeSupervisor(dir, { mode: "no-cdp", launchTimeoutMs: 500 });
+  sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), /not ready/);
   const [{ pid }] = launchesOf(dir);
   await waitFor(() => !isAlive(pid), 5000, "no-cdp fake to be killed");
@@ -565,6 +637,7 @@ test("launch failure: CDP never comes up → rejects after launchTimeoutMs and k
 test("launch failure: CDP answered by a different browser process → rejects, ours is killed", async () => {
   const dir = tmpProfile("fake-foreign");
   const { sup } = fakeSupervisor(dir, { mode: "foreign-pid" });
+  sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), /pid/i);
   const [{ pid }] = launchesOf(dir);
   await waitFor(() => !isAlive(pid), 5000, "foreign-pid fake to be killed");
@@ -595,9 +668,9 @@ function processesMatching(needle) {
 function browserMains(profileDir) {
   return processesMatching(path.basename(profileDir)).filter((r) => r.cmd.includes(RUN_ID) && !/--type=/.test(r.cmd));
 }
+/** Root-only hard kill (TerminateProcess on Windows): Brave's children exit within ~300 ms on their own. */
 function hardKill(pid) {
-  if (process.platform === "win32") execFileSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true });
-  else process.kill(pid, "SIGKILL");
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
 }
 
 function realSupervisor(profileDir, { onSpawn = null, ...opts } = {}) {
@@ -644,12 +717,12 @@ test("real Brave: crash → 'down' → next ensure() recovers on the same cdpUrl
   const { sup } = realSupervisor(dir);
   const first = await sup.ensure();
   const down = nextEvent(sup, "down");
-  hardKill(first.pid); // synchronous taskkill: ~1 s, and it blocks the event loop
   const t0 = Date.now();
+  hardKill(first.pid);
   const [reason] = await down;
   const tDown = Date.now() - t0;
   const second = await sup.ensure();
-  t.diagnostic(`crash (taskkill returned) → 'down'(${reason}) +${tDown} ms → ensure() recovered +${Date.now() - t0} ms`);
+  t.diagnostic(`crash (hard kill) → 'down'(${reason}) +${tDown} ms → ensure() recovered +${Date.now() - t0} ms`);
   assert.notStrictEqual(second.pid, first.pid);
   assert.strictEqual(second.cdpUrl, first.cdpUrl);
   assert.ok(!isAlive(first.pid));
@@ -663,7 +736,8 @@ test("real Brave: crash → 'down' → next ensure() recovers on the same cdpUrl
 test("real Brave: graceful close keeps a cookie set 2 s before close (spike E7a)", REAL, async (t) => {
   const dir = tmpProfile("real-cookie");
   const { sup } = realSupervisor(dir);
-  const cdp = await openCdp((await sup.ensure()).cdpUrl);
+  const first = await sup.ensure();
+  const cdp = await openCdp(first.cdpUrl);
   await cdp.send("Storage.setCookies", {
     cookies: [{ name: "w2c_e7a", value: "graceful-2s", domain: "bmr-w2c.example", path: "/", expires: Math.floor(Date.now() / 1000) + 86400 }],
   });
@@ -672,7 +746,9 @@ test("real Brave: graceful close keeps a cookie set 2 s before close (spike E7a)
   const res = await sup.closeGracefully();
   t.diagnostic(`graceful close (Browser.close → exit) took ${res.ms} ms`);
   assert.strictEqual(res.graceful, true);
-  const cdp2 = await openCdp((await sup.ensure()).cdpUrl);
+  const again = await sup.ensure();
+  assert.strictEqual(again.cdpUrl, first.cdpUrl, "relaunch after an idle close keeps the port");
+  const cdp2 = await openCdp(again.cdpUrl);
   const { cookies } = await cdp2.send("Storage.getCookies");
   await cdp2.close();
   assert.ok(cookies.some((c) => c.name === "w2c_e7a" && c.value === "graceful-2s"), `cookie lost; have: ${cookies.map((c) => c.name)}`);
