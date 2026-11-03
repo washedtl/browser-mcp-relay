@@ -248,6 +248,31 @@ test("loadUpstream: a failed load is not cached, so a retry can succeed", async 
   // the next call (inside the live/static block below) must load for real
 });
 
+test("W2E: loadUpstream reads local-config.json under the env, like index.js and the catalog (a set env var still wins)", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-up-lc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const run = (config, extraEnv = {}) => {
+    const cfg = path.join(dir, `local-config-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(cfg, JSON.stringify(config));
+    const script = `
+      require(${JSON.stringify(path.join(REPO_ROOT, "src", "broker", "upstream-inproc.js"))})
+        .loadUpstream({ cdpUrl: ${JSON.stringify(DUMMY_CDP_URL)}, localConfigPath: ${JSON.stringify(cfg)} })
+        .then((u) => process.stdout.write(JSON.stringify({ names: u.tools.map((e) => e.name) })),
+          (e) => process.stdout.write(JSON.stringify({ error: e.message })));`;
+    const r = spawnSync(process.execPath, ["-e", script], { env: { ...process.env, ...extraEnv }, encoding: "utf8", timeout: 60000 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+  const missing = path.join(dir, "no-such-upstream", "dist", "index.js");
+  assert.match(run({ BROWSER_RELAY_UPSTREAM_PATH: missing }).error || "", /BROWSER_RELAY_UPSTREAM_PATH=".*no-such-upstream/,
+    "the upstream path comes from local-config.json");
+  const fromConfig = run({ TOOL_NAME_PREFIX: "lc_" });
+  assert.ok(fromConfig.names && fromConfig.names.length > 40 && fromConfig.names.every((n) => n.startsWith("lc_")),
+    `upstream's own settings come from local-config.json too: ${JSON.stringify(fromConfig).slice(0, 300)}`);
+  const envWins = run({ TOOL_NAME_PREFIX: "lc_" }, { TOOL_NAME_PREFIX: "env_" });
+  assert.ok(envWins.names && envWins.names.every((n) => n.startsWith("env_")), "a set env var wins");
+});
+
 test("loadUpstream: rejects a missing or malformed cdpUrl", async () => {
   await assert.rejects(up.loadUpstream({}), /cdpUrl/);
   await assert.rejects(up.loadUpstream({ cdpUrl: "127.0.0.1:9222" }), /cdpUrl/);

@@ -188,6 +188,24 @@ test.describe("live windows", { skip: braveAvailable() ? false : "Brave not inst
     assert.strictEqual(await wp.ensureNotMinimized(ctx.page), false);
   });
 
+  test("W2E showWindow (browser_show): restores a minimized window, brings an off-screen one to a cascade slot, leaves a visible one", async () => {
+    wp.installWindowPerPage({ placement: "offscreen" });
+    let ctx;
+    try {
+      ctx = await newCtx("w:show");
+    } finally {
+      wp.installWindowPerPage({ placement: "cascade" });
+    }
+    const w = await windowOf(ctx.page);
+    assert.strictEqual(w.bounds.left, wp.OFFSCREEN_LEFT);
+    await bcdp.send("Browser.setWindowBounds", { windowId: w.windowId, bounds: { windowState: "minimized" } });
+    assert.deepStrictEqual(await wp.showWindow(ctx.page), { restored: true, movedOnScreen: true });
+    const shown = (await windowOf(ctx.page)).bounds;
+    assert.strictEqual(shown.windowState, "normal");
+    assert.ok(shown.left >= 0 && shown.top >= 0, `on-screen now: ${JSON.stringify(shown)}`);
+    assert.deepStrictEqual(await wp.showWindow(ctx.page), { restored: false, movedOnScreen: false }, "already in view");
+  });
+
   test("ensureNotMinimized: a closed page is a no-op (upstream re-opens it in a new window)", async () => {
     const ctx = await newCtx("w:closed");
     await ctx.page.close();

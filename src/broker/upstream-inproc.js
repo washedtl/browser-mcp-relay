@@ -44,6 +44,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createRequire } = require("node:module");
 const { pathToFileURL } = require("node:url");
+const { applyLocalConfigToEnv } = require("../local-config.js");
 
 // Design §3: forced in code so a user's env can't turn telemetry, the
 // "open chrome://inspect in your real Chrome" fallback, or output schemas on.
@@ -106,11 +107,12 @@ function locateUpstreamChunks(distDir) {
 }
 
 /**
- * Where browser-devtools-mcp lives. Same override as src/index.js and the
- * W1B catalog (BROWSER_RELAY_UPSTREAM_PATH = <pkg>/dist/index.js), so the
- * cached catalog and the in-process tools always come from one build.
+ * Where browser-devtools-mcp lives. Same override, read the same way (env
+ * over local-config.json), as src/index.js and the W1B catalog
+ * (BROWSER_RELAY_UPSTREAM_PATH = <pkg>/dist/index.js), so the cached catalog
+ * and the in-process tools always come from one build.
  */
-function resolveUpstreamPackage(env = process.env) {
+function resolveUpstreamPackage(env = applyLocalConfigToEnv(process.env)) {
   let pkgJson;
   const override = env.BROWSER_RELAY_UPSTREAM_PATH;
   if (override) {
@@ -195,14 +197,15 @@ let loaded = null; // { cdpUrl, promise }
 /**
  * Import upstream (once per process) bound to `cdpUrl`.
  *
- * @param {{cdpUrl: string}} opts  http(s)://host:port (or ws(s)://) of the broker's Brave
+ * @param {{cdpUrl: string, localConfigPath?: string}} opts  cdpUrl: http(s)://host:port (or
+ *   ws(s)://) of the broker's Brave; localConfigPath: test seam (default <repo>/local-config.json)
  * @returns {Promise<{version: string,
  *   tools: Array<{name: string, description: string, inputShape: object, tool: object, pageTool: boolean}>,
  *   createContext: (sessionKey: string) => Promise<object>,
  *   execute: (ctx: object, tool: object, args: object) => Promise<object>,
  *   Execute: Function, ScenarioRun: Function}>}
  */
-function loadUpstream({ cdpUrl } = {}) {
+function loadUpstream({ cdpUrl, localConfigPath } = {}) {
   if (typeof cdpUrl !== "string" || !/^(https?|wss?):\/\/[^/]+/.test(cdpUrl)) {
     return Promise.reject(new Error(`[broker] loadUpstream needs cdpUrl as http(s)://host:port or ws(s)://…, got ${JSON.stringify(cdpUrl)}`));
   }
@@ -212,7 +215,7 @@ function loadUpstream({ cdpUrl } = {}) {
     }
     return loaded.promise;
   }
-  const promise = doLoad(cdpUrl);
+  const promise = doLoad(cdpUrl, localConfigPath);
   loaded = { cdpUrl, promise };
   // never cache a failed load: the next call retries from scratch
   promise.catch(() => { if (loaded && loaded.promise === promise) loaded = null; });
@@ -232,8 +235,14 @@ function applyBundleFixes(distDir) {
   }
 }
 
-async function doLoad(cdpUrl) {
-  const pkg = resolveUpstreamPackage();
+async function doLoad(cdpUrl, localConfigPath) {
+  // env over local-config.json, as everywhere in the relay. Upstream reads its
+  // own settings (TOOL_NAME_PREFIX, AVAILABLE_TOOL_DOMAINS, ...) from
+  // process.env at import, so keys only local-config.json sets go there first
+  // (the forced env below still wins).
+  const env = applyLocalConfigToEnv(process.env, localConfigPath ? { path: localConfigPath } : {});
+  for (const [k, v] of Object.entries(env)) if (!process.env[k] && v) process.env[k] = v;
+  const pkg = resolveUpstreamPackage(env);
   applyBundleFixes(pkg.distDir);
   const chunks = locateUpstreamChunks(pkg.distDir);
   forceUpstreamEnv(cdpUrl);

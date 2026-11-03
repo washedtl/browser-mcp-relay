@@ -205,9 +205,29 @@ async function ensureNotMinimized(page) {
   return true;
 }
 
+/**
+ * Bring the page's window into view for the user (browser_show): restore it
+ * if minimized, and move one placed off-screen (right edge past
+ * OFFSCREEN_LEFT / 2, beyond any left-hand monitor) to the next cascade slot.
+ * Raising it is page.bringToFront()'s job. Runs no page JS, so an open
+ * alert() can't block it.
+ * @returns {Promise<{restored: boolean, movedOnScreen: boolean}>}
+ */
+async function showWindow(page) {
+  const restored = await ensureNotMinimized(page);
+  const browser = page.isClosed() ? null : page.context().browser();
+  if (!browser) return { restored, movedOnScreen: false };
+  const { windowId, bounds } = await sendBrowser(browser, "Browser.getWindowForTarget", { targetId: await targetIdOf(page) });
+  if (bounds.windowState !== "normal" || bounds.left + bounds.width > OFFSCREEN_LEFT / 2) return { restored, movedOnScreen: false };
+  const { left, top } = windowBounds("cascade", cascadeIndex++);
+  await sendBrowser(browser, "Browser.setWindowBounds", { windowId, bounds: { left, top } });
+  return { restored, movedOnScreen: true };
+}
+
 module.exports = {
   installWindowPerPage,
   ensureNotMinimized,
+  showWindow,
   // exported for tests and sibling broker modules
   OFFSCREEN_LEFT,
   PLACEMENTS,
