@@ -21,14 +21,15 @@ for (const k of ["FIGMA_ACCESS_TOKEN", "AVAILABLE_TOOL_DOMAINS", "TOOL_NAME_PREF
 
 const wp = require("../src/broker/window-pages.js");
 const up = require("../src/broker/upstream-inproc.js");
-const { braveAvailable, launchTempBrave } = require("./fixtures/temp-brave.js");
+const { BRAVE_PATH, braveAvailable, headfulRequested, launchTempBrave, makeProfileDir, removeProfile } = require("./fixtures/temp-brave.js");
 
-/** BrowserContext class of the playwright-core that upstream itself loads. */
-function upstreamBrowserContextClass() {
+/** Client classes of the playwright-core that upstream itself loads. */
+function upstreamPlaywrightCoreDir() {
   const upReq = createRequire(require.resolve("browser-devtools-mcp/package.json"));
-  const coreDir = path.dirname(createRequire(upReq.resolve("playwright")).resolve("playwright-core/package.json"));
-  return require(path.join(coreDir, "lib", "client", "browserContext.js")).BrowserContext;
+  return path.dirname(createRequire(upReq.resolve("playwright")).resolve("playwright-core/package.json"));
 }
+const upstreamBrowserContextClass = () => require(path.join(upstreamPlaywrightCoreDir(), "lib", "client", "browserContext.js")).BrowserContext;
+const upstreamBrowserTypeClass = () => require(path.join(upstreamPlaywrightCoreDir(), "lib", "client", "browserType.js")).BrowserType;
 
 // ─────────────────── placement (pure) ───────────────────
 
@@ -52,19 +53,23 @@ test("installWindowPerPage: rejects an unknown placement", () => {
 
 // ─────────────────── the newPage hook (fake contexts) ───────────────────
 
-test("makeNewPage: contexts without a browser (persistent launches) use Playwright's newPage", async () => {
+test("makeNewPage: a browser not attached over CDP keeps Playwright's newPage, even for its first context", async () => {
+  // launchPersistentContext / launch(): browser() is set and contexts()[0]
+  // is the context in use, exactly like a CDP default context.
   const calls = [];
   const orig = async function (...a) { calls.push({ self: this, a }); return "orig-page"; };
-  const hooked = wp.makeNewPage(orig, () => "cascade");
-  const ctx = { browser: () => null };
+  const hooked = wp.makeNewPage(orig, () => "cascade", () => false);
+  const ctx = {};
+  const browser = { contexts: () => [ctx] };
+  ctx.browser = () => browser;
   assert.strictEqual(await hooked.call(ctx, "x"), "orig-page");
   assert.deepStrictEqual(calls, [{ self: ctx, a: ["x"] }]);
 });
 
-test("makeNewPage: only the browser's default context is redirected to new windows", async () => {
+test("makeNewPage: on a CDP browser only the default context is redirected to new windows", async () => {
   let origCalls = 0;
   const orig = async function () { origCalls++; return "orig-page"; };
-  const hooked = wp.makeNewPage(orig, () => "cascade");
+  const hooked = wp.makeNewPage(orig, () => "cascade", () => true);
   const defaultCtx = {};
   const other = {};
   const browser = { contexts: () => [defaultCtx, other] };
@@ -73,18 +78,22 @@ test("makeNewPage: only the browser's default context is redirected to new windo
   assert.strictEqual(origCalls, 1);
 });
 
-test("install/uninstall: hooks upstream's BrowserContext.prototype.newPage once and restores it", (t) => {
+test("install/uninstall: hooks upstream's newPage + connectOverCDP once and restores both", (t) => {
   const BrowserContext = upstreamBrowserContextClass();
+  const BrowserType = upstreamBrowserTypeClass();
   const original = BrowserContext.prototype.newPage;
-  t.after(() => { BrowserContext.prototype.newPage = original; });
+  const originalConnect = BrowserType.prototype.connectOverCDP;
+  t.after(() => { BrowserContext.prototype.newPage = original; BrowserType.prototype.connectOverCDP = originalConnect; });
   const uninstall = wp.installWindowPerPage({ placement: "cascade" });
   const hooked = BrowserContext.prototype.newPage;
   assert.notStrictEqual(hooked, original);
+  assert.notStrictEqual(BrowserType.prototype.connectOverCDP, originalConnect, "CDP attaches are recorded");
   assert.strictEqual(wp.installWindowPerPage({ placement: "offscreen" }), uninstall, "second install reuses the hook");
   assert.strictEqual(BrowserContext.prototype.newPage, hooked, "no double wrap");
   assert.strictEqual(wp.currentPlacement(), "offscreen", "second install switches placement");
   uninstall();
   assert.strictEqual(BrowserContext.prototype.newPage, original);
+  assert.strictEqual(BrowserType.prototype.connectOverCDP, originalConnect);
   assert.strictEqual(wp.currentPlacement(), null);
   uninstall(); // idempotent
 });
@@ -198,6 +207,59 @@ test.describe("live windows", { skip: braveAvailable() ? false : "Brave not inst
     const wa = await windowOf(a.page);
     assert.notStrictEqual(wa.windowId, wb.windowId, "re-created page must not land in another session's window");
     assert.notStrictEqual(wa.windowId, oldWindow.windowId);
+  });
+
+  // The relay (legacy cdp-bridge) and upstream share one playwright-core, so
+  // with the hook installed, Playwright's own launches must keep their newPage.
+  async function windowIdOf(context, page) {
+    const s = await context.newCDPSession(page);
+    try {
+      const { targetInfo } = await s.send("Target.getTargetInfo");
+      return (await s.send("Browser.getWindowForTarget", { targetId: targetInfo.targetId })).windowId;
+    } finally {
+      await s.detach().catch(() => {});
+    }
+  }
+
+  test("a persistent launch (legacy cdp-bridge path) is not redirected: newPage stays a tab of its window", async () => {
+    const { chromium } = require("playwright-core");
+    const dir = makeProfileDir("persist");
+    const ctx = await chromium.launchPersistentContext(dir, { executablePath: BRAVE_PATH, headless: !headfulRequested() });
+    try {
+      assert.ok(ctx.browser() && ctx.browser().contexts()[0] === ctx, "looks like a default context, so only the CDP check can tell");
+      const first = ctx.pages()[0];
+      const p = await ctx.newPage();
+      assert.strictEqual(p.context(), ctx);
+      assert.strictEqual(await windowIdOf(ctx, p), await windowIdOf(ctx, first), "redirected into a new window");
+    } finally {
+      await ctx.close();
+      await removeProfile(dir);
+    }
+  });
+
+  test("launch() + newContext().newPage() is not redirected (no 10 s hang, page in its own context)", async () => {
+    const { chromium } = require("playwright-core");
+    // Playwright puts launch()'s temp profile under os.tmpdir(): keep it in .tmp-profiles
+    const tmp = makeProfileDir("launch");
+    const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+    process.env.TEMP = process.env.TMP = tmp;
+    let browser;
+    try {
+      browser = await chromium.launch({ executablePath: BRAVE_PATH, headless: !headfulRequested() });
+    } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+    try {
+      const c = await browser.newContext();
+      assert.strictEqual(browser.contexts()[0], c, "first context of a launched browser");
+      const t0 = Date.now();
+      const p = await c.newPage();
+      assert.strictEqual(p.context(), c);
+      assert.ok(Date.now() - t0 < 5000, `newPage took ${Date.now() - t0}ms`);
+    } finally {
+      await browser.close();
+      await removeProfile(tmp);
+    }
   });
 
   test("pages of a non-default context stay in that context", async () => {

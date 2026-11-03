@@ -22,9 +22,19 @@ const { spawnSync } = require("node:child_process");
 // Catalog-shaping env must not leak in from the developer's shell: a set
 // FIGMA_ACCESS_TOKEN alone adds a tool. Each test file runs in its own
 // process, so this only affects this file.
-for (const k of ["FIGMA_ACCESS_TOKEN", "AVAILABLE_TOOL_DOMAINS", "TOOL_NAME_PREFIX", "TOOL_INPUT_METADATA_ENABLE", "PLATFORM", "BROWSER_RELAY_UPSTREAM_PATH"]) {
+for (const k of ["FIGMA_ACCESS_TOKEN", "AVAILABLE_TOOL_DOMAINS", "TOOL_NAME_PREFIX", "TOOL_INPUT_METADATA_ENABLE", "BROWSER_RELAY_UPSTREAM_PATH",
+  "BROWSER_ALLOWED_DOMAINS", "OTEL_ENABLE"]) {
   delete process.env[k];
 }
+// Hostile values loadUpstream must override or strip (asserted below).
+Object.assign(process.env, {
+  TELEMETRY_ENABLE: "true",
+  BROWSER_CDP_OPEN_INSPECT: "true",
+  TOOL_OUTPUT_SCHEMA_DISABLE: "false",
+  PLATFORM: "node",
+  BROWSER_PERSISTENT_ENABLE: "true",
+  BROWSER_PERSISTENT_USER_DATA_DIR: path.join(os.tmpdir(), "bmr-should-never-be-used"),
+});
 
 const up = require("../src/broker/upstream-inproc.js");
 const { braveAvailable, launchTempBrave } = require("./fixtures/temp-brave.js");
@@ -102,6 +112,48 @@ test("lazy: requiring the broker modules imports nothing heavy and leaves the en
   const r = spawnSync(process.execPath, ["-e", script], { env, encoding: "utf8", timeout: 30000 });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.deepStrictEqual(JSON.parse(r.stdout), { heavy: [], endpoint: null, telemetry: null });
+});
+
+test("F1-20: loadUpstream patches the HttpResourceType enum before importing, idempotently (temp copy of the dist)", (t) => {
+  // Never the junctioned node_modules (that's a live install): copy the
+  // package under the repo so its bare imports still resolve through
+  // <repo>/node_modules, and unpatch the copy.
+  const patcher = require("../scripts/patch-bdmcp-bundle.js");
+  const root = path.join(REPO_ROOT, ".tmp-profiles", `upstream-copy-${process.pid}`);
+  const copyPkg = path.join(root, "browser-devtools-mcp");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(copyPkg, { recursive: true });
+  fs.copyFileSync(path.join(UPSTREAM_PKG_DIR, "package.json"), path.join(copyPkg, "package.json"));
+  fs.cpSync(UPSTREAM_DIST, path.join(copyPkg, "dist"), { recursive: true });
+  fs.cpSync(path.join(UPSTREAM_PKG_DIR, "node_modules", "zod"), path.join(copyPkg, "node_modules", "zod"), { recursive: true });
+  const core = patcher.findBundledCoreFile({ distDir: path.join(copyPkg, "dist") });
+  let src = fs.readFileSync(core, "utf8");
+  const m = patcher.MATCH_OTHER_ENTRY.exec(src);
+  src = src.replace(m[1] + patcher.buildAdditions(m[1].split(".")[0]), m[1]);
+  fs.writeFileSync(core, src);
+  assert.ok(!src.includes('HttpResourceType2.PING="ping"'), "copy must start unpatched");
+
+  const script = `
+    require(${JSON.stringify(path.join(REPO_ROOT, "src", "broker", "upstream-inproc.js"))})
+      .loadUpstream({ cdpUrl: ${JSON.stringify(DUMMY_CDP_URL)} })
+      .then((u) => {
+        let s = u.tools.find((e) => e.name === "o11y_get-http-requests").inputShape.resourceType;
+        while (s && !s._def.values) s = s._def.innerType || s._def.schema;
+        process.stdout.write(JSON.stringify(s ? s._def.values : null));
+      }, (e) => { process.stderr.write(String(e && e.stack)); process.exit(1); });`;
+  const env = { ...process.env, BROWSER_RELAY_UPSTREAM_PATH: path.join(copyPkg, "dist", "index.js") };
+  const load = () => {
+    const r = spawnSync(process.execPath, ["-e", script], { env, encoding: "utf8", timeout: 60000 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+
+  const values = load();
+  assert.ok(fs.readFileSync(core, "utf8").includes('HttpResourceType2.PING="ping"'), "the copy's bundle was patched");
+  assert.ok(values.some((v) => /^ping$/i.test(v)), `the imported enum must include ping (patched before import): ${values}`);
+  const mtime = fs.statSync(core).mtimeMs;
+  assert.deepStrictEqual(load(), values);
+  assert.strictEqual(fs.statSync(core).mtimeMs, mtime, "already-patched bundle is not rewritten");
 });
 
 // ─────────────────── scopeRoutesToPage (fake session context) ───────────────────
@@ -236,6 +288,7 @@ test.describe("loadUpstream (installed dist)", () => {
     assert.strictEqual(process.env.TELEMETRY_ENABLE, "false");
     assert.strictEqual(process.env.BROWSER_CDP_OPEN_INSPECT, "false");
     assert.strictEqual(process.env.TOOL_OUTPUT_SCHEMA_DISABLE, "true");
+    assert.strictEqual(process.env.PLATFORM, "browser");
     assert.strictEqual(process.env.BROWSER_CDP_ENDPOINT_URL, cdpUrl);
     assert.deepStrictEqual(Object.keys(process.env).filter((k) => k.startsWith("BROWSER_PERSISTENT_")), []);
   });
@@ -247,6 +300,7 @@ test.describe("loadUpstream (installed dist)", () => {
     assert.strictEqual(cfg.BROWSER_CDP_OPEN_INSPECT, false);
     assert.strictEqual(cfg.TOOL_OUTPUT_SCHEMA_DISABLE, true);
     assert.strictEqual(cfg.BROWSER_PERSISTENT_ENABLE, false);
+    assert.strictEqual(cfg.PLATFORM, "browser");
   });
 
   test("exposes the Execute and ScenarioRun classes, wired into tools", () => {
@@ -357,6 +411,34 @@ test.describe("loadUpstream (installed dist)", () => {
     assert.strictEqual(opened, 1, "executor re-opens a closed session page first");
     assert.strictEqual(seen.c, ctx);
     assert.deepStrictEqual(seen.args, { a: 1 });
+  });
+
+  test("execute: session-less (scenario store) tools run with ctx = null, no page or browser", async (t) => {
+    // scenario store "global" scope lives under os.homedir(): point it at a temp dir
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-scenario-home-"));
+    const saved = { USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+    process.env.USERPROFILE = process.env.HOME = home;
+    t.after(() => {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      fs.rmSync(home, { recursive: true, force: true });
+    });
+    const tool = (n) => upstream.tools.find((e) => e.name === n);
+    assert.strictEqual(tool("scenario-add").pageTool, false);
+    await upstream.execute(null, tool("scenario-add").tool, { name: "w2b-probe", description: "d", script: "return 1;", scope: "global" });
+    const listed = await upstream.execute(null, tool("scenario-list").tool, { scope: "global" });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(listed)).scenarios.map((s) => s.name), ["w2b-probe"]);
+    assert.ok(fs.existsSync(path.join(home, ".browser-devtools-mcp", "scenarios.json")), "wrote to the redirected home, not the real one");
+  });
+
+  test("stub_* and debug_* keep their stores by context.browserContext (so the per-page Proxy isolates them)", () => {
+    // upstream: STORE_BY_CONTEXT2.get(ctx) for stubs, STORE_BY_CONTEXT.get(ctx)
+    // for debug probes, with ctx = context.browserContext. If a bump re-keys
+    // either store (e.g. by sessionId or a module global), isolation breaks.
+    const scoped = upstream.tools.filter((e) => /^(stub|debug)_/.test(e.name));
+    assert.strictEqual(scoped.length, 15, "4 stub_* + 11 debug_* tools in 0.6.12");
+    for (const e of scoped) {
+      assert.match(e.tool.handle.toString(), /context\.browserContext\b/, `${e.name} no longer keys its store by context.browserContext`);
+    }
   });
 
   // ─────────── live: real Brave, real upstream session contexts ───────────
@@ -491,6 +573,16 @@ test.describe("loadUpstream (installed dist)", () => {
       assert.doesNotMatch(b, /byA/);
       assert.strictEqual(await stubCount("stub-b"), 0);
       assert.strictEqual(await stubCount("stub-a"), 1);
+    });
+
+    test("debug probes are per session: A's watch is not listed in B", async () => {
+      const { call } = harness;
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=DA`, tabId: "dbg-a" });
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=DB`, tabId: "dbg-b" });
+      await call("debug_add-watch", { expression: "document.title", tabId: "dbg-a" });
+      const watches = async (tabId) => JSON.parse(await call("debug_list-probes", { tabId, types: ["watch"] })).watches.length;
+      assert.strictEqual(await watches("dbg-a"), 1);
+      assert.strictEqual(await watches("dbg-b"), 0, "B must not see (or share the debugger of) A's page");
     });
 
     test("page swap: upstream re-opens a closed page with a fresh stub store that routes", async () => {

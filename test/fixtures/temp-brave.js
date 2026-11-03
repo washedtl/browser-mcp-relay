@@ -43,7 +43,7 @@ async function readDevToolsPort(profileDir, child, timeoutMs) {
 }
 
 async function browserWsUrl(port) {
-  const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+  const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) });
   const v = await res.json();
   if (!v.webSocketDebuggerUrl) throw new Error("no webSocketDebuggerUrl in /json/version");
   return v.webSocketDebuggerUrl;
@@ -53,11 +53,11 @@ function sendBrowserClose(wsUrl) {
   const WebSocket = require("ws");
   return new Promise((resolve) => {
     const ws = new WebSocket(wsUrl);
-    const done = () => resolve();
+    const timer = setTimeout(() => { try { ws.terminate(); } catch {} done(); }, 5000);
+    function done() { clearTimeout(timer); resolve(); }
     ws.on("open", () => ws.send(JSON.stringify({ id: 1, method: "Browser.close" })));
     ws.on("close", done);
     ws.on("error", done);
-    setTimeout(() => { try { ws.terminate(); } catch {} done(); }, 5000);
   });
 }
 
@@ -73,12 +73,18 @@ async function waitExit(child, timeoutMs) {
  * @param {string} [opts.label] folds into the profile dir name
  * @returns {Promise<{port:number, cdpUrl:string, pid:number, profileDir:string, close:() => Promise<{graceful:boolean}>}>}
  */
+/** A fresh, empty directory under .tmp-profiles (remove it with removeProfile). */
+function makeProfileDir(label) {
+  const clean = String(label || "t").replace(/[^a-z0-9-]/gi, "");
+  const dir = path.join(PROFILES_ROOT, `${clean}-${process.pid}-${Date.now()}`);
+  if (!path.resolve(dir).startsWith(PROFILES_ROOT + path.sep)) throw new Error("temp profile must live under .tmp-profiles");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 async function launchTempBrave(opts = {}) {
   const headless = opts.headless ?? !headfulRequested();
-  const label = String(opts.label || "t").replace(/[^a-z0-9-]/gi, "");
-  const profileDir = path.join(PROFILES_ROOT, `${label}-${process.pid}-${Date.now()}`);
-  if (!path.resolve(profileDir).startsWith(PROFILES_ROOT + path.sep)) throw new Error("temp profile must live under .tmp-profiles");
-  fs.mkdirSync(profileDir, { recursive: true });
+  const profileDir = makeProfileDir(opts.label);
   const args = [
     "--remote-debugging-port=0",
     `--user-data-dir=${profileDir}`,
@@ -92,6 +98,7 @@ async function launchTempBrave(opts = {}) {
   ];
   if (headless) args.push("--headless=new");
   const child = spawn(BRAVE_PATH, args, { stdio: "ignore" });
+  child.on("error", () => { /* surfaces as "exited during launch" / port timeout */ });
   let port;
   try {
     port = await readDevToolsPort(profileDir, child, 20000);
@@ -126,7 +133,6 @@ async function forceStop(child, profileDir) {
     await waitExit(child, 5000);
   }
   await removeProfile(profileDir);
-  try { fs.rmdirSync(PROFILES_ROOT); } catch { /* other profiles still in use */ }
 }
 
 // Brave's helper processes (GPU, crashpad, utility) can hold profile files
@@ -137,6 +143,7 @@ async function removeProfile(profileDir) {
   for (;;) {
     try {
       fs.rmSync(profileDir, { recursive: true, force: true });
+      try { fs.rmdirSync(PROFILES_ROOT); } catch { /* other profiles still in use */ }
       return;
     } catch (e) {
       if (!["EPERM", "EBUSY", "ENOTEMPTY", "EACCES"].includes(e.code) || Date.now() > deadline) throw e;
@@ -145,4 +152,4 @@ async function removeProfile(profileDir) {
   }
 }
 
-module.exports = { BRAVE_PATH, PROFILES_ROOT, braveAvailable, headfulRequested, launchTempBrave };
+module.exports = { BRAVE_PATH, PROFILES_ROOT, braveAvailable, headfulRequested, launchTempBrave, makeProfileDir, removeProfile };

@@ -3,10 +3,22 @@
 // session map and calls upstream's tool executor directly, so own-tools and
 // upstream tools act on the SAME page object.
 //
-// No bundle patch. Upstream ships hashed ESM chunks (core-XXXX.js); we find
-// the ones we need by the names in their trailing `export{...}` statement,
-// which survives hash renames, and import() them on the first loadUpstream().
+// No new bundle patch. Upstream ships hashed ESM chunks (core-XXXX.js); we
+// find the ones we need by the names in their trailing `export{...}`
+// statement, which survives hash renames, and import() them on the first
+// loadUpstream(). The one existing on-disk fix, F1-20
+// (scripts/patch-bdmcp-bundle.js, idempotent), is applied first, exactly as
+// legacy mode does before spawning upstream.
 // Requiring this module is cheap: no fs work, no upstream import, env untouched.
+//
+// Env: FORCED_UPSTREAM_ENV + BROWSER_CDP_ENDPOINT_URL are forced and
+// BROWSER_PERSISTENT_* is stripped. The other catalog-shaping vars
+// (TOOL_NAME_PREFIX, AVAILABLE_TOOL_DOMAINS, TOOL_INPUT_METADATA_ENABLE,
+// FIGMA_ACCESS_TOKEN) are honoured, as in legacy mode. They are part of the
+// W1B catalog key, so the catalog served for tools/list must be built from
+// the same env with FORCED_UPSTREAM_ENV applied (PLATFORM and
+// TOOL_OUTPUT_SCHEMA_DISABLE are in that key too), or the cached names and
+// these in-process tools can disagree.
 //
 // Contract we depend on (pinned to 0.6.12; test/upstream-contract.test.js
 // asserts every item against the installed dist):
@@ -35,10 +47,13 @@ const { pathToFileURL } = require("node:url");
 
 // Design §3: forced in code so a user's env can't turn telemetry, the
 // "open chrome://inspect in your real Chrome" fallback, or output schemas on.
+// PLATFORM is a generic name some machines set system-wide; upstream would
+// load its Node.js tool platform for PLATFORM=node.
 const FORCED_UPSTREAM_ENV = Object.freeze({
   TELEMETRY_ENABLE: "false",
   BROWSER_CDP_OPEN_INSPECT: "false",
   TOOL_OUTPUT_SCHEMA_DISABLE: "true",
+  PLATFORM: "browser",
 });
 
 // Export names that identify each chunk. A chunk matches when its trailing
@@ -126,13 +141,17 @@ const SCOPED = Symbol("browser-mcp-relay.routesScopedToPage");
  * default context every session shares — so A's mock would be served to B.
  * Here `browserContext` becomes an accessor returning a Proxy whose
  * route/unroute go to `ctx.page`; everything else reaches the real context,
- * methods bound to it.
+ * methods bound to it. (page.route doesn't see popup or service-worker
+ * requests, which context.route did.)
  *
- * The Proxy is per page. Upstream keys its stub store by
- * `context.browserContext` (a WeakMap), so when ensureSessionPageOpen()
- * swaps in a new page the next access yields a fresh object, i.e. a fresh,
- * not-yet-installed stub store that routes on the new page, instead of a
- * store whose `installed` flag still points at the dead page.
+ * The Proxy is per page. Upstream keys two stores by `context.browserContext`
+ * (WeakMaps): stubs, and the debug_* probe store, which binds to the page it
+ * was enabled on. Keyed by the shared context, B would see A's stubs and
+ * probes and B's tracepoints would land on A's page; keyed by this Proxy,
+ * both are per session. When ensureSessionPageOpen() swaps in a new page the
+ * next access yields a fresh object, i.e. fresh stores (stubs not yet
+ * installed, probes not enabled) for the new page, instead of stores still
+ * pointing at the dead one.
  *
  * Idempotent. Assigning ctx.browserContext replaces the real context.
  */
@@ -200,8 +219,22 @@ function loadUpstream({ cdpUrl } = {}) {
   return promise;
 }
 
+function applyBundleFixes(distDir) {
+  // F1-20: upstream's HttpResourceType enum lacks ping/prefetch/... so
+  // o11y_get-http-requests rejects them. Must run before the first import():
+  // ESM caches the module as first read. Idempotent; a no-op when patched.
+  try {
+    const { applyPatch } = require("../../scripts/patch-bdmcp-bundle.js");
+    const result = applyPatch({ distDir });
+    if (!result.patched) process.stderr.write(`[mcp-relay] F1-20 patch skipped: ${result.reason} (o11y_get-http-requests may reject ping/prefetch/etc resourceTypes)\n`);
+  } catch (e) {
+    process.stderr.write(`[mcp-relay] F1-20 patch threw (continuing): ${e.message}\n`);
+  }
+}
+
 async function doLoad(cdpUrl) {
   const pkg = resolveUpstreamPackage();
+  applyBundleFixes(pkg.distDir);
   const chunks = locateUpstreamChunks(pkg.distDir);
   forceUpstreamEnv(cdpUrl);
   const core = await import(pathToFileURL(chunks.core).href);
@@ -281,12 +314,17 @@ async function doLoad(cdpUrl) {
     return p;
   };
 
-  // `args` must already be parsed against the tool's inputShape (McpServer
-  // does that). Do not re-parse here: upstream enum fields use .transform()
-  // ("PNG" -> "png"), so a second parse rejects them.
+  // `args` reach the handler as given, so they must already be parsed against
+  // the tool's inputShape: McpServer.registerTool does that; a low-level
+  // Server must parse with z.object(inputShape) first or defaults are lost.
+  //
+  // Session-less tools (entries with pageTool:false: the scenario store) run
+  // without a session. Pass ctx = null and never create a context for them;
+  // upstream's executor would open (and so launch) a page first.
   const execute = async (ctx, tool, args) => {
     const upstreamArgs = { ...args };
     delete upstreamArgs.tabId; // the broker's routing key, not an upstream argument
+    if (SESSIONLESS_TOOLS.includes(tool.name())) return tool.handle(ctx, upstreamArgs);
     return executor.executeTool(ctx, tool, upstreamArgs);
   };
 

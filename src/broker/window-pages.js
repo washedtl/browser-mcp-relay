@@ -5,9 +5,18 @@
 // where screenshots stall (spike: p90 2.6 s, max 3.5 s vs 515/574 ms in
 // separate windows). installWindowPerPage() hooks BrowserContext.prototype
 // .newPage of the playwright-core that upstream loads, so every page created
-// for the browser's default context (upstream session creation AND
+// for a CDP-attached browser's default context (upstream session creation AND
 // ensureSessionPageOpen's re-creation after a close) comes from
 // Target.createTarget {newWindow:true}, matched back to its Page by targetId.
+//
+// Only CDP-attached browsers are redirected. The relay and upstream share
+// one playwright-core, and a Playwright launch (launchPersistentContext, the
+// legacy cdp-bridge path; or launch() + newContext()) also has a browser()
+// whose contexts()[0] is the context in use, so "default context" alone
+// can't tell them apart. BrowserType.prototype.connectOverCDP is wrapped to
+// record the browsers it returns; everything else keeps Playwright's newPage.
+// Install before upstream's first connection: browsers attached earlier
+// aren't recorded and keep opening tabs.
 //
 // Placement: `cascade` (default; visible, stepped so windows don't stack)
 // or `offscreen` (left of every display; still renders at full rate).
@@ -29,8 +38,9 @@ const { resolveUpstreamPackage } = require("./upstream-inproc.js");
 const PLACEMENTS = Object.freeze(["cascade", "offscreen"]);
 const WINDOW_WIDTH = 1280;
 const WINDOW_HEIGHT = 900;
-// Far enough left that a window clears any monitor arranged left of the
-// primary; Chromium keeps CDP-given bounds as-is (measured, not clamped).
+// Well left of the primary display's origin, past most left-hand monitor
+// setups. Chromium keeps CDP-given bounds as-is (measured headful and
+// headless: created at -3000 / -10000 / -32000, reported unchanged).
 const OFFSCREEN_LEFT = -10000;
 const PAGE_APPEAR_TIMEOUT_MS = 10000;
 
@@ -41,6 +51,9 @@ function windowBounds(placement, index) {
   const i = index % 8;
   return { left: 40 + i * 48, top: 40 + i * 36, width: WINDOW_WIDTH, height: WINDOW_HEIGHT };
 }
+
+// Browsers returned by BrowserType.connectOverCDP while the hook is installed.
+const cdpBrowsers = new WeakSet();
 
 // One browser-level CDP session per Browser; a failed attempt isn't cached.
 const browserSessions = new WeakMap();
@@ -92,13 +105,19 @@ async function waitForTargetPage(context, browser, targetId) {
 
 let cascadeIndex = 0;
 
-/** The replacement for BrowserContext.prototype.newPage. Exported for tests. */
-function makeNewPage(origNewPage, getPlacement) {
+/**
+ * The replacement for BrowserContext.prototype.newPage. Exported for tests.
+ * @param {Function} origNewPage Playwright's newPage
+ * @param {() => string} getPlacement current placement
+ * @param {(browser: object) => boolean} [isCdpAttached] defaults to "returned by connectOverCDP"
+ */
+function makeNewPage(origNewPage, getPlacement, isCdpAttached = (b) => cdpBrowsers.has(b)) {
   return async function newPageInOwnWindow(...args) {
     const browser = typeof this.browser === "function" ? this.browser() : null;
-    // Persistent launches have no browser(); newContext() contexts are not the
-    // default one, and a raw createTarget would land outside them.
-    if (!browser || browser.contexts()[0] !== this) return origNewPage.apply(this, args);
+    // Launched browsers (persistent or not) keep Playwright's behaviour; so do
+    // newContext() contexts of a CDP browser, where a raw createTarget would
+    // land in the default context instead.
+    if (!browser || !isCdpAttached(browser) || browser.contexts()[0] !== this) return origNewPage.apply(this, args);
     const bounds = windowBounds(getPlacement(), cascadeIndex++);
     const { targetId } = await sendBrowser(browser, "Target.createTarget", {
       url: "about:blank", newWindow: true, background: true, ...bounds,
@@ -107,28 +126,40 @@ function makeNewPage(origNewPage, getPlacement) {
   };
 }
 
-/** BrowserContext class of the playwright-core instance upstream imports. */
-function upstreamBrowserContextClass() {
+function makeConnectOverCDP(origConnect) {
+  return async function connectOverCDPRecorded(...args) {
+    const browser = await origConnect.apply(this, args);
+    cdpBrowsers.add(browser);
+    return browser;
+  };
+}
+
+/** Client classes of the playwright-core instance upstream imports. */
+function upstreamPlaywrightClient() {
   const upReq = resolveUpstreamPackage().require;
   const coreDir = path.dirname(createRequire(upReq.resolve("playwright")).resolve("playwright-core/package.json"));
   const { BrowserContext } = require(path.join(coreDir, "lib", "client", "browserContext.js"));
-  if (!BrowserContext || typeof BrowserContext.prototype.newPage !== "function") {
-    throw new Error(`[broker] playwright-core at ${coreDir} has no client BrowserContext.prototype.newPage to hook`);
+  const { BrowserType } = require(path.join(coreDir, "lib", "client", "browserType.js"));
+  if (!BrowserContext || typeof BrowserContext.prototype.newPage !== "function"
+    || !BrowserType || typeof BrowserType.prototype.connectOverCDP !== "function") {
+    throw new Error(`[broker] playwright-core at ${coreDir} has no client BrowserContext.newPage / BrowserType.connectOverCDP to hook`);
   }
-  return BrowserContext;
+  return { BrowserContext, BrowserType };
 }
 
-let installed = null; // { proto, orig, placement }
+let installed = null; // { contextProto, origNewPage, typeProto, origConnect, placement }
 
 function uninstallWindowPerPage() {
   if (!installed) return;
-  installed.proto.newPage = installed.orig;
+  installed.contextProto.newPage = installed.origNewPage;
+  installed.typeProto.connectOverCDP = installed.origConnect;
   installed = null;
 }
 
 /**
- * Route every default-context newPage() into its own window. Install before
- * the first upstream session context. Calling again only switches placement.
+ * Route every newPage() of a CDP-attached browser's default context into its
+ * own window. Install before upstream's first session context. Calling again
+ * only switches placement.
  * @param {{placement?: 'cascade'|'offscreen'}} [opts]
  * @returns {() => void} uninstall
  */
@@ -140,9 +171,16 @@ function installWindowPerPage({ placement = "cascade" } = {}) {
     installed.placement = placement;
     return uninstallWindowPerPage;
   }
-  const proto = upstreamBrowserContextClass().prototype;
-  const state = { proto, orig: proto.newPage, placement };
-  proto.newPage = makeNewPage(state.orig, () => state.placement);
+  const { BrowserContext, BrowserType } = upstreamPlaywrightClient();
+  const state = {
+    contextProto: BrowserContext.prototype,
+    origNewPage: BrowserContext.prototype.newPage,
+    typeProto: BrowserType.prototype,
+    origConnect: BrowserType.prototype.connectOverCDP,
+    placement,
+  };
+  state.contextProto.newPage = makeNewPage(state.origNewPage, () => state.placement);
+  state.typeProto.connectOverCDP = makeConnectOverCDP(state.origConnect);
   installed = state;
   return uninstallWindowPerPage;
 }
