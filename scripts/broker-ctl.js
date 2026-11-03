@@ -21,8 +21,9 @@ const control = require("../src/broker/control.js");
 const processShim = require("../src/process-shim.js");
 
 const USAGE = "usage: npm run broker:status | npm run broker:stop   (node scripts/broker-ctl.js status|stop)";
-// Brave gets 10 s to close before the broker kills it; then the broker exits.
-const STOP_WAIT_MS = 30_000;
+// Brave gets 10 s to close (30 s once it accepted the close) before the
+// broker kills it; then the broker exits.
+const STOP_WAIT_MS = 45_000;
 
 /** @returns {Promise<number>} exit code: 0 ok (incl. "not running"), 1 failed, 2 usage */
 async function run({

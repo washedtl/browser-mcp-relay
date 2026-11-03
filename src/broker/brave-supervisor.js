@@ -3,25 +3,28 @@
 // Raw `spawn` (not Playwright), so the flags are exactly ours. Owns the
 // launch, the PID, CDP readiness, crash detection, the wait-for-old-PID
 // before a relaunch, and graceful close. Every number quoted below was
-// measured by the W2-S spike or the W2C build (Brave 147, Windows 11,
-// elevated Claude Code), see docs/plans/2026-11-03-broker-design.md.
+// measured while building the broker (Brave 147, Windows 11, elevated
+// Claude Code).
 
 const { EventEmitter } = require("node:events");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const WebSocket = require("ws");
 const { detectBravePath } = require("../detect-browser.js");
 
 const PREFIX = "[mcp-relay] brave-supervisor:";
 const KILL_WAIT_MS = 5000;
+// Chromium's exit code when another browser process holds the profile
+const RESULT_CODE_PROFILE_IN_USE = 21;
 
 /**
  * Supervises one Brave on one persistent profile.
  *
  *   ensure()          → {cdpUrl, pid}; launches if needed, concurrent calls share one launch
- *   closeGracefully() → Browser.close over CDP, kill fallback after closeTimeoutMs
+ *   closeGracefully() → Browser.close over CDP, kill fallback (see _close)
  *   isUp()            → launched, CDP connected, PID alive
  *   checkAlive()      → isUp(), after a PID found gone has gone 'down' at once
  *   pid               → the running Brave's PID, or null
@@ -41,6 +44,9 @@ const KILL_WAIT_MS = 5000;
  * an unexpected 'down' the PID gets exitWaitMs to exit, then is killed, and a
  * relaunch always waits for it: a new brave.exe on a profile whose old
  * Brave is still exiting hands off to it and exits.
+ *
+ * A Brave this supervisor did not start (left by an earlier broker) is
+ * reaped before a launch on the same profile: see _reapStrays.
  */
 class BraveSupervisor extends EventEmitter {
   /**
@@ -62,10 +68,16 @@ class BraveSupervisor extends EventEmitter {
    * @param {(msg: string) => void} [opts.log] — default: stderr
    * @param {number} [opts.launchTimeoutMs=20000] — spawn → CDP ready
    * @param {number} [opts.closeTimeoutMs=10000] — Browser.close → exit, then kill
+   *   (unless Brave accepted the close: see shutdownGraceMs)
+   * @param {number} [opts.shutdownGraceMs=20000] — extra wait after closeTimeoutMs
+   *   for a Brave that accepted Browser.close (dropped CDP) and is still shutting down
    * @param {number} [opts.exitWaitMs=5000] — unexpected 'down' → exit, then kill
    * @param {number} [opts.portFreeWaitMs=3000] — relaunch: wait for our port to free
    * @param {number} [opts.proxyProbeTimeoutMs=1500]
+   * @param {number} [opts.strayExitWaitMs=10000] — a reaped stray Brave → its profile lock freed
    * @param {typeof spawn} [opts._spawn] — test seam
+   * @param {{lockHeld?: (profileDir: string) => boolean, find?: (profileDir: string, exeName: string) => Promise<number[]>,
+   *   kill?: (pid: number) => void}} [opts._strays] — test seams for _reapStrays
    */
   constructor(opts = {}) {
     super();
@@ -86,11 +98,14 @@ class BraveSupervisor extends EventEmitter {
     this._t = {
       launchTimeoutMs: opts.launchTimeoutMs || 20000,
       closeTimeoutMs: opts.closeTimeoutMs || 10000,
+      shutdownGraceMs: opts.shutdownGraceMs || 20000,
       exitWaitMs: opts.exitWaitMs || 5000,
       portFreeWaitMs: opts.portFreeWaitMs || 3000,
       proxyProbeTimeoutMs: opts.proxyProbeTimeoutMs || 1500,
+      strayExitWaitMs: opts.strayExitWaitMs || 10000,
     };
     this._spawn = opts._spawn || spawn;
+    this._strays = { lockHeld: profileLockHeld, find: findBraveOnProfile, kill: killPid, ...opts._strays };
     this._proc = null;
     this._launching = null;
     this._closing = null;
@@ -162,7 +177,8 @@ class BraveSupervisor extends EventEmitter {
   /**
    * Browser.close over CDP (Chromium flushes cookies only every ~30 s, so a
    * hard kill loses recent logins), then kill if it has not exited within
-   * closeTimeoutMs. Concurrent calls share one close.
+   * closeTimeoutMs, or within closeTimeoutMs + shutdownGraceMs once it
+   * accepted the close. Concurrent calls share one close.
    *
    * @returns {Promise<{graceful: boolean, ms: number} | null>} null if Brave was not running
    */
@@ -186,8 +202,18 @@ class BraveSupervisor extends EventEmitter {
     if (proc.up && proc.ws.readyState === WebSocket.OPEN) {
       proc.ws.send(JSON.stringify({ id: proc.nextId++, method: "Browser.close" }));
     }
-    if (!(await waitExit(proc, this._t.closeTimeoutMs))) {
-      this._log(`brave pid=${proc.pid} still running ${this._t.closeTimeoutMs} ms after close was requested; killing it (cookie changes since the last flush may be lost)`);
+    let exited = await waitExit(proc, this._t.closeTimeoutMs);
+    // Measured: Brave answers Browser.close and drops CDP within ~10 ms, then
+    // shuts down (flushing cookies and prefs), which took 6 s on a machine at
+    // 100% CPU. A Brave that dropped CDP has accepted the close: give it more
+    // time before a kill that could lose those writes. One whose CDP is still
+    // open ignored the close: kill it now.
+    if (!exited && proc.ws && proc.ws.readyState !== WebSocket.OPEN) {
+      this._log(`brave pid=${proc.pid} accepted the close but is still shutting down after ${this._t.closeTimeoutMs} ms (busy machine?); waiting up to ${this._t.shutdownGraceMs} ms more`);
+      exited = await waitExit(proc, this._t.shutdownGraceMs);
+    }
+    if (!exited) {
+      this._log(`brave pid=${proc.pid} still running ${Date.now() - t0} ms after close was requested; killing it (cookie changes since the last flush may be lost)`);
       await this._kill(proc);
     }
     this._onDown(proc, "closed");
@@ -202,6 +228,7 @@ class BraveSupervisor extends EventEmitter {
     if (prev && !prev.exited) await this._reap(prev);
     const exe = this._executablePath || (this._executablePath = detectBravePath());
     fs.mkdirSync(this.profileDir, { recursive: true });
+    await this._reapStrays(exe);
     disableMemorySaver(this.profileDir, this._log);
     const proxy = await resolveProxy(this._proxyUrl, { log: this._log, timeoutMs: this._t.proxyProbeTimeoutMs });
     const proxyServer = proxy ? proxy.server : null;
@@ -225,6 +252,40 @@ class BraveSupervisor extends EventEmitter {
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
     this._log(`brave pid=${proc.pid} up on :${port} in ${Date.now() - t0} ms (launch #${this._launches}${via})`);
     return cdpInfo(proc);
+  }
+
+  /**
+   * Reap a Brave left on OUR profile by an earlier broker. It normally dies
+   * with that broker (Node puts its children in a kill-on-close job object;
+   * measured: gone ~30 ms after a hard kill of the broker), but one that
+   * survived anyway would make our launch hand off to it and exit with
+   * code 21. Chromium holds <profile>/lockfile open while it runs, so only
+   * then are processes listed: those whose --user-data-dir is exactly this
+   * profile are killed (nothing else, no tree walk), and the launch waits
+   * for the lock to go.
+   */
+  async _reapStrays(exe) {
+    const { lockHeld, find, kill } = this._strays;
+    if (!lockHeld(this.profileDir)) return;
+    const pids = await find(this.profileDir, path.basename(exe));
+    if (pids.length) {
+      this._log(`${this.profileDir} is in use by Brave pid(s) ${pids.join(", ")}, not started by this broker; killing them`);
+      for (const pid of pids) {
+        try {
+          kill(pid);
+        } catch (e) {
+          if (e.code !== "ESRCH") this._log(`could not kill stray Brave pid=${pid}: ${e.message}`);
+        }
+      }
+    }
+    const deadline = Date.now() + this._t.strayExitWaitMs;
+    while (lockHeld(this.profileDir)) {
+      if (Date.now() >= deadline) {
+        const what = pids.length ? `after killing pid(s) ${pids.join(", ")}` : "and no process has exactly this --user-data-dir";
+        throw new Error(`${PREFIX} ${this.profileDir} is still locked by another browser (${what}); not launching on it`);
+      }
+      await sleep(100);
+    }
   }
 
   async _choosePort() {
@@ -279,8 +340,9 @@ class BraveSupervisor extends EventEmitter {
     for (;;) {
       if (proc.spawnError) throw new Error(`${PREFIX} could not start ${exe}: ${proc.spawnError.message}`);
       if (proc.exited) {
+        const inUse = proc.exitCode === RESULT_CODE_PROFILE_IN_USE ? ": the profile is in use" : "";
         throw new Error(
-          `${PREFIX} Brave exited during launch (code=${proc.exitCode}) after ${Date.now() - t0} ms. ` +
+          `${PREFIX} Brave exited during launch (code=${proc.exitCode}${inUse}) after ${Date.now() - t0} ms. ` +
           `If another Brave already runs on ${this.profileDir}, a new one hands off to it and exits; close that Brave first.`,
         );
       }
@@ -404,6 +466,52 @@ class BraveSupervisor extends EventEmitter {
 
 function cdpInfo(proc) {
   return { cdpUrl: `http://127.0.0.1:${proc.port}`, pid: proc.pid };
+}
+
+/**
+ * Is a browser running on `profileDir`? Windows: Chromium holds
+ * `<profile>/lockfile` open (no write sharing) for its whole life and the
+ * file goes when it exits, so opening it for writing fails while one runs
+ * (EBUSY; EPERM while it is being deleted). POSIX: `SingletonLock` links to
+ * "<host>-<pid>" and outlives a crash, so the pid must still be alive.
+ * @param {string} profileDir
+ * @returns {boolean}
+ */
+function profileLockHeld(profileDir, platform = process.platform) {
+  if (platform === "win32") {
+    try {
+      fs.closeSync(fs.openSync(path.join(profileDir, "lockfile"), "r+"));
+      return false;
+    } catch (e) {
+      return e.code === "EBUSY" || e.code === "EPERM";
+    }
+  }
+  let target;
+  try {
+    target = fs.readlinkSync(path.join(profileDir, "SingletonLock"));
+  } catch {
+    return false;
+  }
+  const m = /^(.*)-(\d+)$/.exec(target);
+  return !!m && m[1] === os.hostname() && isPidAlive(Number(m[2]));
+}
+
+/**
+ * PIDs of `exeName` processes (browser and helpers) whose command line passes
+ * exactly `profileDir` as --user-data-dir (pool-shared's whole-argument
+ * matcher: profile never matches profile-2). The process listing runs off
+ * the event loop.
+ * @returns {Promise<number[]>}
+ */
+async function findBraveOnProfile(profileDir, exeName) {
+  const shim = require("../process-shim.js");
+  const matches = require("../pool-shared.js").userDataDirMatcher(profileDir);
+  const procs = await shim.runProbeAsync((spawn) => shim.listProcessesByCommand(exeName, spawn ? { _spawnSync: spawn } : {}));
+  return procs.filter((p) => matches(p.command)).map((p) => p.pid);
+}
+
+function killPid(pid) {
+  process.kill(pid, "SIGKILL");
 }
 
 function isPidAlive(pid) {
@@ -717,4 +825,6 @@ module.exports = {
   resolveProxy,
   isLoopbackHost,
   braveEnv,
+  profileLockHeld,
+  findBraveOnProfile,
 };

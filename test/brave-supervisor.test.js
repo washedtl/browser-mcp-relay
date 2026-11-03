@@ -19,10 +19,12 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const WebSocket = require("ws");
 const { detectBravePath } = require("../src/detect-browser.js");
+const { removeDir } = require("./fixtures/temp-brave.js");
 
 const {
   BraveSupervisor,
@@ -31,6 +33,7 @@ const {
   resolveProxy,
   isLoopbackHost,
   braveEnv,
+  profileLockHeld,
 } = require("../src/broker/brave-supervisor.js");
 
 const RUN_ID = `bsup-${process.pid}-${Date.now()}`;
@@ -817,16 +820,120 @@ test("closeGracefully(): Browser.close, process exits, 'down'('closed'), next en
   assert.strictEqual(second.cdpUrl, first.cdpUrl, "idle close → relaunch keeps the port");
 });
 
-test("closeGracefully(): Brave ignoring Browser.close is killed after closeTimeoutMs", async () => {
+test("closeGracefully(): Brave ignoring Browser.close (CDP still open) is killed after closeTimeoutMs, no shutdown grace", async () => {
   const dir = tmpProfile("fake-ignore-close");
-  const { sup, log } = fakeSupervisor(dir, { mode: "ignore-close", closeTimeoutMs: 400 });
+  const { sup, log } = fakeSupervisor(dir, { mode: "ignore-close", closeTimeoutMs: 400, shutdownGraceMs: 30000 });
   const { pid } = await sup.ensure();
   const t0 = Date.now();
   const res = await sup.closeGracefully();
   assert.strictEqual(res.graceful, false);
   assert.ok(Date.now() - t0 >= 400);
+  assert.ok(Date.now() - t0 < 15000, `took ${Date.now() - t0} ms: the grace is only for a Brave that accepted the close`);
   assert.ok(!isAlive(pid));
   assert.ok(log.lines.some((l) => /kill/i.test(l)), log.lines.join("\n"));
+  assert.ok(!log.lines.some((l) => /accepted the close/.test(l)), log.lines.join("\n"));
+});
+
+test("W2P closeGracefully(): a Brave that accepted the close (dropped CDP) but shuts down slowly gets shutdownGraceMs, not a kill", async () => {
+  const dir = tmpProfile("fake-slow-close");
+  const { sup, log } = fakeSupervisor(dir, { mode: "slow-close", closeTimeoutMs: 300, shutdownGraceMs: 15000 });
+  const { pid } = await sup.ensure();
+  const res = await sup.closeGracefully();
+  assert.strictEqual(res.graceful, true, log.lines.join("\n"));
+  assert.ok(res.ms >= 1000, `closed in ${res.ms} ms, before the fake's 1200 ms shutdown`);
+  assert.ok(!isAlive(pid));
+  assert.ok(log.lines.some((l) => /accepted the close but is still shutting down after 300 ms/.test(l)), log.lines.join("\n"));
+  assert.ok(!log.lines.some((l) => /killing it/.test(l)), log.lines.join("\n"));
+});
+
+test("W2P closeGracefully(): a Brave that accepted the close but never exits is killed after closeTimeoutMs + shutdownGraceMs", async () => {
+  const dir = tmpProfile("fake-close-hang");
+  const { sup, log } = fakeSupervisor(dir, { mode: "close-hang", closeTimeoutMs: 300, shutdownGraceMs: 400 });
+  const { pid } = await sup.ensure();
+  const res = await sup.closeGracefully();
+  assert.strictEqual(res.graceful, false);
+  assert.ok(res.ms >= 700, `killed after ${res.ms} ms`);
+  assert.ok(!isAlive(pid));
+  assert.ok(log.lines.some((l) => /still running \d+ ms after close was requested; killing it/.test(l)), log.lines.join("\n"));
+});
+
+// ── W2P: a Brave this supervisor did not start, on its profile ──
+
+test("W2P stray Brave: profile lock not held → no process listing, launch as usual", async () => {
+  const dir = tmpProfile("fake-no-stray");
+  let listed = 0;
+  const { sup } = fakeSupervisor(dir, { _strays: { lockHeld: () => false, find: async () => { listed++; return []; } } });
+  await sup.ensure();
+  assert.strictEqual(listed, 0);
+  assert.strictEqual(sup.isUp(), true);
+});
+
+test("W2P stray Brave on our profile: only the PIDs on it are killed, and the launch waits for its lock to free", async () => {
+  const dir = tmpProfile("fake-stray");
+  const killed = [];
+  const lookups = [];
+  let held = true;
+  let heldAtSpawn = null;
+  const { sup, log } = fakeSupervisor(dir, {
+    onSpawn: () => { heldAtSpawn = held; },
+    _strays: {
+      lockHeld: () => held,
+      find: async (profileDir, exeName) => { lookups.push({ profileDir, exeName }); return [101, 102]; },
+      kill: (pid) => {
+        killed.push(pid);
+        if (pid === 102) throw Object.assign(new Error("gone"), { code: "ESRCH" }); // exited meanwhile: fine
+        setTimeout(() => { held = false; }, 300);
+      },
+    },
+  });
+  await sup.ensure();
+  assert.deepStrictEqual(killed, [101, 102]);
+  assert.deepStrictEqual(lookups, [{ profileDir: path.resolve(dir), exeName: "fake-brave" }]);
+  assert.strictEqual(heldAtSpawn, false, "launched only once the stray's lock was gone");
+  assert.ok(log.lines.some((l) => /is in use by Brave pid\(s\) 101, 102, not started by this broker; killing them/.test(l)), log.lines.join("\n"));
+  assert.ok(!log.lines.some((l) => /could not kill/.test(l)), log.lines.join("\n"));
+});
+
+test("W2P stray Brave: a profile still locked after the reap fails the launch clearly; nothing is spawned", async () => {
+  const dir = tmpProfile("fake-stray-stuck");
+  let spawned = 0;
+  const { sup } = fakeSupervisor(dir, {
+    strayExitWaitMs: 300,
+    onSpawn: () => spawned++,
+    _strays: { lockHeld: () => true, find: async () => [], kill: () => assert.fail("nothing matched, so nothing is killed") },
+  });
+  await assert.rejects(sup.ensure(), /still locked by another browser \(and no process has exactly this --user-data-dir\); not launching on it/);
+  assert.strictEqual(spawned, 0);
+});
+
+test("W2P profileLockHeld (Windows rule): no lockfile, or one no process holds open, is not a lock", () => {
+  const dir = tmpProfile("lock-win");
+  assert.strictEqual(profileLockHeld(dir, "win32"), false);
+  fs.writeFileSync(path.join(dir, "lockfile"), "");
+  assert.strictEqual(profileLockHeld(dir, "win32"), false);
+  assert.strictEqual(profileLockHeld(path.join(dir, "missing"), "win32"), false);
+});
+
+test("W2P profileLockHeld (POSIX rule): SingletonLock → <this host>-<live pid> is held; a dead pid or another host is stale", (t) => {
+  const dir = tmpProfile("lock-posix");
+  const link = path.join(dir, "SingletonLock");
+  const point = (target) => {
+    try { fs.unlinkSync(link); } catch { /* none yet */ }
+    fs.symlinkSync(target, link);
+  };
+  try {
+    point(`${os.hostname()}-${process.pid}`);
+  } catch (e) {
+    t.skip(`symlinks can't be created here (${e.code})`);
+    return;
+  }
+  assert.strictEqual(profileLockHeld(dir, "linux"), true);
+  point(`${os.hostname()}-2147483646`);
+  assert.strictEqual(profileLockHeld(dir, "linux"), false, "dead pid: a crash left it");
+  point(`another-host-${process.pid}`);
+  assert.strictEqual(profileLockHeld(dir, "linux"), false, "another host's lock (shared home dir)");
+  fs.unlinkSync(link);
+  assert.strictEqual(profileLockHeld(dir, "linux"), false);
 });
 
 test("closeGracefully(): nothing running → null; concurrent calls share one close", async () => {
@@ -871,11 +978,14 @@ test("launch failure: a missing executable rejects with a clear error", async ()
 
 test("launch failure: CDP never comes up → rejects after launchTimeoutMs and kills the process", async () => {
   const dir = tmpProfile("fake-no-cdp");
+  const before = spawnedChildren.length;
   const { sup } = fakeSupervisor(dir, { mode: "no-cdp", launchTimeoutMs: 500 });
   sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), /not ready/);
-  const [{ pid }] = launchesOf(dir);
-  await waitFor(() => !isAlive(pid), 5000, "no-cdp fake to be killed");
+  // The spawn we recorded, not the fake's own launch record: on a loaded
+  // machine the fake can be killed at 500 ms before it has written one.
+  const [child] = spawnedChildren.slice(before);
+  await waitFor(() => child.exitCode !== null || child.signalCode !== null, 5000, "no-cdp fake to be killed");
 });
 
 test("launch failure: CDP answered by a different browser process → rejects, ours is killed", async () => {
@@ -1046,6 +1156,28 @@ test("real Brave: after a root-only hard kill, the immediate relaunch still read
   assert.ok(cookies.some((c) => c.name === "w2c_kill" && c.value === "persisted"), `cookie store unreadable after relaunch; have: ${cookies.map((c) => c.name)}`);
 });
 
+test("W2P real Brave: a Brave left on our profile is reaped before launch; one on a look-alike profile is not", REAL, async (t) => {
+  const dir = tmpProfile("real-stray");
+  const lookalike = `${dir}-2`; // our path is a prefix of its path: the matcher must be exact
+  fs.mkdirSync(lookalike);
+  const launchStray = async (profileDir) => {
+    const child = recordingSpawn()(SYSTEM_BRAVE, buildBraveArgs({ port: 0, profileDir, headless: true }), { stdio: "ignore" });
+    await waitFor(() => profileLockHeld(profileDir), 20000, `a Brave to hold ${profileDir}'s lockfile`);
+    return child;
+  };
+  const stray = await launchStray(dir);
+  const bystander = await launchStray(lookalike);
+  t.after(() => hardKill(bystander.pid));
+  const { sup, log } = realSupervisor(dir, { headless: true });
+  const info = await sup.ensure();
+  assert.ok(log.lines.some((l) => /not started by this broker; killing them/.test(l)), log.lines.join("\n"));
+  assert.ok(!isAlive(stray.pid), "the stray is gone");
+  assert.notStrictEqual(info.pid, stray.pid);
+  await sleep(1000);
+  assert.ok(isAlive(info.pid), "our Brave exited (handed off to a stray?)");
+  assert.ok(isAlive(bystander.pid), "a Brave on another profile was killed");
+});
+
 test("real Brave: --load-extension loads an unpacked MV3 extension", REAL, async () => {
   const extDir = tmpProfile("real-ext-src");
   fs.writeFileSync(path.join(extDir, "manifest.json"), JSON.stringify({
@@ -1106,10 +1238,11 @@ async function shutDownEverything() {
   await waitFor(() => spawnedChildren.every((c) => !c.pid || c.exitCode !== null || c.signalCode !== null), 15000, "recorded children to exit");
 }
 
-test("no Brave or fake-brave process outlives the tests", { timeout: 60000 }, async () => {
+test("no Brave or fake-brave process outlives the tests", { timeout: 120000 }, async () => {
   await shutDownEverything();
   let left = [];
-  await waitFor(() => (left = processesMatching(RUN_ID)).length === 0, 10000, "processes on the run's profiles to exit")
+  // Brave's helpers exit on their own after the browser; on a loaded machine that took several seconds
+  await waitFor(() => (left = processesMatching(RUN_ID)).length === 0, 30000, "processes on the run's profiles to exit")
     .catch(() => {});
   assert.deepStrictEqual(left.map((r) => `${r.pid} ${r.cmd.slice(0, 160)}`), []);
 });
@@ -1121,6 +1254,6 @@ test.after(async () => {
   for (const r of processesMatching(RUN_ID)) {
     try { hardKill(r.pid); } catch { /* already gone */ }
   }
-  fs.rmSync(TMP_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  await removeDir(TMP_ROOT);
   try { fs.rmdirSync(path.dirname(TMP_ROOT)); } catch { /* not empty: another run */ }
 });

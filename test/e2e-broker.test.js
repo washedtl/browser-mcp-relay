@@ -25,6 +25,8 @@ const { until, pidAlive, killTree, freePort } = require("./fixtures/broker-fakes
 const SKIP = !braveAvailable() && "needs Windows + Brave";
 const ENTRY = path.resolve(__dirname, "..", "src", "index.js");
 const IDLE_EXIT_MS = 4000;
+// the broker's close: up to 30 s for a Brave still shutting down on a loaded machine, then exit
+const CLOSE_BUDGET_MS = 40_000;
 const textOf = (r) => (r.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
 
 /** [{pid, name, privateMB, wsMB, cmd}] for processes whose command line contains `needle` or whose pid is listed. */
@@ -123,7 +125,7 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
       left = await until(async () => {
         const procs = [...processes({ needle: runId }), ...processes({ needle: path.basename(profileDir) })];
         return procs.length === 0 ? [] : null;
-      }, IDLE_EXIT_MS + 20_000, "the broker and Brave to exit");
+      }, IDLE_EXIT_MS + CLOSE_BUDGET_MS, "the broker and Brave to exit");
     } catch {
       left = [...processes({ needle: runId }), ...processes({ needle: path.basename(profileDir) })];
       for (const p of left) killTree(p.pid);
@@ -139,8 +141,12 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     const [a, b, c] = await Promise.all(["A", "B", "C"].map(openSession));
     numbers.coldInitializeMs = Date.now() - t0;
     numbers.perSessionInitializeMs = [a.ms, b.ms, c.ms];
-    const brokers = processes({ needle: runId }).filter((p) => /node/i.test(p.name) && /main\.js/.test(p.cmd));
-    assert.strictEqual(brokers.length, 1, `exactly one broker: ${JSON.stringify(brokers.map((p) => p.cmd))}\n${brokerLog()}`);
+    // Brokers that lost the pipe race exit on their own, a moment later on a
+    // loaded machine: wait for that before counting.
+    const brokers = () => processes({ needle: runId }).filter((p) => /node/i.test(p.name) && /main\.js/.test(p.cmd));
+    let left = [];
+    await until(() => (left = brokers()).length <= 1, 20_000, "the losing brokers to exit").catch(() => {});
+    assert.strictEqual(left.length, 1, `exactly one broker: ${JSON.stringify(left.map((p) => p.cmd))}\n${brokerLog()}`);
     const tools = (await a.client.listTools()).tools.map((x) => x.name);
     assert.ok(tools.includes("navigation_go-to") && tools.includes("tabs_new") && tools.includes("browser_show"), tools.join(","));
     const t1 = Date.now();
@@ -257,7 +263,7 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     const st = await status();
     for (const s of sessions) await s.client.close();
     const t0 = Date.now();
-    await until(() => !pidAlive(st.pid) && !pidAlive(st.brave.pid), IDLE_EXIT_MS + 20_000, "the broker + Brave to exit");
+    await until(() => !pidAlive(st.pid) && !pidAlive(st.brave.pid), IDLE_EXIT_MS + CLOSE_BUDGET_MS, "the broker + Brave to exit");
     numbers.idleExitMs = Date.now() - t0;
     assert.match(brokerLog(), /no connections for 4000 ms/);
     assert.match(brokerLog(), /closed gracefully/);

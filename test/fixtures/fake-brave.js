@@ -10,6 +10,9 @@
 //
 // Modes:
 //   ignore-close  ack Browser.close but keep running
+//   slow-close    ack Browser.close, drop CDP at once (as Brave does), exit
+//                 after --fake-exit-ms (default 1200): a slow shutdown
+//   close-hang    ack Browser.close, drop CDP, then keep running until killed
 //   exit-early    exit 0 after 100 ms without serving CDP (a profile handoff)
 //   no-cdp        run without ever serving CDP
 //   foreign-pid   getProcessInfo reports a browser pid that is not ours
@@ -30,6 +33,7 @@ const opt = (name) => {
 };
 const modes = new Set((opt("fake-mode") || "").split(",").filter(Boolean));
 const delay = Number(opt("fake-delay") || 0);
+const exitMs = Number(opt("fake-exit-ms") || 1200);
 const port = Number(opt("remote-debugging-port"));
 const userDataDir = opt("user-data-dir");
 const braveArgs = argv.filter((a) => !a.startsWith("--fake-"));
@@ -60,7 +64,10 @@ function serve() {
       const reply = (result) => ws.send(JSON.stringify({ id: msg.id, result }));
       if (msg.method === "Browser.close") {
         reply({});
-        if (!modes.has("ignore-close")) setTimeout(() => process.exit(0), 50);
+        if (modes.has("slow-close") || modes.has("close-hang")) {
+          for (const c of wss.clients) c.close();
+          if (modes.has("slow-close")) setTimeout(() => process.exit(0), exitMs);
+        } else if (!modes.has("ignore-close")) setTimeout(() => process.exit(0), 50);
       } else if (msg.method === "SystemInfo.getProcessInfo") {
         const id = modes.has("foreign-pid") ? process.pid + 100000 : process.pid;
         reply({ processInfo: [{ type: "browser", id, cpuTime: 0 }, { type: "GPU", id: id + 1, cpuTime: 0 }] });
