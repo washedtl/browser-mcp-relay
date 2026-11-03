@@ -737,6 +737,7 @@ function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false } =
 
 module.exports = {
   CONFIG,
+  WRAPPER_LOCK,
   COOKIE_FILES,
   SNAPSHOT_FILES,
   SNAPSHOT_DIRS,

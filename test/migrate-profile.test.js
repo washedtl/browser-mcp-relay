@@ -34,16 +34,17 @@ function fakeSlot(label, ageMs = 0) {
   return dir;
 }
 
-const pool = (poolDirs) => ({ CONFIG: { poolDirs, standalone: false }, braveNeedle: () => "brave.exe", readLockState: () => null });
+const poolShared = require("../src/pool-shared.js");
+const pool = (poolDirs) => ({ ...poolShared, CONFIG: { poolDirs, standalone: false } });
 
-async function runWith(argv, { target = path.join(tmp("t"), "profile"), poolDirs = [], braveCommands = [], claimed = [] } = {}) {
+async function runWith(argv, { target = path.join(tmp("t"), "profile"), poolDirs = [], braveCommands = [] } = {}) {
   const lines = [];
   const code = await run({
     argv,
     env: { BROWSER_RELAY_BROKER_PROFILE_DIR: target },
     pool: pool(poolDirs),
-    listBraveCommands: () => braveCommands,
-    isSlotClaimed: (d) => claimed.includes(d),
+    // a claimed slot holds a lock written by this (live) process a minute after it started
+    probes: { braveCommands: async () => braveCommands, startTimes: async () => new Map([[process.pid, Date.now() - 60e3]]) },
     out: (l) => lines.push(l),
   });
   return { code, text: lines.join("\n"), target };
@@ -92,7 +93,9 @@ test("refuses: an existing broker profile, a source Brave runs on or a relay hol
   assert.strictEqual(running.code, 1);
   assert.match(running.text, /Brave is running/);
 
-  const held = await runWith(["--from", slot], { claimed: [slot] });
+  fs.writeFileSync(path.join(slot, poolShared.WRAPPER_LOCK), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  const held = await runWith(["--from", slot]);
+  fs.rmSync(path.join(slot, poolShared.WRAPPER_LOCK));
   assert.strictEqual(held.code, 1);
   assert.match(held.text, /legacy relay holds/);
 

@@ -29,10 +29,10 @@ const http = require("node:http");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
 const { WebSocketServer } = require("ws");
 
 const pool = require("./pool-shared.js");
+const { runProbeAsync } = require("./process-shim.js");
 const { summarizeVaultFromEnv, getLoadedVault } = require("./vault.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { detectBraveProfileDir } = require("./detect-browser.js");
@@ -115,50 +115,6 @@ function formatDuration(seconds) {
   return `${h}h ${m % 60}m`;
 }
 
-/** spawnSync's result shape from an async execFile, so a probe written
- *  against spawnSync can be fed a non-blocking run's output. */
-function spawnAsync(cmd, args, options = {}) {
-  const opts = { encoding: options.encoding || "utf8" };
-  for (const k of ["windowsHide", "timeout", "maxBuffer", "env"]) {
-    if (options[k] !== undefined) opts[k] = options[k];
-  }
-  return new Promise((resolve) => {
-    execFile(cmd, args, opts, (err, stdout, stderr) => {
-      if (!err) return resolve({ status: 0, stdout, stderr });
-      // Non-zero exit: err.code is the exit status (spawnSync: status=N,
-      // no error). Anything else (spawn failure, timeout, maxBuffer) is
-      // spawnSync's status=null + error.
-      if (typeof err.code === "number") return resolve({ status: err.code, stdout, stderr });
-      resolve({ status: null, stdout, stderr, error: err });
-    });
-  });
-}
-
-/**
- * W1E-2 (2026-11-03): run a spawnSync-based probe without blocking the
- * event loop. The pool/process-shim probes (PowerShell on Windows, ~1s
- * each) are synchronous and take a `_spawnSync` seam: a dry run captures
- * the exact command the probe would spawn, that command runs async, and the
- * probe runs again on the real output — so command construction and
- * parsing stay in one place (process-shim) with no duplicate.
- *
- * @param {(spawn?: Function) => T} probe — calls its probe with `{ _spawnSync: spawn }`
- * @returns {Promise<T>}
- */
-async function runProbeAsync(probe) {
-  const calls = [];
-  probe((cmd, args, options) => {
-    calls.push({ cmd, args, options });
-    return { status: 0, stdout: "", stderr: "" };
-  });
-  // No spawn needed (e.g. empty pid list), or a shape we can't replay
-  // faithfully: run it as-is.
-  if (calls.length !== 1) return probe();
-  const { cmd, args, options } = calls[0];
-  const result = await spawnAsync(cmd, args, options);
-  return probe(() => result);
-}
-
 // The vault for the status page: the one the relay loaded in this process.
 // Standalone inspector (no relay here): parse once and keep only the
 // summary — counts and file names, never the credentials (W1E V1-4).
@@ -210,7 +166,7 @@ async function buildStatus(seams = {}) {
     try { return { exists: true, meta: JSON.parse(_readFile(lockPath)) }; }
     catch { return { exists: true, meta: null, malformed: true }; }
   };
-  const locks = (cfg.poolDirs || []).map((dir) => readLock(path.join(dir, ".mcp-wrapper-lock")));
+  const locks = (cfg.poolDirs || []).map((dir) => readLock(path.join(dir, pool.WRAPPER_LOCK)));
   const livePids = locks
     .map((l) => l.meta && l.meta.pid)
     .filter((p) => Number.isFinite(p) && _isPidAlive(p));
@@ -221,7 +177,7 @@ async function buildStatus(seams = {}) {
   ]);
 
   const slots = (cfg.poolDirs || []).map((dir, idx) => {
-    const lockPath = path.join(dir, ".mcp-wrapper-lock");
+    const lockPath = path.join(dir, pool.WRAPPER_LOCK);
     let pid = null;
     let pidAlive = null;
     let lockHeldMs = null;
@@ -816,7 +772,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         const absDir = (_loadConfig().poolDirs || [])[n - 1];
         const readLockRaw = () => {
           if (!absDir) return null;
-          try { return _readFile(path.join(absDir, ".mcp-wrapper-lock")); } catch { return null; }
+          try { return _readFile(path.join(absDir, pool.WRAPPER_LOCK)); } catch { return null; }
         };
         // W1E-2: remember the lock as it was when judged. A new relay can
         // claim the slot while the (slow) process probes run; reaping then
@@ -861,7 +817,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
           // the one judged stale — a relay that claimed the slot during the
           // kill has written its own.
           const killed = _reapOrphansFor(dir);
-          _clearStaleLock(path.join(dir, ".mcp-wrapper-lock"), lockRaw, "reaped via inspector");
+          _clearStaleLock(path.join(dir, pool.WRAPPER_LOCK), lockRaw, "reaped via inspector");
           return killed;
         });
         // G0-8 (2026-05-10): cap the reap operation at 10s. taskkill /F /T
@@ -885,7 +841,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         // lockCleared: the stale lock is gone. False when it was left in
         // place (a relay replaced it during the reap, or unlink failed).
         const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
-        const lockCleared = !_existsFile(path.join(absDir, ".mcp-wrapper-lock"));
+        const lockCleared = !_existsFile(path.join(absDir, pool.WRAPPER_LOCK));
         const parts = ["Reaped orphan slot " + n];
         if (Number.isFinite(killed)) parts.push(killed + " brave process" + (killed === 1 ? "" : "es"));
         parts.push(lockCleared ? "lock cleared" : "lock left in place");

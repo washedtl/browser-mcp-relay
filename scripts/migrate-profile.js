@@ -33,17 +33,14 @@ function parseArgs(argv) {
 }
 
 /**
+ * @param {object} [opts] — all test seams; probes are findSeedSource's process probes
  * @returns {Promise<number>} exit code: 0 done (or dry run), 1 refused, 2 usage
  */
 async function run({
   argv = process.argv.slice(2),
   env = applyLocalConfigToEnv(process.env),
   pool = require("../src/pool-shared.js"),
-  listBraveCommands = () => require("../src/process-shim.js").listProcessesByCommand(pool.braveNeedle(process.platform)).map((p) => p.command),
-  isSlotClaimed = (dir) => {
-    const lock = pool.readLockState(path.join(dir, ".mcp-wrapper-lock"));
-    return Boolean(lock && lock.state !== "dead");
-  },
+  probes,
   out = (line) => process.stdout.write(`${line}\n`),
 } = {}) {
   const args = parseArgs(argv);
@@ -57,17 +54,16 @@ async function run({
     out(`The broker profile ${target} already exists. To replace it: npm run broker:stop, move or delete that dir, then run this again.`);
     return 1;
   }
-
-  const candidates = args.from ? [args.from] : (pool.CONFIG.standalone ? [] : pool.CONFIG.poolDirs);
   if (args.from && !fs.existsSync(path.join(args.from, "Default"))) {
     out(`${args.from} is not a Brave profile (no Default/ dir).`);
     return 1;
   }
+  const candidates = args.from ? [args.from] : seed.poolCandidates(pool);
   if (!candidates.length) {
     out("No legacy pool configured to pick a source from; name one with --from <profile dir>.");
     return 1;
   }
-  const pick = seed.pickSeedSource({ poolDirs: candidates, braveCommands: listBraveCommands(), isSlotClaimed });
+  const pick = await seed.findSeedSource({ pool, dirs: candidates, probes });
   for (const s of pick.skipped) out(`not using ${s.dir}: ${s.why}${args.from ? " (close the session or Brave using it first)" : ""}`);
   if (!pick.dir) {
     out(args.from ? "Nothing copied." : "No idle pool slot with cookies; name one with --from <profile dir>.");
@@ -85,7 +81,7 @@ async function run({
   }
   const t0 = Date.now();
   const r = await seed.copySeed(pick.dir, target);
-  out(`seeded ${r.files} files (${mb(r.bytes)}) in ${Date.now() - t0} ms. The broker uses it from its next start.`);
+  out(`seeded ${r.files} files (${mb(plan.bytes)}) in ${Date.now() - t0} ms. The broker uses it from its next start.`);
   return 0;
 }
 

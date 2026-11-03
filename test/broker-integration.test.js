@@ -103,9 +103,11 @@ test("seed: the one-time profile seed finishes before Brave's first launch", asy
       isUp: () => true,
     }),
   });
+  await until(() => finishSeed, 3000, "the seed to start");
+  // the seed is still running: initialize and tools/list are not held up by it
   const c = await connectClient(t, b.pipe);
+  assert.ok((await c.listTools()).tools.length > 0);
   const call = c.callTool({ name: "content_get-as-text", arguments: {} });
-  await until(() => order.length === 1 && finishSeed, 3000, "the seed to start");
   await sleep(50);
   assert.deepStrictEqual(order, ["seed:start:profile-unused"], "no Brave while the profile is being seeded");
   finishSeed();
