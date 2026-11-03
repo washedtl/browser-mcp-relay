@@ -24,6 +24,13 @@ const KILL_WAIT_MS = 5000;
  *   closeGracefully() → Browser.close over CDP, kill fallback after closeTimeoutMs
  *   isUp()            → launched, CDP connected, PID alive
  *   'down' (reason)   → once per launch that came up: "closed" | "cdp disconnected" | "exited (code=N)"
+ *   'fatal' (reason)  → a relaunch cannot get back the CDP port its Brave
+ *                       already used (still taken after portFreeWaitMs). The
+ *                       port is fixed for the supervisor's life, so it never
+ *                       recovers on its own: the broker should exit so the
+ *                       shims start a fresh broker on a new port. ensure()
+ *                       rejects as well. A caller-chosen port taken at the
+ *                       FIRST launch only rejects.
  *
  * Death is detected on our own browser-level CDP websocket (its close fires
  * at once; the process exit lags 20 ms-2 s) and on the process exit. After
@@ -165,10 +172,12 @@ class BraveSupervisor extends EventEmitter {
     const deadline = Date.now() + (this._portUsed ? this._t.portFreeWaitMs : 0);
     while (!(await portIsFree(this._port))) {
       if (Date.now() >= deadline) {
-        throw new Error(
-          `${PREFIX} CDP port ${this._port} is in use by another process. This broker keeps one port ` +
-          `for its whole life (upstream pins BROWSER_CDP_ENDPOINT_URL), so it will not switch; free the port or restart the broker.`,
-        );
+        const reason =
+          `CDP port ${this._port} is in use by another process. This broker keeps one port ` +
+          `for its whole life (upstream pins BROWSER_CDP_ENDPOINT_URL), so it will not switch; free the port or restart the broker.`;
+        // Lost the port our Brave already used: only a new broker (new port) recovers.
+        if (this._portUsed) this._emitSafe("fatal", reason);
+        throw new Error(`${PREFIX} ${reason}`);
       }
       await sleep(100);
     }
@@ -240,12 +249,19 @@ class BraveSupervisor extends EventEmitter {
     if (!wasUp) return;
     if (!proc.exited && !proc.closing) this._reap(proc).catch((e) => this._log(e.message));
     this._log(`brave pid=${proc.pid} down: ${reason}`);
-    // Runs inside ws/process event handlers and inside close(): a throwing
-    // listener must not become an uncaught exception or fail the close.
+    this._emitSafe("down", reason);
+  }
+
+  /**
+   * Emits run inside ws/process event handlers, close() and launch: a
+   * throwing listener must not become an uncaught exception or change what
+   * the supervisor does next.
+   */
+  _emitSafe(event, reason) {
     try {
-      this.emit("down", reason);
+      this.emit(event, reason);
     } catch (e) {
-      this._log(`a 'down' listener threw: ${e.message}`);
+      this._log(`a '${event}' listener threw: ${e.message}`);
     }
   }
 

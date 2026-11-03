@@ -368,6 +368,7 @@ test("ensure(): a caller-chosen port that is already taken fails before spawning
   const port = await listen(s);
   try {
     const { sup } = fakeSupervisor(dir, { port });
+    sup.on("fatal", () => assert.fail("a first launch is not a lost port: no 'fatal'"));
     await assert.rejects(sup.ensure(), /port .*in use/i);
     assert.strictEqual(launchesOf(dir).length, 0);
   } finally {
@@ -452,9 +453,14 @@ test("crash: the port taken while Brave was down → ensure() fails loudly, neve
   await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
   const thief = net.createServer();
   await listen(thief, port);
+  const fatals = [];
+  sup.on("fatal", (reason) => fatals.push(reason));
   try {
     await assert.rejects(sup.ensure(), (e) => e.message.includes(`CDP port ${port}`) && /in use/.test(e.message) && /not switch/.test(e.message));
     assert.strictEqual(launchesOf(dir).length, 1, "must not spawn onto a taken port");
+    // 'fatal' tells the broker to exit so the shims respawn one on a new port.
+    assert.strictEqual(fatals.length, 1);
+    assert.ok(fatals[0].includes(`CDP port ${port}`), fatals[0]);
   } finally {
     await new Promise((r) => thief.close(r));
   }
@@ -462,9 +468,29 @@ test("crash: the port taken while Brave was down → ensure() fails loudly, neve
   assert.strictEqual(again.cdpUrl, first.cdpUrl, "same port once it is free again");
 });
 
+test("'fatal': a throwing listener is logged, ensure() still rejects with the port error", async () => {
+  const dir = tmpProfile("fake-fatal-listener");
+  const { sup, log } = fakeSupervisor(dir, { portFreeWaitMs: 200 });
+  const first = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  process.kill(first.pid);
+  await down;
+  await waitFor(() => !isAlive(first.pid), 5000, "fake to die");
+  const thief = net.createServer();
+  await listen(thief, Number(new URL(first.cdpUrl).port));
+  sup.on("fatal", () => { throw new Error("fatal listener bug"); });
+  try {
+    await assert.rejects(sup.ensure(), /not switch/);
+    assert.ok(log.lines.some((l) => l.includes("fatal listener bug")), log.lines.join("\n"));
+  } finally {
+    await new Promise((r) => thief.close(r));
+  }
+});
+
 test("crash: relaunch waits for the port to free (up to portFreeWaitMs) instead of failing at once", async () => {
   const dir = tmpProfile("fake-port-wait");
   const { sup } = fakeSupervisor(dir, { portFreeWaitMs: 3000 });
+  sup.on("fatal", () => assert.fail("a port that frees in time is not fatal"));
   const first = await sup.ensure();
   const down = nextEvent(sup, "down");
   process.kill(first.pid);
