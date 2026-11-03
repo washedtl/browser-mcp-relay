@@ -158,8 +158,8 @@ test("defaultBind: respects BROWSER_RELAY_INSPECTOR_BIND override", () => {
 
 // ─── buildStatus shape tests ────────────────────────────────────────────
 
-test("buildStatus: returns expected top-level keys", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: returns expected top-level keys", async () => {
+  const status = await buildStatus(makeSeams());
   assert.ok(status.config);
   assert.ok(Array.isArray(status.slots));
   assert.ok(status.cookieSource);
@@ -168,22 +168,22 @@ test("buildStatus: returns expected top-level keys", () => {
   assert.ok(status.server);
 });
 
-test("buildStatus: claimed slot detected when lock + live PID + brave proc", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: claimed slot detected when lock + live PID + brave proc", async () => {
+  const status = await buildStatus(makeSeams());
   const slot1 = status.slots.find((s) => s.index === 1);
   assert.strictEqual(slot1.state, "claimed");
   assert.strictEqual(slot1.pid, 1111);
   assert.strictEqual(slot1.pidAlive, true);
 });
 
-test("buildStatus: idle slot when no lock file present", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: idle slot when no lock file present", async () => {
+  const status = await buildStatus(makeSeams());
   const slot2 = status.slots.find((s) => s.index === 2);
   assert.strictEqual(slot2.state, "idle");
   assert.strictEqual(slot2.pid, null);
 });
 
-test("buildStatus: orphan slot when lock present but PID dead", () => {
+test("buildStatus: orphan slot when lock present but PID dead", async () => {
   const seams = makeSeams({
     lockFiles: {
       "C:/fake/.browser-data-mcp-pool-1/.mcp-wrapper-lock": JSON.stringify({
@@ -192,35 +192,35 @@ test("buildStatus: orphan slot when lock present but PID dead", () => {
       }),
     },
   });
-  const status = buildStatus(seams);
+  const status = await buildStatus(seams);
   const slot1 = status.slots.find((s) => s.index === 1);
   assert.strictEqual(slot1.state, "orphan");
   assert.strictEqual(slot1.pidAlive, false);
 });
 
-test("buildStatus: poolDirs in config are redacted to basenames", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: poolDirs in config are redacted to basenames", async () => {
+  const status = await buildStatus(makeSeams());
   for (const dir of status.config.poolDirs) {
     assert.ok(!dir.includes("C:/"), "absolute path leaked: " + dir);
     assert.ok(!dir.includes("\\"), "absolute path leaked: " + dir);
   }
 });
 
-test("buildStatus: bravePath is redacted to basename", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: bravePath is redacted to basename", async () => {
+  const status = await buildStatus(makeSeams());
   assert.strictEqual(status.config.bravePath, "brave.exe");
 });
 
-test("buildStatus: tools.ownCount comes from ownTools length", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: tools.ownCount comes from ownTools length", async () => {
+  const status = await buildStatus(makeSeams());
   assert.strictEqual(status.tools.ownCount, 19);
   assert.strictEqual(status.tools.total, 19 + 51);
 });
 
 // ─── v0.2.1: cookieSource block on buildStatus ──────────────────────────
 
-test("buildStatus: cookieSource block exposes profile, ageDays, thresholdDays, status", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: cookieSource block exposes profile, ageDays, thresholdDays, status", async () => {
+  const status = await buildStatus(makeSeams());
   const cs = status.cookieSource;
   assert.ok(cs);
   assert.ok(Object.prototype.hasOwnProperty.call(cs, "profile"));
@@ -230,45 +230,45 @@ test("buildStatus: cookieSource block exposes profile, ageDays, thresholdDays, s
   assert.strictEqual(cs.thresholdDays, 7);
 });
 
-test("buildStatus: cookieSource.profile is path-redacted to basename", () => {
+test("buildStatus: cookieSource.profile is path-redacted to basename", async () => {
   const seams = makeSeams({
     extra: {
       _findCookiesFile: (dir) => dir + "/Default/Network/Cookies",
       _checkCookieAgeDays: () => 2,
     },
   });
-  const status = buildStatus(seams);
+  const status = await buildStatus(seams);
   // Default seams use absolute path "C:/fake/.browser-data-mcp-2"
   assert.strictEqual(status.cookieSource.profile, ".browser-data-mcp-2");
   assert.ok(!status.cookieSource.profile.includes("C:"), "absolute path leaked");
   assert.ok(!status.cookieSource.profile.includes("/"), "path separator leaked");
 });
 
-test("buildStatus: cookieSource.status = 'fresh' when age <= threshold", () => {
+test("buildStatus: cookieSource.status = 'fresh' when age <= threshold", async () => {
   const seams = makeSeams({
     extra: {
       _findCookiesFile: () => "/fake/cookies",
       _checkCookieAgeDays: () => 2, // < 7-day threshold
     },
   });
-  const status = buildStatus(seams);
+  const status = await buildStatus(seams);
   assert.strictEqual(status.cookieSource.status, "fresh");
   assert.strictEqual(status.cookieSource.ageDays, 2);
 });
 
-test("buildStatus: cookieSource.status = 'stale' when age > threshold", () => {
+test("buildStatus: cookieSource.status = 'stale' when age > threshold", async () => {
   const seams = makeSeams({
     extra: {
       _findCookiesFile: () => "/fake/cookies",
       _checkCookieAgeDays: () => 14, // > 7-day threshold
     },
   });
-  const status = buildStatus(seams);
+  const status = await buildStatus(seams);
   assert.strictEqual(status.cookieSource.status, "stale");
   assert.strictEqual(status.cookieSource.ageDays, 14);
 });
 
-test("buildStatus: cookieSource.status = 'unknown' when profile is null", () => {
+test("buildStatus: cookieSource.status = 'unknown' when profile is null", async () => {
   const seams = makeSeams({
     config: {
       poolDirs: ["C:/fake/.browser-data-mcp-pool-1"],
@@ -279,14 +279,14 @@ test("buildStatus: cookieSource.status = 'unknown' when profile is null", () => 
       standalone: false,
     },
   });
-  const status = buildStatus(seams);
+  const status = await buildStatus(seams);
   assert.strictEqual(status.cookieSource.profile, null);
   assert.strictEqual(status.cookieSource.ageDays, null);
   assert.strictEqual(status.cookieSource.status, "unknown");
 });
 
-test("buildStatus: no `specialty` block on status response (removed v0.2.1)", () => {
-  const status = buildStatus(makeSeams());
+test("buildStatus: no `specialty` block on status response (removed v0.2.1)", async () => {
+  const status = await buildStatus(makeSeams());
   assert.strictEqual(status.specialty, undefined);
 });
 
@@ -380,7 +380,7 @@ test("POST /api/status → 405 method not allowed", async () => {
   // the request is rejected with 403 before reaching the route's method check.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/status", "POST", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/status", "POST", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
     const body = JSON.parse(r.body);
     assert.strictEqual(body.error, "method not allowed");
@@ -556,7 +556,7 @@ test("POST /api/settings → 405 method not allowed (no mutating endpoints in W8
   // V1-6: send Origin to pass CSRF gate so we test the method check.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/settings", "POST", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/settings", "POST", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -727,7 +727,7 @@ test("POST /api/tools → 405 method not allowed (read-only in W9)", async () =>
   // V1-6: send Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/tools", "POST", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/tools", "POST", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -797,13 +797,13 @@ test("startInspector: in-process mode → /api/slot/:n surfaces buffered traffic
   }
 });
 
-test("buildSlotDetail: returns null for out-of-range index", () => {
-  const detail = buildSlotDetail(99, makeSeams());
+test("buildSlotDetail: returns null for out-of-range index", async () => {
+  const detail = await buildSlotDetail(99, makeSeams());
   assert.strictEqual(detail, null);
 });
 
-test("buildSlotDetail: returns slot + totalSlots for valid n", () => {
-  const detail = buildSlotDetail(2, makeSeams());
+test("buildSlotDetail: returns slot + totalSlots for valid n", async () => {
+  const detail = await buildSlotDetail(2, makeSeams());
   assert.ok(detail.slot);
   assert.strictEqual(detail.slot.index, 2);
   assert.strictEqual(detail.totalSlots, 2);
@@ -1023,7 +1023,7 @@ test("WS upgrade allows http://localhost Origin", async () => {
   try {
     const ws = new WebSocket(
       "ws://127.0.0.1:" + handle.port + "/ws/traffic",
-      { origin: "http://localhost:9090" },
+      { origin: "http://localhost:" + handle.port },
     );
     const result = await new Promise((resolve) => {
       ws.on("open", () => resolve("open"));
@@ -1042,7 +1042,7 @@ test("WS upgrade allows http://127.0.0.1 Origin", async () => {
   try {
     const ws = new WebSocket(
       "ws://127.0.0.1:" + handle.port + "/ws/traffic",
-      { origin: "http://127.0.0.1:9090" },
+      { origin: "http://127.0.0.1:" + handle.port },
     );
     const result = await new Promise((resolve) => {
       ws.on("open", () => resolve("open"));
@@ -1078,7 +1078,7 @@ test("WS upgrade allowedOrigins option overrides default allowlist", async () =>
     port: 0,
     bind: "127.0.0.1",
     seams: makeSeams(),
-    allowedOrigins: ["http://my-custom-host"],
+    allowedOrigins: ["http://my-custom-host:8080"],
   });
   try {
     const wsAllowed = new WebSocket(
@@ -1087,7 +1087,7 @@ test("WS upgrade allowedOrigins option overrides default allowlist", async () =>
     );
     const wsRejected = new WebSocket(
       "ws://127.0.0.1:" + handle.port + "/ws/traffic",
-      { origin: "http://localhost:9090" },
+      { origin: "http://localhost:" + handle.port },
     );
     const allowedResult = await new Promise((resolve) => {
       wsAllowed.on("open", () => resolve("open"));
@@ -1145,7 +1145,7 @@ test("PUT /api/status → 405 (read-only method enforcement)", async () => {
   // V1-6: include Origin so the CSRF gate doesn't 403 first.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/status", "PUT", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/status", "PUT", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1156,7 +1156,7 @@ test("DELETE /api/status → 405", async () => {
   // V1-6: include Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/status", "DELETE", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/status", "DELETE", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1167,7 +1167,7 @@ test("PATCH /api/status → 405", async () => {
   // V1-6: include Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/status", "PATCH", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/status", "PATCH", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1178,7 +1178,7 @@ test("OPTIONS /api/status → 405 (we don't honor CORS preflight)", async () => 
   // V1-6: include Origin to pass CSRF gate so we test method enforcement.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/status", "OPTIONS", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/status", "OPTIONS", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1226,7 +1226,7 @@ test("redactErrorPaths: redacts POSIX absolute paths", () => {
   assert.ok(out.includes("brave-something"));
 });
 
-test("buildStatus: braveDetectError is redacted (no full path leak)", () => {
+test("buildStatus: braveDetectError is redacted (no full path leak)", async () => {
   const seams = makeSeams({
     config: {
       poolDirs: ["C:/fake/.browser-data-mcp-pool-1"],
@@ -1240,7 +1240,7 @@ test("buildStatus: braveDetectError is redacted (no full path leak)", () => {
       standalone: true,
     },
   });
-  const status = buildStatus(seams);
+  const status = await buildStatus(seams);
   const detect = status.config.braveDetectError;
   assert.ok(detect, "braveDetectError should pass through");
   assert.ok(!detect.includes("Program Files"), "braveDetectError leaked path: " + detect);
@@ -1301,7 +1301,7 @@ test("POST /api/activity → 405 (read-only)", async () => {
   // V1-6: send Origin to pass CSRF gate.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/activity", "POST", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/activity", "POST", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1378,7 +1378,7 @@ test("POST /api/slots/1/reap on a non-orphan slot → 400", async () => {
   const { server, port } = await startServer();
   try {
     const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", {
-      Origin: "http://localhost:9090",
+      Origin: "http://localhost:" + port,
     });
     assert.strictEqual(r.status, 400);
     const body = JSON.parse(r.body);
@@ -1415,7 +1415,7 @@ test("POST /api/slots/2/reap on orphan slot → 200 with reaped:true (mutator se
   const port = server.address().port;
   try {
     const r = await fetchWithHeaders(port, "/api/slots/2/reap", "POST", {
-      Origin: "http://localhost:9090",
+      Origin: "http://localhost:" + port,
     });
     assert.strictEqual(r.status, 200);
     const body = JSON.parse(r.body);
@@ -1436,7 +1436,7 @@ test("POST /api/slots/99/reap → 404 (out of range)", async () => {
   const { server, port } = await startServer();
   try {
     const r = await fetchWithHeaders(port, "/api/slots/99/reap", "POST", {
-      Origin: "http://localhost:9090",
+      Origin: "http://localhost:" + port,
     });
     assert.strictEqual(r.status, 404);
   } finally {
@@ -1470,7 +1470,7 @@ test("POST /api/specialty/mcp-2/refresh-hint → 405 (no longer a mutating route
   // V1-6: pass an Origin header so the CSRF gate doesn't intercept first.
   const { server, port } = await startServer();
   try {
-    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", { Origin: "http://localhost:9090" });
+    const r = await fetchWithHeaders(port, "/api/specialty/mcp-2/refresh-hint", "POST", { Origin: "http://localhost:" + port });
     assert.strictEqual(r.status, 405);
   } finally {
     server.close();
@@ -1481,7 +1481,7 @@ test("POST /api/slots/abc/reap → 404 (slot index validation)", async () => {
   const { server, port } = await startServer();
   try {
     const r = await fetchWithHeaders(port, "/api/slots/abc/reap", "POST", {
-      Origin: "http://localhost:9090",
+      Origin: "http://localhost:" + port,
     });
     assert.strictEqual(r.status, 404);
   } finally {
@@ -1493,7 +1493,7 @@ test("POST /api/slots/0/reap → 404 (slots are 1-indexed)", async () => {
   const { server, port } = await startServer();
   try {
     const r = await fetchWithHeaders(port, "/api/slots/0/reap", "POST", {
-      Origin: "http://localhost:9090",
+      Origin: "http://localhost:" + port,
     });
     assert.strictEqual(r.status, 404);
   } finally {
@@ -1512,7 +1512,7 @@ test("buildActivity: returns events from _trafficBuffer seam", () => {
   assert.strictEqual(out.totalCaptured, 2);
 });
 
-test("forwardedCount matches the actual hardcoded catalog length (drift guard)", () => {
+test("forwardedCount matches the actual hardcoded catalog length (drift guard)", async () => {
   const forwarded = require("../scripts/inspector-forwarded-tools.js");
   const catalogLen = (forwarded.tools || []).length;
   // The status response hardcodes forwardedCount: 51. If upstream gets a tool added
@@ -1521,7 +1521,7 @@ test("forwardedCount matches the actual hardcoded catalog length (drift guard)",
   // V2-6: previously this fixture passed `mode: "standalone"` (string) — production
   // reads `cfg.standalone` (boolean), so the field was ignored and "standalone"
   // would resolve to "pool" by accident. Use the production shape.
-  const status = buildStatus({
+  const status = await buildStatus({
     _loadConfig: () => ({ poolDirs: [], slotRoles: {}, cookieFreshnessWarnDays: 7, standalone: true }),
     _findCookiesFile: () => null,
     _checkCookieAgeDays: () => null,
@@ -1529,9 +1529,10 @@ test("forwardedCount matches the actual hardcoded catalog length (drift guard)",
     _now: () => Date.now(),
     _startedAt: Date.now(),
     _ownTools: [],
-    _listProcesses: () => "",
-    _findProcessesFor: () => [],
+    _listBraveProcessesRaw: () => "",
+    _getProcessStartTimes: () => new Map(),
     _isPidAlive: () => false,
+    _loadVault: () => ({ summary: () => ({ totalEntries: 0, uniqueHosts: 0, filesLoaded: [], filesSkipped: [] }) }),
   });
   // V2-6: drift guard for the boolean cfg.standalone contract. Previously
   // the fixture passed `mode: "standalone"` (string) which prod ignored —
@@ -1613,5 +1614,539 @@ test("inspector-forwarded-tools: names match upstream prefix → category mappin
     if (!want) continue; // unknown prefix — drift will show up if the catalog grows a new prefix family
     assert.strictEqual(t.category, want,
       `tool "${t.name}" has prefix "${prefix}" → expected category "${want}", got "${t.category}"`);
+  }
+});
+
+// ─── W1E-1 (2026-11-03): Host allowlist (DNS rebinding) + exact Origin ──
+//
+// Audit probe: `GET /api/activity` with `Host: rebind.attacker.example:9091`
+// returned 200 + traffic. A rebinding page's requests carry the attacker's
+// hostname in Host, so only the inspector's own loopback names (on the port
+// the connection actually arrived on) are accepted. Origin used to be any
+// `http://localhost:*` (a POST from a :5173 dev server passed); it must now
+// be the inspector's own origin.
+
+function rawRequest(port, path, { method = "GET", headers = {}, setHost = true } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, path, method, headers, setHost },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        }));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function wsOutcome(ws, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    ws.on("open", () => resolve("open"));
+    ws.on("error", () => resolve("error"));
+    ws.on("close", () => resolve("close"));
+    setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+}
+
+test("W1E-1: GET /api/activity with a rebinding Host → 403, no traffic leaked", async () => {
+  const ee = makeTestEmitter();
+  ee.push({ id: 1, time: new Date().toISOString(), method: "tools/call", name: "cookies_export", args: { secret: "s3cret-cookie" }, source: "own" });
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams(), trafficEmitter: ee });
+  try {
+    const r = await rawRequest(handle.port, "/api/activity", {
+      headers: { Host: "rebind.attacker.example:" + handle.port },
+    });
+    assert.strictEqual(r.status, 403);
+    assert.ok(!r.body.includes("s3cret-cookie"), "traffic must not be served to a foreign Host");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("W1E-1: Host must name the port the connection arrived on", async () => {
+  const { server, port } = await startServer();
+  try {
+    const other = port === 9091 ? 9092 : 9091;
+    const wrongPort = await rawRequest(port, "/api/status", { headers: { Host: "localhost:" + other } });
+    assert.strictEqual(wrongPort.status, 403);
+    for (const host of ["127.0.0.1:" + port, "localhost:" + port, "LOCALHOST:" + port]) {
+      const ok = await rawRequest(port, "/api/status", { headers: { Host: host } });
+      assert.strictEqual(ok.status, 200, "own loopback Host must be accepted: " + host);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-1: request without a Host header → 403", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await rawRequest(port, "/api/status", { setHost: false });
+    // Node >= 20 rejects a Host-less HTTP/1.1 request itself (400,
+    // requireHostHeader); the inspector's own gate answers 403 otherwise.
+    assert.ok(r.status === 400 || r.status === 403, "expected rejection, got " + r.status);
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-1: static UI is Host-gated too (rebinding can't read the page)", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await rawRequest(port, "/", { headers: { Host: "rebind.attacker.example" } });
+    assert.strictEqual(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-1: WS upgrade with a rebinding Host is rejected", async () => {
+  const ee = makeTestEmitter();
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams(), trafficEmitter: ee });
+  try {
+    const ws = new WebSocket("ws://127.0.0.1:" + handle.port + "/ws/traffic", {
+      headers: { Host: "rebind.attacker.example:" + handle.port },
+    });
+    assert.notStrictEqual(await wsOutcome(ws), "open", "foreign Host must not get the traffic stream");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("W1E-1: POST with Origin http://localhost:5173 (another local port) → 403", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", { Origin: "http://localhost:5173" });
+    assert.strictEqual(r.status, 403);
+    assert.match(JSON.parse(r.body).error, /forbidden origin/);
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-1: POST with the inspector's own Origin passes the CSRF gate", async () => {
+  const { server, port } = await startServer();
+  try {
+    for (const origin of ["http://127.0.0.1:" + port, "http://localhost:" + port]) {
+      // Slot 1 is claimed in the default seams → the route answers 400,
+      // which proves the Origin gate let the request through.
+      const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", { Origin: origin });
+      assert.strictEqual(r.status, 400, "own origin must pass: " + origin);
+    }
+    const https = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", { Origin: "https://localhost:" + port });
+    assert.strictEqual(https.status, 403, "scheme must match too");
+    const nul = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", { Origin: "null" });
+    assert.strictEqual(nul.status, 403, "opaque Origin must be rejected");
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-1: WS upgrade rejects a localhost Origin on another port", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const other = handle.port === 5173 ? 5174 : 5173;
+    const ws = new WebSocket("ws://127.0.0.1:" + handle.port + "/ws/traffic", { origin: "http://localhost:" + other });
+    assert.notStrictEqual(await wsOutcome(ws), "open");
+  } finally {
+    await handle.close();
+  }
+});
+
+// ─── W1E (2026-11-03): quietPortInUse for callers that retry the bind ──
+// The relay (W1A) retries the inspector bind every 30s while the port is
+// busy and logs its own line; startInspector's "Set
+// BROWSER_RELAY_INSPECTOR_PORT=9091" hint would print on every retry.
+
+async function captureStderr(fn) {
+  const orig = process.stderr.write;
+  const lines = [];
+  process.stderr.write = (chunk, ...rest) => { lines.push(String(chunk)); return true; };
+  try { return { result: await fn(), lines }; }
+  catch (e) { return { error: e, lines }; }
+  finally { process.stderr.write = orig; }
+}
+
+test("startInspector: quietPortInUse → EADDRINUSE rejects without the stderr hint", async () => {
+  const first = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const { error, lines } = await captureStderr(() =>
+      startInspector({ port: first.port, bind: "127.0.0.1", seams: makeSeams(), quietPortInUse: true }));
+    assert.ok(error, "second bind must reject so the caller can retry");
+    assert.strictEqual(error.code, "EADDRINUSE");
+    assert.ok(!lines.some((l) => /already in use/.test(l)), "quiet mode must not print the hint: " + lines.join(""));
+  } finally {
+    await first.close();
+  }
+});
+
+test("startInspector: default still prints the port-in-use hint on EADDRINUSE", async () => {
+  const first = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    const { error, lines } = await captureStderr(() =>
+      startInspector({ port: first.port, bind: "127.0.0.1", seams: makeSeams() }));
+    assert.strictEqual(error && error.code, "EADDRINUSE");
+    assert.ok(lines.some((l) => /already in use/.test(l)), "default keeps the standalone hint");
+  } finally {
+    await first.close();
+  }
+});
+
+// ─── W1E-2 (2026-11-03): async + cached buildStatus, vault reuse, reap ─
+//
+// buildStatus ran two synchronous PowerShell probes (Brave listing + lock
+// owner start times) on the event loop for every 5s UI poll, re-parsed the
+// password CSV each time, and re-probed liveness of PIDs it had just read
+// from the live process list. The reap route also unlinked the lock
+// unconditionally, so a lock a new relay wrote mid-reap was deleted.
+
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
+const { runProbeAsync } = require("../src/inspector-server.js");
+const vaultMod = require("../src/vault.js");
+
+const emptyVaultSeam = () => ({ summary: () => ({ totalEntries: 0, uniqueHosts: 0, filesLoaded: [], filesSkipped: [] }) });
+
+test("W1E-2: runProbeAsync runs a spawnSync-style probe without blocking the event loop", async () => {
+  const probe = (spawn) => {
+    const r = (spawn || spawnSync)(process.execPath, ["-e", "setTimeout(() => process.stdout.write('done'), 300)"], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout : "failed:" + r.status;
+  };
+  let ticks = 0;
+  const timer = setInterval(() => { ticks++; }, 20);
+  try {
+    assert.strictEqual(await runProbeAsync(probe), "done");
+    assert.ok(ticks >= 5, "event loop must keep turning while the probe runs (ticks=" + ticks + ")");
+  } finally {
+    clearInterval(timer);
+  }
+});
+
+test("W1E-2: runProbeAsync hands a non-zero exit status + stdout back like spawnSync", async () => {
+  const probe = (spawn) => (spawn || spawnSync)(
+    process.execPath, ["-e", "process.stdout.write('partial'); process.exit(3)"], { encoding: "utf8" });
+  const r = await runProbeAsync(probe);
+  assert.strictEqual(r.status, 3);
+  assert.strictEqual(r.stdout, "partial");
+});
+
+test("W1E-2: buildStatus awaits async process probes", async () => {
+  const seams = makeSeams({ extra: {
+    _listBraveProcessesRaw: async () => "1111|brave.exe --user-data-dir=C:/fake/.browser-data-mcp-pool-1",
+    _getProcessStartTimes: async () => new Map(),
+  } });
+  const status = await buildStatus(seams);
+  assert.strictEqual(status.slots[0].state, "claimed");
+  assert.deepStrictEqual(status.slots[0].bravePids, [1111]);
+});
+
+test("W1E-2: Brave PIDs from the live process listing aren't re-probed for liveness", async () => {
+  const probed = [];
+  const seams = makeSeams({ extra: {
+    _listBraveProcessesRaw: () => "4444|brave.exe --user-data-dir=C:/fake/.browser-data-mcp-pool-1",
+    _isPidAlive: (pid) => { probed.push(pid); return pid === 1111; },
+  } });
+  const status = await buildStatus(seams);
+  assert.deepStrictEqual(status.slots[0].bravePids, [4444]);
+  assert.ok(!probed.includes(4444), "listed Brave PIDs must not get a second liveness probe");
+});
+
+test("W0 V2-3: recycled-PID lock → orphan, genuine owner → claimed (real userDataDirMatcher)", async () => {
+  const now = Date.now();
+  const pool1 = "C:/fake/.browser-data-mcp-pool-1";
+  const pool10 = "C:/fake/.browser-data-mcp-pool-10";
+  const seams = makeSeams({
+    config: { poolDirs: [pool1, pool10], slotRoles: {}, cookieFreshnessWarnDays: 7, cookieSourceProfile: null, bravePath: null, standalone: false },
+    lockFiles: {
+      // Genuine owner: process started before it wrote the lock.
+      [pool1 + "/.mcp-wrapper-lock"]: JSON.stringify({ pid: 2222, startedAt: new Date(now - 3600_000).toISOString() }),
+      // Recycled PID: the lock is a week old, the live process holding
+      // PID 3333 started an hour ago — the owner is long dead.
+      [pool10 + "/.mcp-wrapper-lock"]: JSON.stringify({ pid: 3333, startedAt: new Date(now - 7 * 86400_000).toISOString() }),
+    },
+    extra: {
+      _listBraveProcessesRaw: () => [
+        `4444|brave.exe --user-data-dir=${pool1} --remote-debugging-port=9301`,
+        `6666|brave.exe --user-data-dir="${pool10}" --type=renderer`,
+      ].join("\r\n"),
+      _isPidAlive: () => true,
+      _getProcessStartTimes: () => new Map([[2222, now - 2 * 3600_000], [3333, now - 3600_000]]),
+    },
+  });
+  // Use the production matcher (pool.findBraveProcessesForDir →
+  // userDataDirMatcher), not makeSeams' substring stub — the substring
+  // stub would also hand pool-10's Brave to pool-1.
+  delete seams._findBraveProcessesForDir;
+  const status = await buildStatus(seams);
+  const [slot1, slot10] = status.slots;
+  assert.strictEqual(slot1.state, "claimed");
+  assert.strictEqual(slot1.pidAlive, true);
+  assert.deepStrictEqual(slot1.bravePids, [4444], "pool-1 must not claim pool-10's Brave");
+  assert.strictEqual(slot10.state, "orphan");
+  assert.strictEqual(slot10.pidAlive, false);
+  assert.deepStrictEqual(slot10.bravePids, [6666]);
+});
+
+test("W1E-2: buildStatus reports the vault already loaded in-process — no CSV re-read per poll", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w1e-vault-"));
+  const csv = path.join(dir, "fake-passwords.csv");
+  fs.writeFileSync(csv, "name,url,username,password,note\n,https://a.example,u1,p1,\n,https://b.example,u2,p2,\n");
+  try {
+    // What the relay does at startup (hermetic: no real local-config.json).
+    vaultMod.loadVaultFromEnv({ env: { BROWSER_RELAY_VAULT_FILES: csv }, localConfigPath: path.join(dir, "absent.json") });
+    fs.unlinkSync(csv); // a per-poll re-read would now find nothing
+    const seams = makeSeams();
+    delete seams._loadVault;
+    seams._env = {}; // enabled must follow the loaded vault, not this process's raw env
+    const status = await buildStatus(seams);
+    assert.strictEqual(status.vault.enabled, true);
+    assert.strictEqual(status.vault.totalEntries, 2);
+    assert.deepStrictEqual(status.vault.filesLoaded.map((f) => f.path), ["fake-passwords.csv"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("W1E-2: /api/status + /api/slot/:n share one cached status build", async () => {
+  let listings = 0;
+  const seams = makeSeams({ extra: { _listBraveProcessesRaw: () => { listings++; return ""; } } });
+  const { server, port } = await startServer(seams);
+  try {
+    const rs = await Promise.all([fetch(port, "/api/status"), fetch(port, "/api/status"), fetch(port, "/api/slot/1")]);
+    for (const r of rs) assert.strictEqual(r.status, 200);
+    await fetch(port, "/api/status");
+    assert.strictEqual(listings, 1, "concurrent + follow-up polls inside the TTL must reuse one probe");
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-2: statusCacheMs: 0 rebuilds on every request", async () => {
+  let listings = 0;
+  const seams = makeSeams({ extra: { _listBraveProcessesRaw: () => { listings++; return ""; } } });
+  const server = createInspectorRaw({ seams, statusCacheMs: 0 });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    await fetch(port, "/api/status");
+    await fetch(port, "/api/status");
+    assert.strictEqual(listings, 2);
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-2: reap refuses (409) when the lock is replaced after the orphan check", async () => {
+  const lockPath = "C:/fake/.browser-data-mcp-pool-2/.mcp-wrapper-lock";
+  const dead = JSON.stringify({ pid: 9999, startedAt: new Date(Date.now() - 60_000).toISOString() });
+  const newOwner = JSON.stringify({ pid: 1111, startedAt: new Date().toISOString() });
+  const seams = makeSeams({ lockFiles: { [lockPath]: dead } });
+  // A new relay claims the slot while the (slow, ~1s on Windows) process
+  // probe is running — after the lock was judged, before the kill.
+  let swapped = false;
+  seams._listBraveProcessesRaw = () => { swapped = true; return ""; };
+  const baseRead = seams._readFile;
+  seams._readFile = (p) => (swapped && String(p).split(path.sep).join("/") === lockPath ? newOwner : baseRead(p));
+  let reaped = false;
+  const server = createInspectorRaw({ seams, mutators: { reapSlot: () => { reaped = true; return 1; } } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/2/reap", "POST", { Origin: "http://127.0.0.1:" + port });
+    assert.strictEqual(r.status, 409, r.body);
+    assert.strictEqual(reaped, false, "must not kill the new owner's Brave");
+  } finally {
+    server.close();
+  }
+});
+
+function realFsReapSetup() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w1e-reap-"));
+  const lockPath = path.join(dir, ".mcp-wrapper-lock");
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, startedAt: new Date(Date.now() - 60_000).toISOString() }));
+  const seams = makeSeams({
+    config: { poolDirs: [dir], slotRoles: {}, cookieFreshnessWarnDays: 7, cookieSourceProfile: null, bravePath: null, standalone: false },
+    extra: { _isPidAlive: () => false, _listBraveProcessesRaw: () => "", _loadVault: emptyVaultSeam },
+  });
+  // Real fs for the lock (defaults), fake process side.
+  delete seams._existsFile;
+  delete seams._readFile;
+  delete seams._statFile;
+  return { dir, lockPath, seams };
+}
+
+test("W1E-2: default reap keeps a lock that a new relay wrote during the kill", async () => {
+  const { dir, lockPath, seams } = realFsReapSetup();
+  const newOwner = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+  seams._reapOrphansFor = () => { fs.writeFileSync(lockPath, newOwner); return 1; };
+  const server = createInspectorRaw({ seams });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", { Origin: "http://127.0.0.1:" + port });
+    assert.strictEqual(r.status, 200, r.body);
+    assert.ok(fs.existsSync(lockPath), "a lock rewritten mid-reap must not be unlinked");
+    assert.strictEqual(fs.readFileSync(lockPath, "utf8"), newOwner);
+    assert.strictEqual(JSON.parse(r.body).lockCleared, false, "response must say the lock was left in place");
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("W1E-2: default reap clears an unchanged stale lock and invalidates the status cache", async () => {
+  const { dir, lockPath, seams } = realFsReapSetup();
+  let listings = 0;
+  seams._listBraveProcessesRaw = () => { listings++; return ""; };
+  seams._reapOrphansFor = () => 2;
+  const server = createInspectorRaw({ seams });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const before = JSON.parse((await fetch(port, "/api/status")).body);
+    assert.strictEqual(before.slots[0].state, "orphan");
+    const r = await fetchWithHeaders(port, "/api/slots/1/reap", "POST", { Origin: "http://127.0.0.1:" + port });
+    assert.strictEqual(r.status, 200, r.body);
+    assert.match(JSON.parse(r.body).message, /Reaped orphan slot 1 · 2 brave proc/);
+    assert.strictEqual(JSON.parse(r.body).lockCleared, true);
+    assert.ok(!fs.existsSync(lockPath), "unchanged stale lock must be removed");
+    const after = JSON.parse((await fetch(port, "/api/status")).body);
+    assert.strictEqual(after.slots[0].state, "idle", "status after a reap must not come from the pre-reap cache");
+    assert.strictEqual(listings, 3, "initial poll + fresh pre-reap build + post-reap rebuild");
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── W1E-3 (2026-11-03): CSP without 'unsafe-inline'; export no-store ──
+
+test("W1E-3: CSP allows no inline script or style", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/");
+    const csp = r.headers["content-security-policy"];
+    assert.ok(csp, "CSP header must be present");
+    assert.ok(!csp.includes("'unsafe-inline'"), "CSP must not allow inline: " + csp);
+    assert.match(csp, /script-src 'self'(;|$)/);
+    assert.match(csp, /style-src 'self'(;|$)/);
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E-3: inspector UI uses no inline script, inline style or style attribute (CSP drift guard)", () => {
+  const uiDir = path.join(__dirname, "..", "scripts", "inspector-ui");
+  const html = fs.readFileSync(path.join(uiDir, "index.html"), "utf8");
+  const scripts = html.match(/<script\b[^>]*>/gi) || [];
+  for (const tag of scripts) assert.match(tag, /\ssrc=/i, "inline <script> would be blocked by CSP: " + tag);
+  assert.ok(!/<style\b/i.test(html), "inline <style> would be blocked by CSP");
+  assert.ok(!/\sstyle\s*=/i.test(html), "style= attribute would be blocked by CSP");
+  assert.ok(!/\son[a-z]+\s*=/i.test(html), "inline event handler would be blocked by CSP");
+  const app = fs.readFileSync(path.join(uiDir, "app.js"), "utf8");
+  // el(tag, { style: ... }) goes through setAttribute("style", ...), which
+  // CSP blocks without 'unsafe-inline'. CSSOM writes (node.style.x = ...)
+  // are allowed and are not matched here.
+  assert.ok(!/[{,]\s*style\s*:/.test(app), "el() style attribute would be blocked by CSP");
+  assert.ok(!/setAttribute\(\s*["']style["']/.test(app), "style attribute would be blocked by CSP");
+  assert.ok(!/\.(innerHTML|outerHTML)\s*=|insertAdjacentHTML|cssText/.test(app), "HTML/CSS string injection would bypass the CSP intent");
+});
+
+test("W1E-3: /api/activity/export is Cache-Control: no-store", async () => {
+  const { server, port } = await startServer();
+  try {
+    const r = await fetch(port, "/api/activity/export");
+    assert.strictEqual(r.status, 200);
+    assert.match(r.headers["content-disposition"] || "", /attachment/);
+    assert.strictEqual(r.headers["cache-control"], "no-store");
+  } finally {
+    server.close();
+  }
+});
+
+// ─── W1E V1-3 (2026-11-03): reap follow-ups from review ────────────────
+
+test("W1E V1-3: a 409 reap invalidates the status cache (no stale 'orphan' served)", async () => {
+  const lockPath = "C:/fake/.browser-data-mcp-pool-2/.mcp-wrapper-lock";
+  const dead = JSON.stringify({ pid: 9999, startedAt: new Date(Date.now() - 60_000).toISOString() });
+  const newOwner = JSON.stringify({ pid: 1111, startedAt: new Date().toISOString() });
+  const seams = makeSeams({ lockFiles: { [lockPath]: dead } });
+  let swapped = false;
+  let listings = 0;
+  seams._listBraveProcessesRaw = () => { listings++; swapped = true; return ""; };
+  const baseRead = seams._readFile;
+  seams._readFile = (p) => (swapped && String(p).split(path.sep).join("/") === lockPath ? newOwner : baseRead(p));
+  const server = createInspectorRaw({ seams, mutators: { reapSlot: () => 1 } });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const r = await fetchWithHeaders(port, "/api/slots/2/reap", "POST", { Origin: "http://127.0.0.1:" + port });
+    assert.strictEqual(r.status, 409, r.body);
+    const after = JSON.parse((await fetch(port, "/api/status")).body);
+    assert.strictEqual(listings, 2, "the status poll after a 409 must rebuild");
+    assert.strictEqual(after.slots[1].state, "claimed", "status must reflect the new owner, not the judged orphan");
+  } finally {
+    server.close();
+  }
+});
+
+test("W1E V1-3: orphan card doesn't claim the lock PID is dead (it may be recycled)", () => {
+  const app = fs.readFileSync(path.join(__dirname, "..", "scripts", "inspector-ui", "app.js"), "utf8");
+  assert.ok(!/not alive/.test(app), "orphan wording must not say the PID is not alive");
+  assert.ok(app.includes("lock owner gone (dead or recycled PID)"));
+});
+
+// ─── W1E V1-4 (2026-11-03): standalone inspector keeps only the summary ─
+// With no relay in the process, the inspector used to keep a full Vault
+// (every password) alive for its lifetime just to show counts. Run in a
+// fresh process so no other test's loaded vault is in module state.
+
+test("W1E V1-4: standalone inspector reports vault counts without retaining the vault", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w1e-standalone-vault-"));
+  const csv = path.join(dir, "fake-passwords.csv");
+  fs.writeFileSync(csv, "name,url,username,password,note\n,https://a.example,u1,fake-pw-1,\n,https://b.example,u2,fake-pw-2,\n");
+  const script = `
+    const fs = require("node:fs");
+    const { buildStatus } = require(${JSON.stringify(path.join(__dirname, "..", "src", "inspector-server.js"))});
+    const vault = require(${JSON.stringify(path.join(__dirname, "..", "src", "vault.js"))});
+    const seams = {
+      _loadConfig: () => ({ poolDirs: [], slotRoles: {}, cookieFreshnessWarnDays: 7, standalone: true }),
+      _listBraveProcessesRaw: () => "",
+      _getProcessStartTimes: () => new Map(),
+      _isPidAlive: () => false,
+      _findCookiesFile: () => null,
+    };
+    (async () => {
+      const first = await buildStatus(seams);
+      fs.unlinkSync(${JSON.stringify(csv)}); // a re-read would now find nothing
+      const second = await buildStatus(seams);
+      process.stdout.write(JSON.stringify({
+        retained: vault.getLoadedVault() !== null,
+        first: first.vault.totalEntries,
+        second: second.vault.totalEntries,
+        enabled: second.vault.enabled,
+      }));
+    })().catch((e) => { process.stderr.write(String(e.stack)); process.exit(1); });
+  `;
+  try {
+    const r = spawnSync(process.execPath, ["-e", script], {
+      encoding: "utf8",
+      env: { ...process.env, BROWSER_RELAY_VAULT_FILES: csv },
+      timeout: 20000,
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.strictEqual(out.retained, false, "no Vault (passwords) may stay loaded in the standalone inspector");
+    assert.strictEqual(out.first, 2);
+    assert.strictEqual(out.second, 2, "summary is computed once, not re-read per poll");
+    assert.strictEqual(out.enabled, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

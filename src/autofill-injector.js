@@ -9,8 +9,14 @@
 //     username string truncated to first 3 chars). Stderr-safe.
 //   - Only fills fields that are CURRENTLY EMPTY — won't overwrite user input.
 //   - Does NOT auto-submit. User clicks the submit button themselves.
-//   - The injected script runs in the page's isolated world (frame.evaluate)
-//     so the page's own JS can't read our injected variables.
+//   - W1E-5 (2026-11-03): fills only on https:// pages, only with a
+//     credential saved for exactly the page's origin (scheme+host+port),
+//     and the injected script re-checks location.origin before touching a
+//     field. NOT isolated: Playwright's frame.evaluate runs in the page's
+//     MAIN world, so page JS can observe the call — the origin match is
+//     the protection, and that page is the one the credential belongs to.
+
+const { httpsOrigin } = require("./vault.js");
 
 const PASSWORD_FIELD_SELECTORS = [
   'input[type="password"]:not([disabled])',
@@ -52,8 +58,8 @@ const USERNAME_FIELD_SELECTORS = [
 ];
 
 /** Body of the injected fill function. Stringified and passed to
- *  frame.evaluate as a function — runs in the page's isolated world. */
-function fillScript({ username, password, usernameSelectors, passwordSelectors }) {
+ *  frame.evaluate as a function — runs in the page's main world. */
+function fillScript({ username, password, expectedOrigin, usernameSelectors, passwordSelectors }) {
   function dispatch(el) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -84,6 +90,10 @@ function fillScript({ username, password, usernameSelectors, passwordSelectors }
   return new Promise((resolve) => {
     const start = Date.now();
     function attempt() {
+      // The frame may have navigated to another origin between the
+      // framenavigated event and this evaluate (or during the retries).
+      // location.origin can't be overridden by page script.
+      if (location.origin !== expectedOrigin) return resolve({ user: false, pass: false });
       const userEl = fillFirstEmpty(usernameSelectors, username);
       const passEl = fillFirstEmpty(passwordSelectors, password);
       const filledUser = !!userEl;
@@ -100,8 +110,9 @@ function fillScript({ username, password, usernameSelectors, passwordSelectors }
  *
  *  - Listens for `page` events (new pages in the context, including ones
  *    created by upstream BDMCP via CDP attach since they share this context).
- *  - On each page's framenavigated, looks up the URL's host in the vault.
- *  - If creds found, runs fillScript in the page's isolated world.
+ *  - On each main-frame framenavigated to an https:// URL, takes the vault
+ *    credentials saved for exactly that origin.
+ *  - If any, runs fillScript in the page (main world — see header).
  */
 function attachAutofill(context, vault, log = () => {}) {
   if (!vault || vault.totalEntries === 0) {
@@ -119,33 +130,24 @@ function attachAutofill(context, vault, log = () => {}) {
     page.on("framenavigated", async (frame) => {
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
-      if (!url || url === "about:blank" || url.startsWith("chrome://") || url.startsWith("chrome-error://")) return;
-      const creds = vault.lookup(url);
+      // W1E-5: https only, and only credentials saved for exactly this
+      // origin. The vault already matches this way; re-checked here because
+      // this is where the password leaves the relay.
+      const pageOrigin = httpsOrigin(url);
+      if (!pageOrigin) return;
+      const creds = vault.lookup(url).filter((c) => httpsOrigin(c.url) === pageOrigin);
       if (creds.length === 0) return;
       // Skip if a fill is already in progress for this frame.
       if (ACTIVE_FILLS.has(frame)) return;
-
-      // W0-5: cross-subdomain credential leak protection. When `lookup`
-      // returns multiple registrable-fallback matches (i.e. no exact-host
-      // entry in the vault), don't silently pick `creds[0]` — the candidate
-      // is ambiguous (e.g. on signin.amazon.com with vault entries for AWS,
-      // Audible, Twitch, all under amazon.com, picking creds[0] would fill
-      // the WRONG account). Skip and log; user can log in manually.
       const c = creds[0];
-      const isAmbiguousFallback = c._match === "registrable" && creds.length > 1;
-      if (isAmbiguousFallback) {
-        let host = "";
-        try { host = new URL(url).hostname; } catch {}
-        log(`[autofill] ${host}: ${creds.length} ambiguous cross-subdomain creds (no exact-host match) — skipping autofill to avoid wrong-account fill`);
-        return;
-      }
       const userPeek = c.username.length > 3 ? c.username.slice(0, 3) + "***" : "***";
-      log(`[autofill] ${new URL(url).hostname}: found ${creds.length} cred(s) [${c._match}], trying user=${userPeek}`);
+      log(`[autofill] ${new URL(url).hostname}: found ${creds.length} cred(s), trying user=${userPeek}`);
       const fillPromise = (async () => {
         try {
           const result = await frame.evaluate(fillScript, {
             username: c.username,
             password: c.password,
+            expectedOrigin: pageOrigin,
             usernameSelectors: USERNAME_FIELD_SELECTORS,
             passwordSelectors: PASSWORD_FIELD_SELECTORS,
           });
@@ -166,4 +168,4 @@ function attachAutofill(context, vault, log = () => {}) {
   context.on("page", attachToPage);
 }
 
-module.exports = { attachAutofill, USERNAME_FIELD_SELECTORS, PASSWORD_FIELD_SELECTORS };
+module.exports = { attachAutofill, fillScript, USERNAME_FIELD_SELECTORS, PASSWORD_FIELD_SELECTORS };

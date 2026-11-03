@@ -231,7 +231,7 @@
     }
 
     if (slot.state === "orphan") {
-      card.appendChild(el("div", { class: "slot-client", style: "color: var(--error);" }, "Orphan · stale lock"));
+      card.appendChild(el("div", { class: "slot-client" }, "Orphan · stale lock"));
       card.appendChild(
         el("span", { class: "slot-role" + (slot.role && slot.role !== "default" ? " " + slot.role : "") }, slot.role || "default"),
       );
@@ -243,7 +243,7 @@
       card.appendChild(meta);
 
       const orphanMsg = slot.pid != null
-        ? "PID " + slot.pid + " not alive · lock held " + formatDuration(slot.lockHeldMs ? slot.lockHeldMs / 1000 : null)
+        ? "PID " + slot.pid + " · lock owner gone (dead or recycled PID) · lock held " + formatDuration(slot.lockHeldMs ? slot.lockHeldMs / 1000 : null)
         : "Stale lock · " + formatDuration(slot.lockHeldMs ? slot.lockHeldMs / 1000 : null);
       const reapBtn = el("button", { class: "slot-reap-btn", type: "button" }, "Reap");
       reapBtn.addEventListener("click", (e) => {

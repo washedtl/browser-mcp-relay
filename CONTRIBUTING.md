@@ -112,7 +112,8 @@ scripts/
 - `node --test` is the runner. No mocha, no jest, no babel.
 - Prefer **test seams** over real side-effects. `src/detect-browser.js` + `test/detect-browser.test.js` show the pattern: detection takes injected `platform` + `env` + `existsSync` so the tests don't need a real Brave install.
 - Don't reach for the network in tests.
-- Don't launch Brave in tests. Bridge-missing assertions cover the unhappy path; manual `npm run smoke` covers the happy path.
+- Don't launch Brave in tests. Bridge-missing assertions cover the unhappy path; manual `npm run smoke` covers the happy path. (The one exception, `launchBrave + connectOverCDP roundtrip` in `test/cdp-bridge.test.js`, runs only when Brave is detected — set `BROWSER_RELAY_BRAVE_PATH` to a non-existent path to skip it.)
+- Never hardcode a port a test binds or connects to — other relays, agents and real Brave instances use the 90xx/93xx ranges. Ask the OS for one (listen on `0`, read the port, close) or bind the server under test to `0`.
 
 ## Sending PRs
 

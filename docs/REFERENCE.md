@@ -368,7 +368,8 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_HEADLESS_ENABLE` | `false` | Set `true` to launch Brave headless. |
 | `BROWSER_LOAD_EXTENSIONS` | unset | Path to an unpacked Chrome extension to load. |
 | `BROWSER_MCP_ROLE` | unset | Role-based slot filter (only meaningful with the optional pool wrapper). |
-| `BROWSER_RELAY_PROXY_URL` | unset | Optional HTTP proxy for Brave's outbound traffic. Useful with debug proxies (Charles, mitmproxy, powhttp). See [Proxy whitelist](#proxy-whitelist). |
+| `BROWSER_RELAY_PROXY_URL` | unset | Optional proxy for Brave's outbound traffic (`http`, `https`, `socks4`, `socks5`; `user:pass@` allowed; no scheme = `http://`). Useful with debug proxies (Charles, mitmproxy, powhttp). See [Proxy whitelist](#proxy-whitelist). |
+| `BROWSER_RELAY_IGNORE_HTTPS_ERRORS` | `false` | Set `true` to accept any TLS certificate even without a relay proxy (e.g. a corporate MITM proxy set at the OS level). Weakens TLS for every page the relay opens. See [Proxy whitelist](#proxy-whitelist). |
 | `BROWSER_RELAY_VAULT_FILES` | unset (autofill disabled) | Path-delimiter-separated paths to Brave/Chrome password CSV exports (`;` on Win, `:` on POSIX). Enables form-autofill on navigation. See [Credential vault](#credential-vault--autofill). |
 | `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` | `false` | Include IndexedDB in pool-mode profile snapshot (100+ MB typical). |
 | `BROWSER_RELAY_INSPECTOR_PORT` | unset | When set, the relay boots the Inspector dashboard inline on this port and pipes its live MCP-traffic stream into the `/slot/N` Inspector pages. Without this, run the Inspector separately via `npm run inspector` (no live traffic). See [Inspector](#inspector). |
@@ -480,19 +481,28 @@ Both can be alive simultaneously. The relay's safety net (claim-time + pre-launc
 
 ### Proxy whitelist
 
-Set `BROWSER_RELAY_PROXY_URL=http://127.0.0.1:8888` (or wherever your debug proxy listens) to route the relay's Brave traffic through an HTTP proxy you control. Combined with the relay's per-context `ignoreHTTPSErrors`, this lets you inspect the relay's HTTP traffic via Charles, mitmproxy, powhttp, etc. without affecting your main browser. Your system proxy stays untouched — only this launched Brave opts in.
+Set `BROWSER_RELAY_PROXY_URL=http://127.0.0.1:8888` (or wherever your debug proxy listens) to route the relay's Brave traffic through a proxy you control. The relay passes it to Brave as a real `--proxy-server` (Playwright's `proxy` launch option — works on Windows too, where Chromium ignores `HTTP_PROXY`), keeps `localhost` / `127.0.0.1` / `[::1]` direct, and ignores TLS errors **while the proxy is in use** so the debug proxy's MITM certificate works. That lets you inspect the relay's HTTP traffic via Charles, mitmproxy, powhttp, etc. without affecting your main browser. Your system proxy stays untouched — only this launched Brave opts in. Credentials in the URL (`http://user:pass@host:port`) are handed to Playwright separately, never put on Brave's command line or in the log.
 
-> ⚠️ **Security:** Only point this at HTTP proxies you control on **localhost**. The relay accepts any TLS cert when a proxy is set (so MITM debug proxies "just work"), which means a hostile or compromised remote proxy can transparently MITM all of the relay's traffic — including pages you're authenticated to. If you don't fully control the proxy, leave this unset.
+The proxy is checked **once, when Brave launches** (TCP connect, 1.5 s cap):
+
+- **Local proxy (`127.x`, `localhost`, `::1`) not listening** → one warning, and Brave launches **direct** (no proxy, TLS verified). Start the proxy, then restart the relay to route through it — a proxy started later isn't picked up.
+- **Remote proxy unreachable** → the proxy is **kept** and a loud warning is logged; requests fail until it's up. The relay never silently goes direct, which would expose your real IP.
+
+`BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true` (env or `local-config.json`) makes Brave accept any certificate even without a relay proxy — for a corporate MITM proxy configured at the OS level. Without it (the default), certificates are verified whenever no relay proxy is in use.
+
+> ⚠️ **Security:** Only point this at HTTP proxies you control on **localhost**. The relay accepts any TLS cert while a proxy is in use (so MITM debug proxies "just work"), which means a hostile or compromised remote proxy can transparently MITM all of the relay's traffic — including pages you're authenticated to. If you don't fully control the proxy, leave this unset.
 
 ### Credential vault + autofill
 
-The relay can auto-fill login forms when a saved credential matches the current page's hostname. **Off by default.** To enable:
+The relay can auto-fill login forms when a saved credential matches the current page's origin. **Off by default.** To enable:
 
 1. Export passwords from Brave (or Chrome): `brave://settings/passwords` → "Export passwords" → save as CSV
-2. Set `BROWSER_RELAY_VAULT_FILES=/absolute/path/to/passwords.csv` (path-delimiter-separated for multiple paths — `;` on Win, `:` on POSIX)
+2. Set `BROWSER_RELAY_VAULT_FILES=/absolute/path/to/passwords.csv` as an env var **or** the same key in `local-config.json` (path-delimiter-separated for multiple paths — `;` on Win, `:` on POSIX)
 3. Restart the relay
 
-The vault loads CSVs at startup, indexes by hostname + registrable domain, and fills the first empty username + password fields on each `framenavigated`. **It does not auto-submit** — you click submit yourself.
+The vault loads CSVs at startup, indexes them by origin, and fills the first empty username + password fields on each main-frame `framenavigated`. **It does not auto-submit** — you click submit yourself.
+
+A credential fills only when the page is **`https://`** and its **scheme + host + port exactly match** the URL the credential was saved under — the rule Chromium uses before filling without a click. There is **no subdomain fallback**: an entry saved for `https://www.example.com` doesn't fill on `https://signin.example.com`, and `https://mycompany.atlassian.net` never fills on `https://evil.atlassian.net`. `http://` pages never autofill. The injected script re-checks the page's origin before every fill attempt. It runs in the page's main world (Playwright `frame.evaluate`), not an isolated one — the origin match is the protection.
 
 > ⚠️ **Security:** Passwords stay in memory only — never logged, never re-written. But anyone with read access to your relay process's memory could read them. Only point this at CSVs you trust. The vault is most useful when scraping authed sites that block Playwright's password manager (e.g. Brave 127+'s App-Bound Encryption).
 
@@ -598,9 +608,18 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 | **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode. | ![Activity history](./screenshots/04-activity-history.png) |
 | **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet | ![Settings](./screenshots/06-settings.png) |
 
-The only mutating endpoint (`POST /api/slots/N/reap`) requires a same-origin Origin header (or no Origin — the curl path); cross-origin POSTs are rejected with 403.
+**Host + Origin gate (DNS rebinding).** Every HTTP request and WebSocket upgrade must carry a `Host` of `localhost`, `127.0.0.1`, `[::1]` (or the IP the connection arrived on, for an explicit `BROWSER_RELAY_INSPECTOR_BIND`) **on the inspector's own port**; anything else gets 403. So a port-remapped SSH tunnel (`-L 9999:127.0.0.1:9091`), a LAN hostname (`http://mydesktop:9091`) or a reverse proxy is rejected — reach it by `localhost` / IP on the same port. A browser `Origin` must be the inspector's own origin (`http://localhost:<port>` or `http://127.0.0.1:<port>`); another local port is a different origin. The only mutating endpoint (`POST /api/slots/N/reap`) requires that Origin to be present — curl-style clients may call the read-only GETs without one. Reap decides from a fresh status, answers 409 if the slot's lock changed while it was being checked, removes the lock only if it is still the one judged stale, and reports `lockCleared` in its response.
 
-> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. **Treat the inspector port as if it had your bearer tokens on it** — `tools/call` arguments routinely contain auth tokens, URLs of authed sessions, the cookies your AI is sending, etc. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). Defenses in place: localhost-only bind, Origin allowlist on the WS upgrade and on every mutating POST, `X-Frame-Options: DENY` + `frame-ancestors 'none'` (clickjacking gate), `Cache-Control: no-store` on every API response, path-traversal hard stop, 64 KB WS frame cap + 1 MB back-pressure cap.
+> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. **Treat the inspector port as if it had your bearer tokens on it** — `tools/call` arguments routinely contain auth tokens, URLs of authed sessions, the cookies your AI is sending, etc. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). Defenses in place: localhost-only bind, Host allowlist on every request (DNS rebinding), exact own-origin check on the WS upgrade and on every mutating POST, `X-Frame-Options: DENY` + `frame-ancestors 'none'` (clickjacking gate), a CSP with no `'unsafe-inline'`, `Cache-Control: no-store` on every API response and the activity export, path-traversal hard stop, 64 KB WS frame cap + 1 MB back-pressure cap. The standalone inspector keeps only the vault's counts in memory, never the passwords.
+
+#### Module API changes (2026-11)
+
+For code that imports `src/inspector-server.js` (or `scripts/inspector.js`) directly:
+
+- `buildStatus(seams)` and `buildSlotDetail(n, seams[, status])` are now **async** — they return Promises (the process probes no longer block the event loop). `await` them.
+- `/api/status` and `/api/slot/:n` share one status build per 5 s (`statusCacheMs` option on `startInspector` / `createInspector`; `0` disables).
+- `startInspector({ quietPortInUse: true })` rejects with `EADDRINUSE` without printing the port-in-use hint, for callers that retry the bind.
+- `allowedOrigins`, when given, now matches origins exactly (it used to accept any port of a listed host).
 
 ---
 

@@ -26,10 +26,11 @@ const http = require("node:http");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { execFile } = require("node:child_process");
 const { WebSocketServer } = require("ws");
 
 const pool = require("./pool-shared.js");
-const { loadVaultFromEnv } = require("./vault.js");
+const { summarizeVaultFromEnv, getLoadedVault } = require("./vault.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { detectBraveProfileDir } = require("./detect-browser.js");
 const forwardedCatalog = require("../scripts/inspector-forwarded-tools.js");
@@ -111,30 +112,91 @@ function formatDuration(seconds) {
   return `${h}h ${m % 60}m`;
 }
 
+/** spawnSync's result shape from an async execFile, so a probe written
+ *  against spawnSync can be fed a non-blocking run's output. */
+function spawnAsync(cmd, args, options = {}) {
+  const opts = { encoding: options.encoding || "utf8" };
+  for (const k of ["windowsHide", "timeout", "maxBuffer", "env"]) {
+    if (options[k] !== undefined) opts[k] = options[k];
+  }
+  return new Promise((resolve) => {
+    execFile(cmd, args, opts, (err, stdout, stderr) => {
+      if (!err) return resolve({ status: 0, stdout, stderr });
+      // Non-zero exit: err.code is the exit status (spawnSync: status=N,
+      // no error). Anything else (spawn failure, timeout, maxBuffer) is
+      // spawnSync's status=null + error.
+      if (typeof err.code === "number") return resolve({ status: err.code, stdout, stderr });
+      resolve({ status: null, stdout, stderr, error: err });
+    });
+  });
+}
+
+/**
+ * W1E-2 (2026-11-03): run a spawnSync-based probe without blocking the
+ * event loop. The pool/process-shim probes (PowerShell on Windows, ~1s
+ * each) are synchronous and take a `_spawnSync` seam: a dry run captures
+ * the exact command the probe would spawn, that command runs async, and the
+ * probe runs again on the real output — so command construction and
+ * parsing stay in one place (process-shim) with no duplicate.
+ *
+ * @param {(spawn?: Function) => T} probe — calls its probe with `{ _spawnSync: spawn }`
+ * @returns {Promise<T>}
+ */
+async function runProbeAsync(probe) {
+  const calls = [];
+  probe((cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { status: 0, stdout: "", stderr: "" };
+  });
+  // No spawn needed (e.g. empty pid list), or a shape we can't replay
+  // faithfully: run it as-is.
+  if (calls.length !== 1) return probe();
+  const { cmd, args, options } = calls[0];
+  const result = await spawnAsync(cmd, args, options);
+  return probe(() => result);
+}
+
+// The vault for the status page: the one the relay loaded in this process.
+// Standalone inspector (no relay here): parse once and keep only the
+// summary — counts and file names, never the credentials (W1E V1-4).
+let standaloneVaultSummary = null;
+function defaultVault() {
+  const loaded = getLoadedVault();
+  if (loaded) return loaded;
+  if (!standaloneVaultSummary) standaloneVaultSummary = summarizeVaultFromEnv();
+  const summary = standaloneVaultSummary;
+  return { summary: () => summary };
+}
+
+const listBraveProcessesAsync = () =>
+  runProbeAsync((spawn) => pool.listBraveProcessesRaw(spawn ? { _spawnSync: spawn } : {}));
+const getProcessStartTimesAsync = (pids) =>
+  runProbeAsync((spawn) => pool.getProcessStartTimes(pids, spawn ? { _spawnSync: spawn } : {}));
+
 /** Build the /api/status payload. Pure-ish (everything stateful is injected
- *  via the seams object). */
-function buildStatus(seams = {}) {
+ *  via the seams object). Async (W1E-2): the process probes run off the
+ *  event loop; process seams may return values or promises. */
+async function buildStatus(seams = {}) {
   const _loadConfig = seams._loadConfig || pool.loadConfig;
   const _findBraveProcessesForDir =
     seams._findBraveProcessesForDir || pool.findBraveProcessesForDir;
   const _listBraveProcessesRaw =
-    seams._listBraveProcessesRaw || pool.listBraveProcessesRaw;
+    seams._listBraveProcessesRaw || listBraveProcessesAsync;
   const _isPidAlive = seams._isPidAlive || pool.isPidAlive;
-  const _getProcessStartTimes = seams._getProcessStartTimes || pool.getProcessStartTimes;
+  const _getProcessStartTimes = seams._getProcessStartTimes || getProcessStartTimesAsync;
   const _findCookiesFile = seams._findCookiesFile || pool.findCookiesFile;
   const _checkCookieAgeDays =
     seams._checkCookieAgeDays || pool.checkCookieAgeDays;
-  const _loadVault = seams._loadVault || loadVaultFromEnv;
+  // W1E-2: the CSV is parsed once, not per poll (see defaultVault).
+  const _loadVault = seams._loadVault || defaultVault;
   const _readFile = seams._readFile || ((p) => fs.readFileSync(p, "utf8"));
   const _statFile = seams._statFile || ((p) => fs.statSync(p));
   const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
   const _now = seams._now || (() => Date.now());
   const _startedAt = seams._startedAt || moduleStartedAt;
   const _ownTools = seams._ownTools || ownTools;
-  const _env = seams._env || process.env;
 
   const cfg = _loadConfig();
-  const braveProcessText = _listBraveProcessesRaw();
 
   // W0-2 (2026-11-03): read every lock up front so the recycled-PID check is
   // ONE batched start-time probe per poll, not one per slot.
@@ -149,7 +211,11 @@ function buildStatus(seams = {}) {
   const livePids = locks
     .map((l) => l.meta && l.meta.pid)
     .filter((p) => Number.isFinite(p) && _isPidAlive(p));
-  const startTimes = livePids.length > 0 ? _getProcessStartTimes(livePids) : new Map();
+  // The two probes are independent — run them concurrently.
+  const [braveProcessText, startTimes] = await Promise.all([
+    _listBraveProcessesRaw(),
+    livePids.length > 0 ? _getProcessStartTimes(livePids) : new Map(),
+  ]);
 
   const slots = (cfg.poolDirs || []).map((dir, idx) => {
     const lockPath = path.join(dir, ".mcp-wrapper-lock");
@@ -183,8 +249,9 @@ function buildStatus(seams = {}) {
       }
     }
 
-    const bravePids = _findBraveProcessesForDir(braveProcessText, dir);
-    const liveBravePids = bravePids.filter((p) => _isPidAlive(p));
+    // These PIDs come from the live process listing — no second liveness
+    // probe per PID (W1E-2).
+    const liveBravePids = _findBraveProcessesForDir(braveProcessText, dir);
 
     if (lockExists && pidAlive && liveBravePids.length > 0) {
       state = "claimed";
@@ -257,7 +324,9 @@ function buildStatus(seams = {}) {
     const vault = _loadVault();
     const summary = vault.summary();
     vaultBlock = {
-      enabled: !!_env.BROWSER_RELAY_VAULT_FILES,
+      // Configured = the vault was given at least one file. Read from the
+      // vault itself so a local-config.json key counts too.
+      enabled: (summary.filesLoaded || []).length + (summary.filesSkipped || []).length > 0,
       totalEntries: summary.totalEntries,
       uniqueHosts: summary.uniqueHosts,
       filesLoaded: (summary.filesLoaded || []).map((f) => ({
@@ -440,9 +509,10 @@ function buildToolsCatalog(seams = {}) {
 
 /** Build the per-slot detail payload for /api/slot/:n. Returns null if `n`
  *  is out of range, so the caller can 404 cleanly. The payload is the full
- *  slot entry from buildStatus + a `recentTraffic` array (last 200 events). */
-function buildSlotDetail(n, seams = {}) {
-  const status = buildStatus(seams);
+ *  slot entry from buildStatus + a `recentTraffic` array (last 200 events).
+ *  Pass `status` to reuse an already-built (cached) status. */
+async function buildSlotDetail(n, seams = {}, status = null) {
+  if (!status) status = await buildStatus(seams);
   const slot = status.slots.find((s) => s.index === n);
   if (!slot) return null;
 
@@ -473,16 +543,17 @@ const STATIC_MAP = {
 //
 // V2-1: CSP tightened from `frame-ancestors 'none'`-only to a full directive
 // list. `default-src 'self'` denies cross-origin script/img/etc by default;
-// `script-src 'self' 'unsafe-inline'` keeps the inspector's inline init
-// script working without opening up to remote eval; `connect-src 'self'`
-// limits XHR/WS to same-origin (defense against compromised inline script).
-// Forms blocked entirely (we have one POST endpoint reached via fetch).
+// `connect-src 'self'` limits XHR/WS to same-origin. Forms blocked entirely
+// (we have one POST endpoint reached via fetch).
+// W1E-3 (2026-11-03): no 'unsafe-inline' — the UI has no inline script,
+// <style> or style= attribute (CSSOM writes like node.style.x are still
+// allowed); test/inspector-server.test.js guards against new ones.
 const SECURITY_HEADERS = {
   "X-Frame-Options": "DENY",
   "Content-Security-Policy": [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline'",
-    "style-src 'self' 'unsafe-inline'",
+    "script-src 'self'",
+    "style-src 'self'",
     "img-src 'self' data:",
     "connect-src 'self'",
     "form-action 'none'",
@@ -514,16 +585,66 @@ function writeHtmlOrAssetHead(res, status, mime) {
   });
 }
 
-/** Origin allowlist matcher — shared with the WS upgrade path. Browsers
- *  always send Origin on cross-origin XHR + WS upgrade, so a missing
- *  Origin = trusted (curl, native ws-client). */
+// W1E-1 (2026-11-03): DNS-rebinding gate. A 127.0.0.1 bind alone doesn't
+// stop a hostile page whose hostname re-resolves to 127.0.0.1 — its
+// requests are same-origin to the attacker but land here, and the audit
+// probe read /api/activity (tool-call args incl. cookie values) that way.
+// Such requests carry the attacker's hostname in Host, so we only answer
+// to our own names on the port the connection actually arrived on.
+const LOOPBACK_HOSTNAMES = ["localhost", "127.0.0.1", "[::1]"];
+
+/** A socket's local address in Host-header form ("127.0.0.1", "[::1]",
+ *  "192.168.1.5"), or null. IPv4-mapped IPv6 is unwrapped. */
+function socketAddressAsHost(address) {
+  if (!address) return null;
+  const a = String(address).toLowerCase();
+  if (a.startsWith("::ffff:") && a.includes(".")) return a.slice("::ffff:".length);
+  return a.includes(":") ? `[${a}]` : a;
+}
+
+/** Host-header values this connection may carry: the loopback names plus
+ *  the address the connection arrived on (so an explicit LAN bind still
+ *  works by IP — an IP literal can't be rebound), all on the connection's
+ *  local port. Lower-case; the default port may be omitted. */
+function ownHostValues(socket) {
+  const port = socket && socket.localPort;
+  const out = new Set();
+  if (!port) return out;
+  const names = new Set(LOOPBACK_HOSTNAMES);
+  const local = socketAddressAsHost(socket.localAddress);
+  if (local) names.add(local);
+  for (const n of names) {
+    out.add(`${n}:${port}`);
+    if (port === 80) out.add(n);
+  }
+  return out;
+}
+
+function isHostAllowed(req) {
+  const host = req && req.headers && req.headers.host;
+  if (typeof host !== "string") return false;
+  return ownHostValues(req.socket).has(host.trim().toLowerCase());
+}
+
+/** Origin allowlist matcher — shared with the WS upgrade path. Default:
+ *  the inspector's own origin only (`http://` + one of ownHostValues for
+ *  this connection) — any other port on localhost is a different origin
+ *  (W1E-1: a POST from a :5173 dev server used to pass). An explicit
+ *  `allowedOrigins` list replaces the default and matches exactly.
+ *  A missing Origin returns true; mutating routes require presence
+ *  separately (browsers always send Origin on cross-origin XHR + WS
+ *  upgrade, so absence = curl / native ws-client). */
 function makeOriginChecker(allowedOrigins) {
-  const DEFAULT_ALLOWED = ["http://localhost", "http://127.0.0.1"];
-  const list = (allowedOrigins && allowedOrigins.length) ? allowedOrigins : DEFAULT_ALLOWED;
-  return function isOriginAllowed(originHeader) {
+  const normalize = (o) => String(o).trim().replace(/\/$/, "").toLowerCase();
+  const explicit = (allowedOrigins && allowedOrigins.length)
+    ? new Set(allowedOrigins.map(normalize))
+    : null;
+  return function isOriginAllowed(originHeader, req) {
     if (!originHeader) return true;
-    const probe = String(originHeader).replace(/\/$/, "");
-    return list.some((prefix) => probe === prefix || probe.startsWith(prefix + ":"));
+    const probe = normalize(originHeader);
+    if (explicit) return explicit.has(probe);
+    if (!probe.startsWith("http://")) return false;
+    return ownHostValues(req && req.socket).has(probe.slice("http://".length));
   };
 }
 
@@ -567,13 +688,49 @@ function readJsonBody(req, maxBytes = 65536) {
   });
 }
 
+// W1E-2: /api/status, /api/slot/:n and every open inspector tab share one
+// status build per window (the UI polls every 5s; the probes behind a build
+// take ~1-2s on Windows). Concurrent requests share the in-flight build.
+const STATUS_CACHE_MS = 5000;
+
+function makeStatusCache(seams, ttlMs) {
+  let entry = null; // { at, promise }
+  return {
+    get({ fresh = false } = {}) {
+      if (!fresh && entry && (entry.at === null || Date.now() - entry.at < ttlMs)) {
+        return entry.promise;
+      }
+      const e = { at: null, promise: null };
+      e.promise = buildStatus(seams).then(
+        (status) => { e.at = Date.now(); return status; },
+        (err) => { if (entry === e) entry = null; throw err; },
+      );
+      entry = e;
+      return e.promise;
+    },
+    invalidate() { entry = null; },
+  };
+}
+
 /** Build the request handler. */
-function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators } = {}) {
+function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs } = {}) {
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
   const _mutators = mutators || {};
+  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs);
+  const slotDetail = async (n, opts) => (getSlotDetail
+    ? getSlotDetail(n, seams)
+    : buildSlotDetail(n, seams, await statusCache.get(opts)));
 
   return async function handler(req, res) {
     const method = req.method || "GET";
+
+    // W1E-1: Host gate before anything else — static files included, the
+    // UI bundle is as readable to a rebinding page as the API.
+    if (!isHostAllowed(req)) {
+      writeJsonHead(res, 403);
+      res.end(JSON.stringify({ error: "forbidden host" }));
+      return;
+    }
 
     // Parse URL. Use WHATWG URL parser (url.parse is deprecated). Bogus
     // requests with no req.url default to "/".
@@ -621,7 +778,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         res.end(JSON.stringify({ error: "missing origin header (required on mutating requests)" }));
         return;
       }
-      if (!isOriginAllowed(origin)) {
+      if (!isOriginAllowed(origin, req)) {
         writeJsonHead(res, 403);
         res.end(JSON.stringify({ error: "forbidden origin" }));
         return;
@@ -648,8 +805,21 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
       }
       try {
         await readJsonBody(req).catch(() => ({})); // drain
-        // Re-build slot detail to find the slot's actual dir + state.
-        const detail = (getSlotDetail || buildSlotDetail)(n, seams);
+        // We need the absolute dir for reaping — the slot detail carries the
+        // basename. Pull it from the loaded config.
+        const _loadConfig = seams._loadConfig || pool.loadConfig;
+        const _readFile = seams._readFile || ((p) => fs.readFileSync(p, "utf8"));
+        const absDir = (_loadConfig().poolDirs || [])[n - 1];
+        const readLockRaw = () => {
+          if (!absDir) return null;
+          try { return _readFile(path.join(absDir, ".mcp-wrapper-lock")); } catch { return null; }
+        };
+        // W1E-2: remember the lock as it was when judged. A new relay can
+        // claim the slot while the (slow) process probes run; reaping then
+        // would kill its Brave and delete its lock.
+        const lockBefore = readLockRaw();
+        // Never decide a reap from a cached status.
+        const detail = await slotDetail(n, { fresh: true });
         if (!detail) {
           writeJsonHead(res, 404);
           res.end(JSON.stringify({ error: "slot out of range" }));
@@ -664,21 +834,30 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
           }));
           return;
         }
-        // We need the absolute dir for reaping — buildSlotDetail returns the
-        // basename. Pull it from the loaded config.
-        const _loadConfig = seams._loadConfig || pool.loadConfig;
-        const cfg = _loadConfig();
-        const absDir = (cfg.poolDirs || [])[n - 1];
         if (!absDir) {
           writeJsonHead(res, 500);
           res.end(JSON.stringify({ ok: false, reaped: false, message: "slot dir unresolved" }));
           return;
         }
-        const reapFn = _mutators.reapSlot || ((dir) => {
-          // Reap brave processes + clear the stale lock file.
-          const killed = pool.reapOrphansFor(dir);
-          const lockPath = path.join(dir, ".mcp-wrapper-lock");
-          try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+        if (readLockRaw() !== lockBefore) {
+          // The fresh build above judged the old lock — don't serve it.
+          statusCache.invalidate();
+          writeJsonHead(res, 409);
+          res.end(JSON.stringify({
+            ok: false,
+            reaped: false,
+            message: "slot " + n + " lock changed while it was being checked — refresh and retry",
+          }));
+          return;
+        }
+        const _reapOrphansFor = seams._reapOrphansFor || pool.reapOrphansFor;
+        const _clearStaleLock = seams._clearStaleLock || pool.clearStaleLock;
+        const reapFn = _mutators.reapSlot || ((dir, _n, { lockRaw }) => {
+          // Reap brave processes, then unlink the lock only if it is still
+          // the one judged stale — a relay that claimed the slot during the
+          // kill has written its own.
+          const killed = _reapOrphansFor(dir);
+          _clearStaleLock(path.join(dir, ".mcp-wrapper-lock"), lockRaw, "reaped via inspector");
           return killed;
         });
         // G0-8 (2026-05-10): cap the reap operation at 10s. taskkill /F /T
@@ -688,17 +867,30 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         // hangs indefinitely on a Reap click — bad UX, and the inspector
         // backend's HTTP server can't drain.
         const REAP_TIMEOUT_MS = 10000;
-        const reapPromise = Promise.resolve(reapFn(absDir, n));
-        const killed = await Promise.race([
-          reapPromise,
-          new Promise((_, rej) => setTimeout(() => rej(new Error("reap timed out after " + REAP_TIMEOUT_MS + "ms")), REAP_TIMEOUT_MS)),
-        ]);
+        let killed;
+        try {
+          const reapPromise = Promise.resolve(reapFn(absDir, n, { lockRaw: lockBefore }));
+          killed = await Promise.race([
+            reapPromise,
+            new Promise((_, rej) => setTimeout(() => rej(new Error("reap timed out after " + REAP_TIMEOUT_MS + "ms")), REAP_TIMEOUT_MS)),
+          ]);
+        } finally {
+          // The slot changed state — don't serve the pre-reap status.
+          statusCache.invalidate();
+        }
+        // lockCleared: the stale lock is gone. False when it was left in
+        // place (a relay replaced it during the reap, or unlink failed).
+        const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
+        const lockCleared = !_existsFile(path.join(absDir, ".mcp-wrapper-lock"));
+        const parts = ["Reaped orphan slot " + n];
+        if (Number.isFinite(killed)) parts.push(killed + " brave process" + (killed === 1 ? "" : "es"));
+        parts.push(lockCleared ? "lock cleared" : "lock left in place");
         writeJsonHead(res, 200);
         res.end(JSON.stringify({
           ok: true,
           reaped: true,
-          message: "Reaped orphan slot " + n + " · " +
-            (Number.isFinite(killed) ? killed + " brave proc" + (killed === 1 ? "" : "es") : "lock cleared"),
+          lockCleared,
+          message: parts.join(" · "),
         }));
       } catch (e) {
         writeJsonHead(res, 500);
@@ -725,7 +917,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         return;
       }
       try {
-        const detail = (getSlotDetail || buildSlotDetail)(n, seams);
+        const detail = await slotDetail(n);
         if (!detail) {
           writeJsonHead(res, 404);
           res.end(JSON.stringify({ error: "slot out of range" }));
@@ -753,6 +945,8 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         res.writeHead(200, {
           ...SECURITY_HEADERS,
           "Content-Type": "application/json; charset=utf-8",
+          // Tool-call traffic (auth tokens, cookie values) — never cached.
+          "Cache-Control": "no-store",
           "Content-Disposition": `attachment; filename="${filename}"`,
         });
         res.end(JSON.stringify(payload, null, 2));
@@ -764,7 +958,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
     }
 
     const apiBuilders = {
-      "/api/status": buildStatus,
+      "/api/status": () => statusCache.get(),
       "/api/settings": buildSettings,
       "/api/tools": buildToolsCatalog,
       "/api/activity": buildActivity,
@@ -772,7 +966,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
     const apiBuilder = apiBuilders[pathname];
     if (apiBuilder) {
       try {
-        const payload = apiBuilder(seams);
+        const payload = await apiBuilder(seams);
         writeJsonHead(res, 200);
         res.end(JSON.stringify(payload, null, 2));
       } catch (e) {
@@ -833,8 +1027,8 @@ function attachWebsocket(httpServer, { trafficEmitter, getRecent, allowedOrigins
   // so a tab on evil.com could open ws://127.0.0.1:9090/ws/traffic and
   // receive every captured tool call — even though our HTTP bind is
   // localhost-only. We accept connections only when the Origin header is
-  // absent (curl, native MCP client, our own UI fetched from same origin)
-  // or when it matches an allowlist. Default allowlist = localhost / 127.0.0.1.
+  // absent (curl, native MCP client) or matches the allowlist — by default
+  // the inspector's own origin (see makeOriginChecker).
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
 
   // Back-pressure cap: if a slow/paused client lets the send buffer grow
@@ -879,7 +1073,23 @@ function attachWebsocket(httpServer, { trafficEmitter, getRecent, allowedOrigins
     });
   }
 
+  const rejectUpgrade = (socket) => {
+    try {
+      socket.write(
+        "HTTP/1.1 403 Forbidden\r\n" +
+        "Connection: close\r\n" +
+        "Content-Length: 0\r\n\r\n",
+      );
+    } catch { /* noop */ }
+    socket.destroy();
+  };
+
   httpServer.on("upgrade", (req, socket, head) => {
+    // W1E-1: same DNS-rebinding Host gate as the HTTP handler.
+    if (!isHostAllowed(req)) {
+      rejectUpgrade(socket);
+      return;
+    }
     let parsedPath;
     try { parsedPath = new URL(req.url || "/", "http://x").pathname; }
     catch { socket.destroy(); return; }
@@ -891,15 +1101,8 @@ function attachWebsocket(httpServer, { trafficEmitter, getRecent, allowedOrigins
     // hostile webpage. Browsers ALWAYS send Origin on WS upgrade, so a
     // missing Origin = non-browser client (curl, ws-client) which is fine.
     const origin = req.headers && req.headers.origin;
-    if (!isOriginAllowed(origin)) {
-      try {
-        socket.write(
-          "HTTP/1.1 403 Forbidden\r\n" +
-          "Connection: close\r\n" +
-          "Content-Length: 0\r\n\r\n",
-        );
-      } catch { /* noop */ }
-      socket.destroy();
+    if (!isOriginAllowed(origin, req)) {
+      rejectUpgrade(socket);
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -992,6 +1195,7 @@ function startInspector(opts = {}) {
     seams: enrichedSeams,
     allowedOrigins: opts.allowedOrigins,
     mutators: opts.mutators,
+    statusCacheMs: opts.statusCacheMs,
   });
   const server = http.createServer(handler);
 
@@ -1014,9 +1218,11 @@ function startInspector(opts = {}) {
     // EADDRINUSE friendly path. Most users hit this when a previous relay
     // run is still holding 9090. Print a one-line hint instead of spewing
     // a stack trace + suggesting the env-var override + reject the promise
-    // so the caller can `process.exit(1)` cleanly.
+    // so the caller can `process.exit(1)` cleanly. `quietPortInUse` skips
+    // the hint (still rejects) for callers that retry the bind and log
+    // their own line — the relay does, and would repeat it every retry.
     const onError = (err) => {
-      if (err && err.code === "EADDRINUSE") {
+      if (err && err.code === "EADDRINUSE" && !opts.quietPortInUse) {
         process.stderr.write(
           `[inspector] Port ${port} already in use. ` +
           `Set BROWSER_RELAY_INSPECTOR_PORT=9091 (or another free port) and try again.\n`,
@@ -1100,6 +1306,7 @@ function createInspector(seamsOrOpts = {}) {
     seams: enrichedSeams,
     allowedOrigins: opts.allowedOrigins,
     mutators: opts.mutators,
+    statusCacheMs: opts.statusCacheMs,
   });
   const server = http.createServer(handler);
   const wss = attachWebsocket(server, {
@@ -1136,6 +1343,7 @@ module.exports = {
   buildSlotDetail,
   buildActivity,
   makeHandler,
+  runProbeAsync,
   defaultPort,
   defaultBind,
   redactPath,

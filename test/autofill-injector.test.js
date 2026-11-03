@@ -1,7 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { attachAutofill, USERNAME_FIELD_SELECTORS } = require("../src/autofill-injector.js");
+const vm = require("node:vm");
+
+const { attachAutofill, fillScript, USERNAME_FIELD_SELECTORS, PASSWORD_FIELD_SELECTORS } = require("../src/autofill-injector.js");
 
 // Minimal mock of a Playwright BrowserContext: just enough surface for
 // attachAutofill — `pages()` returns existing pages, `on("page", fn)`
@@ -76,7 +78,7 @@ test("V1-2: rapid framenavigated events do NOT spawn concurrent fills", async ()
   // Vault returns a real cred each time — without debounce, every nav fires.
   const vault = {
     totalEntries: 1,
-    lookup: () => [{ username: "alice", password: "p1" }],
+    lookup: () => [{ username: "alice", password: "p1", url: "https://example.com/login" }],
   };
   attachAutofill(ctx, vault, () => {});
 
@@ -94,72 +96,116 @@ test("V1-2: rapid framenavigated events do NOT spawn concurrent fills", async ()
 });
 
 // ──────────────────────────────────────────────────────────────────
-// W0-5: cross-subdomain credential leak protection. When vault.lookup
-// returns multiple registrable-fallback matches with no exact-host
-// entry, autofill must SKIP — picking creds[0] would silently fill
-// the wrong account on a brand with multiple subdomains in the vault
-// (AWS, Audible, Twitch all under amazon.com).
+// W1E-5 (2026-11-03): only fill a credential whose stored origin is
+// exactly the page's origin, only on https://, and re-check the origin
+// inside the page right before filling (the frame may have navigated
+// between framenavigated and the evaluate landing). Replaces the W0-5
+// "skip only when the registrable fallback is ambiguous" rule, which
+// still filled a single lookalike match (evil.atlassian.net).
 // ──────────────────────────────────────────────────────────────────
 
-test("W0-5: autofill SKIPS when lookup returns ambiguous registrable fallback (>1 _match=registrable)", async () => {
+function makeNavHarness(pageUrl, creds) {
   const evalCalls = [];
   const logs = [];
   const fakeFrame = {
-    url: () => "https://signin.amazon.com/login",
-    evaluate: async () => { evalCalls.push("called"); return { user: true, pass: true }; },
+    url: () => pageUrl,
+    evaluate: async (fn, args) => { evalCalls.push(args); return { user: true, pass: true }; },
   };
   const fakePage = {
-    on: (event, fn) => { fakePage._fn = fn; },
-    mainFrame: () => fakeFrame,
-  };
-  fakeFrame.equals = (other) => other === fakeFrame;
-  // Patch fakeFrame === comparison: page.mainFrame() returns fakeFrame, and
-  // attachToPage compares `frame !== page.mainFrame()`. Use object identity.
-  const ctx = {
-    pages: () => [fakePage],
-    on: () => {},
-  };
-  // Vault with two AMBIGUOUS registrable matches.
-  const vault = {
-    totalEntries: 2,
-    lookup: () => [
-      { username: "aws-user", password: "p1", url: "https://aws.amazon.com", _match: "registrable" },
-      { username: "audible-user", password: "p2", url: "https://www.audible.com", _match: "registrable" },
-    ],
-  };
-  attachAutofill(ctx, vault, (m) => logs.push(m));
-  // Trigger framenavigated.
-  fakePage._fn(fakeFrame);
-  // Allow microtasks to drain.
-  await new Promise((r) => setImmediate(r));
-  assert.strictEqual(evalCalls.length, 0,
-    "autofill must SKIP frame.evaluate when lookup is ambiguous-registrable (>1 cred, no exact host)");
-  assert.ok(logs.some((m) => /ambiguous|skipping/i.test(m)),
-    "expected a 'skipping' log line when ambiguous fallback");
-});
-
-test("W0-5: autofill DOES fill when lookup returns 1 registrable match (unambiguous)", async () => {
-  const evalCalls = [];
-  const fakeFrame = {
-    url: () => "https://signin.amazon.com/login",
-    evaluate: async () => { evalCalls.push("called"); return { user: true, pass: true }; },
-  };
-  const fakePage = {
-    on: (event, fn) => { fakePage._fn = fn; },
+    on: (event, fn) => { if (event === "framenavigated") fakePage._fn = fn; },
     mainFrame: () => fakeFrame,
   };
   const ctx = { pages: () => [fakePage], on: () => {} };
-  const vault = {
-    totalEntries: 1,
-    lookup: () => [
-      { username: "alice", password: "p1", url: "https://amazon.com", _match: "registrable" },
-    ],
+  attachAutofill(ctx, { totalEntries: creds.length, lookup: () => creds }, (m) => logs.push(m));
+  return {
+    evalCalls,
+    logs,
+    navigate: async () => { fakePage._fn(fakeFrame); await new Promise((r) => setImmediate(r)); },
   };
-  attachAutofill(ctx, vault, () => {});
-  fakePage._fn(fakeFrame);
-  await new Promise((r) => setImmediate(r));
-  // Single registrable match is unambiguous — fill DID happen.
-  assert.strictEqual(evalCalls.length, 1, "single registrable match must fill");
+}
+
+test("W1E-5: never fills a credential stored for a different origin (lookalike subdomain)", async () => {
+  const h = makeNavHarness("https://evil.atlassian.net/login", [
+    { username: "alice", password: "p1", url: "https://mycompany.atlassian.net/login" },
+  ]);
+  await h.navigate();
+  assert.strictEqual(h.evalCalls.length, 0, "lookalike origin must not be filled");
+});
+
+test("W1E-5: never fills on an http:// page", async () => {
+  const h = makeNavHarness("http://example.com/login", [
+    { username: "alice", password: "p1", url: "http://example.com/login" },
+  ]);
+  await h.navigate();
+  assert.strictEqual(h.evalCalls.length, 0, "plain-http page must not be filled");
+});
+
+test("W1E-5: fills an exact-origin match and hands the page origin to the in-page check", async () => {
+  const h = makeNavHarness("https://example.com/signin?next=/", [
+    { username: "alice", password: "p1", url: "https://example.com/login" },
+  ]);
+  await h.navigate();
+  assert.strictEqual(h.evalCalls.length, 1);
+  assert.strictEqual(h.evalCalls[0].expectedOrigin, "https://example.com");
+  assert.strictEqual(h.evalCalls[0].username, "alice");
+});
+
+// Execute the injected function itself (as Playwright does: serialized
+// source, run in the page) against a minimal fake DOM.
+function runFillScript({ origin, args }) {
+  const filled = [];
+  const makeInput = (name) => ({
+    value: "",
+    offsetParent: {},
+    dispatchEvent: () => true,
+    _name: name,
+  });
+  const userEl = makeInput("user");
+  const passEl = makeInput("pass");
+  const document = {
+    querySelectorAll: (sel) => {
+      if (sel === args.usernameSelectors[0]) return [userEl];
+      if (sel === args.passwordSelectors[0]) return [passEl];
+      return [];
+    },
+  };
+  const sandbox = {
+    document,
+    location: { origin },
+    getComputedStyle: () => ({ visibility: "visible" }),
+    Event: class { constructor(type) { this.type = type; } },
+    setTimeout,
+    Date,
+    Promise,
+    Object,
+  };
+  const run = vm.runInNewContext("(" + fillScript.toString() + ")", sandbox);
+  return run(args).then((result) => {
+    if (userEl.value) filled.push("user");
+    if (passEl.value) filled.push("pass");
+    return { result, filled, userEl, passEl };
+  });
+}
+
+const fillArgs = (expectedOrigin) => ({
+  username: "alice",
+  password: "p1",
+  expectedOrigin,
+  usernameSelectors: USERNAME_FIELD_SELECTORS,
+  passwordSelectors: PASSWORD_FIELD_SELECTORS,
+});
+
+test("W1E-5: injected fill runs when the document is still on the expected origin", async () => {
+  const { filled, passEl } = await runFillScript({ origin: "https://example.com", args: fillArgs("https://example.com") });
+  assert.deepStrictEqual(filled, ["user", "pass"]);
+  assert.strictEqual(passEl.value, "p1");
+});
+
+test("W1E-5: injected fill refuses once the document is on another origin", async () => {
+  const { result, filled } = await runFillScript({ origin: "https://evil.example", args: fillArgs("https://example.com") });
+  assert.deepStrictEqual(filled, [], "no field may be touched on a different origin");
+  assert.strictEqual(result.user, false);
+  assert.strictEqual(result.pass, false);
 });
 
 // ──────────────────────────────────────────────────────────────────
