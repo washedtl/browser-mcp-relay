@@ -2,7 +2,6 @@
 // Each field calls page.fill(selector, value) sequentially. Stops on first failure
 // (returning the partial-fill state for diagnosis).
 
-
 // W1C2: Playwright appends a call log to fill errors (ANSI-dimmed line by
 // line, even with piped stdio). It holds the raw `fill("<value>")` (a
 // multi-line value spans lines) and element previews like `<input value="…">`
@@ -34,7 +33,7 @@ function redactValue(message, value) {
 module.exports = {
   name: "form_fill",
   description:
-    "Fill multiple form fields on the active page in one call. Each field is " +
+    "Fill multiple form fields on this tab in one call. Each field is " +
     "{ selector, value }. By default fills sequentially and stops on first " +
     "failure (returning partial state). Set `continueOnError: true` to attempt " +
     "every field regardless of failures. `timeoutMs` caps each field's wait " +

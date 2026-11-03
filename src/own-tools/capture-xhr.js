@@ -35,13 +35,13 @@ const PREVIEW_LINES = 20;
 module.exports = {
   name: "capture_xhr",
   description:
-    "Record XHR/fetch responses on the active page for durationMs, optionally while navigating to navigateToUrl. " +
+    "Record XHR/fetch responses on this tab for durationMs, optionally while navigating to navigateToUrl. " +
     "Inline output is compact: url/status/method/contentType, bodies cut to 2KB, ~100KB total, no headers. " +
     "Pass outputPath to write the full capture (headers, 100KB bodies) to a file and get only a summary back.",
   inputSchema: {
     type: "object",
     properties: {
-      navigateToUrl: { type: "string", description: "Navigate the active page here while capturing." },
+      navigateToUrl: { type: "string", description: "Navigate this tab here while capturing." },
       durationMs: {
         type: "integer", default: 5000, minimum: 100, maximum: 300000,
         description: "Capture window incl. navigation; the call blocks this long (+ up to 2s for bodies to finish).",

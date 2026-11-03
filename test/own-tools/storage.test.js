@@ -52,7 +52,7 @@ function makeFakePage(initialLocal = {}, initialSession = {}, opts = {}) {
 }
 
 function withFakePage(page) {
-  return { page, context: { pages: () => [page] } };
+  return { page };
 }
 
 // ──────────────────────────────────────────────────────────────────

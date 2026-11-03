@@ -6,6 +6,11 @@
 // window placed off-screen (broker placement "offscreen") is moved onto the
 // display Chromium reports for it. Acts on ctx.page: the tab the call's
 // tabId names, else main.
+//
+// TODO(W2E): route the restore / on-screen move through W2B's
+// src/broker/window-pages.js (ensureNotMinimized, placement bounds) instead
+// of this page-session + in-page screen.avail* math; the page.evaluate
+// below also has no timeout of its own.
 
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
 

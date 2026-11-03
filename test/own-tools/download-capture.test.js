@@ -40,7 +40,7 @@ test("T0-9: download_capture short-circuits when page closes before download", a
     },
     off: () => {},
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   // Long timeoutMs to prove the close path is what triggers fast resolution.
   const promise = tool.handler({ timeoutMs: 30000 }, ctx);
   setTimeout(() => {
@@ -172,7 +172,7 @@ function removeSaved(download) {
 }
 
 async function onPage(page, fn) {
-  return fn({ page, context: { pages: () => [page] } });
+  return fn({ page });
 }
 
 async function collectUnhandled(fn, settleMs) {

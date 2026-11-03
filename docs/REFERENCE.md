@@ -50,13 +50,13 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `tabs_list` | List your tabs (this session only) with index, `tabId`, URL | — | "Where did I leave that page?" |
+| `tabs_list` | List your tabs (this session only) with `tabId`, URL, title | — | "Where did I leave that page?" |
 | `tabs_new` | Open a new tab and return its `tabId` | `url` | Give each parallel subagent its own tab |
-| `tabs_select` | Bring one of your tabs to the front | `tabId` or `index` | Show the user a specific tab |
-| `tabs_close` | Close one of your tabs | `tabId` or `index` | Tear down workflow tabs |
+| `tabs_select` | Bring one of your tabs to the front | `tabId` | Show the user a specific tab |
+| `tabs_close` | Close one of your tabs | `tabId` | Tear down workflow tabs |
 | `browser_show` | Bring your window on-screen and to the front (restores a minimized window, moves an off-screen one into view) | `tabId` | Let the user log in or pass 2FA by hand |
 
-Tools that act on a page take an optional `tabId` (from `tabs_new`); without it they act on your main tab. Tabs belong to one MCP connection: another session's tabs are never listed, selected or closed. In legacy (per-session pool) mode the relay's own tools honour `tabId`, while forwarded upstream tools always act on upstream's page.
+Tools that act on a page take an optional `tabId` (from `tabs_new`); without it they act on your main tab. Only `tabs_new` opens tabs: an unknown `tabId` is an error. Tabs belong to one MCP connection: another session's tabs are never listed, selected or closed, and `tabs_list` / `tabs_select` / `tabs_close` never open a tab or launch the browser. In legacy (per-session pool) mode only the relay's own tools take `tabId`; a forwarded upstream tool called with one returns an error (it would act on your main tab).
 
 #### 📤 Forms, dialogs, files
 
@@ -78,7 +78,7 @@ Tools that act on a page take an optional `tabId` (from `tabs_new`); without it 
 |---|---|---|---|
 | `cookies_export` | Export cookies as JSON (one jar, shared by every tab and session) | `urls`, `domains`, `names` (filters), `outputPath` (keeps values out of the transcript) | Save an authed session for later |
 | `cookies_import` | Import cookies into the shared jar | `cookies` or `inputPath` (a file from `cookies_export`) | Restore an authed session |
-| `stealth_apply` | Anti-detection patches (Tier 1), this tab only | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
+| `stealth_apply` | Anti-detection patches (Tier 1), all your tabs, never another session's | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
 
 #### 💾 Downloads
 
@@ -556,7 +556,7 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 
 ## Stealth model
 
-`stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load in the calling tab (other tabs and sessions are never touched; popups the tab opens are not patched). **Off by default** — call the tool once per tab to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
+`stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load of the calling session, never another session's pages. In legacy (per-session pool) mode that is the whole browser context, so pages opened later are covered too; in shared-broker mode it is each of your open tabs (call it again after `tabs_new`; popups a tab opens are not patched). **Off by default** — call the tool once per session to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
 
 ### Tier 1+2 — what's covered (v0.3.5)
 

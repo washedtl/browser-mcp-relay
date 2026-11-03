@@ -38,7 +38,7 @@ function makePageWithFillRecorder(fillImpl) {
 
 test("T1-11: form_fill passes timeoutMs to page.fill", async () => {
   const { fakePage, calls } = makePageWithFillRecorder();
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   await tool.handler({
     fields: [{ selector: "#a", value: "x" }, { selector: "#b", value: "y" }],
     timeoutMs: 7777,
@@ -50,7 +50,7 @@ test("T1-11: form_fill passes timeoutMs to page.fill", async () => {
 
 test("T1-11: form_fill default timeoutMs is 5000 (NOT Playwright default 30000)", async () => {
   const { fakePage, calls } = makePageWithFillRecorder();
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   await tool.handler({ fields: [{ selector: "#a", value: "x" }] }, ctx);
   assert.strictEqual(calls[0].opts.timeout, 5000, "default per-field timeout must be 5000ms (was: implicit Playwright 30000)");
 });
@@ -65,7 +65,7 @@ test("T1-11: form_fill continueOnError=true attempts all fields even on failure"
       if (selector === "#bad") throw new Error("element not found");
     },
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const r = await tool.handler({
     fields: [
       { selector: "#a", value: "x" },
@@ -92,7 +92,7 @@ test("T1-11: form_fill continueOnError=false (default) stops at first failure", 
       if (selector === "#bad") throw new Error("element not found");
     },
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   await tool.handler({
     fields: [
       { selector: "#a", value: "x" },
@@ -126,7 +126,7 @@ function failLikePlaywright({ selector, value, opts }) {
 for (const continueOnError of [false, true]) {
   test(`W1C2: form_fill error output never contains a field value (continueOnError=${continueOnError})`, async () => {
     const { fakePage } = makePageWithFillRecorder(failLikePlaywright);
-    const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+    const ctx = { page: fakePage };
     const r = await tool.handler({
       fields: [{ selector: "#user", value: "alice" }, { selector: "#pw", value: SECRET }],
       continueOnError,
@@ -154,7 +154,7 @@ test("W1C2: form_fill: element previews of a multi-line value can't leak", async
       `  - fill("${value}")\n`,
     );
   });
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] }, ctx);
   assert.strictEqual(r.isError, true);
   const text = r.content[0].text;
@@ -166,7 +166,7 @@ test("W1C2: form_fill: element previews of a multi-line value can't leak", async
 
 test("W1C2: form_fill keeps the error readable for very short values", async () => {
   const { fakePage } = makePageWithFillRecorder(failLikePlaywright);
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const r = await tool.handler({ fields: [{ selector: "#pw", value: "e" }] }, ctx);
   assert.match(r.content[0].text, /Timeout 5000ms exceeded/);
 });
@@ -185,7 +185,7 @@ test("W1C2: form_fill keeps call-log diagnostics but not the value-bearing lines
       `    - element is not visible\n`,
     );
   });
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const r = await tool.handler({ fields: [{ selector: "#pw", value: SECRET }] }, ctx);
   const text = r.content[0].text;
   assert.ok(!text.includes(SECRET), `value leaked:\n${text}`);
@@ -203,7 +203,7 @@ test("W1C2: form_fill drops the fill line even if Playwright escapes the value",
       `    - fill(${JSON.stringify(value)})\n`,
     );
   });
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const r = await tool.handler({ fields: [{ selector: "#pw", value: VALUE }] }, ctx);
   assert.ok(!r.content[0].text.includes("et-word"), `value leaked:\n${r.content[0].text}`);
 });
@@ -234,7 +234,7 @@ test("W1C2: form_fill redacts a multi-line value in a real (ANSI-coloured) Playw
     ]);
     throw new Error(`page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n${colors.dim(log.join("\n"))}\n`);
   });
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] }, ctx);
   const text = r.content[0].text;
   for (const frag of ["AAAAsecretline1", "BBBBsecretline2", "END KEY"]) {
@@ -258,7 +258,7 @@ test("W1C2 review: a value that itself contains ANSI codes + a '- ' line can't l
       );
     },
   };
-  const res = await tool.handler({ fields: [{ selector: "#pw", value: secret }] }, { page, context: { pages: () => [page] } });
+  const res = await tool.handler({ fields: [{ selector: "#pw", value: secret }] }, { page });
   const text = res.content.map((c) => c.text).join("\n");
   assert.ok(!text.includes("s3cretTail"), "secret tail must not appear: " + text);
   assert.ok(text.includes("element is not visible"), "diagnostic line survives");

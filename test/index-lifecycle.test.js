@@ -161,6 +161,20 @@ test("lazy: first ensureBrave claims the slot once and derives the CDP port from
   assert.ok(h.logs.some((l) => /slot=2\/2/.test(l)), "banner logged at claim time");
 });
 
+// W2D: tabs_list / tabs_select / tabs_close look at the running Brave only.
+test("W2D: peekBrave returns the running bridge (null before launch / after Brave dies) and never launches", async () => {
+  const h = makeHarness();
+  const lc = createLifecycle(h.deps);
+  assert.strictEqual(lc.peekBrave(), null);
+  assert.strictEqual(h.calls.claim, 0);
+  assert.strictEqual(h.calls.launch.length, 0);
+  const bridge = await lc.ensureBrave();
+  assert.strictEqual(lc.peekBrave(), bridge);
+  h.contexts[0].emit("close");
+  assert.strictEqual(lc.peekBrave(), null);
+  assert.strictEqual(h.calls.launch.length, 1);
+});
+
 test("lazy: BROWSER_RELAY_POOL_SLOT override sets the port at claim time", async () => {
   const h = makeHarness();
   const lc = createLifecycle({ ...h.deps, env: { BROWSER_RELAY_POOL_SLOT: "4" } });
@@ -498,7 +512,7 @@ async function connectClient(server) {
 }
 
 test("MCP server: version comes from package.json and tools.listChanged is declared", async () => {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   const { server } = buildServer({ lifecycle, recordTraffic: false });
   const { client, connect } = await connectClient(server);
   await connect();
@@ -513,7 +527,7 @@ test("MCP server: version comes from package.json and tools.listChanged is decla
 
 test("RelayServer receives lifecycle hooks, recordTraffic, and a notifyToolsChanged that emits tools/list_changed", async () => {
   const { ToolListChangedNotificationSchema } = require("@modelcontextprotocol/sdk/types.js");
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   for (const recordTraffic of [true, false]) {
     let opts = null;
     const { server, relay } = buildServer({
@@ -525,6 +539,7 @@ test("RelayServer receives lifecycle hooks, recordTraffic, and a notifyToolsChan
     assert.strictEqual(opts.recordTraffic, recordTraffic);
     assert.strictEqual(opts.getUpstream, lifecycle.getUpstream);
     assert.strictEqual(opts.ensureBrave, lifecycle.ensureBrave);
+    assert.strictEqual(opts.peekBrave, lifecycle.peekBrave);
     assert.ok(relay.ownTools.size > 0, "own-tools registered");
 
     const { client, connect } = await connectClient(server);
@@ -542,7 +557,7 @@ test("RelayServer receives lifecycle hooks, recordTraffic, and a notifyToolsChan
 });
 
 test("MCP server instructions tell agents hidden toolsets exist and to ask the user before `toolsets`", async () => {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   const { server } = buildServer({ lifecycle, recordTraffic: false });
   const { client, connect } = await connectClient(server);
   await connect();
@@ -559,7 +574,7 @@ test("MCP server instructions tell agents hidden toolsets exist and to ask the u
 });
 
 test("elicit: null when the client doesn't support elicitation (or before initialize)", async () => {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   let opts = null;
   const { server } = buildServer({
     lifecycle, recordTraffic: false,
@@ -589,7 +604,7 @@ async function connectWithCaps(server, capabilities, onElicit) {
 }
 
 function buildWithOpts() {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   let opts = null;
   const { server } = buildServer({
     lifecycle, recordTraffic: false,
@@ -637,7 +652,7 @@ test("elicit: forwards to the client as elicitation/create when supported", asyn
   const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
   const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
   const { ElicitRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   let opts = null;
   const { server } = buildServer({
     lifecycle, recordTraffic: false,

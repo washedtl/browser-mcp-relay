@@ -1,4 +1,4 @@
-// emulate_device — applies CDP Emulation overrides to the active page.
+// emulate_device — applies CDP Emulation overrides to this tab.
 // User-agent, viewport, device scale factor, mobile/touch flags, network throttle.
 //
 // V0-3: CDP `Emulation.*` overrides are session-scoped — they revert when
@@ -20,7 +20,7 @@ const { clientHintsFromUA } = require("./_client-hints.js");
 module.exports = {
   name: "emulate_device",
   description:
-    "Apply device emulation to the active page via CDP Emulation. " +
+    "Apply device emulation to this tab via CDP Emulation. " +
     "Useful for testing mobile layouts, slow networks, or specific user-agent behavior. " +
     "Overrides stay on that tab across navigations until the tab closes or you call reset:true.",
   inputSchema: {
@@ -28,7 +28,7 @@ module.exports = {
     properties: {
       reset: {
         type: "boolean",
-        description: "Clear every override this tool set on the active page (user agent, viewport, touch, network). Use alone.",
+        description: "Clear every override this tool set on this tab (user agent, viewport, touch, network). Use alone.",
       },
       userAgent: { type: "string", description: "User-Agent header override" },
       viewport: {

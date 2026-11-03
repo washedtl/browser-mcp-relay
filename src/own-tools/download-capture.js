@@ -61,7 +61,7 @@ function sanitizeDownloadFilename(raw) {
 module.exports = {
   name: "download_capture",
   description:
-    "Save the next download from the active page to disk and return its path. " +
+    "Save the next download from this tab to disk and return its path. " +
     "Listening starts when this tool is called and the call blocks until a download starts, " +
     "so pass clickSelector to trigger it here; a download started before the call is missed.",
   inputSchema: {

@@ -14,6 +14,8 @@
 //     ~3MB CJS/ESM on every call (~80–150ms cold cost); now imports once
 //     on first call and reuses
 
+const { errorResult } = require("./_tool-args.js");
+
 // T1-1: lazy + memoized — first call pays the import cost, subsequent calls
 // reuse the resolved module. The module is ~3MB; eager loading at startup
 // would add ~100ms to relay boot. Lazy + memoized = best of both.
@@ -73,12 +75,7 @@ module.exports = {
         isError: true,
       };
     }
-    if (!cdpUrl) {
-      return {
-        content: [{ type: "text", text: "lighthouse_audit unavailable: no browser CDP endpoint" }],
-        isError: true,
-      };
-    }
+    if (!cdpUrl) return errorResult("lighthouse_audit unavailable: no browser CDP endpoint");
     const { hostname, port } = new URL(cdpUrl);
     const probeUrl = new URL("/json/version", cdpUrl).href;
 

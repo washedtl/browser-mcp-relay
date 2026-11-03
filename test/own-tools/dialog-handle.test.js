@@ -35,7 +35,7 @@ test("T0-9: dialog_handle short-circuits when page closes before dialog", async 
     },
     off: () => {},
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   // Start dialog wait with a long timeout, then trigger close.
   const promise = tool.handler({ action: "accept", timeoutMs: 30000 }, ctx);
   // Trigger close immediately.
@@ -61,7 +61,7 @@ test("T0-10: dialog_handle calls defaultValue() as a method", async () => {
     once: (event, fn) => { if (event === "dialog") registeredDialogHandler = fn; },
     off: () => {},
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   let dvCallCount = 0;
   const fakeDialog = {
     type: () => "prompt",
@@ -91,7 +91,7 @@ test("V1-3: dialog_handle settles exactly once when timeout + dialog race", asyn
     once: (event, fn) => { if (event === "dialog") registeredDialogHandler = fn; },
     off: () => {},
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
 
   // Use a tiny timeout, then synchronously fire the dialog as well.
   let acceptCalls = 0;
@@ -159,7 +159,7 @@ async function runWithDialog(args, dialog) {
     once: (event, fn) => { if (event === "dialog") onDialog = fn; },
     off: () => {},
   };
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const promise = tool.handler(args, ctx);
   await new Promise((r) => setImmediate(r));
   await onDialog(dialog);

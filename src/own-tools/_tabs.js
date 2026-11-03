@@ -1,36 +1,22 @@
-// _tabs.js — the calling connection's tabs, shared by tabs_list /
-// tabs_select / tabs_close. Tabs come from ctx.registry (the broker's
-// SessionRegistry, or LegacyTabs in legacy mode): listTabs(connId) gives the
-// tab keys, and getCtx on a listed key returns that tab without creating one.
-// Another connection's tabs are never visible here.
+// _tabs.js — helpers for tabs_list / tabs_select / tabs_close. Tabs come
+// from ctx.registry.listTabs(connId) ([{ tabKey, page }], the calling
+// connection's tabs only), which never creates a tab or launches a browser.
+// No registry (no browser running in legacy mode) means no tabs.
 
-/** [{ tabId, page }] in registry order. */
 async function connectionTabs({ registry, connId }) {
-  const keys = await registry.listTabs(connId);
-  return Promise.all(keys.map(async (tabId) => ({ tabId, page: (await registry.getCtx(connId, tabId)).page })));
+  return registry ? registry.listTabs(connId) : [];
 }
 
-/**
- * The tab named by args.tabId, else by args.index (tabs_list order).
- * Returns { tab } or { error } (error text prefixed with the tool name).
- */
-function pickTab(tool, args, tabs) {
-  if (args.tabId != null) {
-    const tab = tabs.find((t) => t.tabId === args.tabId);
-    if (tab) return { tab };
-    const have = tabs.map((t) => t.tabId).join(", ") || "none";
-    return { error: `${tool}: no tab ${JSON.stringify(args.tabId)} in this session (have ${have})` };
+/** The tab args.tabId names → { tab } or { error } (prefixed with the tool name). */
+async function pickTab(tool, args, ctx) {
+  if (typeof args.tabId !== "string" || args.tabId === "") {
+    return { error: `${tool}: tabId is required (from tabs_new / tabs_list)` };
   }
-  const { index } = args;
-  if (index == null) return { error: `${tool}: pass tabId (from tabs_new / tabs_list) or index` };
-  // JSON-Schema minimum/type aren't enforced by the MCP SDK at handler entry.
-  if (!Number.isInteger(index) || index < 0 || index >= tabs.length) {
-    return { error: `${tool}: index out of range: ${JSON.stringify(index)} (have ${tabs.length} tabs)` };
-  }
-  return { tab: tabs[index] };
+  const tab = (await connectionTabs(ctx)).find((t) => t.tabKey === args.tabId);
+  return tab ? { tab } : { error: `${tool}: unknown tabId ${JSON.stringify(args.tabId)}; call tabs_new or tabs_list` };
 }
 
-/** page.url() can throw on a crashed / closed page. */
+/** page.url() can throw on a crashed / closed page; a tab may have no page. */
 function safeUrl(page) {
   try { return page.url(); } catch { return ""; }
 }

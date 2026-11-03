@@ -5,6 +5,7 @@ const { fakeRegistry } = require("../fixtures/fake-registry.js");
 
 const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
 const body = (r) => JSON.parse(r.content[0].text);
+const keys = async (registry, connId = "c1") => (await registry.listTabs(connId)).map((t) => t.tabKey);
 
 test("tabs_new has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_new");
@@ -13,6 +14,7 @@ test("tabs_new has required tool shape", () => {
   assert.strictEqual(typeof tool.handler, "function");
   assert.strictEqual(tool.needsPage, false, "opens its own tab; the caller's tab is not needed");
   assert.match(tool.description, /tabId/);
+  assert.match(tool.description, /subagent/, "the parallel-subagent guidance lives here");
 });
 
 // W2D regression: tabs_new used to open a relay tab AND navigate upstream's
@@ -23,7 +25,6 @@ test("W2D: tabs_new loads the URL exactly once, in a new registry tab, and retur
   const main = (await registry.getCtx("c1", "main")).page;
   const b = body(await run({ url: "https://example.com/" }, registry));
   assert.match(b.tabId, /^t\d+$/);
-  assert.notStrictEqual(b.tabId, "main");
   const page = registry.pageOf("c1", b.tabId);
   assert.deepStrictEqual(page.gotos.map((g) => g.url), ["https://example.com/"], "one navigation");
   assert.deepStrictEqual(main.gotos, [], "no other tab is navigated");
@@ -33,17 +34,13 @@ test("W2D: tabs_new loads the URL exactly once, in a new registry tab, and retur
   assert.match(b.note, /tabId/);
 });
 
-test("W2D: each tabs_new gets a fresh tabId that no existing tab uses", async () => {
+test("W2D: each tabs_new gets its own fresh tabId and page", async () => {
   const registry = fakeRegistry();
-  // An agent may have named a tab itself; tabs_new must not hand out a taken id.
-  for (let i = 1; i <= 50; i++) await registry.getCtx("c1", `t${i}`);
   const a = body(await run({}, registry)).tabId;
   const b = body(await run({}, registry)).tabId;
   assert.notStrictEqual(a, b);
-  for (const id of [a, b]) {
-    assert.ok(!/^t([1-9]|[1-4]\d|50)$/.test(id), `${id} collides with an existing tab`);
-  }
   assert.notStrictEqual(registry.pageOf("c1", a), registry.pageOf("c1", b));
+  assert.deepStrictEqual(await keys(registry), [a, b]);
 });
 
 test("W2D: tabs_new without url opens the tab and navigates nothing", async () => {
@@ -56,8 +53,8 @@ test("W2D: tabs_new without url opens the tab and navigates nothing", async () =
 test("W2D: tabs_new opens the tab in the calling connection only", async () => {
   const registry = fakeRegistry();
   const b = body(await run({}, registry, "c2"));
-  assert.deepStrictEqual(registry.listTabs("c2"), [b.tabId]);
-  assert.deepStrictEqual(registry.listTabs("c1"), []);
+  assert.deepStrictEqual(await keys(registry, "c2"), [b.tabId]);
+  assert.deepStrictEqual(await keys(registry, "c1"), []);
 });
 
 test("T0-7: tabs_new with a bad URL returns isError + navError, and the tab stays usable by its tabId", async () => {
@@ -72,7 +69,7 @@ test("T0-7: tabs_new with a bad URL returns isError + navError, and the tab stay
   assert.strictEqual(r.isError, true);
   const b = body(r);
   assert.match(b.navError, /ERR_NAME_NOT_RESOLVED/);
-  assert.deepStrictEqual(registry.listTabs("c1"), [b.tabId], "the tab exists (close it with tabs_close)");
+  assert.deepStrictEqual(await keys(registry), [b.tabId], "the tab exists (close it with tabs_close)");
 });
 
 test("T1-10: tabs_new passes waitUntil + timeoutMs to goto", async () => {

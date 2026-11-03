@@ -1,12 +1,11 @@
 // tabs_new — open a new tab, optionally navigating to a URL, and return its
-// tabId.
+// tabId. The only tool that creates tabs (an unknown tabId is an error).
 //
 // W2D (2026-11-03): the tab comes from ctx.registry, so it is a session tab
-// like any other (in broker mode its own window, driven by upstream's tools
-// as well as ours). Every tool call that passes the tabId acts on it.
-// Replaces the old relay-side "active page" + propagate-to-upstream pair,
-// which opened a relay tab AND navigated upstream's page to the same URL:
-// every URL loaded twice, in two tabs.
+// like main: in broker mode its own window, used by upstream's tools as well
+// as ours; in legacy mode a tab of the relay's browser that only the relay's
+// own tools accept a tabId for. Before W2D, tabs_new opened a relay tab AND
+// navigated upstream's page to the same URL: every URL loaded twice.
 //
 // T0-7 / T1-10 (2026-05-09): a failed goto still returns the tab (it exists;
 // close it with tabs_close) with a structured navError; `waitUntil` is
@@ -16,21 +15,14 @@ const { errorResult } = require("./_tool-args.js");
 
 const WAIT_UNTIL = ["load", "domcontentloaded", "networkidle", "commit"];
 
+// tabIds are unique per process (one broker, or one legacy relay).
 let lastTabNumber = 0;
-
-/** "t<N>" that none of the connection's tabs use (an agent may name its own). */
-async function freshTabId(registry, connId) {
-  const taken = new Set(await registry.listTabs(connId));
-  let id;
-  do id = `t${++lastTabNumber}`; while (taken.has(id));
-  return id;
-}
 
 module.exports = {
   name: "tabs_new",
   description:
-    "Open a new tab (its own window), optionally navigating to a URL, and return its tabId. " +
-    "Pass that tabId on any later tool call to act on this tab; calls without tabId use your main tab. " +
+    "Open a new tab, optionally navigating to a URL, and return its tabId. Pass the tabId on later calls " +
+    "to act on that tab (a tool that can't take it says so); without it, calls act on your main tab. " +
     "Parallel subagents share one connection: each should open its own tab and pass its tabId.",
   inputSchema: {
     type: "object",
@@ -66,7 +58,7 @@ module.exports = {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > 300000) {
       return errorResult(`tabs_new: timeoutMs must be a number in [100, 300000] (got ${JSON.stringify(_args.timeoutMs)})`);
     }
-    const tabId = await freshTabId(registry, connId);
+    const tabId = `t${++lastTabNumber}`;
     const { page } = await registry.getCtx(connId, tabId);
 
     let navError = null;

@@ -144,9 +144,14 @@ function makePage({ disposable = true, doc = null } = {}) {
   return { ...initScriptRecorder(disposable), evaluate: async (s) => (doc ? doc.run(s) : undefined) };
 }
 
-/** Fake BrowserContext (applyStealth's broker-wide target). */
+/** Fake BrowserContext: in legacy mode the session's whole context is patched. */
 function makeContext({ pages = [], disposable = true } = {}) {
   return { ...initScriptRecorder(disposable), pages: () => pages };
+}
+
+/** Broker-style registry: connId → [tab pages]; listTabs → [{ tabKey, page }]. */
+function tabsRegistry(byConn) {
+  return { listTabs: async (connId) => (byConn[connId] || []).map((page, i) => ({ tabKey: i ? `t${i}` : "main", page })) };
 }
 
 /** Run a page "load": every still-registered init script, in registration order. */
@@ -156,15 +161,15 @@ function loadNewDoc(target, docOpts) {
   return doc;
 }
 
-/** Calls fn with the ctx a handler gets for `tab`. */
+/** Calls fn with the ctx a handler gets in a broker session whose only tab is `tab`. */
 async function withTab(tab, fn) {
-  return fn({ page: tab });
+  return fn({ page: tab, registry: tabsRegistry({ c1: [tab] }), connId: "c1" });
 }
 
 /** Returns the script the handler injects for one fresh tab. */
 async function captureScript(args = {}) {
   const tab = makePage();
-  await tool.handler(args, { page: tab });
+  await withTab(tab, (ctx) => tool.handler(args, ctx));
   return tab.scripts[0];
 }
 
@@ -184,46 +189,57 @@ test("stealth_apply description stays compact (model-visible catalog weight)", (
   assert.match(tool.description, /emulate_device/);
 });
 
-// W2D: stealth is per tab. The shared context (every session's tabs) is
-// never touched by the tool; a broker-wide option uses applyStealth(context).
-test("W2D: stealth_apply patches ctx.page only — never the shared context or other tabs", async () => {
+// W2D: stealth patches the calling session only. Broker: each of the
+// connection's tabs (the shared context holds other sessions' tabs).
+// Legacy: the session's whole BrowserContext (registry.sessionContext).
+test("W2D: stealth_apply patches every tab of the calling connection — never another connection's tab or the shared context", async () => {
+  const docs = [makeDoc(), makeDoc()];
+  const [main, t1] = docs.map((doc) => makePage({ doc }));
   const otherDoc = makeDoc();
   const other = makePage({ doc: otherDoc });
-  const context = makeContext({ pages: [other] });
-  const tab = makePage({ doc: makeDoc() });
-  const body = JSON.parse((await tool.handler({ languages: ["fr-FR"] }, { page: tab, context })).content[0].text);
-  assert.strictEqual(body.applied, true);
-  assert.strictEqual(body.patchedOpenPages, 1);
-  assert.strictEqual(tab.scripts.length, 1, "init script registered on the tab");
+  const context = makeContext({ pages: [main, t1, other] });
+  const registry = tabsRegistry({ c1: [main, t1], c2: [other] });
+  const body = JSON.parse((await tool.handler({ languages: ["fr-FR"] }, { page: main, context, registry, connId: "c1" })).content[0].text);
+  assert.deepStrictEqual(body.applied, ["main", "t1"]);
+  assert.deepStrictEqual(body.alreadyApplied, []);
+  assert.strictEqual(body.patchedOpenPages, 2);
+  assert.deepStrictEqual([main.scripts.length, t1.scripts.length], [1, 1], "init script on each tab");
+  for (const doc of docs) assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["fr-FR"]);
   assert.strictEqual(context.scripts.length, 0, "nothing registered context-wide");
   assert.strictEqual(other.scripts.length, 0);
-  assert.deepStrictEqual(plain(otherDoc.get("navigator.languages")), ["en-US"], "another tab's document is untouched");
+  assert.deepStrictEqual(plain(otherDoc.get("navigator.languages")), ["en-US"], "another session's document is untouched");
 });
 
-test("W2D: applying to one tab does not mark another tab as already applied", async () => {
-  const a = makePage();
-  const b = makePage();
-  await tool.handler({}, { page: a });
-  const body = JSON.parse((await tool.handler({}, { page: b })).content[0].text);
-  assert.strictEqual(body.applied, true);
-  assert.strictEqual(b.scripts.length, 1);
+test("W2D: a tab opened after stealth_apply is patched by the next call; patched tabs report alreadyApplied", async () => {
+  const tabs = [makePage()];
+  const ctx = { registry: tabsRegistry({ c1: tabs }), connId: "c1" };
+  await tool.handler({}, ctx);
+  tabs.push(makePage());
+  const body = JSON.parse((await tool.handler({}, ctx)).content[0].text);
+  assert.deepStrictEqual(body.applied, ["t1"]);
+  assert.deepStrictEqual(body.alreadyApplied, ["main"]);
+  assert.deepStrictEqual(tabs.map((t) => t.scripts.length), [1, 1]);
 });
 
-test("W2D: applyStealth(context) is the broker-wide option: one context init script + every open page", async () => {
-  const docs = [makeDoc(), makeDoc()];
-  const context = makeContext({ pages: docs.map((doc) => makePage({ doc })) });
-  const body = JSON.parse((await tool.applyStealth(context, { languages: ["de-DE"] })).content[0].text);
-  assert.strictEqual(body.patchedOpenPages, 2);
-  assert.strictEqual(context.scripts.length, 1);
-  for (const doc of docs) assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["de-DE"]);
-  assert.deepStrictEqual(plain(loadNewDoc(context, {}).get("navigator.languages")), ["de-DE"]);
+// Spec-review regression: legacy "stealth, then navigate" — upstream opens
+// its page AFTER the call, so patching the open tabs alone missed it.
+test("W2D legacy: the session's whole BrowserContext is patched, covering pages opened later", async () => {
+  const openDoc = makeDoc();
+  const context = makeContext({ pages: [makePage({ doc: openDoc })] });
+  const registry = { sessionContext: context, listTabs: async () => { throw new Error("not used in legacy"); } };
+  const body = JSON.parse((await tool.handler({ languages: ["de-DE"] }, { registry, connId: "legacy" })).content[0].text);
+  assert.deepStrictEqual(body.applied, ["all tabs"]);
+  assert.strictEqual(body.patchedOpenPages, 1);
+  assert.strictEqual(context.scripts.length, 1, "one context init script");
+  assert.deepStrictEqual(plain(openDoc.get("navigator.languages")), ["de-DE"]);
+  assert.deepStrictEqual(plain(loadNewDoc(context, {}).get("navigator.languages")), ["de-DE"], "a page upstream opens later is patched");
 });
 
 test("W2D: every tab of this browser gets the same audio perturbation (like one real device)", async () => {
   const a = makePage();
   const b = makePage();
-  await tool.handler({}, { page: a });
-  await tool.handler({}, { page: b });
+  await withTab(a, (ctx) => tool.handler({}, ctx));
+  await withTab(b, (ctx) => tool.handler({}, ctx));
   const read = (tab) => Array.from(loadNewDoc(tab, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
   assert.notDeepStrictEqual(read(a), read(makePage()), "the tab's audio is perturbed");
   assert.deepStrictEqual(read(b), read(a));
@@ -239,8 +255,8 @@ test("T0-4/T1-7: stealth_apply is idempotent per tab (second call no-ops)", asyn
     assert.strictEqual(r2.isError, undefined, "second call must not error");
     assert.strictEqual(tab.scripts.length, 1, "addInitScript called ONCE — second call must be no-op (T1-7)");
     const r2Body = JSON.parse(r2.content[0].text);
-    assert.strictEqual(r2Body.alreadyApplied, true);
-    assert.strictEqual(r2Body.applied, false);
+    assert.deepStrictEqual(r2Body.alreadyApplied, ["main"]);
+    assert.deepStrictEqual(r2Body.applied, []);
     assert.deepStrictEqual(r2Body.languages, ["en-US", "en"]);
   });
 });
@@ -253,7 +269,7 @@ test("T1-7: force=true registers a new init script and reports the new languages
     const r2 = await tool.handler({ languages: ["fr-FR"], force: true }, ctx);
     assert.strictEqual(tab.scripts.length, 2, "force=true must register a new init script");
     const r2Body = JSON.parse(r2.content[0].text);
-    assert.strictEqual(r2Body.applied, true);
+    assert.deepStrictEqual(r2Body.applied, ["main"]);
     assert.deepStrictEqual(r2Body.languages, ["fr-FR"]);
   });
 });
@@ -414,7 +430,7 @@ test("W1D-2: a failed addInitScript releases the tab so a retry can apply", asyn
     await assert.rejects(tool.handler({}, ctx), /Target closed/);
     tab.addInitScript = realAdd;
     const body = JSON.parse((await tool.handler({ languages: ["en-US"] }, ctx)).content[0].text);
-    assert.strictEqual(body.applied, true, "retry must apply, not report alreadyApplied");
+    assert.deepStrictEqual(body.applied, ["main"], "retry must apply, not report alreadyApplied");
   });
   assert.strictEqual(tab.scripts.length, 1);
 });

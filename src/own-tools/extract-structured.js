@@ -1,4 +1,4 @@
-// extract_structured — schema-driven data extraction from the active page.
+// extract_structured — schema-driven data extraction from this tab.
 // Schema is { fieldName: { selector, attribute?, multiple? }, ... }.
 // Uses the authed session — sees logged-in content unlike unauthenticated scrapers.
 //
@@ -76,7 +76,7 @@ const EXTRACT_IN_PAGE = new Function("arg", `const fitJson = ${fitJson}; return 
 module.exports = {
   name: "extract_structured",
   description:
-    "Extract data from the active page with a CSS-selector schema: { field: { selector, attribute?, multiple? } }. " +
+    "Extract data from this tab with a CSS-selector schema: { field: { selector, attribute?, multiple? } }. " +
     "attribute defaults to textContent; also innerText (rendered text only, slow on big lists), innerHTML, value, or any attribute name. " +
     "Output is capped by maxItems (per multiple field) and maxBytes (all values); cut fields are listed in truncated.",
   inputSchema: {

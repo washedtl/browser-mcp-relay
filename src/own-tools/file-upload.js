@@ -1,7 +1,6 @@
 // file_upload — sets file input via Playwright's setInputFiles.
 // Bypasses the OS file picker dialog entirely.
 
-
 module.exports = {
   name: "file_upload",
   description:

@@ -19,6 +19,8 @@ test("W2D: every page-routed own-tool advertises an optional string tabId", () =
   for (const t of tools.filter(routed)) {
     assert.strictEqual(t.inputSchema.properties.tabId.type, "string", t.name);
     assert.match(t.inputSchema.properties.tabId.description, /tabs_new/, t.name);
+    // Repeated in every routed schema; the long guidance lives in tabs_new.
+    assert.ok(t.inputSchema.properties.tabId.description.length <= 60, t.name);
     assert.ok(!(t.inputSchema.required || []).includes("tabId"), `${t.name}: tabId must stay optional`);
   }
 });

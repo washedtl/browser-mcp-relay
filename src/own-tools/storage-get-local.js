@@ -1,4 +1,4 @@
-// storage_get-local — read localStorage / sessionStorage from the active page.
+// storage_get-local — read localStorage / sessionStorage from this tab.
 //
 // Why this exists: cookies_export covers HTTP cookies, but modern OAuth and
 // chat apps (Discord, Notion, Slack, Linear, Mercury, etc.) keep auth tokens
@@ -19,7 +19,7 @@ const MAX_OMITTED_KEYS_LISTED = 100;
 module.exports = {
   name: "storage_get-local",
   description:
-    "Read localStorage or sessionStorage entries on the active page's origin (many SaaS apps keep auth tokens there, not in cookies). " +
+    "Read localStorage or sessionStorage entries on this tab's origin (many SaaS apps keep auth tokens there, not in cookies). " +
     "key reads one value; keyFilter (regex) narrows a dump. Values that don't fit in maxBytes are left out and listed in omittedKeys.",
   inputSchema: {
     type: "object",

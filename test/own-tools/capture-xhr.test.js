@@ -77,7 +77,7 @@ function makeFakeResponse({ url, status = 200, method = "GET", body = "{}", body
 }
 
 function withPage(fakePage, fn) {
-  return Promise.resolve().then(() => fn({ page: fakePage, context: { pages: () => [fakePage] } }));
+  return Promise.resolve().then(() => fn({ page: fakePage }));
 }
 
 function hangGuard(promise, ms, label) {
@@ -95,7 +95,7 @@ test("T0-3: capture_xhr enforces maxResponses cap and sets truncated", async () 
     responses.push(makeFakeResponse({ url: `https://api.example/${i}`, body: `{"i":${i}}` }));
   }
   const fakePage = makeFakePageWithResponses(responses);
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   // Kick off the handler with a short window so we don't actually wait 5s.
   const promise = tool.handler({ durationMs: 200, maxResponses: 3, includeBody: false }, ctx);
   // Emit responses synchronously then wait for the duration.
@@ -114,7 +114,7 @@ test("T0-2: capture_xhr body fetches run in parallel, not serialized", async () 
     makeFakeResponse({ url: "https://api/fast", body: "FAST", bodyDelay: 10 }),
   ];
   const fakePage = makeFakePageWithResponses(responses);
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   const promise = tool.handler({ durationMs: 250, includeBody: true }, ctx);
   fakePage._respondAll();
   const result = await promise;
@@ -145,7 +145,7 @@ test("T0-1: capture_xhr navTimeoutMs separates nav timeout from capture window (
 test("T0-9 (capture-xhr leg): pageClosedEarly flag set when page closes during capture", async () => {
   const responses = [makeFakeResponse({ url: "https://api/x", body: "{}" })];
   const fakePage = makeFakePageWithResponses(responses);
-  const ctx = { page: fakePage, context: { pages: () => [fakePage] } };
+  const ctx = { page: fakePage };
   try {
     const promise = tool.handler({ durationMs: 5000, includeBody: false }, ctx);
     fakePage._emit("response", responses[0]);

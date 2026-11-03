@@ -1,21 +1,30 @@
 // own-tools/index.js — registry of all relay-owned tools (Phase C).
-// Each tool module exports an object with shape:
+//
+// THE own-tool contract (other files point here). Each tool module exports
 //   { name, description, inputSchema, handler, needsBrave?, needsPage? }
-// where handler is async (args, ctx) => mcpToolResult and ctx is
+// where handler is async (args, ctx) => mcpToolResult and ctx, built by
+// toolContext() in _tool-context.js, is
 //   { page, context, sessionKey, registry, connId, cdpUrl, relay }:
-//   • page / context — the session tab the call is routed to (args.tabId,
-//     default "main") and its BrowserContext. Broker mode: the page upstream's
-//     tools use for that tab. Legacy mode: _legacy-context.js.
-//   • registry / connId — the caller's tabs (getCtx / listTabs / closeTab);
-//     tabs_* use them, never another connection's tabs.
-//   • cdpUrl — the browser's CDP endpoint (lighthouse_audit).
+//   • page / context / sessionKey — the tab the call is routed to (args.tabId,
+//     default "main"; an unknown tabId is an error, only tabs_new opens
+//     tabs), its BrowserContext and "<connId>:<tabKey>". Broker mode: the
+//     page upstream's tools use for that tab. Legacy mode: LegacyTabs.
+//   • registry / connId — the caller's tabs: getCtx(connId, tabKey) →
+//     { page, browserContext }, listTabs(connId) → [{ tabKey, page }] (never
+//     creates anything), closeTab(connId, tabKey). Another connection's tabs
+//     are never reachable.
+//   • cdpUrl — the browser's http:// CDP endpoint (lighthouse_audit).
 //   • relay — the RelayServer (toolsets).
-// needsPage:false — the handler doesn't read ctx.page, so no tab is opened
-// for it (it still gets context / registry / connId / cdpUrl).
-// needsBrave:false — relay-local, ctx is just { relay }.
+// needsPage:false — the handler doesn't read ctx.page: no tab is routed or
+//   opened (ctx keeps context / registry / connId / cdpUrl / relay; context
+//   then comes from the provider).
+// needsBrave:false — never launches the browser, never routed: ctx has the
+//   registry & co. only while a browser runs, else just { relay }.
 //
 // Naming: matches upstream's verb_action style. Collision with upstream is
 // detected at RelayServer.handleToolsList time (collisions throw on launch).
+
+const { isRouted } = require("./_tool-context.js");
 
 const modules = [
   require("./lighthouse-audit.js"),
@@ -44,16 +53,12 @@ const modules = [
   require("./toolsets.js").tool,
 ];
 
-// Parallel subagents share their parent's MCP connection, so each needs its
-// own tab: every tool that acts on a page takes an optional tabId.
-const TAB_ID = {
-  type: "string",
-  description: "Optional: which of your tabs to act on (a tabId from tabs_new). Omit for your main tab. " +
-    "Parallel subagents should each open their own tab and pass its tabId.",
-};
+// Every routed tool takes an optional tabId (kept short: it is in every
+// one of their schemas; the parallel-subagent guidance lives in tabs_new).
+const TAB_ID = { type: "string", description: "Tab from tabs_new; omit for your main tab." };
 
 function withTabId(tool) {
-  if (tool.needsBrave === false || tool.needsPage === false) return tool;
+  if (!isRouted(tool)) return tool;
   const { inputSchema } = tool;
   return { ...tool, inputSchema: { ...inputSchema, properties: { ...inputSchema.properties, tabId: TAB_ID } } };
 }

@@ -45,7 +45,7 @@ function withPageLock(page, fn) {
 module.exports = {
   name: "memory_take-heap-snapshot",
   description:
-    "Take a V8 heap snapshot of the active page via CDP HeapProfiler. " +
+    "Take a V8 heap snapshot of this tab via CDP HeapProfiler. " +
     "Saves the .heapsnapshot file to disk and returns its path. " +
     "The file can be loaded into Chrome DevTools' Memory tab for analysis. " +
     "Chunks are streamed directly to disk so memory overhead stays constant " +

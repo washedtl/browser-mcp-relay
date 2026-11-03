@@ -5,23 +5,26 @@ const { fakeRegistry } = require("../fixtures/fake-registry.js");
 
 const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
 
+// Selecting never creates a tab: getCtx is only used here to set tabs up.
 async function twoTabs() {
   const registry = fakeRegistry();
   await registry.getCtx("c1", "main");
   await registry.getCtx("c1", "t1");
+  await registry.getCtx("other", "t9");
+  registry.getCtx = async () => { throw new Error("tabs_select must not call getCtx"); };
   return registry;
 }
 
-test("tabs_select has required tool shape", () => {
+test("tabs_select has required tool shape: selects by tabId only", () => {
   assert.strictEqual(tool.name, "tabs_select");
   assert.strictEqual(typeof tool.description, "string");
-  assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
-  assert.strictEqual(tool.needsPage, false);
-  assert.ok(tool.inputSchema.properties.tabId && tool.inputSchema.properties.index);
+  assert.strictEqual(tool.needsBrave, false);
+  assert.deepStrictEqual(Object.keys(tool.inputSchema.properties), ["tabId"]);
+  assert.deepStrictEqual(tool.inputSchema.required, ["tabId"]);
 });
 
-test("W2D: tabs_select brings the tab named by tabId to the front and navigates nothing", async () => {
+test("W2D: tabs_select brings the tab to the front and navigates nothing", async () => {
   const registry = await twoTabs();
   const r = await run({ tabId: "t1" }, registry);
   assert.notStrictEqual(r.isError, true, r.content[0].text);
@@ -33,34 +36,24 @@ test("W2D: tabs_select brings the tab named by tabId to the front and navigates 
   assert.deepStrictEqual(registry.pageOf("c1", "t1").gotos, []);
 });
 
-test("W2D: tabs_select by index uses tabs_list order", async () => {
+test("W2D: tabs_select rejects an unknown tabId, another connection's, or none", async () => {
   const registry = await twoTabs();
-  assert.strictEqual(JSON.parse((await run({ index: 0 }, registry)).content[0].text).selected, "main");
-  assert.strictEqual(registry.pageOf("c1", "main").fronted, 1);
-});
-
-test("W2D: tabs_select cannot reach another connection's tab", async () => {
-  const registry = await twoTabs();
-  await registry.getCtx("other", "t9");
-  const r = await run({ tabId: "t9" }, registry);
-  assert.strictEqual(r.isError, true);
-  assert.match(r.content[0].text, /^tabs_select: no tab "t9"/);
+  for (const [args, re] of [
+    [{ tabId: "t9" }, /^tabs_select: unknown tabId "t9"; call tabs_new or tabs_list/],
+    [{ tabId: "nope" }, /^tabs_select: unknown tabId "nope"/],
+    [{}, /^tabs_select: tabId is required/],
+    [{ index: 0 }, /^tabs_select: tabId is required/],
+  ]) {
+    const r = await run(args, registry);
+    assert.strictEqual(r.isError, true, JSON.stringify(args));
+    assert.match(r.content[0].text, re);
+  }
   assert.strictEqual(registry.pageOf("other", "t9").fronted, 0);
 });
 
-test("V1-5: tabs_select rejects out-of-range / negative / non-integer index with the tab count", async () => {
-  const registry = await twoTabs();
-  for (const index of [2, -1, 1.5, "abc"]) {
-    const r = await run({ index }, registry);
-    assert.strictEqual(r.isError, true, `index ${index}`);
-    assert.match(r.content[0].text, /^tabs_select: index out of range: .* \(have 2 tabs\)/);
-  }
-});
-
-test("W2D: tabs_select needs tabId or index", async () => {
-  const r = await run({}, await twoTabs());
-  assert.strictEqual(r.isError, true);
-  assert.match(r.content[0].text, /^tabs_select: pass tabId/);
+test("W2D: with no browser running (no registry) every tabId is unknown", async () => {
+  const r = await tool.handler({ tabId: "t1" }, {});
+  assert.match(r.content[0].text, /^tabs_select: unknown tabId "t1"/);
 });
 
 test("tabs_select: a bringToFront failure does not fail the call (it's cosmetic)", async () => {

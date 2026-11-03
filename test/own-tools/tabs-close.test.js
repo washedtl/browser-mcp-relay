@@ -4,24 +4,28 @@ const tool = require("../../src/own-tools/tabs-close.js");
 const { fakeRegistry } = require("../fixtures/fake-registry.js");
 
 const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
+const keys = async (registry, connId = "c1") => (await registry.listTabs(connId)).map((t) => t.tabKey);
 
+// Closing never creates a tab: getCtx is only used here to set tabs up.
 async function twoTabs() {
   const registry = fakeRegistry();
   await registry.getCtx("c1", "main");
   await registry.getCtx("c1", "t1");
+  await registry.getCtx("other", "t9");
+  registry.getCtx = async () => { throw new Error("tabs_close must not call getCtx"); };
   return registry;
 }
 
-test("tabs_close has required tool shape", () => {
+test("tabs_close has required tool shape: closes by tabId only", () => {
   assert.strictEqual(tool.name, "tabs_close");
   assert.strictEqual(typeof tool.description, "string");
-  assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
-  assert.strictEqual(tool.needsPage, false, "closing must not open a tab first");
-  assert.ok(tool.inputSchema.properties.tabId && tool.inputSchema.properties.index);
+  assert.strictEqual(tool.needsBrave, false, "closing never launches the browser");
+  assert.deepStrictEqual(Object.keys(tool.inputSchema.properties), ["tabId"]);
+  assert.deepStrictEqual(tool.inputSchema.required, ["tabId"]);
 });
 
-test("W2D: tabs_close closes the tab named by tabId through the registry", async () => {
+test("W2D: tabs_close closes the tab through the registry", async () => {
   const registry = await twoTabs();
   const page = registry.pageOf("c1", "t1");
   await page.goto("https://x.example/");
@@ -29,37 +33,27 @@ test("W2D: tabs_close closes the tab named by tabId through the registry", async
   assert.notStrictEqual(r.isError, true, r.content[0].text);
   assert.deepStrictEqual(JSON.parse(r.content[0].text), { closed: "t1", url: "https://x.example/", remaining: 1 });
   assert.strictEqual(page.isClosed(), true);
-  assert.deepStrictEqual(registry.listTabs("c1"), ["main"]);
+  assert.deepStrictEqual(await keys(registry), ["main"]);
 });
 
-test("W2D: tabs_close by index uses tabs_list order", async () => {
+test("W2D: tabs_close rejects an unknown tabId, another connection's, or none; nothing is closed", async () => {
   const registry = await twoTabs();
-  await run({ index: 0 }, registry);
-  assert.deepStrictEqual(registry.listTabs("c1"), ["t1"]);
-});
-
-test("W2D: tabs_close cannot close another connection's tab (or a tab that doesn't exist)", async () => {
-  const registry = await twoTabs();
-  await registry.getCtx("other", "t9");
-  for (const tabId of ["t9", "nope"]) {
-    const r = await run({ tabId }, registry);
-    assert.strictEqual(r.isError, true);
-    assert.match(r.content[0].text, new RegExp(`^tabs_close: no tab "${tabId}"`));
+  for (const [args, re] of [
+    [{ tabId: "t9" }, /^tabs_close: unknown tabId "t9"; call tabs_new or tabs_list/],
+    [{ tabId: "nope" }, /^tabs_close: unknown tabId "nope"/],
+    [{ index: 0 }, /^tabs_close: tabId is required/],
+  ]) {
+    const r = await run(args, registry);
+    assert.strictEqual(r.isError, true, JSON.stringify(args));
+    assert.match(r.content[0].text, re);
   }
   assert.strictEqual(registry.pageOf("other", "t9").isClosed(), false);
-  assert.ok(!registry.calls.some(([m]) => m === "closeTab"), "registry.closeTab never called");
-  assert.ok(!registry.calls.some(([m, conn, key]) => m === "getCtx" && conn === "c1" && (key === "t9" || key === "nope")),
-    "no tab created to look it up");
+  assert.deepStrictEqual(await keys(registry), ["main", "t1"]);
 });
 
-test("V1-5: tabs_close rejects out-of-range / negative / non-integer index", async () => {
-  const registry = await twoTabs();
-  for (const index of [2, -1, 1.5, "abc"]) {
-    const r = await run({ index }, registry);
-    assert.strictEqual(r.isError, true, `index ${index}`);
-    assert.match(r.content[0].text, /^tabs_close: index out of range: .* \(have 2 tabs\)/);
-  }
-  assert.deepStrictEqual(registry.listTabs("c1"), ["main", "t1"]);
+test("W2D: with no browser running (no registry) every tabId is unknown", async () => {
+  const r = await tool.handler({ tabId: "t1" }, {});
+  assert.match(r.content[0].text, /^tabs_close: unknown tabId "t1"/);
 });
 
 test("W1C2: tabs_close returns isError when the registry fails to close, and the tab stays listed", async () => {
@@ -68,5 +62,5 @@ test("W1C2: tabs_close returns isError when the registry fails to close, and the
   const r = await run({ tabId: "t1" }, registry);
   assert.strictEqual(r.isError, true);
   assert.match(r.content[0].text, /^tabs_close: failed to close tab t1 \(about:blank\): connection lost/);
-  assert.deepStrictEqual(registry.listTabs("c1"), ["main", "t1"]);
+  assert.deepStrictEqual(await keys(registry), ["main", "t1"]);
 });

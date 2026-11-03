@@ -1,9 +1,12 @@
-// fake-registry.js — stand-in for the broker's SessionRegistry (W2 frozen
-// contract): tabs per connection, each tab its own page (window). Only the
-// methods own-tools use: getCtx(connId, tabKey="main"), listTabs(connId),
-// closeTab(connId, tabKey). listTabs returns the connection's tab keys.
+// fake-registry.js — test doubles for own-tool ctx plumbing.
+//   fakePage / fakeContext: a Playwright Page / BrowserContext, enough for
+//     the tab tools and the legacy registry.
+//   fakeRegistry: the broker's SessionRegistry (W2 frozen contract), only
+//     the methods own-tools use: getCtx(connId, tabKey="main") →
+//     { page, browserContext }, listTabs(connId) → [{ tabKey, page }],
+//     closeTab(connId, tabKey).
 
-function fakePage(url = "about:blank") {
+function fakePage(url = "about:blank", props = {}) {
   const page = {
     gotos: [],
     fronted: 0,
@@ -21,36 +24,49 @@ function fakePage(url = "about:blank") {
     bringToFront: async () => { page.fronted++; },
     close: async () => { page.closed = true; },
   };
-  return page;
+  return Object.assign(page, props);
+}
+
+/** pages() lists open pages in creation order; newPage() appends one a tick later (like Playwright). */
+function fakeContext(initialPages = []) {
+  const all = [...initialPages];
+  const context = {
+    created: 0,
+    pages: () => all.filter((p) => !p.isClosed()),
+    newPage: async () => {
+      context.created++;
+      await new Promise((r) => setImmediate(r));
+      const p = fakePage();
+      all.push(p);
+      return p;
+    },
+  };
+  return context;
 }
 
 function fakeRegistry() {
-  const conns = new Map(); // connId → Map<tabKey, ctx>
-  const calls = [];
+  const conns = new Map(); // connId → Map<tabKey, page>
   const tabsOf = (connId) => {
     if (!conns.has(connId)) conns.set(connId, new Map());
     return conns.get(connId);
   };
   return {
-    calls,
-    pageOf: (connId, tabKey) => tabsOf(connId).get(tabKey)?.page,
+    pageOf: (connId, tabKey) => tabsOf(connId).get(tabKey),
     async getCtx(connId, tabKey = "main") {
-      calls.push(["getCtx", connId, tabKey]);
       const tabs = tabsOf(connId);
-      if (!tabs.has(tabKey)) tabs.set(tabKey, { page: fakePage(), sessionKey: `${connId}:${tabKey}`, connId });
-      return tabs.get(tabKey);
+      if (!tabs.has(tabKey)) tabs.set(tabKey, fakePage());
+      return { page: tabs.get(tabKey), browserContext: null };
     },
-    listTabs(connId) {
-      return [...tabsOf(connId).keys()];
+    async listTabs(connId) {
+      return [...tabsOf(connId)].map(([tabKey, page]) => ({ tabKey, page }));
     },
     async closeTab(connId, tabKey) {
-      calls.push(["closeTab", connId, tabKey]);
-      const tab = tabsOf(connId).get(tabKey);
-      if (!tab) return;
-      await tab.page.close();
+      const page = tabsOf(connId).get(tabKey);
+      if (!page) return;
+      await page.close();
       tabsOf(connId).delete(tabKey);
     },
   };
 }
 
-module.exports = { fakePage, fakeRegistry };
+module.exports = { fakePage, fakeContext, fakeRegistry };

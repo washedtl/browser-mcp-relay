@@ -1,5 +1,5 @@
 // dialog_handle — registers a one-shot listener for the next dialog
-// (alert/confirm/prompt) on the active page. The call blocks until a dialog,
+// (alert/confirm/prompt) on this tab. The call blocks until a dialog,
 // page close, or timeout, so the triggering action must run concurrently.
 //
 // T0-9 / T0-10 / T1-12 fixes (2026-05-09):
@@ -10,11 +10,10 @@
 //   • description corrected: "auto-dismissed" was wrong (default is `accept`,
 //     and the action parameter controls accept-vs-dismiss)
 
-
 module.exports = {
   name: "dialog_handle",
   description:
-    "Handle the NEXT JavaScript dialog (alert/confirm/prompt) on the active page " +
+    "Handle the NEXT JavaScript dialog (alert/confirm/prompt) on this tab " +
     "per `action` (accept by default, or dismiss). This call BLOCKS until a dialog " +
     "appears, the page closes (isError + `pageClosed: true`), or timeoutMs elapses " +
     "(isError), so the action that opens the dialog must run concurrently (e.g. a " +

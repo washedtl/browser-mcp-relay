@@ -176,6 +176,7 @@ const SHUTDOWN_STEP_MS = 1500;
  *   ensureSlot()   claim a pool slot + snapshot the cookie source into it +
  *                  load the vault, once. Derives the CDP port.
  *   ensureBrave()  launch Brave on the slot; relaunches after Brave dies.
+ *   peekBrave()    the running Brave's bridge, or null; never launches.
  *   getUpstream()  spawn upstream against the slot's CDP port; respawns
  *                  after upstream dies or Brave is relaunched.
  *
@@ -551,7 +552,10 @@ function createLifecycle({
     return shutdownPromise;
   }
 
-  return { ensureBrave, getUpstream, shutdownAsync, shutdownSync };
+  // The running bridge, or null — never launches (tabs_list & co.).
+  const peekBrave = () => bridge;
+
+  return { ensureBrave, peekBrave, getUpstream, shutdownAsync, shutdownSync };
 }
 
 /**
@@ -571,6 +575,7 @@ function buildServer({ lifecycle, recordTraffic, createRelay = (opts) => new Rel
   const relay = createRelay({
     getUpstream: lifecycle.getUpstream,
     ensureBrave: lifecycle.ensureBrave,
+    peekBrave: lifecycle.peekBrave,
     // Toolsets enabled/disabled at runtime change tools/list; the client is
     // told via notifications/tools/list_changed.
     // Rejects "Not connected" once the transport closes — nothing to tell then.

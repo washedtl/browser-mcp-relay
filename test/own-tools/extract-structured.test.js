@@ -37,7 +37,7 @@ const fakeCtx = () => {
     goto: async () => undefined,
     waitForSelector: async () => undefined,
   };
-  return { page, context: { pages: () => [page] } };
+  return { page };
 };
 
 test("T0-5: extract_structured rejects schema=null at entry", async () => {
@@ -108,7 +108,7 @@ function makeDomPage(dom) {
 
 async function onDom(dom, fn) {
   const page = makeDomPage(dom);
-  return fn({ page, context: { pages: () => [page] } });
+  return fn({ page });
 }
 
 test("W1C1: extract_structured still extracts normally (compact JSON, no truncation noise)", async () => {
