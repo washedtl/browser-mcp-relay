@@ -1,13 +1,29 @@
 # Changelog
 
-## Unreleased (0.4.1)
+## v0.4.1 — CDP lockdown, stealth fixes, cookie bridge
 
-### Security
+### Security: no CDP port in broker mode
 
 - **Broker mode: no unauthenticated CDP port.** Brave used to listen on a TCP DevTools port (random, 127.0.0.1), and any local process could drive the shared, logged-in Brave and read its cookies through it. Brave now runs with `--remote-debugging-pipe` and opens no port (measured: 0 listening sockets on any of its processes). The broker serves CDP to upstream and its own tools at `ws://127.0.0.1:<port>/<secret>/devtools/browser` (a 256-bit secret, one browser session per client). Without the secret every request is refused: `/json/*` discovery (404), a wrong path, an `Origin` header or a foreign `Host` (403); 503 while Brave is down. Clients can't send `Browser.close`, `Browser.crash`, `Browser.crashGpuProcess` or `Target.sendMessageToTarget` (the non-flat channel that could carry them) to the shared Brave.
 - **The secret stays in the broker.** It is redacted from the broker log, `broker:status`, the relay Inspector and tool results (Playwright's and upstream's connect errors print the whole URL), and removed from the broker's environment once upstream is loaded.
 - `lighthouse_audit` connects over that URL in broker mode (puppeteer, a tab it closes after). Legacy mode is unchanged and keeps its unauthenticated `9333 + slot - 1` port.
 - The broker no longer picks or restarts for a CDP port: the "CDP port is taken by another process" restart is gone.
+
+### Cookie bridge (optional, new)
+
+- **Your Chrome logins in the broker's Brave, live.** A Chrome extension (`extensions/cookie-bridge/`, ID `dfcccancdkogdddemhecnffcjllbjmba`) reads cookies through `chrome.cookies`, a native-messaging host passes them to the broker over its pipe, and the broker sets them in Brave. It starts with a full sync, then mirrors every change (logins, rotated sessions, logouts), one way. Windows, Chrome and broker mode only; nothing syncs until you click **Approve & start sync** on the extension's review page. See the README's *Cookie bridge (optional)* and [REFERENCE](docs/REFERENCE.md#cookie-bridge).
+- **Denylist with a keyword hold.** Banking, payments, crypto, brokerages, insurance, payroll, email and identity, password managers, government, tax and health, and cloud and registrar consoles never sync unless you re-allow them on the review page. Unknown sensitive-looking domains (keywords, IP addresses, local names) wait for your approval. Only generic categories ship in `policy.js`. `BROWSER_RELAY_BRIDGE_ALLOW` is the broker-side always-allow list (it lifts the keyword hold, never a deny).
+- **Checked on both ends.** The broker classifies every cookie again. It applies them over its own CDP connection, the secret proxy URL (no port, no `/json` discovery), and again on every Brave launch, before any tool runs. A deletion Brave may have lost in a crash (Chromium writes cookies every ~30 s) is applied again at the relaunch. The native host opens no port and authenticates with `broker.key` through a challenge (no replay; a squatter gets no MAC). A bridge never keeps an idle broker alive.
+- **Values stay out of results and logs.** `cookies_export` returns bridge-managed cookies with value `"[bridge-managed]"` (name, domain, path and flags kept); `cookies_import` skips the placeholder. Page scripts (`execute`, `document.cookie`) can still read non-HttpOnly values: `execute` isn't a sandbox. Logs, `broker:status` (`cookieBridge` counts), the state file and acks never hold a value.
+- `npm run bridge:install` / `bridge:uninstall` register or remove the host (HKCU, Chrome) and print the load-unpacked steps. Files: `cookie-bridge.log` and `cookie-bridge-<hash>.json` (identities only) in the broker home.
+- Limits: cookies only (no localStorage), Google sign-ins may not transfer, one Chrome profile at a time.
+
+### Stealth: Chromium-exact client hints
+
+- **GREASE brand and brand order** generated the way Chromium does it (seeded by the major version), checked against headers measured on real Chrome builds. A Chrome UA gets the "Google Chrome" brand; Edge, Opera and Chromium UAs get an unbranded list instead of a wrong brand.
+- **`fullVersionList` / `fullVersion`** carry a real stable build per major instead of `x.0.0.0`. `fullVersion` and `formFactors` are always sent: without them Chromium fell back to the host's own values (an emulated Chrome 131 reported Brave's 147; Android emulation reported Desktop).
+- **`navigator.platform`** matches the UA's OS (`emulate_device` passes CDP `platform`; `stealth_apply` patches it only when it contradicts the UA).
+- **Cross-origin iframes and dedicated workers** get the same UA override from `emulate_device` (auto-attached and paused until it's applied; `reset` turns it off). Service and shared workers, a worker's `navigator.platform`, popups and `navigator.brave` are still not covered (documented).
 
 ## v0.4.0 — shared broker
 

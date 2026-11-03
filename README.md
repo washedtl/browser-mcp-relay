@@ -119,7 +119,38 @@ For inspector details (in-process vs standalone modes, security defenses, screen
 
 The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **21 of its own** into a single 72-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
 
-For the full architecture deep-dive, configuration env vars, modes, optional features (proxy whitelist, credential vault, autofill), troubleshooting, and worked examples, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
+For the full architecture deep-dive, configuration env vars, modes, optional features (proxy whitelist, credential vault, autofill, cookie bridge), troubleshooting, and worked examples, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
+
+## Cookie bridge (optional)
+
+The cookie bridge copies the logins (cookies) of the Chrome you use every day into the broker's Brave, so your AI is signed in where you are without logging in again there. It keeps up live: a new login, a rotated session or a logout in Chrome follows into Brave within seconds. It's **Chrome only** (Windows, broker mode) and **off until you install it**.
+
+- **What syncs:** everything except a built-in denylist: banking, credit unions, payments, crypto, brokerages, insurance and payroll; email and identity (Google, Microsoft and Apple accounts, Proton, Yahoo, single sign-on providers); password managers; government, tax and health; cloud, hosting and domain-registrar consoles. An unknown domain that looks sensitive (a keyword such as `bank`, `pay`, `tax`, `health` or `wallet`, an IP address, a `.local` or single-label host) is **held** until you approve it.
+- **The review page** (the extension's options page): nothing syncs until you click **Approve & start sync**. It lists what will sync and what's held back. You can turn any domain on or off there, including a denylisted one. A newly seen held domain waits there, with a badge on the extension icon.
+- **Your always-allow list:** allowing a held domain on the review page makes it sync. The broker checks every cookie again against the same policy. `BROWSER_RELAY_BRIDGE_ALLOW` (comma-separated domains, in the MCP server's `env` or `local-config.json`) is the broker's side of that list: the broker accepts those domains and their subdomains even when the keyword guard would hold them. It never lifts a denylisted category: only the review page can re-allow one of those.
+
+**Install** (once, from the repo):
+
+```bash
+npm run bridge:install     # registers the native-messaging host for Chrome (HKCU) and prints these steps
+```
+
+1. In Chrome, open `chrome://extensions` and turn on **Developer mode**.
+2. Click **Load unpacked** and pick `<repo>/extensions/cookie-bridge`.
+3. Check that the extension ID is `dfcccancdkogdddemhecnffcjllbjmba`.
+4. Open the extension's options page (click its icon), review the lists, and click **Approve & start sync**.
+
+`npm run bridge:uninstall` removes the registry key and the two files `bridge:install` wrote; then remove the extension in `chrome://extensions`. Re-run `bridge:install` after moving the repo or switching Node installs.
+
+**Check it:** `npm run broker:status` has a `cookieBridge` block (`bridges` connected, `cookies`, `domains`, `managed`, `pendingDeletes`, `lastSyncAt`, and the `allow` list it read). These are counts only, never a value. The native host logs to `%LOCALAPPDATA%\browser-mcp-relay\broker\cookie-bridge.log`. The broker's lines in `broker.log` start with `cookie bridge:`. Next to `broker.key`, a `cookie-bridge-<hash>.json` keeps the identities (name, domain, path, flags; never a value) of the cookies the bridge put into Brave, so a deletion in Chrome reaches Brave even across broker restarts.
+
+**Values stay out of tool results:** `cookies_export` returns bridge-managed cookies with value `"[bridge-managed]"`, and `cookies_import` skips that placeholder. This is not a sandbox: a page script (`execute`, `document.cookie`) can still read any cookie that isn't HttpOnly.
+
+**Limits:**
+- Cookies only: no localStorage, sessionStorage or IndexedDB. A site that keeps its login token there still needs a login in Brave.
+- Google sign-ins may not transfer (device-bound sessions), and Google accounts are on the denylist anyway.
+- One way, Chrome → Brave: a login made in Brave doesn't go back to Chrome.
+- One Chrome profile at a time. Changes made while no broker runs are caught up by a full resync when one starts.
 
 ## Platform support
 
@@ -135,6 +166,7 @@ For the full architecture deep-dive, configuration env vars, modes, optional fea
 - 🦁 Requires Brave installed locally. Other Chromium browsers may work via `BROWSER_RELAY_BRAVE_PATH` but are untested.
 - 🤝 **One broker serves every session** (broker mode): a hung tool or a crash affects all of them for a moment, and `execute` runs agent JavaScript inside that shared broker process. See [the known risks](docs/REFERENCE.md#broker-mode-known-risks).
 - 🚧 Not in broker mode yet: the credential vault's autofill and authenticated proxies (`user:pass@`). Use `BROWSER_RELAY_MODE=legacy` if you need them.
+- 🍪 The [cookie bridge](#cookie-bridge-optional) is Chrome → Brave, cookies only, Windows and broker mode only.
 
 ## Contributing
 
