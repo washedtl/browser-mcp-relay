@@ -21,6 +21,7 @@ src/
 │   ├── profile-seed.js   #   one-time profile seed from a legacy pool slot
 │   └── control.js        #   broker:status / broker:stop over the pipe
 ├── relay-server.js       # tools/list merge + tools/call routing (+ traffic recording)
+├── inspector-launch.js   # starts the in-process Inspector (relay or broker)
 ├── upstream-client.js    # JSON-RPC over stdio to browser-devtools-mcp
 ├── cdp-bridge.js         # launchBrave / closeBrave (Playwright-over-CDP)
 ├── detect-browser.js     # cross-platform Brave + profile-dir detection

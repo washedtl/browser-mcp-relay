@@ -757,7 +757,7 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 
 #### Hosted by the broker (broker mode)
 
-With `BROWSER_RELAY_INSPECTOR_PORT` set, the **broker** hosts the one Inspector. Legacy relays each raced for the port. The Activity feed shows every session's calls, upstream tools included, and each event carries a `conn` field naming its session. The home page gains a **Broker** section (Brave up/pid, sessions, each tab and its URL), and `GET /api/broker` returns the same JSON as `npm run broker:status`. The Host/Origin gates and the redaction rules below apply unchanged.
+With `BROWSER_RELAY_INSPECTOR_PORT` set, the **broker** hosts the one Inspector. Legacy relays each raced for the port. The Activity feed shows every session's calls, upstream tools included, and each event carries a `conn` field naming its session. The home page gains a **Broker** section (Brave up/pid, sessions, each tab and its URL), and `GET /api/broker` returns the same JSON as `npm run broker:status`. `/api/status` reports mode `broker` and runs none of the legacy pool probes. The Host/Origin gates and the redaction rules below apply unchanged.
 
 ### Pages
 
@@ -800,6 +800,7 @@ For code that imports `src/inspector-server.js` (or `scripts/inspector.js`) dire
 
 - **What is it doing?** Run `npm run broker:status`, or read the broker log (`%LOCALAPPDATA%\browser-mcp-relay\broker\broker.log` on Windows). Shim errors go to the session's MCP stderr, prefixed `[mcp-relay shim]`.
 - **Restart it** (new settings, a wedged Brave): run `npm run broker:stop`. The next tool call in any session starts a fresh broker.
+- **"the broker key file … is missing; waiting for the running broker to restore it"**: `broker.key` was deleted while a broker runs. The broker writes it back within 30 s, and the session waits up to 35 s for that; it never makes a key of its own while a broker answers.
 - **"browser broker restarted; please retry the call"**: the broker died while that call was in flight. Retry it; the shim has already reconnected.
 - **"This tab was reset because …"**: Brave was relaunched (crash, idle close, broker restart). The tab's URL, console and network buffers, element refs, stubs and emulation are gone. Navigate again.
 - **"refusing \\.\pipe\…: the pipe's owner failed authentication"**: something other than your broker holds the pipe name. Close it, or set `BROWSER_RELAY_BROKER_PIPE`.
