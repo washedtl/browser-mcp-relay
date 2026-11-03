@@ -16,13 +16,46 @@
 //     frozen at "Intel Mac OS X 10_15_7" even on Apple Silicon, and
 //     stealth_apply's WebGL patch reports an Apple M1 GPU for Mac UAs.
 //   • Linux reports an empty platformVersion.
-// The return value has exactly the fields of CDP Emulation.UserAgentMetadata.
+//   • STEALTH2-1/2: brands = Chromium's GREASE brand + "Chromium" + the
+//     browser brand ("Google Chrome" for a Chrome UA), in Chromium's
+//     major-seeded order (user_agent_utils.cc GenerateBrandVersionList /
+//     GetGreasedUserAgentBrandVersion / GetRandomOrder, chromium main at
+//     482f8fbb, 2026-10-19). Exact for Chrome 110+ (lists measured on real
+//     builds match); older majors used an earlier GREASE scheme.
+//   • STEALTH2-3: fullVersionList / fullVersion carry a real Chrome build
+//     (Chrome never reports x.0.0.0 there; Brave does, for its own brand).
+// The return value has exactly the fields of CDP Emulation.UserAgentMetadata:
+// any field left out falls back to the HOST browser's value in Chromium
+// (content/browser/devtools/protocol/emulation_handler.cc), e.g. Brave's own
+// full version under an emulated Chrome 131.
 
 function clientHintsFromUA(ua) {
   ua = typeof ua === "string" ? ua : "";
   var cm = ua.match(/Chrome\/(\d+)((?:\.\d+){3})?/);
   var major = cm ? cm[1] : "127";
-  var fullVersion = cm && cm[2] ? major + cm[2] : major + ".0.0.0";
+  var seed = Number(major);
+  // STEALTH2-3: an unreduced UA's own version, else (reduced "x.0.0.0") the
+  // highest build Chrome shipped to Windows, Mac and Linux in that milestone
+  // (chromiumdash.appspot.com, 2026-11-03), majors 100..157. Majors outside
+  // the table step the build from the nearest entry (~25/milestone lately,
+  // ~55 before 100) so it stays plausible; refresh the table from
+  // chromiumdash as new milestones ship.
+  var fullVersion;
+  if (cm && cm[2] && cm[2] !== ".0.0.0") {
+    fullVersion = major + cm[2];
+  } else {
+    var FIRST = 100;
+    var BUILDS = ("4896.127 4951.64 5005.115 5060.134 5112.101 5195.125 5249.119 5304.121 5359.124 5414.119 " +
+      "5481.177 5563.146 5615.121 5672.126 5735.198 5790.170 5845.187 5938.149 5993.117 6045.199 " +
+      "6099.216 6167.184 6261.128 6312.122 6367.207 6422.141 6478.182 6533.119 6613.137 6668.100 " +
+      "6723.116 6778.264 6834.159 6943.141 6998.165 7049.114 7103.113 7151.119 7204.183 7258.154 " +
+      "7339.207 7390.122 7444.162 7499.192 7559.132 7632.159 7680.177 7727.137 7778.178 7827.200 " +
+      "7871.186 7922.173 7977.82 8010.52 8037.97 8059.84 8078.79 8103.26").split(" ");
+    var nearest = Math.max(0, Math.min(BUILDS.length - 1, seed - FIRST));
+    var bp = BUILDS[nearest].split(".");
+    var build = Math.max(1, Number(bp[0]) + (seed - FIRST - nearest) * (seed < FIRST ? 55 : 25));
+    fullVersion = major + ".0." + build + "." + bp[1];
+  }
   // Order matters: Android UAs contain "Linux; Android", iOS UAs contain
   // "Mac OS X", Chrome OS UAs contain "X11".
   var platform = /Windows/.test(ua) ? "Windows"
@@ -70,18 +103,35 @@ function clientHintsFromUA(ua) {
     m = osToken.match(/CrOS \S+ (\d+\.\d+\.\d+)/);
     platformVersion = m ? m[1] : "";
   }
-  // "Not?A_Brand" is the GREASE slot real Chromium ships.
-  var brands = [
-    { brand: "Chromium", version: major },
-    { brand: "Not?A_Brand", version: "24" },
-  ];
-  var fullVersionList = [
-    { brand: "Chromium", version: fullVersion },
-    { brand: "Not?A_Brand", version: "24.0.0.0" },
-  ];
+  // STEALTH2-2: a Chrome UA carries the "Google Chrome" brand. Other
+  // Chromium browsers name themselves in the UA (Edge "Edg/", Opera "OPR/",
+  // ...) and report their OWN full version, which we can't know, so they get
+  // Chromium's unbranded list rather than a wrong brand. Headless Chrome
+  // ("HeadlessChrome/") still sends Google Chrome's hints. (Brave's UA is
+  // byte-identical to Chrome's; Brave's native hints are never generated
+  // here: stealth_apply keeps them, emulate_device only replaces them when
+  // asked to emulate a UA.)
+  var brand = cm && !/\b(?:Edg|EdgA|EdgiOS|OPR|OPX|SamsungBrowser|YaBrowser|Chromium)\//.test(ua)
+    ? "Google Chrome" : null;
+  // STEALTH2-1: port of GetGreasedUserAgentBrandVersion + GenerateBrandVersionList
+  // + ShuffleBrandList: [GREASE, Chromium, brand?] placed at order[i].
+  var GREASE_CHARS = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
+  var GREASE_VERSIONS = ["8", "99", "24"];
+  var greaseBrand = "Not" + GREASE_CHARS[seed % 11] + "A" + GREASE_CHARS[(seed + 1) % 11] + "Brand";
+  var greaseVersion = GREASE_VERSIONS[seed % 3];
+  var ORDERS = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  function brandList(version, greaseFull) {
+    var list = [{ brand: greaseBrand, version: greaseFull }, { brand: "Chromium", version: version }];
+    if (brand) list.push({ brand: brand, version: version });
+    var order = list.length === 2 ? [seed % 2, (seed + 1) % 2] : ORDERS[seed % 6];
+    var out = [];
+    for (var i = 0; i < list.length; i++) out[order[i]] = list[i];
+    return out;
+  }
   return {
-    brands: brands,
-    fullVersionList: fullVersionList,
+    brands: brandList(major, greaseVersion),
+    fullVersionList: brandList(fullVersion, greaseVersion + ".0.0.0"),
+    fullVersion: fullVersion,
     platform: platform,
     platformVersion: platformVersion,
     architecture: architecture,
@@ -89,10 +139,27 @@ function clientHintsFromUA(ua) {
     mobile: mobile,
     bitness: bitness,
     wow64: wow64,
+    formFactors: [mobile ? "Mobile" : "Desktop"],
   };
+}
+
+// STEALTH2-4: the navigator.platform Chromium reports for the hints' OS
+// (third_party/blink/renderer/core/execution_context/navigator_base.cc,
+// GetReducedNavigatorPlatform: Linux + ChromeOS report "Linux x86_64" on any
+// CPU, Android "Linux armv81"). emulate_device passes it to CDP as
+// `platform`; stealth_apply uses it in-page, so it is self-contained too.
+function navigatorPlatformFromHints(hints, ua) {
+  var p = hints && hints.platform;
+  if (p === "macOS") return "MacIntel";
+  if (p === "Android") return "Linux armv81";
+  if (p === "Linux" || p === "Chrome OS") return "Linux x86_64";
+  if (p === "iOS") return /iPad/.test(typeof ua === "string" ? ua : "") ? "iPad" : "iPhone";
+  return "Win32";
 }
 
 module.exports = {
   clientHintsFromUA,
   CLIENT_HINTS_SOURCE: clientHintsFromUA.toString(),
+  navigatorPlatformFromHints,
+  NAVIGATOR_PLATFORM_SOURCE: navigatorPlatformFromHints.toString(),
 };

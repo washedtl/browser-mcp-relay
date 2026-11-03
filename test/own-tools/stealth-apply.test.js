@@ -50,6 +50,7 @@ function installFakeBrowser(opts) {
   function Navigator() {}
   Object.defineProperties(Navigator.prototype, {
     userAgent: { get: function () { return opts.userAgent; }, configurable: true, enumerable: true },
+    platform: { get: function () { return opts.platform; }, configurable: true, enumerable: true },
     webdriver: { get: function () { return true; }, configurable: true, enumerable: true },
     languages: { get: function () { return Object.freeze(["en-US"]); }, configurable: true, enumerable: true },
     plugins: { get: function () { return []; }, configurable: true, enumerable: true },
@@ -111,10 +112,13 @@ function installFakeBrowser(opts) {
   g.WebGL2RenderingContext = WebGL2RenderingContext;
 }
 
-/** A fresh document. `uaData`: object (native hints) or null (insecure context / no UA-CH). */
-function makeDoc({ userAgent = WIN_UA, uaData = BRAVE_NATIVE_UAD } = {}) {
+/**
+ * A fresh document. `uaData`: object (native hints) or null (insecure context / no UA-CH).
+ * `platform`: navigator.platform (a Windows host's "Win32" unless a CDP override set it).
+ */
+function makeDoc({ userAgent = WIN_UA, uaData = BRAVE_NATIVE_UAD, platform = "Win32" } = {}) {
   const ctx = vm.createContext({});
-  vm.runInContext(`(${installFakeBrowser.toString()})(${JSON.stringify({ userAgent, uaData })})`, ctx);
+  vm.runInContext(`(${installFakeBrowser.toString()})(${JSON.stringify({ userAgent, uaData, platform })})`, ctx);
   return {
     ctx,
     run: (script) => vm.runInContext(script, ctx),
@@ -528,6 +532,76 @@ test("W1D-3: stale native hints that contradict the UA are replaced", async () =
   doc.run(script);
   assert.strictEqual(doc.get("navigator.userAgentData.platform"), "Android");
   assert.strictEqual(doc.get("navigator.userAgentData.mobile"), true);
+});
+
+// ─── STEALTH2: Chromium-exact brands, full version, platform ─────────
+
+const chromeUA = (major, os = "Windows NT 10.0; Win64; x64") =>
+  `Mozilla/5.0 (${os}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+// Captured live 2026-11-03 from Brave 1.89.143 (Chromium 147, Windows,
+// throwaway profile): Brave's own UA + hints, full versions reduced to x.0.0.0.
+const BRAVE_147_UA = chromeUA(147);
+const BRAVE_147_UAD = {
+  brands: [{ brand: "Brave", version: "147" }, { brand: "Not.A/Brand", version: "8" }, { brand: "Chromium", version: "147" }],
+  fullVersionList: [{ brand: "Brave", version: "147.0.0.0" }, { brand: "Not.A/Brand", version: "8.0.0.0" }, { brand: "Chromium", version: "147.0.0.0" }],
+  uaFullVersion: "147.0.0.0",
+  mobile: false, platform: "Windows", platformVersion: "19.0.0", architecture: "x86", bitness: "64", model: "", wow64: false, formFactors: ["Desktop"],
+};
+
+test("STEALTH2-2: Brave's live native hints (Brave brand, x.0.0.0 versions) are kept under Brave's own UA", async () => {
+  const script = await captureScript();
+  const doc = makeDoc({ userAgent: BRAVE_147_UA, uaData: BRAVE_147_UAD });
+  doc.run(script);
+  assert.strictEqual(doc.get("navigator.userAgentData === __nativeUAD"), true);
+  assert.deepStrictEqual(plain(doc.get("navigator.userAgentData.brands")).map((b) => b.brand), ["Brave", "Not.A/Brand", "Chromium"]);
+});
+
+test("STEALTH2-1: stale native hints are replaced even when their GREASE version equals the UA's", async () => {
+  // UA says Chrome 120 (GREASE "Not_A Brand" v8); native hints are Brave
+  // 147's, whose GREASE is also v8. Matching on any "8" kept them before.
+  const script = await captureScript();
+  const doc = makeDoc({ userAgent: chromeUA(120), uaData: BRAVE_147_UAD });
+  doc.run(script);
+  assert.deepStrictEqual(plain(doc.get("navigator.userAgentData.brands")),
+    plain(emulate.synthesizeUserAgentMetadata(chromeUA(120)).brands));
+});
+
+test("STEALTH2-1/3: synthesized uaFullVersion / formFactors equal the HTTP side whatever slot GREASE takes", async () => {
+  for (const ua of [chromeUA(120), chromeUA(127), chromeUA(131), chromeUA(147), ANDROID_UA]) {
+    const http = plain(emulate.synthesizeUserAgentMetadata(ua));
+    const script = await captureScript();
+    const doc = makeDoc({ userAgent: ua, uaData: BLANKED_UAD });
+    doc.run(script);
+    const js = plain(await doc.get(`navigator.userAgentData.getHighEntropyValues(${JSON.stringify([...ALL_HINTS, "formFactors"])})`));
+    assert.strictEqual(js.uaFullVersion, http.fullVersion, ua);
+    assert.ok(!/\.0\.0\.0$/.test(js.uaFullVersion), `${ua}: ${js.uaFullVersion}`);
+    assert.deepStrictEqual(js.formFactors, http.formFactors, ua);
+  }
+});
+
+test("STEALTH2-4: navigator.platform is left alone when it already matches the UA (native, or emulate_device's override)", async () => {
+  const script = await captureScript();
+  for (const [ua, platform] of [[WIN_UA, "Win32"], [MAC_UA, "MacIntel"], [ANDROID_UA, "Linux armv81"]]) {
+    const doc = makeDoc({ userAgent: ua, uaData: plain(emulate.synthesizeUserAgentMetadata(ua)), platform });
+    doc.run(script);
+    assert.strictEqual(doc.get("navigator.platform"), platform, ua);
+    assert.strictEqual(doc.get("Object.getOwnPropertyDescriptor(navigator, 'platform')"), undefined, `${ua}: no own-property shadow`);
+  }
+});
+
+test("STEALTH2-4: navigator.platform that contradicts the UA (override without platform) follows the UA", async () => {
+  const script = await captureScript();
+  for (const [ua, expected] of [[MAC_UA, "MacIntel"], [ANDROID_UA, "Linux armv81"], [chromeUA(131, "X11; Linux x86_64"), "Linux x86_64"]]) {
+    // No userAgentData at all (insecure context) must not skip this patch.
+    for (const uaData of [BLANKED_UAD, null]) {
+      const doc = makeDoc({ userAgent: ua, uaData, platform: "Win32" });
+      doc.run(script);
+      assert.strictEqual(doc.get("navigator.platform"), expected, `${ua} uaData=${JSON.stringify(uaData)}`);
+    }
+  }
+  const doc = makeDoc({ userAgent: MAC_UA, uaData: BLANKED_UAD, platform: "Win32" });
+  doc.run(script);
+  assert.strictEqual(doc.get("Object.getOwnPropertyDescriptor(navigator, 'platform').get.toString()"), "function get platform() { [native code] }");
 });
 
 // ─── Characterization: the rest of the patch set, executed ───────────

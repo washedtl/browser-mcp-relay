@@ -15,14 +15,132 @@ const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
 // headers and the page's navigator.userAgentData. Overriding the UA without
 // it blanks the client hints (an obvious tell). The metadata now comes from
 // the one generator stealth_apply also uses, so header + JS values agree.
-const { clientHintsFromUA } = require("./_client-hints.js");
+// STEALTH2-4: the same generator names the navigator.platform for the UA's
+// OS, sent as setUserAgentOverride's `platform` (else a Mac UA on a Windows
+// host still reports "Win32").
+const { clientHintsFromUA, navigatorPlatformFromHints } = require("./_client-hints.js");
+
+// ─── STEALTH2-5: the override on the tab's child targets ─────────────────
+// A cross-origin iframe (OOPIF) and a dedicated worker are separate CDP
+// targets. Chromium applies UA overrides per DevTools agent host
+// (devtools_instrumentation.cc ApplyNetworkRequestOverrides /
+// ApplyUserAgentMetadataOverrides → RenderFrameDevToolsAgentHost::GetFor),
+// so the page session's override never reaches them: live in Brave 147 an
+// OOPIF (e.g. a challenge iframe) reported the host's UA, brands and
+// platform, and so did its subresource requests and its workers.
+//
+// So the page session auto-attaches to its child targets, paused
+// (waitForDebuggerOnStart; an OOPIF is held before commit, a worker before
+// its script runs), sets the same override on each, auto-attaches to ITS
+// children, and resumes it. Non-flat (Target.sendMessageToTarget) because
+// Playwright's CDPSession can't address flat child sessions; Chromium still
+// supports non-flat auto-attach below browser level (target_handler.cc).
+// reset turns auto-attach off: Chromium then detaches those sessions and
+// their overrides go with them.
+//
+// Not covered (documented in the tool description + docs/REFERENCE.md):
+//   • service / shared workers: shared by every tab of an origin (other
+//     sessions' tabs included), and their navigator.userAgent ignores CDP
+//     overrides anyway (live check), so they're filtered out and keep the
+//     browser's real UA.
+//   • navigator.platform inside ANY worker: WorkerNavigator has no override
+//     hook (navigator_base.cc), so it always reports the host OS.
+//   • popups the tab opens (new tabs, not children).
+const CHILD_TARGETS = new WeakMap(); // page CDP session → { params, autoAttach (Promise | null), root }
+const AUTO_ATTACH = {
+  autoAttach: true,
+  waitForDebuggerOnStart: true,
+  flatten: false,
+  filter: [
+    { type: "service_worker", exclude: true },
+    { type: "shared_worker", exclude: true },
+    // Chromium's default filter excludes these two; a custom filter replaces it.
+    { type: "browser", exclude: true },
+    { type: "tab", exclude: true },
+    {},
+  ],
+};
+const OVERRIDDEN_TYPES = new Set(["iframe", "worker"]);
+
+/** Fire-and-forget: a closed target must not surface as an unhandled rejection. */
+function fire(node, method, params) {
+  try { Promise.resolve(node.send(method, params)).catch(() => {}); } catch { /* target gone */ }
+}
+
+/** Per-session child-target state; installs the CDP event listeners once. */
+function childTargetsOf(cdp) {
+  let state = CHILD_TARGETS.get(cdp);
+  if (state) return state;
+  state = { params: null, autoAttach: null, root: { send: (m, p) => cdp.send(m, p), children: new Map() } };
+  const childOf = (parent, sessionId, type) => {
+    let id = 0;
+    return {
+      type,
+      children: new Map(),
+      send: (method, params) => parent.send("Target.sendMessageToTarget", {
+        sessionId,
+        message: JSON.stringify({ id: ++id, method, params: params || {} }),
+      }),
+    };
+  };
+  const onEvent = (parent, method, p) => {
+    if (method === "Target.attachedToTarget") {
+      const type = p.targetInfo && p.targetInfo.type;
+      const child = childOf(parent, p.sessionId, type);
+      parent.children.set(p.sessionId, child);
+      if (state.params && OVERRIDDEN_TYPES.has(type)) {
+        fire(child, "Network.setUserAgentOverride", state.params);
+        fire(child, "Target.setAutoAttach", AUTO_ATTACH);
+      }
+      // Always, and last on that session: the target stays paused until
+      // every client that auto-attached with waitForDebuggerOnStart resumes it.
+      fire(child, "Runtime.runIfWaitingForDebugger");
+    } else if (method === "Target.receivedMessageFromTarget") {
+      // A child's own events (its children attaching / detaching), wrapped.
+      const child = parent.children.get(p.sessionId);
+      let msg = null;
+      try { msg = JSON.parse(p.message); } catch { /* not JSON */ }
+      if (child && msg && msg.method) onEvent(child, msg.method, msg.params || {});
+    } else if (method === "Target.detachedFromTarget") {
+      parent.children.delete(p.sessionId);
+    }
+  };
+  for (const m of ["Target.attachedToTarget", "Target.receivedMessageFromTarget", "Target.detachedFromTarget"]) {
+    cdp.on(m, (p) => { try { onEvent(state.root, m, p || {}); } catch { /* never throw into the emitter */ } });
+  }
+  CHILD_TARGETS.set(cdp, state);
+  return state;
+}
+
+/** Apply `params` (setUserAgentOverride args) to current and future child targets. */
+async function overrideChildTargets(cdp, params) {
+  const state = childTargetsOf(cdp);
+  state.params = params;
+  (function update(node) {
+    for (const child of node.children.values()) {
+      if (OVERRIDDEN_TYPES.has(child.type)) fire(child, "Network.setUserAgentOverride", params);
+      update(child);
+    }
+  })(state.root);
+  // One in-flight setAutoAttach per session: a concurrent call awaits the
+  // same one, so it can't report success for an auto-attach that failed.
+  if (!state.autoAttach) {
+    state.autoAttach = cdp.send("Target.setAutoAttach", AUTO_ATTACH).catch((e) => {
+      state.autoAttach = null; // the next call retries
+      throw e;
+    });
+  }
+  await state.autoAttach;
+}
 
 module.exports = {
   name: "emulate_device",
   description:
     "Apply device emulation to this tab via CDP Emulation. " +
     "Useful for testing mobile layouts, slow networks, or specific user-agent behavior. " +
-    "Overrides stay on that tab across navigations until the tab closes or you call reset:true.",
+    "Overrides stay on that tab across navigations until the tab closes or you call reset:true. " +
+    "userAgent also sets matching client hints + navigator.platform and reaches the tab's cross-origin iframes " +
+    "and dedicated workers; service/shared workers keep the real UA, and navigator.platform inside workers stays the host's.",
   inputSchema: {
     type: "object",
     properties: {
@@ -101,20 +219,37 @@ module.exports = {
           p: cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }),
         },
       );
+      // STEALTH2-5: auto-attach off → Chromium detaches the child sessions,
+      // which drops the overrides set through them. The child map is left to
+      // their detachedFromTarget events: a child that reports a new target
+      // before it is detached must still be able to resume it (params null →
+      // resume only).
+      const children = CHILD_TARGETS.get(cdp);
+      if (children && children.autoAttach) {
+        children.params = null;
+        children.autoAttach = null;
+        sends.push({
+          name: "childTargets",
+          p: cdp.send("Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: false }),
+        });
+      }
     }
     if (userAgent) {
       // T2-A: pass userAgentMetadata so Sec-CH-UA-* headers and
       // navigator.userAgentData describe the override UA, not Brave.
       const uaMetadata = clientHintsFromUA(userAgent);
-      sends.push({
-        name: "userAgent",
-        p: cdp.send("Network.setUserAgentOverride", {
-          userAgent,
-          userAgentMetadata: uaMetadata,
-        }),
-      });
+      const uaParams = {
+        userAgent,
+        userAgentMetadata: uaMetadata,
+        platform: navigatorPlatformFromHints(uaMetadata, userAgent),
+      };
+      sends.push(
+        { name: "userAgent", p: cdp.send("Network.setUserAgentOverride", uaParams) },
+        { name: "childTargets", p: overrideChildTargets(cdp, uaParams) },
+      );
       applied.userAgent = userAgent;
       applied.userAgentMetadata = uaMetadata;
+      applied.platform = uaParams.platform;
     }
     if (viewport) {
       sends.push({

@@ -21,7 +21,7 @@ test("W2D: emulate_device attaches CDP to ctx.page, not to the context's other p
   let attachedTo = null;
   const context = {
     pages: () => [other, mine],
-    newCDPSession: async (page) => { attachedTo = page; return { send: async () => ({}), detach: async () => {} }; },
+    newCDPSession: async (page) => { attachedTo = page; return { send: async () => ({}), detach: async () => {}, on() {} }; },
   };
   try {
     const result = await tool.handler({ userAgent: "test-agent" }, { page: mine, context });
@@ -44,6 +44,7 @@ test("V0-3: emulate_device does NOT detach CDP session after applying overrides"
   const fakeCdp = {
     send: async (method, params) => { sentCommands.push({ method, params }); },
     detach: async () => { detachCalls++; },
+    on() {},
   };
   const fakeContext = {
     pages: () => [fakePage],
@@ -73,6 +74,7 @@ test("V0-3: emulate_device reuses cached CDP session on second call (no double-a
   const fakeCdp = {
     send: async () => {},
     detach: async () => {},
+    on() {},
   };
   const fakeContext = {
     pages: () => [fakePage],
@@ -101,6 +103,7 @@ test("T1-2: emulate_device dispatches CDP commands in parallel", async () => {
   const fakeCdp = {
     send: async () => new Promise((r) => setTimeout(r, 50)),
     detach: async () => {},
+    on() {},
   };
   const fakeContext = {
     pages: () => [fakePage],
@@ -130,6 +133,7 @@ test("T1-8: emulate_device always sends setTouchEmulationEnabled when viewport g
   const fakeCdp = {
     send: async (method, params) => { sentCommands.push({ method, params }); },
     detach: async () => {},
+    on() {},
   };
   const fakeContext = {
     pages: () => [fakePage],
@@ -192,10 +196,14 @@ test("T2-A: synthesizeUserAgentMetadata produces correct shape from a Windows Ch
   assert.ok(Array.isArray(out.brands));
   assert.ok(out.brands.some((b) => b.brand === "Chromium"),
     "brands must include Chromium");
-  assert.ok(out.brands.some((b) => b.brand === "Not?A_Brand"),
-    "brands must include the Not?A_Brand randomization slot");
+  // STEALTH2-1: Chromium's GREASE brand for major 127 (was a fixed "Not?A_Brand"/24).
+  assert.ok(out.brands.some((b) => b.brand === "Not)A;Brand" && b.version === "99"),
+    "brands must include Chromium's GREASE slot for 127");
+  assert.ok(out.brands.some((b) => b.brand === "Google Chrome" && b.version === "127"),
+    "a Chrome UA carries the Google Chrome brand");
   assert.ok(Array.isArray(out.fullVersionList));
-  assert.ok(out.fullVersionList[0].version.startsWith("127."),
+  // GREASE may take any slot (Chromium's seeded order), so find Chromium by name.
+  assert.ok(out.fullVersionList.find((b) => b.brand === "Chromium").version.startsWith("127."),
     "fullVersionList must reflect the Chrome major version");
 });
 
@@ -230,6 +238,7 @@ test("T2-A: emulate_device's handler passes userAgentMetadata to setUserAgentOve
   const fakeCdp = {
     send: async (method, params) => { sentCommands.push({ method, params }); },
     detach: async () => {},
+    on() {},
   };
   const fakeContext = { pages: () => [fakePage], newCDPSession: async () => fakeCdp };
   const ctx = { page: fakePage, context: fakeContext };
@@ -333,4 +342,236 @@ test("W1D-4: a failed reset command is reported, not swallowed", async () => {
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
   }
+});
+
+// ─── STEALTH2 (2026-11-03) ───
+// A UA override must look the same everywhere a site can read it: the
+// page's navigator, the Sec-CH-UA-* headers, and the tab's cross-origin
+// iframes (OOPIFs) + dedicated workers, which are separate CDP targets the
+// page session's override does not reach (live check, Brave 147: the OOPIF
+// reported the host's UA, Brave brands and "Win32").
+
+const MAC_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const ANDROID_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+
+/** Fake page CDP session: records sends; tests emit CDP events into it. */
+function fakeSession({ fail = () => false } = {}) {
+  const sent = [];
+  const listeners = {};
+  return {
+    sent,
+    send: async (method, params) => {
+      sent.push({ method, params });
+      if (fail(method, params)) throw new Error("boom: " + method);
+      return {};
+    },
+    detach: async () => {},
+    on(event, fn) { (listeners[event] ||= []).push(fn); },
+    emit(event, params) { for (const fn of listeners[event] || []) fn(params); },
+  };
+}
+
+/** Calls fn with a handler ctx whose page CDP session is `session`. */
+async function withSession(session, fn) {
+  const page = { once() {} };
+  try {
+    return await fn({ page, context: { pages: () => [page], newCDPSession: async () => session } });
+  } finally {
+    PAGE_CDP_SESSIONS.delete(page);
+  }
+}
+
+/** Unwraps (nested) Target.sendMessageToTarget → [{ path: "F1>F2", method, params }]. */
+function childCommands(sent) {
+  const out = [];
+  const unwrap = (path, method, params) => {
+    if (method === "Target.sendMessageToTarget") {
+      const m = JSON.parse(params.message);
+      unwrap([...path, params.sessionId], m.method, m.params);
+    } else if (path.length) {
+      out.push({ path: path.join(">"), method, params });
+    }
+  };
+  for (const s of sent) unwrap([], s.method, s.params);
+  return out;
+}
+const methodsFor = (sent, path) => childCommands(sent).filter((c) => c.path === path).map((c) => c.method);
+const pageOverride = (sent) => sent.filter((c) => c.method === "Network.setUserAgentOverride").map((c) => c.params);
+const attach = (sessionId, type) => ({ sessionId, targetInfo: { targetId: "T-" + sessionId, type, url: "" }, waitingForDebugger: true });
+const AUTO_ATTACH = {
+  autoAttach: true,
+  waitForDebuggerOnStart: true,
+  flatten: false,
+  filter: [{ type: "service_worker", exclude: true }, { type: "shared_worker", exclude: true }, { type: "browser", exclude: true }, { type: "tab", exclude: true }, {}],
+};
+
+test("STEALTH2-4: the UA override carries navigator.platform for the UA's OS (CDP platform)", async () => {
+  for (const [ua, platform] of [[MAC_UA, "MacIntel"], [ANDROID_UA, "Linux armv81"]]) {
+    const s = fakeSession();
+    const r = await withSession(s, (ctx) => tool.handler({ userAgent: ua }, ctx));
+    assert.strictEqual(pageOverride(s.sent)[0].platform, platform, ua);
+    assert.strictEqual(JSON.parse(r.content[0].text).applied.platform, platform);
+  }
+});
+
+test("STEALTH2-3: the metadata pins fullVersion + formFactors (left out, Chromium reports the host's)", async () => {
+  const s = fakeSession();
+  await withSession(s, (ctx) => tool.handler({ userAgent: ANDROID_UA }, ctx));
+  const meta = pageOverride(s.sent)[0].userAgentMetadata;
+  assert.strictEqual(meta.fullVersion, "131.0.6778.264");
+  assert.deepStrictEqual(meta.formFactors, ["Mobile"]);
+  assert.deepStrictEqual(meta.brands.map((b) => b.brand), ["Google Chrome", "Chromium", "Not_A Brand"]);
+});
+
+test("STEALTH2-5: a userAgent override auto-attaches (non-flat, paused) to the tab's child targets, minus service/shared workers", async () => {
+  const s = fakeSession();
+  await withSession(s, (ctx) => tool.handler({ userAgent: MAC_UA }, ctx));
+  assert.deepStrictEqual(s.sent.filter((c) => c.method === "Target.setAutoAttach").map((c) => c.params), [AUTO_ATTACH]);
+});
+
+test("STEALTH2-5: an OOPIF and a dedicated worker get the page's exact override, their own auto-attach, then resume", async () => {
+  const s = fakeSession();
+  await withSession(s, async (ctx) => {
+    await tool.handler({ userAgent: MAC_UA }, ctx);
+    s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    s.emit("Target.attachedToTarget", attach("W1", "worker"));
+  });
+  const page = pageOverride(s.sent)[0];
+  for (const path of ["F1", "W1"]) {
+    // Order matters: the target is paused until resumed, so the override
+    // must be in place before Runtime.runIfWaitingForDebugger.
+    assert.deepStrictEqual(methodsFor(s.sent, path), ["Network.setUserAgentOverride", "Target.setAutoAttach", "Runtime.runIfWaitingForDebugger"], path);
+    const cmds = childCommands(s.sent).filter((c) => c.path === path);
+    assert.deepStrictEqual(cmds[0].params, page, `${path} gets the page's override`);
+    assert.deepStrictEqual(cmds[1].params, AUTO_ATTACH);
+  }
+});
+
+test("STEALTH2-5: nested targets (an OOPIF's own iframe / worker) are reached through their parent", async () => {
+  const s = fakeSession();
+  await withSession(s, async (ctx) => {
+    await tool.handler({ userAgent: MAC_UA }, ctx);
+    s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    s.emit("Target.receivedMessageFromTarget", {
+      sessionId: "F1",
+      message: JSON.stringify({ method: "Target.attachedToTarget", params: attach("W2", "worker") }),
+    });
+  });
+  assert.deepStrictEqual(methodsFor(s.sent, "F1>W2"), ["Network.setUserAgentOverride", "Target.setAutoAttach", "Runtime.runIfWaitingForDebugger"]);
+  assert.strictEqual(childCommands(s.sent).find((c) => c.path === "F1>W2").params.userAgent, MAC_UA);
+});
+
+test("STEALTH2-5: other target types are only resumed, never overridden", async () => {
+  const s = fakeSession();
+  await withSession(s, async (ctx) => {
+    await tool.handler({ userAgent: MAC_UA }, ctx);
+    for (const [id, type] of [["S1", "service_worker"], ["S2", "shared_worker"], ["O1", "other"]]) s.emit("Target.attachedToTarget", attach(id, type));
+  });
+  for (const id of ["S1", "S2", "O1"]) assert.deepStrictEqual(methodsFor(s.sent, id), ["Runtime.runIfWaitingForDebugger"], id);
+});
+
+test("STEALTH2-5: a new userAgent reaches the live child targets (not detached ones); auto-attach is set up once", async () => {
+  const s = fakeSession();
+  await withSession(s, async (ctx) => {
+    await tool.handler({ userAgent: MAC_UA }, ctx);
+    s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    s.emit("Target.attachedToTarget", attach("W1", "worker"));
+    s.emit("Target.detachedFromTarget", { sessionId: "W1", targetId: "T-W1" });
+    await tool.handler({ userAgent: ANDROID_UA }, ctx);
+  });
+  const f1 = childCommands(s.sent).filter((c) => c.path === "F1" && c.method === "Network.setUserAgentOverride");
+  assert.deepStrictEqual(f1.map((c) => c.params.userAgent), [MAC_UA, ANDROID_UA]);
+  assert.deepStrictEqual(f1[1].params, pageOverride(s.sent)[1]);
+  assert.strictEqual(childCommands(s.sent).filter((c) => c.path === "W1").length, 3, "nothing more for a detached worker");
+  assert.strictEqual(s.sent.filter((c) => c.method === "Target.setAutoAttach").length, 1);
+});
+
+test("STEALTH2-5: reset turns child auto-attach off (Chromium detaches them, their overrides go too)", async () => {
+  const s = fakeSession();
+  let body;
+  await withSession(s, async (ctx) => {
+    await tool.handler({ userAgent: MAC_UA }, ctx);
+    s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    body = JSON.parse((await tool.handler({ reset: true }, ctx)).content[0].text);
+    s.emit("Target.attachedToTarget", attach("F2", "iframe")); // a straggler after reset
+  });
+  assert.deepStrictEqual(s.sent.filter((c) => c.method === "Target.setAutoAttach").map((c) => c.params),
+    [AUTO_ATTACH, { autoAttach: false, waitForDebuggerOnStart: false, flatten: false }]);
+  assert.ok(body.reset.includes("childTargets"));
+  assert.deepStrictEqual(methodsFor(s.sent, "F2"), ["Runtime.runIfWaitingForDebugger"]);
+});
+
+test("STEALTH2-5 review: after reset, a late grandchild an old child reports is still resumed (never left paused)", async () => {
+  const s = fakeSession();
+  await withSession(s, async (ctx) => {
+    await tool.handler({ userAgent: MAC_UA }, ctx);
+    s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    await tool.handler({ reset: true }, ctx);
+    // Chromium hasn't processed autoAttach:false yet; F1's own auto-attach fires.
+    s.emit("Target.receivedMessageFromTarget", {
+      sessionId: "F1",
+      message: JSON.stringify({ method: "Target.attachedToTarget", params: attach("W9", "worker") }),
+    });
+  });
+  assert.deepStrictEqual(methodsFor(s.sent, "F1>W9"), ["Runtime.runIfWaitingForDebugger"]);
+});
+
+test("STEALTH2-5 review: concurrent first calls share one child auto-attach and both see its failure", async () => {
+  const s = fakeSession({ fail: (method) => method === "Target.setAutoAttach" });
+  await withSession(s, async (ctx) => {
+    const [a, b] = await Promise.all([tool.handler({ userAgent: MAC_UA }, ctx), tool.handler({ userAgent: MAC_UA }, ctx)]);
+    for (const r of [a, b]) {
+      assert.strictEqual(r.isError, true);
+      assert.deepStrictEqual(JSON.parse(r.content[0].text).failed.map((f) => f.name), ["childTargets"]);
+    }
+  });
+  assert.strictEqual(s.sent.filter((c) => c.method === "Target.setAutoAttach").length, 1);
+});
+
+test("STEALTH2-5: a failing child command never blocks the resume or leaks an unhandled rejection", async () => {
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(e);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const s = fakeSession({
+      fail: (method, params) => method === "Target.sendMessageToTarget" && JSON.parse(params.message).method !== "Runtime.runIfWaitingForDebugger",
+    });
+    await withSession(s, async (ctx) => {
+      await tool.handler({ userAgent: MAC_UA }, ctx);
+      s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+      s.emit("Target.receivedMessageFromTarget", { sessionId: "F1", message: "not json" });
+      s.emit("Target.receivedMessageFromTarget", { sessionId: "nope", message: "{}" });
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(methodsFor(s.sent, "F1").at(-1), "Runtime.runIfWaitingForDebugger");
+    assert.deepStrictEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("STEALTH2-5: a failed child auto-attach is reported (page override still applied) and retried next call", async () => {
+  let failAutoAttach = true;
+  const s = fakeSession({ fail: (method) => method === "Target.setAutoAttach" && failAutoAttach });
+  await withSession(s, async (ctx) => {
+    const r = await tool.handler({ userAgent: MAC_UA }, ctx);
+    assert.strictEqual(r.isError, true);
+    assert.deepStrictEqual(JSON.parse(r.content[0].text).failed, [{ name: "childTargets", error: "boom: Target.setAutoAttach" }]);
+    assert.strictEqual(pageOverride(s.sent).length, 1);
+    failAutoAttach = false;
+    const r2 = await tool.handler({ userAgent: MAC_UA }, ctx);
+    assert.strictEqual(r2.isError, undefined);
+  });
+  assert.strictEqual(s.sent.filter((c) => c.method === "Target.setAutoAttach").length, 2);
+});
+
+test("STEALTH2-5: viewport / network calls don't touch child targets", async () => {
+  const s = fakeSession();
+  await withSession(s, (ctx) => tool.handler({ viewport: { width: 400, height: 800 }, network: { offline: true } }, ctx));
+  assert.ok(!s.sent.some((c) => c.method.startsWith("Target.")));
+});
+
+test("STEALTH2-5: the description states what the override reaches and what it can't", () => {
+  assert.match(tool.description, /cross-origin iframes/);
+  assert.match(tool.description, /service\/shared workers/);
 });

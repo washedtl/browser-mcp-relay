@@ -50,7 +50,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `emulate_device` | UA / viewport / network throttling (`reset: true` clears all overrides) | `network.downloadKbps` | Verify a layout on Slow 3G |
+| `emulate_device` | UA / viewport / network throttling (`reset: true` clears all overrides). A `userAgent` also sets Chrome-exact client hints + `navigator.platform` and reaches the tab's cross-origin iframes + dedicated workers (see [Stealth model](#stealth-model) for what it can't reach) | `network.downloadKbps` | Verify a layout on Slow 3G |
 
 #### 📑 Multi-tab control
 
@@ -687,6 +687,7 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 | `navigator.languages` override | Mismatched-language flagging |
 | `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
 | `navigator.userAgentData` replaced only when it contradicts the UA | Sec-CH-UA-* JS-side fingerprinting; same generator as `emulate_device`'s HTTP client hints; Brave's native object is kept when no UA override is active |
+| `navigator.platform` replaced only when it contradicts the UA | A Mac / Android UA reporting `Win32`: a UA override set without CDP's `platform` (`emulate_device` sets it). Values are Chromium's reduced ones (`Win32`, `MacIntel`, `Linux x86_64`, `Linux armv81`, `iPhone` / `iPad`); a matching native value is kept. Not reachable in workers (see below) |
 | `toString()` defense on patched getters | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
 | AudioBuffer `getChannelData` / `copyFromChannel` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; one seed per relay process, so every tab of the browser matches (< 1e-7), applied once per channel buffer, never cumulative or random per-call |
 
@@ -694,12 +695,12 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 
 | Patch | What it defeats |
 |---|---|
-| **HTTP-side `Sec-CH-UA-*` headers via `userAgentMetadata`** | The Tier-1 JS-side `userAgentData` paired with HTTP-side `Sec-CH-UA-*` mismatch detection. `emulate_device` now passes a synthesized `userAgentMetadata` to CDP's `Network.setUserAgentOverride`. |
+| **HTTP-side `Sec-CH-UA-*` headers via `userAgentMetadata`** | The Tier-1 JS-side `userAgentData` paired with HTTP-side `Sec-CH-UA-*` mismatch detection. `emulate_device` passes a synthesized `userAgentMetadata` (plus the matching `platform`) to CDP's `Network.setUserAgentOverride`. The brand list is Chromium's own: the GREASE brand, its version and the brand order are seeded by the major exactly as `components/embedder_support/user_agent_utils.cc` does (Chrome 131 → `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`), with `"Google Chrome"` for a Chrome UA (other Chromium browsers such as Edge / Opera get the unbranded Chromium list, never a wrong brand). A reduced UA (`Chrome/131.0.0.0`) gets a real stable build in `fullVersionList` / `uaFullVersion` / `Sec-CH-UA-Full-Version-List` (`131.0.6778.264`; table from chromiumdash, majors 100-157, later majors extrapolated). `fullVersion` and `formFactors` are always sent, since Chromium otherwise reports the host browser's own (Brave's `147.0.0.0`, `Desktop` on an Android UA). The override also reaches the tab's **cross-origin iframes and dedicated workers**: the page session auto-attaches to them (paused until overridden), since Chromium applies overrides per DevTools target. |
 | **`window.chrome` runtime expansion** | Probes for `chrome.loadTimes()` / `chrome.csi()` / `chrome.app` namespace. Real Chrome ships all three; Tier 1's bare `runtime: {}` was a tell. Now populates plausible-shape stubs. |
 | **Full permissions overrides** | Probes for `geolocation` / `clipboard-read` / `clipboard-write` / `camera` / `microphone` / `midi` / `push` / etc. Tier 1 only covered notifications; Tier 2 extends to the canonical 17 permission types with realistic states. |
 | **WebGL renderer + vendor override** | `getParameter(UNMASKED_VENDOR_WEBGL)` / `getParameter(UNMASKED_RENDERER_WEBGL)` returning Playwright signature strings. UA-aware GPU strings on both `WebGLRenderingContext` and `WebGL2RenderingContext`. |
 
-This covers trivial bot checks + the bottom ~85% of common fingerprint surface. **Verified by source-pattern tests** (`test/own-tools/stealth-apply.test.js` T1-A/B/C + T2-B/C/D, plus `test/own-tools/emulate-device.test.js` T2-A).
+This covers trivial bot checks + the bottom ~85% of common fingerprint surface. **Verified by executing the injected script** in a fake-Chromium vm realm (`test/own-tools/stealth-apply.test.js`), client hints against real Chrome headers for several majors (`test/own-tools/client-hints.test.js`), CDP traffic incl. child targets (`test/own-tools/emulate-device.test.js`), and a live check in Brave 147 (2026-11-03: top page, cross-origin iframe, workers, HTTP headers).
 
 ### What it does NOT cover
 
@@ -711,6 +712,7 @@ The relay is honest about these limits — pretending otherwise misleads callers
 | **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. Tier 1's getter-level toString defense doesn't reach this. | Tier 3 (deferred — see BACKLOG): rebrowser-patches at the chromium-binary level. |
 | **`event.isTrusted` detection (press-and-hold, CAPTCHAs)** | Synthetic events from CDP fundamentally have `isTrusted=false`. This is by browser design — there's no JS-level fix. | Don't try to auto-solve press-and-hold CAPTCHAs; route the user through them manually. |
 | **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | Tier 2.5 (deferred — see BACKLOG): `humanlike_click` + `humanlike_type` tools. Has an explicit ship gate (capture the detection signal first; design the humanizer to match the target's tolerance window). |
+| **Where `emulate_device`'s UA override can't reach** | (1) **Service and shared workers** keep the browser's real UA, brands and platform: they are shared by every tab of an origin (other sessions' tabs too), and a service worker's `navigator.userAgent` ignores CDP overrides anyway (live check), so they are excluded from the auto-attach. (2) **`navigator.platform` inside any worker** (dedicated too) is always the host OS: Blink's `WorkerNavigator` has no override hook (`navigator_base.cc`), and `stealth_apply` can't patch workers. (3) **Popups** the tab opens are new tabs: call `emulate_device` on them. (4) In Brave, **`navigator.brave`** still exists (`isBrave()` → true) under an emulated Chrome UA. (5) Brand lists are exact for **Google Chrome 110+**; Chrome ≤ 109 used an earlier GREASE scheme, and an **Edge / Opera** UA gets Chromium's unbranded list (no `"Microsoft Edge"` / `"Opera"` brand, whose own full versions aren't known here). | Fingerprinters that compare a worker's `navigator.platform` (or a service worker's UA) with the page's will see the host OS: emulate a UA of the host's own OS when that matters. |
 
 ### Hard targets
 

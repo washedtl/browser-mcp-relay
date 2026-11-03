@@ -10,6 +10,7 @@
 //   • window.chrome runtime stub                                  [T0]
 //   • navigator.userAgentData replaced only when it contradicts   [T1-A]
 //     the UA (W1D-3; shared generator in _client-hints.js)
+//   • navigator.platform replaced only when it contradicts the UA [STEALTH2-4]
 //   • toString defense on patched getters (returns native-looking) [T1-B]
 //   • AudioBuffer getChannelData per-session jitter, applied once  [T1-C]
 //     per buffer+channel (W1D-2)
@@ -59,7 +60,7 @@
 // (scope "context"), which also covers the page upstream opens after the
 // call (the usual "stealth, then navigate" order).
 
-const { CLIENT_HINTS_SOURCE } = require("./_client-hints.js");
+const { CLIENT_HINTS_SOURCE, NAVIGATOR_PLATFORM_SOURCE } = require("./_client-hints.js");
 
 // Page | BrowserContext → { languages, initScript }. WeakMap so closed tabs
 // and contexts are garbage-collected normally.
@@ -217,18 +218,24 @@ async function applyStealth(target, scope, { languages, force }) {
       // which blanks the brands. The replacement comes from the same
       // generator emulate_device uses for the headers. No userAgentData at
       // all (insecure context) stays that way, as in real Chrome.
+      let hints = null;
+      try {
+        const clientHintsFromUA = ${CLIENT_HINTS_SOURCE};
+        hints = clientHintsFromUA(navigator.userAgent || '');
+      } catch (e) {}
       try {
         const nativeUAD = navigator.userAgentData;
-        if (nativeUAD) {
-          const clientHintsFromUA = ${CLIENT_HINTS_SOURCE};
-          const hints = clientHintsFromUA(navigator.userAgent || '');
+        if (hints && nativeUAD) {
+          // STEALTH2-1: compare the Chromium entry's major. GREASE can sit in
+          // any slot and its version (8 / 99 / 24) can equal another one's.
+          const major = hints.brands.filter(function (b) { return b.brand === 'Chromium'; })[0].version;
           let coherent = false;
           try {
             const nativeBrands = nativeUAD.brands || [];
             coherent = nativeBrands.length > 0
               && nativeUAD.platform === hints.platform
               && nativeUAD.mobile === hints.mobile
-              && Array.prototype.some.call(nativeBrands, function (b) { return !!b && b.version === hints.brands[0].version; });
+              && Array.prototype.some.call(nativeBrands, function (b) { return !!b && b.brand === 'Chromium' && b.version === major; });
           } catch (e) {}
           if (!coherent) {
             const copyList = function (list) { return list.map(function (b) { return { brand: b.brand, version: b.version }; }); };
@@ -242,9 +249,9 @@ async function applyStealth(target, scope, { languages, force }) {
                   ['platformVersion', 'architecture', 'bitness', 'model', 'wow64'].forEach(function (k) {
                     if (keys.includes(k)) out[k] = hints[k];
                   });
-                  if (keys.includes('uaFullVersion')) out.uaFullVersion = hints.fullVersionList[0].version;
+                  if (keys.includes('uaFullVersion')) out.uaFullVersion = hints.fullVersion;
                   if (keys.includes('fullVersionList')) out.fullVersionList = copyList(hints.fullVersionList);
-                  if (keys.includes('formFactors')) out.formFactors = hints.mobile ? ['Mobile'] : ['Desktop'];
+                  if (keys.includes('formFactors')) out.formFactors = hints.formFactors.slice();
                 }
                 return Promise.resolve(out);
               }, 'getHighEntropyValues'),
@@ -253,6 +260,21 @@ async function applyStealth(target, scope, { languages, force }) {
             const uadGetter = nativeLike(function () { return fakeUAD; }, 'get userAgentData');
             Object.defineProperty(navigator, 'userAgentData', { configurable: true, get: uadGetter });
           }
+        }
+      } catch (e) {}
+
+      // ─── STEALTH2-4: navigator.platform follows the UA ─────────────
+      // Desktop Chromium always reports the reduced value for its OS (Win32,
+      // MacIntel, "Linux x86_64"), so a native value that differs from the
+      // UA's means a UA override without CDP's platform (emulate_device sets
+      // it). Same rule as userAgentData: replace only a contradiction.
+      // Workers can't be patched from here and keep the host's value.
+      try {
+        const navigatorPlatformFromHints = ${NAVIGATOR_PLATFORM_SOURCE};
+        const expectedPlatform = hints && navigatorPlatformFromHints(hints, navigator.userAgent || '');
+        if (expectedPlatform && navigator.platform !== expectedPlatform) {
+          const platformGetter = nativeLike(function () { return expectedPlatform; }, 'get platform');
+          Object.defineProperty(navigator, 'platform', { configurable: true, get: platformGetter });
         }
       } catch (e) {}
 
@@ -474,8 +496,8 @@ module.exports = {
     "and, best-effort, the open documents (other sessions are never touched; tabs " +
     "you open later need another call): hides navigator.webdriver; " +
     "fakes plugins, languages, permission states and window.chrome; UA-matched " +
-    "WebGL vendor; stable audio jitter; replaces navigator.userAgentData only " +
-    "when it contradicts the UA. Once per tab; force=true re-applies with " +
+    "WebGL vendor; stable audio jitter; replaces navigator.userAgentData / platform " +
+    "only when they contradict the UA. Once per tab; force=true re-applies with " +
     "new languages. Pair with emulate_device so Sec-CH-UA headers match. Won't " +
     "beat TLS fingerprinting, deep toString checks, isTrusted or behavioral detection.",
   inputSchema: {
