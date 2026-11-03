@@ -554,9 +554,55 @@ test("importer: managedMatcher() — the cookies_export check: bridge-managed na
   assert.strictEqual(m({ name: "host", domain: "www.example.com", path: "/" }), false, "another path");
   assert.strictEqual(m({ name: "brave-own", domain: ".example.com", path: "/" }), false, "Brave's own cookie");
   assert.strictEqual(m(null), false);
-  // Chrome deletes one: no longer managed
+  // Chrome deletes one: still hidden (the bridge put a value there; the deletion may not have landed)
   await imp.delta([{ removed: true, cause: "explicit", cookie: ck() }]);
-  assert.strictEqual(imp.managedMatcher()({ name: "sid", domain: ".example.com", path: "/" }), false);
+  assert.strictEqual(imp.status().managed, 2);
+  assert.strictEqual(imp.managedMatcher()({ name: "sid", domain: ".example.com", path: "/" }), true);
+});
+
+test("importer: managedMatcher() also hides a cookie whose update Brave refused (Brave still holds the bridge's earlier value) and one loaded from an earlier broker's state", async (t) => {
+  let refuse = false;
+  const cdp = fakeCdp({ refuse: () => refuse });
+  const { imp } = make({ up: true, cdp });
+  await imp.braveReady({ pid: 1 });
+  await imp.full("b1", [ck()], true); // applied
+  refuse = true;
+  await imp.delta([{ removed: false, cause: "explicit", cookie: ck({ value: "newer" }) }]); // refused: dropped from the managed set
+  assert.strictEqual(imp.status().managed, 0);
+  assert.strictEqual(imp.managedMatcher()({ name: "sid", domain: ".example.com", path: "/" }), true);
+  const file = path.join(stateDir(t), "cookie-bridge-x.json");
+  const first = make({ stateFile: file });
+  await first.imp.full("b1", [ck({ name: "old" })], true);
+  const second = make({ stateFile: file });
+  assert.strictEqual(second.imp.managedMatcher()({ name: "old", domain: ".example.com", path: "/" }), true);
+});
+
+test("importer: a deletion lost in a crash is applied again at the relaunch even when the snapshot is empty", async () => {
+  let now = 1_800_000_000_000;
+  const { imp, cdp, supervisor } = make({ now: () => now });
+  await imp.full("b1", [ck()], true); // Brave down: in memory only
+  await imp.delta([{ removed: true, cause: "explicit", cookie: ck() }]); // snapshot now empty, deletion pending
+  supervisor.up = true;
+  await imp.braveReady({ pid: 1 });
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["sid"]);
+  now += 5_000;
+  supervisor.emit("down", "exited (pid gone)"); // within Chromium's flush interval
+  await imp.braveReady({ pid: 2 });
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["sid", "sid"], "re-applied although nothing is left to set");
+});
+
+test("importer: the always-allow list never lets a Chrome deletion reach a held-domain cookie the bridge didn't put into Brave", async () => {
+  const policy = require("../../extensions/cookie-bridge/policy.js");
+  const { allow } = policy.parseAllowList("pay.example.com");
+  const { imp, cdp } = make({ up: true, allow });
+  const r = await imp.delta([{ removed: true, cause: "explicit", cookie: ck({ domain: ".pay.example.com", name: "brave-own" }) }]);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.domain, x.reason]), [["pay.example.com", "hold:keyword"]]);
+  assert.strictEqual(cdp.calls.length, 0);
+  // one it did put there is deleted as usual
+  await imp.full("b1", [ck({ domain: ".pay.example.com", name: "synced" })], true);
+  const d = await imp.delta([{ removed: true, cause: "explicit", cookie: ck({ domain: ".pay.example.com", name: "synced" }) }]);
+  assert.strictEqual(d.applied, 1);
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["synced"]);
 });
 
 test("importer: the owner's always-allow list lets a keyword-held domain in broker-side, never a denied one", async () => {

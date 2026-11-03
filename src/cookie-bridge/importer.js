@@ -145,6 +145,7 @@ class CookieImporter {
     this._managed = new Map(); // key → identity: every cookie the bridge put into Brave (persisted)
     this._pendingDeletes = new Map(); // key → expired CookieParam, not yet applied to Brave (persisted)
     this._unflushed = new Map(); // key → {param, at, epoch}: applied, maybe not on disk yet (persisted as pending)
+    this._seen = new Set(); // every key the bridge has put into Brave in this broker's life (cookies_export masks them)
     this._epoch = 0; // bumped whenever Brave goes down: the running Brave's tombstones carry it
     this._staging = new Map(); // bridge id → {keys, fresh} of the full sync in progress
     this._bridge = null; // the one connected bridge
@@ -258,7 +259,9 @@ class CookieImporter {
       if (removed) {
         // Deleting is safe, except a deny/hold domain's cookie the bridge
         // never put there: that one is Brave's own.
-        const verdict = this._managed.has(mapped.key) || ch.cookie.userOverride === true ? null : this._verdict(mapped, ch.cookie);
+        // (The always-allow list doesn't count here: it never lets a deletion
+        // reach a cookie the bridge didn't put into Brave.)
+        const verdict = this._managed.has(mapped.key) || ch.cookie.userOverride === true ? null : this._verdict(mapped, ch.cookie, { allow: [] });
         if (verdict) {
           refusals.add(verdict.domain, verdict.reason);
           continue;
@@ -307,7 +310,8 @@ class CookieImporter {
     this._readyPid = pid;
     this._readyLaunch = this._launch;
     const run = this._enqueue(async () => {
-      if (!this._snapshot.size && !this._pendingDeletes.size) return;
+      const lostDeletes = [...this._unflushed.values()].some((u) => u.epoch !== this._epoch);
+      if (!this._snapshot.size && !this._pendingDeletes.size && !lostDeletes) return;
       const t0 = this._now();
       const nowSec = t0 / 1000;
       const sets = [];
@@ -364,15 +368,17 @@ class CookieImporter {
 
   /**
    * A matcher for cookies as cookies_export reads them from Brave
-   * ({name, domain, path}): true for one the bridge manages, whose value
-   * cookies_export then hides. Built from the managed set as it is now (one
-   * per export). Matched on name, domain (host-only or not) and path,
+   * ({name, domain, path}): true for one the bridge manages or has put
+   * into Brave in this broker's life, whose value cookies_export then hides.
+   * Built from those sets as they are now (one per export). Matched on name, domain (host-only or not) and path,
    * ignoring the partition: a doubt hides a value rather than shows it.
    * @returns {(cookie: {name: string, domain: string, path?: string}) => boolean}
    */
   managedMatcher() {
     const index = new Set();
-    for (const key of this._managed.keys()) {
+    // managed now, or put there earlier and not certainly gone (a deletion
+    // pending or not on disk yet, a refused update over an earlier value)
+    for (const key of new Set([...this._seen, ...this._managed.keys(), ...this._pendingDeletes.keys(), ...this._unflushed.keys()])) {
       const [name, where, path] = key.split("\u0000");
       index.add(`${name}\u0000${where.toLowerCase()}\u0000${path}`);
     }
@@ -421,8 +427,7 @@ class CookieImporter {
   }
 
   /** The policy refusal for a cookie's domain or partition site, or null when both are allowed. */
-  _verdict(mapped, cookie) {
-    const opts = { allow: this._allow };
+  _verdict(mapped, cookie, opts = { allow: this._allow }) {
     const own = policy.classify(mapped.host, opts);
     if (own.decision !== "allow") return { domain: domainOf(cookie), reason: `${own.decision}:${own.category}` };
     const pk = mapped.param.partitionKey;
@@ -448,6 +453,7 @@ class CookieImporter {
   /** Snapshot it; the bridge manages it from now on. */
   _setSynced(key, param) {
     this._snapshot.set(key, param);
+    this._seen.add(key);
     const id = identityOf(param);
     const was = this._managed.get(key);
     if (!was || JSON.stringify(was) !== JSON.stringify(id)) {
@@ -583,10 +589,10 @@ class CookieImporter {
       return;
     }
     for (const id of Array.isArray(data.managed) ? data.managed : []) {
-      if (validIdentity(id)) this._managed.set(cookieKey(id), identityOf(id));
+      if (validIdentity(id)) { this._managed.set(cookieKey(id), identityOf(id)); this._seen.add(cookieKey(id)); }
     }
     for (const id of Array.isArray(data.pendingDeletes) ? data.pendingDeletes : []) {
-      if (validIdentity(id)) this._pendingDeletes.set(cookieKey(id), expireParam(identityOf(id)));
+      if (validIdentity(id)) { this._pendingDeletes.set(cookieKey(id), expireParam(identityOf(id))); this._seen.add(cookieKey(id)); }
     }
     if (this._managed.size || this._pendingDeletes.size) {
       this._log(`state: ${this._managed.size} bridge-managed cookie(s), ${this._pendingDeletes.size} pending deletion(s) from an earlier broker`);

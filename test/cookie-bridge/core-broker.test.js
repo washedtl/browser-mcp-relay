@@ -497,7 +497,7 @@ test("v0.4.1: own-tools get the bridge-managed matcher in-process (main.js → t
   await br.request({ ctl: "cookies.full", cookies: [ck()], last: true });
   assert.deepStrictEqual(await ask(), { type: "function", sid: true, other: false });
   await br.request({ ctl: "cookies.delta", changes: [{ removed: true, cause: "explicit", cookie: ck() }] });
-  assert.deepStrictEqual(await ask(), { type: "function", sid: false, other: false });
+  assert.deepStrictEqual(await ask(), { type: "function", sid: true, other: false }, "deleted in Chrome: still hidden (a doubt hides)");
 });
 
 test("v0.4.1: a bridge reply never carries the CDP secret, even when an apply error quotes the proxy URL", async (t) => {

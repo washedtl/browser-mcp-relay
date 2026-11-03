@@ -922,12 +922,6 @@ function watchdogSetting(raw) {
 }
 
 /**
- * The broker's env: process.env + local-config.json. Keys only in
- * local-config are also copied into processEnv, because the in-process
- * upstream (W2B) reads process.env only: the catalog (built from this env)
- * and the in-process tools must come from the same build and names.
- */
-/**
  * W2F: the owner's always-allow list for the cookie bridge
  * (BROWSER_RELAY_BRIDGE_ALLOW, env or local-config.json; comma-separated).
  * It lifts the keyword guard for those domains; it never lifts a built-in
@@ -942,6 +936,12 @@ function bridgeAllowList(env, log = () => {}) {
   return allow;
 }
 
+/**
+ * The broker's env: process.env + local-config.json. Keys only in
+ * local-config are also copied into processEnv, because the in-process
+ * upstream (W2B) reads process.env only: the catalog (built from this env)
+ * and the in-process tools must come from the same build and names.
+ */
 function brokerEnv(processEnv = process.env, applyLocalConfig = require("../local-config.js").applyLocalConfigToEnv) {
   const env = applyLocalConfig(processEnv);
   // "" counts as unset, as local-config.js treats it
