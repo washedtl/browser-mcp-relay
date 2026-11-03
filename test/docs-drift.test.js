@@ -263,3 +263,13 @@ test("v0.4.1: the cookie bridge's docs match the code: npm scripts, the allow-li
 });
 
 function CHANGELOG_TEXT() { return fs.readFileSync(path.join(REPO, "CHANGELOG.md"), "utf8"); }
+
+test("v0.4.1: README + REFERENCE document --purge, what Pause / removal leave in Brave, and the risks you accept", () => {
+  for (const [name, doc] of [["README", README], ["REFERENCE", REFERENCE]]) {
+    assert.ok(doc.includes("npm run bridge:uninstall -- --purge"), `${name}: --purge`);
+    assert.ok(doc.includes("Risks you accept"), `${name}: risks`);
+    assert.ok(/DPAPI only/.test(doc) && /App-Bound Encryption/.test(doc), `${name}: DPAPI risk`);
+    assert.ok(/revoke approval/.test(doc), `${name}: what revoking does`);
+  }
+  assert.match(fs.readFileSync(path.join(REPO, "scripts", "bridge-install.js"), "utf8"), /argv\.includes\("--purge"\)/);
+});

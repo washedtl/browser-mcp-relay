@@ -140,11 +140,25 @@ npm run bridge:install     # registers the native-messaging host for Chrome (HKC
 3. Check that the extension ID is `dfcccancdkogdddemhecnffcjllbjmba`.
 4. Open the extension's options page (click its icon), review the lists, and click **Approve & start sync**.
 
-`npm run bridge:uninstall` removes the registry key and the two files `bridge:install` wrote; then remove the extension in `chrome://extensions`. Re-run `bridge:install` after moving the repo or switching Node installs.
+**Stop, undo, uninstall:**
+- **Pause sync** (on the review page) stops syncing. Nothing already in Brave is removed, and un-pausing resyncs.
+- Turning a domain **off** on the review page removes that domain's bridge cookies from Brave while a broker runs.
+- There is no separate "revoke approval" button: removing the extension (or clearing its data) resets the approval. That stops syncing, but it doesn't remove anything from Brave either.
+- `npm run bridge:uninstall` removes the registry key and the two files `bridge:install` wrote.
+- **`npm run bridge:uninstall -- --purge`** also takes the synced logins back out. Remove (or pause) the extension first, so it can't sync them straight back. The running broker then expires, in Brave, every cookie the bridge put there, and the bridge's state file and log are deleted. With no broker running, or the extension still connected, it changes nothing and says what to do.
+
+Re-run `bridge:install` after moving the repo or switching Node installs. If the broker runs elevated (as administrator, e.g. `BROWSER_RELAY_BROKER_DEELEVATE=off`), the bridge can't connect to it: the extension's review page and `cookie-bridge.log` say so.
 
 **Check it:** `npm run broker:status` has a `cookieBridge` block (`bridges` connected, `cookies`, `domains`, `managed`, `pendingDeletes`, `lastSyncAt`, and the `allow` list it read). These are counts only, never a value. The native host logs to `%LOCALAPPDATA%\browser-mcp-relay\broker\cookie-bridge.log`. The broker's lines in `broker.log` start with `cookie bridge:`. Next to `broker.key`, a `cookie-bridge-<hash>.json` keeps the identities (name, domain, path, flags; never a value) of the cookies the bridge put into Brave and of the deletions Brave may not have yet, so a deletion in Chrome reaches Brave even across broker restarts.
 
 **Values stay out of tool results:** `cookies_export` returns the cookies the bridge has put into Brave with value `"[bridge-managed]"`, and `cookies_import` skips that placeholder. This is not a sandbox: a page script (`execute`, `document.cookie`) can still read any cookie that isn't HttpOnly.
+
+**Risks you accept** by installing it:
+- Brave stores the synced cookies with DPAPI only (no App-Bound Encryption like Chrome's), so any process running as you can decrypt them from the broker profile on disk.
+- Any process running as you can drive the broker, or rewrite the native host's launcher or its HKCU registry key.
+- Page scripts and `execute` can read synced values (non-HttpOnly cookies).
+- Parent-domain cookies (e.g. `.amazon.com`) sync even where a subdomain is denied (`pay.amazon.com`).
+- Powerful but allowed domains (code hosting, package registries, AI accounts) sync unless you untick them on the review page.
 
 **Limits:**
 - Cookies only: no localStorage, sessionStorage or IndexedDB. A site that keeps its login token there still needs a login in Brave.
