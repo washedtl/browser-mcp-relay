@@ -600,7 +600,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       if (done) return undefined;
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
-        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)") });
+        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)") }, rest);
         return undefined;
       }
       sessions.set(connId, Date.now());

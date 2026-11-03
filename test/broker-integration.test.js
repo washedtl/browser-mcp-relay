@@ -122,24 +122,49 @@ test("control status: connections with their tabs, Brave up + pid, pipe, profile
   assert.ok(Number.isFinite(s.rssMB) && Number.isFinite(s.uptimeS));
 });
 
+/** A raw control exchange: hello{ctl} → [hello reply, challenge] → answer(mac(challenge)) → reply. */
+async function rawControl(pipe, cmd, macFor) {
+  const sock = net.connect(pipe);
+  await new Promise((r) => sock.once("connect", r));
+  const lines = [];
+  let buf = "";
+  const waitLines = (n) => until(() => lines.length >= n, 3000, `${n} lines`);
+  sock.setEncoding("utf8");
+  sock.on("data", (d) => {
+    buf += d;
+    for (let i; (i = buf.indexOf("\n")) >= 0;) { lines.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); }
+  });
+  sock.write(JSON.stringify({ bmr: "hello", v: 1, nonce: crypto.randomBytes(16).toString("hex"), ctl: cmd }) + "\n");
+  await waitLines(2);
+  const challenge = lines[1].challenge;
+  sock.write(JSON.stringify({ bmr: "ctl", mac: macFor(challenge) }) + "\n");
+  await waitLines(3);
+  sock.destroy();
+  return { challenge, answer: lines[2] };
+}
+
 test("control: a request without the key's MAC gets no status and is not served as MCP", async (t) => {
   const b = await startTestBroker(t);
   const wrongKey = Buffer.alloc(32, 9);
   await assert.rejects(requestControl({ pipe: b.pipe, key: wrongKey, cmd: "status" }), (e) => e.code === "EAUTH");
-  // right hello, forged ctlMac
-  const sock = net.connect(b.pipe);
-  await new Promise((r) => sock.once("connect", r));
-  const nonce = crypto.randomBytes(16).toString("hex");
-  sock.write(JSON.stringify({ bmr: "hello", v: 1, nonce, ctl: "stop", ctlMac: ctlMac(wrongKey, "stop", nonce) }) + "\n");
-  const lines = await new Promise((resolve) => {
-    let buf = "";
-    sock.on("data", (d) => { buf += d; });
-    sock.on("close", () => resolve(buf.trim().split("\n")));
-  });
-  assert.strictEqual(JSON.parse(lines[1]).ok, false);
-  assert.match(JSON.parse(lines[1]).error, /not authenticated/);
+  const { answer } = await rawControl(b.pipe, "stop", (challenge) => ctlMac(wrongKey, "stop", challenge));
+  assert.strictEqual(answer.ok, false);
+  assert.match(answer.error, /not authenticated/);
   await sleep(100);
   assert.deepStrictEqual(b.exits, [], "a forged stop does nothing");
+});
+
+test("V2-e: the broker issues the challenge — a recorded control MAC can't be replayed", async (t) => {
+  const b = await startTestBroker(t);
+  const first = await rawControl(b.pipe, "stop", (challenge) => ctlMac(KEY, "status", challenge)); // valid for status, not stop
+  assert.strictEqual(first.answer.ok, false, "a MAC is bound to its command");
+  const recorded = await rawControl(b.pipe, "status", (challenge) => ctlMac(KEY, "status", challenge));
+  assert.strictEqual(recorded.answer.ok, true);
+  const replay = await rawControl(b.pipe, "status", () => ctlMac(KEY, "status", recorded.challenge));
+  assert.notStrictEqual(replay.challenge, recorded.challenge, "a fresh challenge per request");
+  assert.strictEqual(replay.answer.ok, false);
+  assert.match(replay.answer.error, /not authenticated/);
+  assert.deepStrictEqual(b.exits, []);
 });
 
 test("control stop: Brave closes gracefully, the broker shuts down and releases the pipe", async (t) => {
