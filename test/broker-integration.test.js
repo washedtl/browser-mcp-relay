@@ -269,3 +269,16 @@ test("control: a status bigger than a handshake line (4 KB cap) still arrives wh
   assert.ok(JSON.stringify(r).length > 40_000);
   assert.deepStrictEqual(r.status, big);
 });
+
+test("A8: the broker loads upstream with its own merged env (one env writer: brokerEnv)", async (t) => {
+  const env = { BROWSER_RELAY_UPSTREAM_PATH: "C:\custom\dist\index.js", TOOL_NAME_PREFIX: "x_" };
+  let seen = null;
+  const upstream = fakes.fakeUpstreamModule();
+  const orig = upstream.loadUpstream;
+  upstream.loadUpstream = (opts) => { seen = opts; return orig.call(upstream, opts); };
+  const b = await startTestBroker(t, { env, deps: { upstreamModule: () => upstream } });
+  const c = await connectClient(t, b.pipe);
+  await c.callTool({ name: "content_get-as-text", arguments: {} });
+  assert.strictEqual(seen.env, env);
+  assert.match(seen.cdpUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+});

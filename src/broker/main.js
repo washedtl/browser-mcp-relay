@@ -346,7 +346,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     if (!upstreamPromise) {
       upstreamPromise = (async () => {
         const t0 = Date.now();
-        const up = await upstreamModule.loadUpstream({ cdpUrl });
+        const up = await upstreamModule.loadUpstream({ cdpUrl, env });
         if (!uninstallWindows) uninstallWindows = getWindowPages().installWindowPerPage({ placement }) || (() => {});
         log(`upstream ${up.version} in-process: ${up.tools.length} tools in ${Date.now() - t0} ms`);
         return { up, byName: new Map(up.tools.map((e) => [e.name, e])) };

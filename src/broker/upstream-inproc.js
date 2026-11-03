@@ -197,15 +197,17 @@ let loaded = null; // { cdpUrl, promise }
 /**
  * Import upstream (once per process) bound to `cdpUrl`.
  *
- * @param {{cdpUrl: string, localConfigPath?: string}} opts  cdpUrl: http(s)://host:port (or
- *   ws(s)://) of the broker's Brave; localConfigPath: test seam (default <repo>/local-config.json)
+ * @param {{cdpUrl: string, env?: object}} opts  cdpUrl: http(s)://host:port (or ws(s)://) of the
+ *   broker's Brave; env: the local-config-merged env (the broker's), for BROWSER_RELAY_UPSTREAM_PATH.
+ *   Upstream itself reads its settings from process.env at import: the broker's brokerEnv() puts
+ *   local-config.json's keys there before anything loads.
  * @returns {Promise<{version: string,
  *   tools: Array<{name: string, description: string, inputShape: object, tool: object, pageTool: boolean}>,
  *   createContext: (sessionKey: string) => Promise<object>,
  *   execute: (ctx: object, tool: object, args: object) => Promise<object>,
  *   Execute: Function, ScenarioRun: Function}>}
  */
-function loadUpstream({ cdpUrl, localConfigPath } = {}) {
+function loadUpstream({ cdpUrl, env = applyLocalConfigToEnv(process.env) } = {}) {
   if (typeof cdpUrl !== "string" || !/^(https?|wss?):\/\/[^/]+/.test(cdpUrl)) {
     return Promise.reject(new Error(`[broker] loadUpstream needs cdpUrl as http(s)://host:port or ws(s)://…, got ${JSON.stringify(cdpUrl)}`));
   }
@@ -215,7 +217,7 @@ function loadUpstream({ cdpUrl, localConfigPath } = {}) {
     }
     return loaded.promise;
   }
-  const promise = doLoad(cdpUrl, localConfigPath);
+  const promise = doLoad(cdpUrl, env);
   loaded = { cdpUrl, promise };
   // never cache a failed load: the next call retries from scratch
   promise.catch(() => { if (loaded && loaded.promise === promise) loaded = null; });
@@ -235,13 +237,7 @@ function applyBundleFixes(distDir) {
   }
 }
 
-async function doLoad(cdpUrl, localConfigPath) {
-  // env over local-config.json, as everywhere in the relay. Upstream reads its
-  // own settings (TOOL_NAME_PREFIX, AVAILABLE_TOOL_DOMAINS, ...) from
-  // process.env at import, so keys only local-config.json sets go there first
-  // (the forced env below still wins).
-  const env = applyLocalConfigToEnv(process.env, localConfigPath ? { path: localConfigPath } : {});
-  for (const [k, v] of Object.entries(env)) if (!process.env[k] && v) process.env[k] = v;
+async function doLoad(cdpUrl, env) {
   const pkg = resolveUpstreamPackage(env);
   applyBundleFixes(pkg.distDir);
   const chunks = locateUpstreamChunks(pkg.distDir);
