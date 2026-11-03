@@ -1,12 +1,179 @@
 const test = require("node:test");
 const assert = require("node:assert");
+const vm = require("node:vm");
 const tool = require("../../src/own-tools/stealth-apply.js");
+const emulate = require("../../src/own-tools/emulate-device.js");
+
+// ─── Execution harness ────────────────────────────────────────────────
+// The stealth patches are a string injected into the page, so source regexes
+// prove nothing about behaviour. Every behavioural test below EXECUTES the
+// exact script the handler hands to addInitScript / page.evaluate inside a
+// fresh vm realm ("a document") whose globals mimic Chromium: accessors on
+// Navigator.prototype, a NavigatorUAData built the way Chromium builds it,
+// an AudioBuffer whose getChannelData returns the SAME live Float32Array on
+// every call, WebGL prototypes with native getParameter, etc.
+
+const WIN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
+const MAC_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
+const ANDROID_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36";
+
+// Brave's own (native) client hints on Windows: note the "Brave" brand.
+const BRAVE_NATIVE_UAD = {
+  brands: [
+    { brand: "Brave", version: "127" },
+    { brand: "Chromium", version: "127" },
+    { brand: "Not)A;Brand", version: "99" },
+  ],
+  mobile: false,
+  platform: "Windows",
+  platformVersion: "19.0.0",
+  architecture: "x86",
+  bitness: "64",
+  model: "",
+  wow64: false,
+};
+// What Chromium exposes when the UA is overridden WITHOUT userAgentMetadata:
+// navigator.userAgentData still exists but brands are blanked.
+const BLANKED_UAD = { brands: [], mobile: false, platform: "" };
+
+const ALL_HINTS = ["architecture", "bitness", "brands", "fullVersionList", "mobile", "model", "platform", "platformVersion", "uaFullVersion", "wow64"];
+
+// Runs INSIDE the vm realm (serialized via toString), so it may only use
+// its argument and realm globals.
+function installFakeBrowser(opts) {
+  var g = globalThis;
+  g.window = g;
+  g.__nativeQueryCalls = [];
+  var permissions = {
+    query: function query(p) { g.__nativeQueryCalls.push(p && p.name); return Promise.resolve({ state: "denied" }); },
+  };
+  function Navigator() {}
+  Object.defineProperties(Navigator.prototype, {
+    userAgent: { get: function () { return opts.userAgent; }, configurable: true, enumerable: true },
+    webdriver: { get: function () { return true; }, configurable: true, enumerable: true },
+    languages: { get: function () { return Object.freeze(["en-US"]); }, configurable: true, enumerable: true },
+    plugins: { get: function () { return []; }, configurable: true, enumerable: true },
+    permissions: { get: function () { return permissions; }, configurable: true, enumerable: true },
+  });
+  if (opts.uaData) {
+    // Chromium builds NavigatorUAData from the (possibly CDP-overridden)
+    // UserAgentMetadata: low-entropy getters + getHighEntropyValues.
+    var d = opts.uaData;
+    var brands = Object.freeze(d.brands.map(function (b) { return Object.freeze({ brand: b.brand, version: b.version }); }));
+    function NavigatorUAData() {}
+    Object.defineProperties(NavigatorUAData.prototype, {
+      brands: { get: function () { return brands; }, configurable: true, enumerable: true },
+      mobile: { get: function () { return d.mobile; }, configurable: true, enumerable: true },
+      platform: { get: function () { return d.platform; }, configurable: true, enumerable: true },
+    });
+    NavigatorUAData.prototype.getHighEntropyValues = function getHighEntropyValues(hints) {
+      var out = { brands: brands, mobile: d.mobile, platform: d.platform };
+      hints.forEach(function (h) { if (h in d) out[h] = d[h]; });
+      return Promise.resolve(out);
+    };
+    var uad = new NavigatorUAData();
+    g.__nativeUAD = uad;
+    Object.defineProperty(Navigator.prototype, "userAgentData", { get: function () { return uad; }, configurable: true, enumerable: true });
+  }
+  g.navigator = new Navigator();
+  g.Notification = function Notification() {};
+  g.Notification.permission = "default";
+
+  function AudioBuffer(o) {
+    this._ch = [];
+    for (var c = 0; c < o.numberOfChannels; c++) {
+      var a = new Float32Array(o.length);
+      for (var i = 0; i < a.length; i++) a[i] = Math.sin((i + 1) * (c + 1) / 7) * 0.25;
+      this._ch.push(a);
+    }
+  }
+  // Real Chromium returns the same live Float32Array view on every call.
+  AudioBuffer.prototype.getChannelData = function getChannelData(ch) {
+    if (!(this instanceof AudioBuffer)) throw new TypeError("Illegal invocation");
+    var a = this._ch[ch >>> 0];
+    if (!a) throw new RangeError("channel index out of range");
+    return a;
+  };
+  AudioBuffer.prototype.copyFromChannel = function copyFromChannel(dest, ch, start) {
+    if (!(this instanceof AudioBuffer)) throw new TypeError("Illegal invocation");
+    var a = this._ch[ch >>> 0];
+    if (!a) throw new RangeError("channel index out of range");
+    start = start >>> 0;
+    for (var i = 0; i < dest.length && start + i < a.length; i++) dest[i] = a[start + i];
+  };
+  g.AudioBuffer = AudioBuffer;
+
+  function WebGLRenderingContext() {}
+  WebGLRenderingContext.prototype.getParameter = function getParameter(p) { return "native1:" + p; };
+  function WebGL2RenderingContext() {}
+  WebGL2RenderingContext.prototype.getParameter = function getParameter(p) { return "native2:" + p; };
+  g.WebGLRenderingContext = WebGLRenderingContext;
+  g.WebGL2RenderingContext = WebGL2RenderingContext;
+}
+
+/** A fresh document. `uaData`: object (native hints) or null (insecure context / no UA-CH). */
+function makeDoc({ userAgent = WIN_UA, uaData = BRAVE_NATIVE_UAD } = {}) {
+  const ctx = vm.createContext({});
+  vm.runInContext(`(${installFakeBrowser.toString()})(${JSON.stringify({ userAgent, uaData })})`, ctx);
+  return {
+    ctx,
+    run: (script) => vm.runInContext(script, ctx),
+    get: (expr) => vm.runInContext(expr, ctx),
+  };
+}
+
+// Cross-realm values have foreign prototypes; normalize before deepStrictEqual.
+const plain = (v) => JSON.parse(JSON.stringify(v));
+
+/** Fake BrowserContext that records init scripts and returns Playwright-style disposables. */
+function makeContext({ pages = [], disposable = true } = {}) {
+  const scripts = [];
+  const disposed = [];
+  return {
+    scripts,
+    disposed,
+    addInitScript: async (s) => {
+      const idx = scripts.push(s) - 1;
+      return disposable ? { dispose: async () => { disposed.push(idx); } } : undefined;
+    },
+    pages: () => pages,
+  };
+}
+
+/** Run a page "load": every still-registered init script, in registration order. */
+function loadNewDoc(context, docOpts) {
+  const doc = makeDoc(docOpts);
+  context.scripts.forEach((s, i) => { if (!context.disposed.includes(i)) doc.run(s); });
+  return doc;
+}
+
+async function withBridge(context, fn) {
+  const prev = globalThis.__relayBridge;
+  globalThis.__relayBridge = { context };
+  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+}
+
+/** Returns the script the handler injects for one fresh context. */
+async function captureScript(args = {}) {
+  const context = makeContext();
+  await withBridge(context, () => tool.handler(args));
+  return context.scripts[0];
+}
+
+// ─── Tool shape + handler contract ────────────────────────────────────
 
 test("stealth_apply has required tool shape", () => {
   assert.strictEqual(tool.name, "stealth_apply");
   assert.strictEqual(typeof tool.description, "string");
   assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
+});
+
+test("stealth_apply description stays compact (model-visible catalog weight)", () => {
+  // Was ~1.2K chars before W1D; the full coverage list lives in docs/REFERENCE.md.
+  assert.ok(tool.description.length <= 600, `description is ${tool.description.length} chars (cap 600)`);
+  assert.match(tool.description, /force/);
+  assert.match(tool.description, /emulate_device/);
 });
 
 test("stealth_apply returns isError when bridge missing", async () => {
@@ -21,326 +188,327 @@ test("stealth_apply returns isError when bridge missing", async () => {
   }
 });
 
-// V1-6 + T0-4 + T1-7: stealth_apply is now idempotent per context. First call
-// installs the init script; second call no-ops with alreadyApplied:true; only
-// `force: true` re-applies. Previously, repeat calls accumulated init scripts
-// AND chained `navigator.permissions.query` recursively (each call's monkey-
-// patch wrapped the previous override).
+// T0-4 + T1-7: idempotent per context — second call without force no-ops.
 test("T0-4/T1-7: stealth_apply is idempotent per context (second call no-ops)", async () => {
-  const prev = globalThis.__relayBridge;
-  // Fresh WeakMap per test by getting a fresh context each time.
-  tool._APPLIED_CONTEXTS && (() => {})(); // (sanity — _APPLIED_CONTEXTS exists for inspection)
-  const initScripts = [];
-  const fakeContext = {
-    addInitScript: async (s) => { initScripts.push(s); },
-    pages: () => [],
-  };
-  globalThis.__relayBridge = { context: fakeContext };
-  try {
+  const context = makeContext();
+  await withBridge(context, async () => {
     const r1 = await tool.handler({ languages: ["en-US", "en"] });
     const r2 = await tool.handler({ languages: ["fr-FR", "fr"] });
     assert.strictEqual(r1.isError, undefined, "first call must not error");
     assert.strictEqual(r2.isError, undefined, "second call must not error");
-    assert.strictEqual(initScripts.length, 1, "addInitScript called ONCE — second call must be no-op (T1-7)");
+    assert.strictEqual(context.scripts.length, 1, "addInitScript called ONCE — second call must be no-op (T1-7)");
     const r2Body = JSON.parse(r2.content[0].text);
-    assert.strictEqual(r2Body.alreadyApplied, true, "second call must report alreadyApplied=true");
-    assert.strictEqual(r2Body.applied, false, "second call must report applied=false");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+    assert.strictEqual(r2Body.alreadyApplied, true);
+    assert.strictEqual(r2Body.applied, false);
+    assert.deepStrictEqual(r2Body.languages, ["en-US", "en"]);
+  });
 });
 
-test("T1-7: stealth_apply with force=true re-applies even if already applied", async () => {
-  const prev = globalThis.__relayBridge;
-  const initScripts = [];
-  const fakeContext = {
-    addInitScript: async (s) => { initScripts.push(s); },
-    pages: () => [],
-  };
-  globalThis.__relayBridge = { context: fakeContext };
-  try {
+test("T1-7: force=true registers a new init script and reports the new languages", async () => {
+  // Older playwright-core: addInitScript returns nothing disposable.
+  const context = makeContext({ disposable: false });
+  await withBridge(context, async () => {
     await tool.handler({ languages: ["en-US"] });
     const r2 = await tool.handler({ languages: ["fr-FR"], force: true });
-    assert.strictEqual(initScripts.length, 2, "force=true must re-add the init script");
+    assert.strictEqual(context.scripts.length, 2, "force=true must register a new init script");
     const r2Body = JSON.parse(r2.content[0].text);
     assert.strictEqual(r2Body.applied, true);
     assert.deepStrictEqual(r2Body.languages, ["fr-FR"]);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  });
 });
 
-test("T0-4: stealth script has window.__relayStealthApplied sentinel for page-level idempotency", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // The script must start with the sentinel guard so a re-run on the same
-  // page short-circuits before re-monkey-patching navigator.permissions.query.
-  assert.ok(/window\.__relayStealthApplied/.test(src),
-    "stealth script must include window.__relayStealthApplied sentinel");
-  assert.ok(/if\s*\(\s*window\.__relayStealthApplied\s*\)\s*return/.test(src),
-    "stealth script must early-return when sentinel set");
+test("handler injects syntactically valid JS that runs cleanly in a bare realm (no browser globals)", async () => {
+  const script = await captureScript({ languages: ["en-US"] });
+  assert.doesNotThrow(() => new Function(script), "stealth script must parse");
+  // Every patch block is try-guarded: a window with none of the patched
+  // APIs (no navigator, no AudioBuffer, no WebGL) must not throw.
+  const bare = vm.createContext({});
+  vm.runInContext("this.window = this;", bare);
+  assert.doesNotThrow(() => vm.runInContext(script, bare));
 });
 
-test("V1-6: stealth script source guards each defineProperty in try/catch", () => {
-  // Source-level guard against reverting to the unguarded form. Each
-  // defineProperty must be inside its own try {…} catch block so a
-  // second-run redefinition is a no-op rather than throwing the whole
-  // script down.
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // Find each Object.defineProperty(navigator, ...) and confirm it sits
-  // inside an open `try {` that hasn't been closed by `} catch` yet.
-  // We scan backward up to 50 lines (the userAgentData synthesis block is
-  // long because it builds a full NavigatorUAData literal). Bail when we
-  // see `} catch` (means we're past the end of a previous try block) OR
-  // when we find the enclosing `try {`.
-  const lines = src.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (!/Object\.defineProperty\(navigator/.test(lines[i])) continue;
-    let inTry = false;
-    for (let j = i; j >= Math.max(0, i - 50); j--) {
-      if (/\}\s*catch\b/.test(lines[j]) && j !== i) break;
-      if (/\btry\s*\{/.test(lines[j])) { inTry = true; break; }
-    }
-    assert.ok(inTry,
-      `defineProperty(navigator,...) at line ${i + 1} must be inside a try {}: ${lines[i].trim()}`);
-  }
+// ─── W1D-1: force:true must actually take effect ──────────────────────
+
+test("W1D-1: force re-apply changes navigator.languages on NEW documents (both scripts registered)", async () => {
+  const context = makeContext({ disposable: false }); // worst case: old script can't be removed
+  await withBridge(context, async () => {
+    await tool.handler({ languages: ["en-US", "en"] });
+    await tool.handler({ languages: ["fr-FR", "fr"], force: true });
+  });
+  const doc = loadNewDoc(context, {});
+  assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["fr-FR", "fr"],
+    "the newer apply must win even though the older init script runs first on every load");
 });
 
-// Sanity: the stealth script string itself, evaluated in a clean realm,
-// must not throw when run twice. We can't run actual page JS, but we can
-// extract the script body and verify it parses + the try/catch guards work
-// on a normal Node.js global (where navigator doesn't exist) — the catch
-// blocks should silently swallow the absent-navigator errors.
-test("V1-6: stealth script source has try/catch guards on every patch block", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // Count try/catch blocks inside the stealthScript template literal.
-  const scriptStart = src.indexOf("const stealthScript = `");
-  const scriptEnd = src.indexOf("`;", scriptStart + 1);
-  assert.ok(scriptStart >= 0 && scriptEnd > scriptStart, "stealthScript template literal must exist");
-  const scriptBody = src.slice(scriptStart, scriptEnd);
-  const tryCount = (scriptBody.match(/\btry\s*\{/g) || []).length;
-  // 7 guards now: T0 (webdriver / plugins / languages / permissions /
-  // chrome runtime) + T1-A (userAgentData) + T1-C (AudioBuffer
-  // getChannelData). T1-B toString defense is a helper used WITHIN those
-  // try blocks, not its own.
-  assert.ok(tryCount >= 7,
-    `expected >=7 try blocks in stealthScript (5 T0 + T1-A + T1-C), got ${tryCount}`);
-});
-
-// ─── Tier 1 (v0.3.4) — new patches ───
-
-test("T1-A: stealth script synthesizes navigator.userAgentData from current UA", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // The userAgentData synthesis must:
-  //  1. Read navigator.userAgent at runtime (so it tracks emulate_device)
-  //  2. Produce { brands, mobile, platform, getHighEntropyValues, toJSON }
-  //  3. Wrap in defineProperty so it overrides any existing userAgentData
-  assert.ok(/navigator\.userAgent/.test(src),
-    "must read navigator.userAgent at runtime");
-  assert.ok(/Object\.defineProperty\(navigator,\s*['"]userAgentData['"]/.test(src),
-    "must defineProperty(navigator, 'userAgentData')");
-  assert.ok(/getHighEntropyValues/.test(src),
-    "must expose getHighEntropyValues");
-  assert.ok(/brands/.test(src) && /platform/.test(src) && /mobile/.test(src),
-    "must expose brands + platform + mobile fields");
-  assert.ok(/Chromium/.test(src),
-    "Chromium brand must appear in synthesized brands list");
-});
-
-test("T1-B: stealth script installs toString defense on patched getters", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // Helper must exist + be applied to the patched getters.
-  assert.ok(/function nativeLike\b|nativeLike\(/.test(src),
-    "must define + use nativeLike helper");
-  // The native-string template must include "[native code]".
-  assert.ok(/\[native code\]/.test(src),
-    "toString defense must produce '[native code]' marker");
-  // Verify nativeLike is applied to the patched getters by name.
-  assert.ok(/nativeLike\([\s\S]{0,200}'get webdriver'/.test(src),
-    "webdriver getter must use nativeLike");
-  assert.ok(/nativeLike\([\s\S]{0,200}'get plugins'/.test(src),
-    "plugins getter must use nativeLike");
-  assert.ok(/nativeLike\([\s\S]{0,200}'get languages'/.test(src),
-    "languages getter must use nativeLike");
-  assert.ok(/nativeLike\([\s\S]{0,300}'get userAgentData'/.test(src),
-    "userAgentData getter must use nativeLike");
-});
-
-test("T1-C: stealth script stabilizes AudioBuffer.getChannelData fingerprint with per-session seed", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  assert.ok(/AudioBuffer\.prototype\.getChannelData/.test(src),
-    "must override AudioBuffer.prototype.getChannelData");
-  // Must use a per-session seed (window.__relayAudioSeed) — NOT random per
-  // call (which would be its OWN tell — real fingerprints are stable).
-  assert.ok(/__relayAudioSeed/.test(src),
-    "must use a per-session seed (window.__relayAudioSeed), not random per-call");
-  // Seed must be in the floating-point error band so it's imperceptible.
-  assert.ok(/1e-7/.test(src),
-    "seed magnitude must be <= 1e-7 (imperceptible jitter)");
-});
-
-test("T1: handler runs with new patches without throwing", async () => {
-  // Smoke-test the actual handler with all the new patches in place. We
-  // want to confirm the stringified script doesn't have a syntax bug that
-  // only manifests at addInitScript time.
-  const prev = globalThis.__relayBridge;
-  let scriptSeen = null;
-  const fakeContext = {
-    addInitScript: async (s) => { scriptSeen = s; },
-    pages: () => [],
-  };
-  globalThis.__relayBridge = { context: fakeContext };
-  try {
-    const r = await tool.handler({ languages: ["en-US", "en"] });
-    assert.strictEqual(r.isError, undefined, "handler must not error");
-    assert.ok(scriptSeen, "addInitScript must have been called");
-    // Confirm the script contains all 3 Tier-1 patches.
-    assert.ok(/userAgentData/.test(scriptSeen), "script must include userAgentData patch");
-    assert.ok(/getChannelData/.test(scriptSeen), "script must include getChannelData patch");
-    assert.ok(/\[native code\]/.test(scriptSeen), "script must include toString defense");
-    // Confirm the script PARSES as valid JS by Function-constructing it.
-    // (Node's parser throws on syntax errors.)
-    assert.doesNotThrow(() => new Function(scriptSeen),
-      "stealth script must be syntactically valid JS");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
-});
-
-// ─── Tier 2 (v0.3.5) — additional patches ───
-
-test("T2-B: stealth script populates window.chrome with loadTimes / csi / app", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // chrome.loadTimes — must return an object with timing fields.
-  assert.ok(/window\.chrome\.loadTimes\s*=/.test(src),
-    "must populate window.chrome.loadTimes");
-  assert.ok(/requestTime[\s\S]*startLoadTime/.test(src),
-    "loadTimes must return realistic timing fields");
-  assert.ok(/connectionInfo/.test(src),
-    "loadTimes must include connectionInfo (real Chrome ships it)");
-  // chrome.csi — Client-Side Instrumentation timing.
-  assert.ok(/window\.chrome\.csi\s*=/.test(src),
-    "must populate window.chrome.csi");
-  assert.ok(/onloadT[\s\S]*pageT/.test(src),
-    "csi must return onloadT + pageT fields");
-  // chrome.app — installation/runtime state namespace.
-  assert.ok(/window\.chrome\.app\s*=/.test(src),
-    "must populate window.chrome.app");
-  assert.ok(/InstallState[\s\S]*RunningState/.test(src),
-    "chrome.app must include InstallState + RunningState constants");
-  assert.ok(/getDetails[\s\S]*getIsInstalled/.test(src),
-    "chrome.app must include getDetails + getIsInstalled methods");
-});
-
-test("T2-C: stealth script overrides multiple permission types beyond notifications", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // PERMISSION_OVERRIDES map must cover the canonical bot-detection probes.
-  const REQUIRED_PERMISSIONS = [
-    "geolocation",
-    "clipboard-read",
-    "clipboard-write",
-    "camera",
-    "microphone",
-    "midi",
-    "push",
-  ];
-  for (const p of REQUIRED_PERMISSIONS) {
-    assert.ok(new RegExp(`['"]${p}['"]`).test(src),
-      `PERMISSION_OVERRIDES must include '${p}'`);
-  }
-  // Map must be consulted inside the patched query function.
-  assert.ok(/PERMISSION_OVERRIDES\b/.test(src),
-    "permissions.query patch must consult PERMISSION_OVERRIDES");
-  // Notifications must STILL be handled separately (its state is dynamic
-  // based on Notification.permission, not a static map value).
-  assert.ok(/params\.name === ['"]notifications['"]/.test(src),
-    "notifications must still be handled via dynamic Notification.permission lookup");
-});
-
-test("T2-D: stealth script overrides WebGL renderer + vendor on both WebGL1 and WebGL2", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const src = fs.readFileSync(
-    path.resolve(__dirname, "..", "..", "src", "own-tools", "stealth-apply.js"),
-    "utf8",
-  );
-  // The two debug-renderer-info constants.
-  assert.ok(/0x9245/.test(src),
-    "must reference UNMASKED_VENDOR_WEBGL constant (0x9245)");
-  assert.ok(/0x9246/.test(src),
-    "must reference UNMASKED_RENDERER_WEBGL constant (0x9246)");
-  // Both WebGL1 and WebGL2 prototypes must be patched (WebGL2 has its own
-  // getParameter — patching only WebGL1 leaves WebGL2 callers exposed).
-  assert.ok(/WebGLRenderingContext\.prototype\.getParameter\s*=/.test(src),
-    "must patch WebGLRenderingContext.prototype.getParameter");
-  assert.ok(/WebGL2RenderingContext\.prototype\.getParameter\s*=/.test(src),
-    "must patch WebGL2RenderingContext.prototype.getParameter (WebGL2 has its own getParameter)");
-  // GPU string selection must be UA-aware (per docs/BACKLOG.md: mismatched
-  // UA + GPU = instant flag).
-  assert.ok(/Macintosh/.test(src) && /Linux/.test(src) && /Android/.test(src),
-    "GPU string selection must branch on UA platform (Macintosh / Linux / Android / Windows)");
-});
-
-// T2-A is in emulate-device.js — its tests live in test/own-tools/emulate-device.test.js.
-
-// ─── Sanity: full handler still ships valid JS with Tier 2 patches ───
-
-test("T2: handler still ships valid JS after Tier 2 additions", async () => {
-  const prev = globalThis.__relayBridge;
-  let scriptSeen = null;
-  const fakeContext = {
-    addInitScript: async (s) => { scriptSeen = s; },
-    pages: () => [],
-  };
-  globalThis.__relayBridge = { context: fakeContext };
-  try {
+test("W1D-1: force re-apply is order-independent (newer generation wins even if it runs first)", async () => {
+  const context = makeContext({ disposable: false });
+  await withBridge(context, async () => {
     await tool.handler({ languages: ["en-US"] });
-    // T2 markers — must all be present.
-    assert.ok(/loadTimes/.test(scriptSeen), "T2-B loadTimes patch missing");
-    assert.ok(/PERMISSION_OVERRIDES/.test(scriptSeen), "T2-C permissions map missing");
-    assert.ok(/UNMASKED_VENDOR_WEBGL|0x9245/.test(scriptSeen), "T2-D WebGL patch missing");
-    assert.doesNotThrow(() => new Function(scriptSeen),
-      "stealth script with Tier 2 patches must be syntactically valid JS");
-  } finally {
-    globalThis.__relayBridge = prev;
+    await tool.handler({ languages: ["de-DE"], force: true });
+  });
+  const doc = makeDoc();
+  doc.run(context.scripts[1]);
+  doc.run(context.scripts[0]);
+  assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["de-DE"]);
+});
+
+test("W1D-1: force re-apply updates ALREADY-OPEN pages (page.evaluate path)", async () => {
+  const doc = makeDoc();
+  const page = { evaluate: async (s) => doc.run(s) };
+  const context = makeContext({ pages: [page] });
+  await withBridge(context, async () => {
+    const r1 = JSON.parse((await tool.handler({ languages: ["en-US"] })).content[0].text);
+    assert.strictEqual(r1.patchedOpenPages, 1);
+    assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["en-US"]);
+    await tool.handler({ languages: ["ja-JP", "ja"], force: true });
+  });
+  assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["ja-JP", "ja"],
+    "open page must reflect the forced languages, not stay on the first apply");
+});
+
+test("W1D-1: force re-apply retires the previous init script when Playwright returns a disposable", async () => {
+  const context = makeContext({ disposable: true });
+  await withBridge(context, async () => {
+    await tool.handler({ languages: ["en-US"] });
+    await tool.handler({ languages: ["fr-FR"], force: true });
+    await tool.handler({ languages: ["es-ES"], force: true });
+  });
+  assert.deepStrictEqual(context.disposed, [0, 1], "each force must dispose the script it replaces (no accumulation)");
+  const doc = loadNewDoc(context, {});
+  assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["es-ES"]);
+});
+
+test("W1D-1: re-running the script on one document never chains permissions.query", async () => {
+  const context = makeContext({ disposable: false });
+  await withBridge(context, async () => {
+    await tool.handler({ languages: ["en-US"] });
+    await tool.handler({ languages: ["fr-FR"], force: true });
+  });
+  const doc = loadNewDoc(context, {});
+  doc.run(context.scripts[1]); // e.g. page.evaluate on an open page after the init scripts
+  await doc.get("navigator.permissions.query({ name: 'x-unknown' })");
+  assert.deepStrictEqual(plain(doc.get("__nativeQueryCalls")), ["x-unknown"], "native query must be hit exactly once");
+});
+
+// ─── W1D-2: audio perturbation is stable and never accumulates ───────
+
+test("W1D-2 review V1-1: a valueOf-shifting channel argument cannot re-perturb a channel", async () => {
+  const script = await captureScript();
+  const ref = makeDoc();
+  ref.run(script);
+  const once0 = Array.from(ref.get("new AudioBuffer({ numberOfChannels: 2, length: 1000 }).getChannelData(0)"));
+  const doc = makeDoc();
+  doc.run(script);
+  doc.run("var __b = new AudioBuffer({ numberOfChannels: 2, length: 1000 }); var __k = 0;" +
+    "var __c = { valueOf: function () { return __k++ ? 1 : 0; } }; __b.getChannelData(__c);");
+  assert.strictEqual(doc.get("__k"), 1, "channel argument converted exactly once");
+  assert.deepStrictEqual(Array.from(doc.get("__b.getChannelData(0)")), once0, "channel 0 perturbed exactly once");
+});
+
+test("W1D-2 review V2-1: copyFromChannel sees the same jitter and reads never change the buffer", async () => {
+  const script = await captureScript();
+  const doc = makeDoc();
+  const original = Array.from(doc.get("new AudioBuffer({ numberOfChannels: 1, length: 500 }).getChannelData(0)"));
+  doc.run(script);
+  doc.run("var __b = new AudioBuffer({ numberOfChannels: 1, length: 500 });" +
+    "var __d1 = new Float32Array(500); __b.copyFromChannel(__d1, 0);" +
+    "var __g = Array.from(__b.getChannelData(0));" +
+    "var __d2 = new Float32Array(500); __b.copyFromChannel(__d2, 0, 0);");
+  const d1 = Array.from(doc.get("__d1"));
+  assert.deepStrictEqual(Array.from(doc.get("__d2")), d1, "second copy equals first copy");
+  assert.deepStrictEqual(Array.from(doc.get("__g")), d1, "getChannelData agrees with copyFromChannel");
+  assert.notDeepStrictEqual(d1, original, "copyFromChannel output is perturbed too");
+});
+
+test("W1D-2: getChannelData returns the same values on every call (no cumulative drift)", async () => {
+  const script = await captureScript();
+  const doc = makeDoc();
+  const original = Array.from(doc.get("new AudioBuffer({ numberOfChannels: 1, length: 1000 }).getChannelData(0)"));
+  doc.run(script);
+  doc.run("var __b = new AudioBuffer({ numberOfChannels: 1, length: 1000 });");
+  const first = Array.from(doc.get("__b.getChannelData(0)"));
+  const second = Array.from(doc.get("__b.getChannelData(0)"));
+  const third = Array.from(doc.get("__b.getChannelData(0)"));
+  assert.deepStrictEqual(second, first, "second read must equal first read");
+  assert.deepStrictEqual(third, first, "third read must equal first read");
+  assert.notDeepStrictEqual(first, original, "the perturbation must still change the fingerprint");
+  const changed = first.filter((v, i) => v !== original[i]).length;
+  assert.ok(changed > 0 && changed <= 10, `perturbation should touch a sparse set of samples, touched ${changed}`);
+  assert.ok(first.every((v, i) => Math.abs(v - original[i]) < 1e-6), "perturbation must stay imperceptible");
+});
+
+test("W1D-2: each channel and each buffer is perturbed exactly once", async () => {
+  const script = await captureScript();
+  const mk = "new AudioBuffer({ numberOfChannels: 2, length: 500 })";
+  // Reference: one read per channel on a fresh document with the same script.
+  const ref = makeDoc();
+  ref.run(script);
+  ref.run(`var __r = ${mk};`);
+  const once0 = Array.from(ref.get("__r.getChannelData(0)"));
+  const once1 = Array.from(ref.get("__r.getChannelData(1)"));
+  const orig0 = Array.from(makeDoc().get(`${mk}.getChannelData(0)`));
+  assert.notDeepStrictEqual(once0, orig0, "first read must be perturbed");
+
+  const doc = makeDoc();
+  doc.run(script);
+  doc.run(`var __a = ${mk}; var __b = ${mk};`);
+  // Interleave reads across channels and buffers; repeated reads must not re-apply the seed.
+  doc.run("__a.getChannelData(1); __b.getChannelData(0); __a.getChannelData(0); __a.getChannelData(1); __b.getChannelData(0);");
+  assert.deepStrictEqual(Array.from(doc.get("__a.getChannelData(0)")), once0);
+  assert.deepStrictEqual(Array.from(doc.get("__a.getChannelData(1)")), once1);
+  assert.deepStrictEqual(Array.from(doc.get("__b.getChannelData(0)")), once0, "same waveform in another buffer → same output");
+  assert.deepStrictEqual(Array.from(doc.get("__b.getChannelData(1)")), once1);
+});
+
+test("W1D-2: concurrent first calls register ONE init script (one audio seed per session)", async () => {
+  const context = makeContext();
+  await withBridge(context, () => Promise.all([tool.handler({}), tool.handler({})]));
+  assert.strictEqual(context.scripts.length, 1);
+});
+
+test("W1D-2: a failed addInitScript releases the context so a retry can apply", async () => {
+  const context = makeContext();
+  const realAdd = context.addInitScript;
+  context.addInitScript = async () => { throw new Error("Target closed"); };
+  await withBridge(context, async () => {
+    await assert.rejects(tool.handler({}), /Target closed/);
+    context.addInitScript = realAdd;
+    const body = JSON.parse((await tool.handler({ languages: ["en-US"] })).content[0].text);
+    assert.strictEqual(body.applied, true, "retry must apply, not report alreadyApplied");
+  });
+  assert.strictEqual(context.scripts.length, 1);
+});
+
+test("W1D-2: the audio perturbation is identical across documents in one session", async () => {
+  const context = makeContext();
+  await withBridge(context, () => tool.handler({}));
+  const read = (doc) => Array.from(doc.get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
+  const docA = loadNewDoc(context, {});
+  const docB = loadNewDoc(context, {});
+  assert.deepStrictEqual(read(docB), read(docA), "a per-page random seed is its own tell — must be per-session");
+});
+
+test("W1D-2: force re-apply keeps the session's audio seed", async () => {
+  const context = makeContext({ disposable: true });
+  await withBridge(context, async () => {
+    await tool.handler({ languages: ["en-US"] });
+    const before = Array.from(loadNewDoc(context, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
+    await tool.handler({ languages: ["fr-FR"], force: true });
+    const after = Array.from(loadNewDoc(context, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
+    assert.deepStrictEqual(after, before);
+  });
+});
+
+// ─── W1D-3: client hints — JS side agrees with HTTP side, native kept ─
+
+async function highEntropy(doc) {
+  return plain(await doc.get(`navigator.userAgentData.getHighEntropyValues(${JSON.stringify(ALL_HINTS)})`));
+}
+
+test("W1D-3: Brave's native navigator.userAgentData is left alone when no UA override is active", async () => {
+  const script = await captureScript();
+  const doc = makeDoc({ userAgent: WIN_UA, uaData: BRAVE_NATIVE_UAD });
+  doc.run(script);
+  assert.strictEqual(doc.get("navigator.userAgentData === __nativeUAD"), true, "native object must not be replaced");
+  assert.ok(plain(doc.get("navigator.userAgentData.brands")).some((b) => b.brand === "Brave"),
+    "the Brave brand must survive (HTTP Sec-CH-UA still carries it)");
+  assert.strictEqual(doc.get("Object.getOwnPropertyDescriptor(navigator, 'userAgentData')"), undefined,
+    "no own-property shadow on navigator");
+});
+
+test("W1D-3: emulate_device's metadata (which Chromium also exposes to JS) is kept as-is", async () => {
+  for (const ua of [WIN_UA, MAC_UA, ANDROID_UA]) {
+    const http = plain(emulate.synthesizeUserAgentMetadata(ua)); // what emulate_device sends over CDP
+    const script = await captureScript();
+    const doc = makeDoc({ userAgent: ua, uaData: http });
+    doc.run(script);
+    assert.strictEqual(doc.get("navigator.userAgentData === __nativeUAD"), true, `kept native for ${ua}`);
   }
+});
+
+test("W1D-3: when a UA override blanked the hints, the synthesized JS hints equal emulate_device's HTTP hints", async () => {
+  for (const ua of [WIN_UA, MAC_UA, ANDROID_UA]) {
+    const http = plain(emulate.synthesizeUserAgentMetadata(ua));
+    const script = await captureScript();
+    const doc = makeDoc({ userAgent: ua, uaData: BLANKED_UAD });
+    doc.run(script);
+    const js = await highEntropy(doc);
+    for (const k of ["brands", "fullVersionList", "platform", "platformVersion", "architecture", "bitness", "model", "mobile", "wow64"]) {
+      assert.deepStrictEqual(js[k], http[k], `${k} disagrees between JS and HTTP for ${ua}`);
+    }
+    assert.strictEqual(doc.get("navigator.userAgentData.platform"), http.platform);
+    assert.strictEqual(doc.get("navigator.userAgentData.mobile"), http.mobile);
+    assert.strictEqual(js.uaFullVersion, http.fullVersionList.find((b) => b.brand === "Chromium").version);
+  }
+});
+
+test("W1D-3: userAgentData is not invented where the browser exposes none (insecure context)", async () => {
+  const script = await captureScript();
+  const doc = makeDoc({ uaData: null });
+  doc.run(script);
+  assert.strictEqual(doc.get("typeof navigator.userAgentData"), "undefined");
+});
+
+test("W1D-3: stale native hints that contradict the UA are replaced", async () => {
+  const script = await captureScript();
+  // UA says Android, hints still say Windows (override from a tool that sent mismatched metadata).
+  const doc = makeDoc({ userAgent: ANDROID_UA, uaData: BRAVE_NATIVE_UAD });
+  doc.run(script);
+  assert.strictEqual(doc.get("navigator.userAgentData.platform"), "Android");
+  assert.strictEqual(doc.get("navigator.userAgentData.mobile"), true);
+});
+
+// ─── Characterization: the rest of the patch set, executed ───────────
+
+test("patches: webdriver, plugins, languages, chrome runtime", async () => {
+  const script = await captureScript({ languages: ["en-GB", "en"] });
+  const doc = makeDoc();
+  assert.strictEqual(doc.get("navigator.webdriver"), true, "fake starts as automation-flagged");
+  doc.run(script);
+  assert.strictEqual(doc.get("navigator.webdriver"), undefined);
+  assert.strictEqual(doc.get("navigator.plugins.length"), 3);
+  assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["en-GB", "en"]);
+  assert.strictEqual(doc.get("navigator.languages === navigator.languages"), true, "stable identity like a FrozenArray");
+  assert.strictEqual(doc.get("Object.isFrozen(navigator.languages)"), true);
+  assert.strictEqual(doc.get("typeof chrome.loadTimes().requestTime"), "number");
+  assert.strictEqual(doc.get("typeof chrome.csi().pageT"), "number");
+  assert.strictEqual(doc.get("chrome.app.InstallState.INSTALLED"), "installed");
+  assert.strictEqual(doc.get("chrome.app.getIsInstalled()"), false);
+});
+
+test("patches: permissions.query overrides + passthrough", async () => {
+  const script = await captureScript();
+  const doc = makeDoc();
+  doc.run(script);
+  assert.strictEqual((await doc.get("navigator.permissions.query({ name: 'notifications' })")).state, "default");
+  assert.strictEqual((await doc.get("navigator.permissions.query({ name: 'geolocation' })")).state, "prompt");
+  assert.strictEqual((await doc.get("navigator.permissions.query({ name: 'clipboard-write' })")).state, "granted");
+  for (const name of ["clipboard-read", "camera", "microphone", "midi", "push"]) {
+    assert.strictEqual((await doc.get(`navigator.permissions.query({ name: '${name}' })`)).state, "prompt", name);
+  }
+  assert.strictEqual((await doc.get("navigator.permissions.query({ name: 'x-other' })")).state, "denied", "unknown names pass through");
+  assert.deepStrictEqual(plain(doc.get("__nativeQueryCalls")), ["x-other"]);
+});
+
+test("patches: WebGL vendor/renderer follow the UA platform on WebGL1 + WebGL2, other params pass through", async () => {
+  const script = await captureScript();
+  const win = makeDoc({ userAgent: WIN_UA });
+  win.run(script);
+  assert.strictEqual(win.get("WebGLRenderingContext.prototype.getParameter.call(new WebGLRenderingContext(), 0x9245)"), "Google Inc. (Intel)");
+  assert.match(win.get("WebGL2RenderingContext.prototype.getParameter.call(new WebGL2RenderingContext(), 0x9246)"), /Direct3D11/);
+  assert.strictEqual(win.get("new WebGLRenderingContext().getParameter(7936)"), "native1:7936");
+  assert.strictEqual(win.get("new WebGL2RenderingContext().getParameter(7936)"), "native2:7936");
+  const mac = makeDoc({ userAgent: MAC_UA, uaData: BLANKED_UAD });
+  mac.run(script);
+  assert.match(mac.get("new WebGLRenderingContext().getParameter(0x9246)"), /Apple M1/);
+});
+
+test("patches: patched functions report native-looking toString", async () => {
+  const script = await captureScript();
+  const doc = makeDoc();
+  doc.run(script);
+  assert.strictEqual(doc.get("Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()"), "function get webdriver() { [native code] }");
+  assert.strictEqual(doc.get("navigator.permissions.query.toString()"), "function query() { [native code] }");
+  assert.strictEqual(doc.get("AudioBuffer.prototype.getChannelData.toString()"), "function getChannelData() { [native code] }");
+  assert.strictEqual(doc.get("WebGLRenderingContext.prototype.getParameter.toString()"), "function getParameter() { [native code] }");
 });

@@ -11,78 +11,26 @@
 
 const { getOrCreatePageCdp } = require("./_page-cdp-session.js");
 const { withActivePage } = require("./_active-page.js");
-
-/**
- * T2-A (v0.3.5): synthesize a CDP userAgentMetadata struct from a UA string.
- *
- * CDP's `Network.setUserAgentOverride` accepts a `userAgentMetadata` arg
- * that chromium uses to set HTTP-side `Sec-CH-UA-*` headers. If we override
- * the UA but don't pass userAgentMetadata, chromium falls back to its
- * INTERNAL UA config — producing Sec-CH-UA-* headers that disagree with
- * the override UA we just set. Anti-bot vendors use that mismatch as a
- * detection signal.
- *
- * This pairs with stealth_apply's T1-A patch which synthesizes the JS-side
- * `navigator.userAgentData` from the SAME string. Together they keep the
- * HTTP-header side and the JS-side aligned.
- *
- * Pure helper — exported as a test seam.
- *
- * @param {string} ua — the UA string the caller is overriding to
- * @returns {object} userAgentMetadata in CDP's expected shape
- */
-function synthesizeUserAgentMetadata(ua) {
-  const cm = ua.match(/Chrome\/(\d+)/);
-  const version = cm ? cm[1] : "127";
-  // CDP's userAgentMetadata.platform names: see the chromium source — they're
-  // human-readable strings matching what real Chrome/Brave reports.
-  // Order matters: Android UAs contain "Linux; Android..." so Android
-  // must be checked BEFORE Linux. iPhone/iPad before macOS for the same
-  // reason (the iOS UA contains "Mac OS X" in the version string).
-  const platform = /Windows/.test(ua) ? "Windows"
-    : /iPhone|iPad/.test(ua) ? "iOS"
-    : /Android/.test(ua) ? "Android"
-    : /Macintosh/.test(ua) ? "macOS"
-    : /Linux/.test(ua) ? "Linux"
-    : "Windows";
-  const mobile = /Mobi|Android|iPhone/.test(ua);
-  const platformVersion = /Windows NT 10/.test(ua) ? "15.0.0"
-    : /Mac OS X (\d+)[._](\d+)/.test(ua) ? RegExp.$1 + "." + RegExp.$2 + ".0"
-    : "15.0.0";
-  const architecture = /Win64|x86_64|x64/.test(ua) ? "x86" : "arm";
-  const bitness = /Win64|x86_64|x64|arm64/.test(ua) ? "64" : "32";
-  // The "Not?A_Brand" is the canonical Greasy-spec randomization slot real
-  // Chrome ships — including it makes the brands list look genuine.
-  const brands = [
-    { brand: "Chromium", version },
-    { brand: "Not?A_Brand", version: "24" },
-  ];
-  const fullVersionList = brands.map((b) => ({
-    brand: b.brand,
-    version: `${b.version}.0.0.0`,
-  }));
-  return {
-    brands,
-    fullVersionList,
-    platform,
-    platformVersion,
-    architecture,
-    model: "",
-    mobile,
-    bitness,
-    wow64: false,
-  };
-}
+// T2-A (v0.3.5) → W1D: CDP's `Network.setUserAgentOverride` takes a
+// `userAgentMetadata` arg that Chromium uses for BOTH the HTTP Sec-CH-UA-*
+// headers and the page's navigator.userAgentData. Overriding the UA without
+// it blanks the client hints (an obvious tell). The metadata now comes from
+// the one generator stealth_apply also uses, so header + JS values agree.
+const { clientHintsFromUA } = require("./_client-hints.js");
 
 module.exports = {
   name: "emulate_device",
   description:
     "Apply device emulation to the active page via CDP Emulation. " +
     "Useful for testing mobile layouts, slow networks, or specific user-agent behavior. " +
-    "Persists until the page navigates or the page is closed.",
+    "Overrides stay on that tab across navigations until the tab closes or you call reset:true.",
   inputSchema: {
     type: "object",
     properties: {
+      reset: {
+        type: "boolean",
+        description: "Clear every override this tool set on the active page (user agent, viewport, touch, network). Use alone.",
+      },
       userAgent: { type: "string", description: "User-Agent header override" },
       viewport: {
         type: "object",
@@ -107,7 +55,15 @@ module.exports = {
       },
     },
   },
-  handler: async ({ userAgent, viewport, network }) => withActivePage(async ({ bridge, page }) => {
+  handler: async ({ reset, userAgent, viewport, network }) => withActivePage(async ({ bridge, page }) => {
+    // W1D-4: reset is all-or-nothing. Mixing it with overrides would race
+    // "clear" against "set" across CDP domains, so reject the combination.
+    if (reset && (userAgent || viewport || network)) {
+      return {
+        content: [{ type: "text", text: "emulate_device: reset:true can't be combined with userAgent / viewport / network. Call reset alone, then apply new overrides." }],
+        isError: true,
+      };
+    }
     // T1-9: validate viewport.{width, height} when a viewport block is provided.
     // The schema declares them required, but JSON-RPC + the MCP SDK don't
     // enforce nested-required. CDP throws an opaque ParameterError on
@@ -133,15 +89,24 @@ module.exports = {
     // structured per-command result instead of short-circuiting and leaving
     // the page in a half-applied state with no diagnostics.
     const sends = [];
+    if (reset) {
+      // W1D-4: undo everything this tool can set. An empty userAgent is
+      // CDP's "no override" (metadata must not accompany it); -1 throughput
+      // = no throttling.
+      sends.push(
+        { name: "userAgent", p: cdp.send("Network.setUserAgentOverride", { userAgent: "" }) },
+        { name: "viewport", p: cdp.send("Emulation.clearDeviceMetricsOverride") },
+        { name: "touch", p: cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false }) },
+        {
+          name: "network",
+          p: cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }),
+        },
+      );
+    }
     if (userAgent) {
-      // T2-A (v0.3.5): also pass userAgentMetadata so the HTTP-side
-      // Sec-CH-UA-* headers align with the JS-side navigator.userAgentData
-      // that stealth_apply T1-A synthesizes. Without this, sites that read
-      // the headers see Brave's defaults while JS-side reports the override
-      // — instant mismatch flag. CDP's setUserAgentOverride accepts a
-      // userAgentMetadata arg with the full UA decomposition; we synthesize
-      // it from the override UA the same way T1-A does at the JS layer.
-      const uaMetadata = synthesizeUserAgentMetadata(userAgent);
+      // T2-A: pass userAgentMetadata so Sec-CH-UA-* headers and
+      // navigator.userAgentData describe the override UA, not Brave.
+      const uaMetadata = clientHintsFromUA(userAgent);
       sends.push({
         name: "userAgent",
         p: cdp.send("Network.setUserAgentOverride", {
@@ -196,15 +161,17 @@ module.exports = {
         failed.push({ name: sends[i].name, error: r.reason && (r.reason.message || String(r.reason)) });
       }
     });
+    const summary = reset ? { reset: sends.map((s) => s.name) } : { applied };
     const result = {
       content: [{
         type: "text",
-        text: JSON.stringify({ applied, failed: failed.length ? failed : undefined }, null, 2),
+        text: JSON.stringify({ ...summary, failed: failed.length ? failed : undefined }, null, 2),
       }],
     };
     if (failed.length) result.isError = true;
     return result;
   }),
-  // T2-A: exported as a test seam.
-  synthesizeUserAgentMetadata,
+  // T2-A: test seam, kept under its old name (docs/BACKLOG.md cites it).
+  // Same function stealth_apply runs in-page.
+  synthesizeUserAgentMetadata: clientHintsFromUA,
 };

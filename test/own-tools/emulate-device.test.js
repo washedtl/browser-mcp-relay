@@ -256,3 +256,92 @@ test("T2-A: emulate_device's handler passes userAgentMetadata to setUserAgentOve
     globalThis.__relayBridge = prev;
   }
 });
+
+// ─── W1D (2026-11-03) ───
+
+test("W1D-3: emulate_device uses the shared client-hints generator (same values stealth_apply exposes to JS)", () => {
+  const { clientHintsFromUA } = require("../../src/own-tools/_client-hints.js");
+  assert.strictEqual(tool.synthesizeUserAgentMetadata, clientHintsFromUA);
+});
+
+test("W1D-3: Mac + Android metadata follow Chromium's rules (arch/bitness/platformVersion)", () => {
+  const mac = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+  );
+  // Was architecture "arm" + bitness "32" (no Mac is 32-bit) and "10.15.0".
+  assert.deepStrictEqual([mac.architecture, mac.bitness, mac.platformVersion], ["arm", "64", "14.0.0"]);
+  const android = tool.synthesizeUserAgentMetadata(
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36"
+  );
+  // Chromium sends no arch/bitness on Android; was "arm" / "32" / "15.0.0".
+  assert.deepStrictEqual([android.architecture, android.bitness, android.platformVersion, android.model], ["", "", "14.0.0", "Pixel 8"]);
+});
+
+test("W1D-4: description no longer claims overrides end on navigation, and documents reset", () => {
+  assert.doesNotMatch(tool.description, /until the page navigates/i);
+  assert.match(tool.description, /navigation/i);
+  assert.match(tool.description, /reset/);
+  assert.strictEqual(tool.inputSchema.properties.reset.type, "boolean");
+});
+
+test("W1D-4: reset:true clears UA, device metrics, touch and network overrides on the active page", async () => {
+  const prev = globalThis.__relayBridge;
+  const sentCommands = [];
+  const fakePage = { once() {} };
+  const fakeCdp = { send: async (method, params) => { sentCommands.push({ method, params }); }, detach: async () => {} };
+  globalThis.__relayBridge = { context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
+  try {
+    const r = await tool.handler({ reset: true });
+    assert.strictEqual(r.isError, undefined);
+    const byMethod = Object.fromEntries(sentCommands.map((c) => [c.method, c.params]));
+    // Empty UA string = "no override" in CDP; no metadata may accompany it.
+    assert.deepStrictEqual(byMethod["Network.setUserAgentOverride"], { userAgent: "" });
+    assert.ok("Emulation.clearDeviceMetricsOverride" in byMethod, "must clear device metrics");
+    assert.deepStrictEqual(byMethod["Emulation.setTouchEmulationEnabled"], { enabled: false });
+    assert.deepStrictEqual(byMethod["Network.emulateNetworkConditions"],
+      { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    assert.strictEqual(sentCommands.length, 4);
+    const body = JSON.parse(r.content[0].text);
+    assert.deepStrictEqual(body.reset.sort(), ["network", "touch", "userAgent", "viewport"]);
+  } finally {
+    PAGE_CDP_SESSIONS.delete(fakePage);
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("W1D-4: reset:true combined with an override is rejected before any CDP command", async () => {
+  const prev = globalThis.__relayBridge;
+  const sentCommands = [];
+  const fakePage = { once() {} };
+  const fakeCdp = { send: async (method) => { sentCommands.push(method); }, detach: async () => {} };
+  globalThis.__relayBridge = { context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
+  try {
+    for (const extra of [{ userAgent: "UA" }, { viewport: { width: 400, height: 800 } }, { network: { offline: true } }]) {
+      const r = await tool.handler({ reset: true, ...extra });
+      assert.strictEqual(r.isError, true, JSON.stringify(extra));
+      assert.match(r.content[0].text, /reset/);
+    }
+    assert.deepStrictEqual(sentCommands, []);
+  } finally {
+    PAGE_CDP_SESSIONS.delete(fakePage);
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("W1D-4: a failed reset command is reported, not swallowed", async () => {
+  const prev = globalThis.__relayBridge;
+  const fakePage = { once() {} };
+  const fakeCdp = {
+    send: async (method) => { if (method === "Emulation.clearDeviceMetricsOverride") throw new Error("boom"); },
+    detach: async () => {},
+  };
+  globalThis.__relayBridge = { context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
+  try {
+    const r = await tool.handler({ reset: true });
+    assert.strictEqual(r.isError, true);
+    assert.deepStrictEqual(JSON.parse(r.content[0].text).failed, [{ name: "viewport", error: "boom" }]);
+  } finally {
+    PAGE_CDP_SESSIONS.delete(fakePage);
+    globalThis.__relayBridge = prev;
+  }
+});

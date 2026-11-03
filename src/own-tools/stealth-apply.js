@@ -8,9 +8,11 @@
 //   • navigator.languages override                                [T0]
 //   • navigator.permissions.query notifications fix               [T0]
 //   • window.chrome runtime stub                                  [T0]
-//   • navigator.userAgentData synthesized from current UA         [T1-A]
+//   • navigator.userAgentData replaced only when it contradicts   [T1-A]
+//     the UA (W1D-3; shared generator in _client-hints.js)
 //   • toString defense on patched getters (returns native-looking) [T1-B]
-//   • AudioContext getChannelData per-session deterministic jitter [T1-C]
+//   • AudioBuffer getChannelData per-session jitter, applied once  [T1-C]
+//     per buffer+channel (W1D-2)
 //
 // Tier 2 coverage (v0.3.5 — added 2026-05-10):
 //   • Sec-CH-UA HTTP-side via emulate_device's userAgentMetadata   [T2-A]
@@ -38,32 +40,42 @@
 //     `origQuery = navigator.permissions.query` to the PREVIOUS override,
 //     creating a recursive call chain. A `__relayStealthApplied` flag on
 //     window short-circuits re-runs at the page level.
+//
+// W1D fixes (2026-11-03):
+//   • force:true used to report success while changing nothing: the new
+//     init script (and the open-page evaluate) stopped at the first apply's
+//     page flag. The flag now carries a generation + live config; a newer
+//     apply updates the config in place (patches still install once per
+//     document), and the replaced init script is disposed when
+//     addInitScript returns a Disposable (playwright-core 1.59.1 does).
+//   • audio jitter used to be re-added to the LIVE buffer on every
+//     getChannelData call (cumulative drift) with a per-page seed.
+
+const { CLIENT_HINTS_SOURCE } = require("./_client-hints.js");
 
 // WeakMap so contexts get garbage-collected normally — no leak when the
 // relay's BrowserContext closes.
 const APPLIED_CONTEXTS = new WeakMap();
 
+// W1D-1: each apply gets a newer generation than any before it. Date-based so
+// a restarted relay still outranks an install an older relay process left in
+// an already-open page.
+let lastGeneration = 0;
+function nextGeneration() {
+  lastGeneration = Math.max(Date.now(), lastGeneration + 1);
+  return lastGeneration;
+}
+
 module.exports = {
   name: "stealth_apply",
   description:
-    "Apply anti-detection JavaScript patches to all future page loads in " +
-    "the active context. Session-wide + persistent. Idempotent (no-op on " +
-    "second call unless force=true). Re-runs against currently-open pages " +
-    "too (best-effort). Tier 1+2 coverage (v0.3.5): navigator.webdriver " +
-    "hidden, plugins/languages overridden, navigator.userAgentData " +
-    "synthesized from current UA, full permissions overrides (notifications" +
-    "/geolocation/clipboard/camera/microphone/midi/push and more), Chrome " +
-    "runtime expansion (loadTimes/csi/app namespaces), WebGL renderer + " +
-    "vendor override (UA-aware GPU strings), toString defense on patched " +
-    "getters, AudioContext getChannelData per-session deterministic jitter." +
-    " Use emulate_device to ALSO align HTTP-side Sec-CH-UA-* headers. " +
-    "Defeats trivial bot detection + the bottom ~85% of common fingerprint" +
-    " checks. Does NOT defeat: TLS/HTTP fingerprinting (need proxy chain)," +
-    " Function.prototype.toString deep checks (need rebrowser-patches), " +
-    "event.isTrusted detection (impossible — synthetic events are " +
-    "fundamentally flagged), behavioral fingerprinting (humanlike " +
-    "interaction is deferred to Tier 2.5 in BACKLOG with a ship gate). " +
-    "For hard targets, use a real-Brave-attach pattern instead.",
+    "Inject anti-fingerprinting patches into every future page load in the " +
+    "active context, and best-effort into open pages: hides navigator.webdriver; " +
+    "fakes plugins, languages, permission states and window.chrome; UA-matched " +
+    "WebGL vendor; stable audio jitter; replaces navigator.userAgentData only " +
+    "when it contradicts the UA. Once per context; force=true re-applies with " +
+    "new languages. Pair with emulate_device so Sec-CH-UA headers match. Won't " +
+    "beat TLS fingerprinting, deep toString checks, isTrusted or behavioral detection.",
   inputSchema: {
     type: "object",
     properties: {
@@ -94,29 +106,48 @@ module.exports = {
 
     // T1-7: per-context applied-flag. Without `force`, calling stealth_apply
     // twice no-ops on the second call — preventing init-script accumulation.
-    const alreadyApplied = APPLIED_CONTEXTS.get(bridge.context);
-    if (alreadyApplied && !force) {
+    const prior = APPLIED_CONTEXTS.get(bridge.context);
+    if (prior && !force) {
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
             applied: false,
             alreadyApplied: true,
-            languages: alreadyApplied.languages,
+            languages: prior.languages,
             note: "stealth_apply was already applied to this context. Pass force=true to re-apply with new languages.",
           }, null, 2),
         }],
       };
     }
+    // W1D-2: one audio seed per session (context), kept across force
+    // re-applies. In [5e-8, 1e-7): imperceptible, yet more than half a
+    // float32 ulp for any sample in (-1, 1), so it never rounds away.
+    const audioSeed = prior ? prior.audioSeed : (1 + Math.random()) * 5e-8;
+    // Claim the context synchronously so a concurrent first call no-ops
+    // instead of registering a second script with a second seed.
+    const entry = { languages, audioSeed, initScript: null };
+    APPLIED_CONTEXTS.set(bridge.context, entry);
 
-    // T0-4: page-level idempotency sentinel inside the injected script.
-    // Even if `addInitScript` somehow runs the script twice (different
-    // call sites, framework bug, etc.), the sentinel ensures the
-    // `navigator.permissions.query` monkey-patch chain doesn't recurse.
+    // T0-4 → W1D-1: page-level sentinel inside the injected script. Patches
+    // install once per document, so `navigator.permissions.query` (and the
+    // other wrappers) never chain. A NEWER apply — a later init script, or
+    // page.evaluate on an open page — updates the live config instead of
+    // stopping at the flag; an older one is ignored, whatever the run order.
     const stealthScript = `
       (function() {
-        if (window.__relayStealthApplied) return;
-        window.__relayStealthApplied = true;
+        var GEN = ${nextGeneration()};
+        var CFG = ${JSON.stringify({ languages, audioSeed })};
+        Object.freeze(CFG.languages);
+        var installed = window.__relayStealthApplied;
+        if (installed) {
+          if (typeof installed === 'object' && installed.gen < GEN) { installed.gen = GEN; installed.cfg = CFG; }
+          return;
+        }
+        var state = { gen: GEN, cfg: CFG };
+        try {
+          Object.defineProperty(window, '__relayStealthApplied', { value: state, configurable: false, enumerable: false, writable: false });
+        } catch (e) { return; }
 
         // ─── Tier 1-B: toString defense helper ─────────────────────────
         // When you do Object.defineProperty(obj, 'foo', { get: () => X }),
@@ -161,8 +192,8 @@ module.exports = {
         } catch (e) {}
 
         try {
-          const langs = ${JSON.stringify(languages)};
-          const getter = nativeLike(function () { return langs; }, 'get languages');
+          // Reads the live config so a newer apply (force) takes effect here.
+          const getter = nativeLike(function () { return state.cfg.languages; }, 'get languages');
           Object.defineProperty(navigator, 'languages', { configurable: true, get: getter });
         } catch (e) {}
 
@@ -209,90 +240,97 @@ module.exports = {
 
         try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
 
-        // ─── Tier 1-A: navigator.userAgentData synthesis ───────────────
-        // Modern Sec-CH-UA-* HTTP headers + navigator.userAgentData are the
-        // canonical fingerprint surface for modern anti-bot vendors. If
-        // emulate_device overrides the UA but userAgentData stays as the
-        // host Brave's defaults, sites flag the mismatch. We synthesize
-        // userAgentData from the current navigator.userAgent string at
-        // each page load so it tracks emulate_device's overrides.
-        //
-        // Limitation: HTTP-side Sec-CH-UA-* headers are set by chromium
-        // itself based on its INTERNAL UA config, not navigator.userAgent.
-        // For full alignment, emulate_device's CDP Network.setUserAgent-
-        // Override needs a userAgentMetadata arg (Tier 2). This patch
-        // covers the JS-side check; the HTTP-side gap is documented.
+        // ─── Tier 1-A → W1D-3: navigator.userAgentData coherence ───────
+        // Chromium builds navigator.userAgentData from the same metadata as
+        // the Sec-CH-UA-* headers: Brave's own values (incl. its "Brave"
+        // brand) when nothing is overridden, emulate_device's metadata when
+        // it set one. Replacing a coherent native object would CREATE a
+        // header-vs-JS mismatch, so we only step in when the native hints
+        // contradict the UA — typically a UA override without metadata,
+        // which blanks the brands. The replacement comes from the same
+        // generator emulate_device uses for the headers. No userAgentData at
+        // all (insecure context) stays that way, as in real Chrome.
         try {
-          const ua = navigator.userAgent || '';
-          const cm = ua.match(/Chrome\\/(\\d+)/);
-          const version = cm ? cm[1] : '127';
-          // Order matters: Android UAs contain 'Linux; Android...' so
-          // Android must come BEFORE Linux. iPhone/iPad before macOS
-          // because iOS UAs contain 'Mac OS X' in the version string.
-          const platform = /Windows/.test(ua) ? 'Windows'
-            : /iPhone|iPad/.test(ua) ? 'iOS'
-            : /Android/.test(ua) ? 'Android'
-            : /Macintosh/.test(ua) ? 'macOS'
-            : /Linux/.test(ua) ? 'Linux'
-            : 'Windows';
-          const mobile = /Mobi|Android|iPhone/.test(ua);
-          // The "Not?A_Brand" pattern matches what real Chrome ships.
-          const brands = [
-            { brand: 'Chromium', version: version },
-            { brand: 'Not?A_Brand', version: '24' },
-          ];
-          const fakeUAD = {
-            brands: brands.slice(),
-            mobile: mobile,
-            platform: platform,
-            getHighEntropyValues: nativeLike(function (keys) {
-              const out = { brands: brands.slice(), mobile: mobile, platform: platform };
-              if (Array.isArray(keys)) {
-                if (keys.includes('platformVersion')) out.platformVersion = '15.0.0';
-                if (keys.includes('architecture')) out.architecture = 'x86';
-                if (keys.includes('bitness')) out.bitness = '64';
-                if (keys.includes('model')) out.model = '';
-                if (keys.includes('uaFullVersion')) out.uaFullVersion = version + '.0.0.0';
-                if (keys.includes('fullVersionList')) out.fullVersionList = brands.map(function(b){ return { brand: b.brand, version: b.version + '.0.0.0' }; });
-                if (keys.includes('wow64')) out.wow64 = false;
-                if (keys.includes('formFactors')) out.formFactors = mobile ? ['Mobile'] : ['Desktop'];
-              }
-              return Promise.resolve(out);
-            }, 'getHighEntropyValues'),
-            toJSON: nativeLike(function () { return { brands: brands.slice(), mobile: mobile, platform: platform }; }, 'toJSON'),
-          };
-          const uadGetter = nativeLike(function () { return fakeUAD; }, 'get userAgentData');
-          Object.defineProperty(navigator, 'userAgentData', { configurable: true, get: uadGetter });
+          const nativeUAD = navigator.userAgentData;
+          if (nativeUAD) {
+            const clientHintsFromUA = ${CLIENT_HINTS_SOURCE};
+            const hints = clientHintsFromUA(navigator.userAgent || '');
+            let coherent = false;
+            try {
+              const nativeBrands = nativeUAD.brands || [];
+              coherent = nativeBrands.length > 0
+                && nativeUAD.platform === hints.platform
+                && nativeUAD.mobile === hints.mobile
+                && Array.prototype.some.call(nativeBrands, function (b) { return !!b && b.version === hints.brands[0].version; });
+            } catch (e) {}
+            if (!coherent) {
+              const copyList = function (list) { return list.map(function (b) { return { brand: b.brand, version: b.version }; }); };
+              const fakeUAD = {
+                brands: copyList(hints.brands),
+                mobile: hints.mobile,
+                platform: hints.platform,
+                getHighEntropyValues: nativeLike(function (keys) {
+                  const out = { brands: copyList(hints.brands), mobile: hints.mobile, platform: hints.platform };
+                  if (Array.isArray(keys)) {
+                    ['platformVersion', 'architecture', 'bitness', 'model', 'wow64'].forEach(function (k) {
+                      if (keys.includes(k)) out[k] = hints[k];
+                    });
+                    if (keys.includes('uaFullVersion')) out.uaFullVersion = hints.fullVersionList[0].version;
+                    if (keys.includes('fullVersionList')) out.fullVersionList = copyList(hints.fullVersionList);
+                    if (keys.includes('formFactors')) out.formFactors = hints.mobile ? ['Mobile'] : ['Desktop'];
+                  }
+                  return Promise.resolve(out);
+                }, 'getHighEntropyValues'),
+                toJSON: nativeLike(function () { return { brands: copyList(hints.brands), mobile: hints.mobile, platform: hints.platform }; }, 'toJSON'),
+              };
+              const uadGetter = nativeLike(function () { return fakeUAD; }, 'get userAgentData');
+              Object.defineProperty(navigator, 'userAgentData', { configurable: true, get: uadGetter });
+            }
+          }
         } catch (e) {}
 
-        // ─── Tier 1-C: AudioContext fingerprint stabilization ──────────
+        // ─── Tier 1-C → W1D-2: AudioBuffer fingerprint perturbation ────
         // Common detection: render a known waveform via OfflineAudioContext
-        // → call getChannelData on the result → hash the samples → use as
-        // a per-machine fingerprint. Playwright's chromium produces a
-        // recognizable variant.
-        //
-        // Defense: deterministic per-session jitter on getChannelData
-        // output. Stable across calls within a session (so the fingerprint
-        // doesn't randomize per call — that's its OWN tell), but distinct
-        // from the un-patched value. Seed is a single Math.random() at
-        // first use, scoped to this session via window.__relayAudioSeed.
+        // → getChannelData → hash the samples. We add a tiny seed to every
+        // 100th sample. The seed is generated once per relay session and
+        // embedded here, so the fingerprint is stable across reads AND
+        // pages (per-page randomness is its own tell). getChannelData
+        // returns the buffer's LIVE storage, so each (buffer, channel) is
+        // perturbed exactly once — re-adding on every call made it drift.
         try {
           if (typeof AudioBuffer !== 'undefined' && AudioBuffer.prototype && AudioBuffer.prototype.getChannelData) {
-            const seed = window.__relayAudioSeed || (window.__relayAudioSeed = Math.random() * 1e-7);
-            const orig = AudioBuffer.prototype.getChannelData;
-            // Replace with a wrapped version that mutates output by a
-            // tiny stable amount. We use a Proxy so .toString and other
-            // metadata still look reasonable.
-            const wrapped = nativeLike(function () {
-              const data = orig.apply(this, arguments);
-              // Mutate every 100th sample by the seed. Determinstic +
-              // imperceptible (< 1e-7 floating-point error band).
+            const seed = CFG.audioSeed;
+            const proto = AudioBuffer.prototype;
+            const orig = proto.getChannelData;
+            // Keyed on the returned live storage, not (buffer, channel): a
+            // channel object whose valueOf returns a different number per
+            // conversion would desync a channel-keyed record and re-perturb.
+            const perturbed = new WeakSet(); // Float32Array (live channel storage)
+            const perturbOnce = function (data) {
+              if (perturbed.has(data)) return;
+              perturbed.add(data);
               for (var i = 0; i < data.length; i += 100) {
                 data[i] = data[i] + seed;
               }
+            };
+            proto.getChannelData = nativeLike(function (channel) {
+              const data = orig.apply(this, arguments); // throws on bad this / channel first
+              perturbOnce(data);
               return data;
             }, 'getChannelData');
-            AudioBuffer.prototype.getChannelData = wrapped;
+            // copyFromChannel reads the same storage: jitter it first so both
+            // read paths agree and no read visibly changes the buffer. The
+            // channel is converted exactly once (as the native call would).
+            if (typeof proto.copyFromChannel === 'function') {
+              const origCopy = proto.copyFromChannel;
+              proto.copyFromChannel = nativeLike(function (destination, channelNumber) {
+                const ch = channelNumber >>> 0;
+                perturbOnce(orig.call(this, ch));
+                return arguments.length > 2
+                  ? origCopy.call(this, destination, ch, arguments[2])
+                  : origCopy.call(this, destination, ch);
+              }, 'copyFromChannel');
+            }
           }
         } catch (e) {}
 
@@ -428,7 +466,23 @@ module.exports = {
       })();
     `;
 
-    await bridge.context.addInitScript(stealthScript);
+    try {
+      entry.initScript = await bridge.context.addInitScript(stealthScript);
+    } catch (e) {
+      // Un-claim so the caller can retry (e.g. after the context recovers).
+      if (APPLIED_CONTEXTS.get(bridge.context) === entry) {
+        if (prior) APPLIED_CONTEXTS.set(bridge.context, prior);
+        else APPLIED_CONTEXTS.delete(bridge.context);
+      }
+      throw e;
+    }
+    // W1D-1: retire the script this apply replaces so force doesn't stack
+    // init scripts. Without a Disposable (older playwright-core) the stale
+    // script keeps running first on each load, then this newer generation
+    // overrides its config — same end state.
+    if (prior && prior.initScript && typeof prior.initScript.dispose === "function") {
+      try { await prior.initScript.dispose(); } catch { /* the newer generation still wins */ }
+    }
 
     // Also apply to currently-open pages (addInitScript only affects future loads).
     const openPages = bridge.context.pages();
@@ -442,8 +496,6 @@ module.exports = {
         skippedOpenPages++; // page may be at chrome:// / mid-nav / closed
       }
     }
-
-    APPLIED_CONTEXTS.set(bridge.context, { languages });
 
     return {
       content: [{

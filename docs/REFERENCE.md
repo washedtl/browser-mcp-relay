@@ -43,7 +43,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `emulate_device` | UA / viewport / network throttling | `network.downloadKbps` | Verify a layout on Slow 3G |
+| `emulate_device` | UA / viewport / network throttling (`reset: true` clears all overrides) | `network.downloadKbps` | Verify a layout on Slow 3G |
 
 #### 📑 Multi-tab control
 
@@ -512,9 +512,9 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 | `navigator.plugins` faked | Bot detection that flags empty plugins arrays |
 | `navigator.languages` override | Mismatched-language flagging |
 | `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
-| `navigator.userAgentData` synthesized from current UA | Sec-CH-UA-* JS-side fingerprinting; tracks `emulate_device`'s UA override |
+| `navigator.userAgentData` replaced only when it contradicts the UA | Sec-CH-UA-* JS-side fingerprinting; same generator as `emulate_device`'s HTTP client hints; Brave's native object is kept when no UA override is active |
 | `toString()` defense on patched getters | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
-| AudioContext `getChannelData` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; per-session deterministic jitter (≤ 1e-7), not random per-call |
+| AudioBuffer `getChannelData` / `copyFromChannel` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; one per-session seed (< 1e-7) applied once per channel buffer, never cumulative or random per-call |
 
 **Tier 2** (v0.3.5 — added 2026-05-10):
 
