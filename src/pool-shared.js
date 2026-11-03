@@ -306,23 +306,39 @@ const CONFIG = loadConfig();
 // plain `ps`. The brave-process needle differs by platform: Windows command
 // lines contain `brave.exe` literally, Mac/Linux contain `brave` (no .exe).
 
+/** W0-1 (2026-11-03): matcher for "this command line passes exactly `dir`
+ *  as --user-data-dir", unquoted or `"..."`-quoted. Whole-argument match:
+ *  the previous substring check made pool-1's needle match pool-10..16,
+ *  so slot 1's reap force-killed slot 10-16's Brave mid-session.
+ *  Case-insensitive on Windows (paths are). */
+function userDataDirMatcher(dir, platform = process.platform) {
+  const trimmed = String(dir).replace(/[\\/]+$/, "");
+  const esc = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Optional trailing separators: a dir passed as "C:\x\" (or with a
+  // trailing backslash that Node doubled while quoting) still matches.
+  const re = new RegExp(
+    `--user-data-dir=(?:"${esc}[\\\\/]*"|${esc}[\\\\/]*)(?=[\\s"]|$)`,
+    platform === "win32" ? "i" : "",
+  );
+  return (cmd) => re.test(cmd);
+}
+
 /** Pure parser. Given the stdout of the brave-process probe (one
  *  `<PID>|<command-line>` line per process) and a profile dir, return the
- *  PIDs of brave processes whose command line includes `--user-data-dir=<dir>`
- *  either unquoted or with `"..."` around dir.
+ *  PIDs of brave processes whose command line passes `--user-data-dir=<dir>`
+ *  (exact dir, unquoted or with `"..."` around it).
  *
  *  Kept as the canonical Windows-shape parser for backwards compat with
  *  external callers and for unit tests. Internally we use the structured
  *  output of `processShim.listProcessesByCommand`. */
-function findBraveProcessesForDir(stdoutText, dir) {
-  const needleBare = `--user-data-dir=${dir}`;
-  const needleQuoted = `--user-data-dir="${dir}"`;
+function findBraveProcessesForDir(stdoutText, dir, opts = {}) {
+  const matches = userDataDirMatcher(dir, opts._platform);
   const pids = [];
   for (const line of (stdoutText || "").split(/\r?\n/)) {
     const sep = line.indexOf("|");
     if (sep < 0) continue;
     const cmd = line.slice(sep + 1);
-    if (!cmd.includes(needleBare) && !cmd.includes(needleQuoted)) continue;
+    if (!matches(cmd)) continue;
     const pid = parseInt(line.slice(0, sep), 10);
     if (Number.isFinite(pid)) pids.push(pid);
   }
@@ -359,11 +375,8 @@ function reapOrphansFor(dir, opts = {}) {
   const platform = opts._platform || process.platform;
   const spawn = opts._spawnSync || spawnSync;
   const procs = processShim.listProcessesByCommand(braveNeedle(platform), opts);
-  const needleBare = `--user-data-dir=${dir}`;
-  const needleQuoted = `--user-data-dir="${dir}"`;
-  const matched = procs.filter(
-    (p) => p.command.includes(needleBare) || p.command.includes(needleQuoted),
-  );
+  const matches = userDataDirMatcher(dir, platform);
+  const matched = procs.filter((p) => matches(p.command));
 
   let killed = 0;
   for (const { pid } of matched) {
@@ -410,10 +423,90 @@ function reapOrphansFor(dir, opts = {}) {
   return killed;
 }
 
-/** PID liveness check. Delegates to processShim for cross-platform handling
- *  (Win uses `tasklist`; Mac/Linux use POSIX `process.kill(pid, 0)`). */
+/** PID liveness check. Delegates to processShim (signal-zero everywhere). */
 function isPidAlive(pid, opts) {
   return processShim.isPidAlive(pid, opts);
+}
+
+/** Batched process start-time lookup. Delegates to processShim. */
+function getProcessStartTimes(pids, opts) {
+  return processShim.getProcessStartTimes(pids, opts);
+}
+
+// The owner starts before it writes startedAt, so procStart <= startedAt.
+// Slack absorbs wall-clock steps (NTP / VM resync): Linux ps derives start
+// times from the current clock, and a backward step between process start
+// and lock write skews either platform. A recycled PID is still caught as
+// long as it was reused more than this long after the lock was written —
+// the live case was a week later. Erring large only means a quickly-reused
+// PID keeps its slot "claimed" (the pre-W0 behavior), never a stolen slot.
+const LOCK_START_SLACK_MS = 10 * 60 * 1000;
+
+/**
+ * W0-2 (2026-11-03): is the process recorded in a wrapper-lock still the
+ * process that wrote it?
+ *
+ * PID alone isn't enough: Windows recycles PIDs, so a dead relay's PID
+ * handed to any later process kept that slot "claimed" forever (live case:
+ * pool-9's lock PID was reassigned to another relay's upstream child a week
+ * after the owner died). The owner necessarily started before it wrote
+ * `startedAt`, so a live PID whose process started *after* `startedAt` is
+ * a recycled PID → the lock is stale.
+ *
+ * Fail-safe: when the start time can't be determined (legacy lock without
+ * startedAt, pid missing from `startTimes`, probe failed) the owner is
+ * treated as alive — stealing a live slot crashes its Brave.
+ *
+ * @param {{pid:number, startedAt?:string}} meta — parsed lock JSON
+ * @param {object} [opts]
+ * @param {Map<number, number>} [opts.startTimes] — from getProcessStartTimes
+ * @param {(pid:number)=>boolean} [opts.isAlive=isPidAlive]
+ * @returns {boolean}
+ */
+function isLockOwnerAlive(meta, { startTimes, isAlive = isPidAlive } = {}) {
+  if (!meta || !Number.isFinite(meta.pid)) return false;
+  if (!isAlive(meta.pid)) return false;
+  const lockedAt = Date.parse(meta.startedAt);
+  const procStart = startTimes ? startTimes.get(meta.pid) : undefined;
+  if (!Number.isFinite(lockedAt) || !Number.isFinite(procStart)) return true;
+  return procStart <= lockedAt + LOCK_START_SLACK_MS;
+}
+
+// A lock file that exists but doesn't parse yet may be mid-write by a relay
+// that just won the O_EXCL race. Only treat it as stale once it's this old.
+const MALFORMED_LOCK_GRACE_MS = 10000;
+
+/** Read + classify one lock file. Returns null when there's no lock.
+ *  `state` is "dead" (owner PID gone or lock unparseable past the grace
+ *  window), "young" (unparseable but recent — leave it), or "alive"
+ *  (PID alive; caller may still verify start time). `raw` lets callers
+ *  confirm the lock is unchanged before unlinking it. */
+function readLockState(lockPath, opts = {}) {
+  const isAlive = opts.isAlive || isPidAlive;
+  let raw;
+  try { raw = fs.readFileSync(lockPath, "utf8"); }
+  catch { return null; }
+  let meta = null;
+  try { meta = JSON.parse(raw); } catch { /* malformed */ }
+  if (!meta || !Number.isFinite(meta.pid)) {
+    let ageMs = Infinity;
+    try { ageMs = Date.now() - fs.statSync(lockPath).mtimeMs; } catch { /* gone */ }
+    return { raw, meta: null, state: ageMs < MALFORMED_LOCK_GRACE_MS ? "young" : "dead" };
+  }
+  return { raw, meta, state: isAlive(meta.pid) ? "alive" : "dead" };
+}
+
+/** Unlink a stale lock only if it still holds the content we judged —
+ *  another relay may have replaced it since. Returns true if removed. */
+function clearStaleLock(lockPath, raw, reason) {
+  try {
+    if (fs.readFileSync(lockPath, "utf8") !== raw) return false;
+    fs.unlinkSync(lockPath);
+    process.stderr.write(`[mcp-relay] cleared stale lock at ${lockPath} (${reason})\n`);
+    return true;
+  } catch {
+    return false; // race: file vanished or changed
+  }
 }
 
 // ───────────────────────── Cookie helpers ────────────────────────────
@@ -469,11 +562,14 @@ function pickDirCandidates(cfg, requestedRole) {
  * dead. After the lock is acquired, reaps orphan brave processes still
  * holding that dir (Windows-only; non-Windows skips reap).
  *
+ * @param {object} [opts] — test seams only; production calls claimSlot().
  * @returns {{ dir: string, lock: { fd: number, path: string }, role: string, release: () => void }}
  */
-function claimSlot() {
+function claimSlot(opts = {}) {
   const requestedRole = process.env.BROWSER_MCP_ROLE || undefined;
-  const candidates = pickDirCandidates(CONFIG, requestedRole);
+  const candidates = opts._candidates || pickDirCandidates(CONFIG, requestedRole);
+  const isAlive = opts._isPidAlive || isPidAlive;
+  const startTimesFn = opts._getProcessStartTimes || getProcessStartTimes;
   if (candidates.length === 0) {
     throw new Error(
       `[mcp-relay] no pool dirs configured for role="${requestedRole}". ` +
@@ -481,72 +577,80 @@ function claimSlot() {
     );
   }
 
+  // Pass 1: clear dead-PID locks and take the first free slot. Locks whose
+  // PID is alive are remembered for pass 2 — verifying their start time
+  // costs one ~1s probe, so it only runs when the pool looks full.
+  const liveLocks = [];
   for (const dir of candidates) {
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
     const lockPath = path.join(dir, WRAPPER_LOCK);
+    const lock = readLockState(lockPath, { isAlive });
+    if (lock && lock.state === "dead") clearStaleLock(lockPath, lock.raw, "pidAlive=false");
+    else if (lock && lock.state === "alive") liveLocks.push({ dir, lockPath, ...lock });
+    const claimed = tryClaimDir(dir, lockPath, opts);
+    if (claimed) return claimed;
+  }
 
-    // Stale-clean: dead-PID-only.
-    try {
-      if (fs.existsSync(lockPath)) {
-        let pidAlive;
-        try {
-          const meta = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-          pidAlive = isPidAlive(meta.pid);
-        } catch {
-          pidAlive = false;
-        }
-        if (!pidAlive) {
-          fs.unlinkSync(lockPath);
-          process.stderr.write(`[mcp-relay] cleared stale lock at ${lockPath} (pidAlive=false)\n`);
-        }
-      }
-    } catch { /* race: file vanished */ }
-
-    let fd;
-    try {
-      // F1-10 (2026-05-10): explicit 0o600 mode on POSIX so the lock file
-      // (which contains pid + hostname + start-time) isn't world-readable
-      // on multi-user systems. Windows ignores the mode arg.
-      fd = fs.openSync(lockPath, "wx", 0o600);
-    } catch (e) {
-      if (e.code === "EEXIST") continue;
-      throw e;
+  // Pass 2 (W0-2): every slot looked taken. Locks held by a recycled PID are
+  // stale — one batched start-time probe finds them.
+  if (liveLocks.length > 0) {
+    const startTimes = startTimesFn(liveLocks.map((l) => l.meta.pid));
+    for (const l of liveLocks) {
+      if (isLockOwnerAlive(l.meta, { startTimes, isAlive })) continue;
+      if (!clearStaleLock(l.lockPath, l.raw, `pid ${l.meta.pid} was recycled`)) continue;
+      const claimed = tryClaimDir(l.dir, l.lockPath, opts);
+      if (claimed) return claimed;
     }
-    fs.writeSync(
-      fd,
-      JSON.stringify({
-        pid: process.pid,
-        startedAt: new Date().toISOString(),
-        host: os.hostname(),
-        relay: true,
-      }),
-    );
-    // V1-4: fdatasync flushes the lock contents to disk so a crash between
-    // write and the OS's lazy flush doesn't leave a zero-length / partial
-    // lock file that other relays would see as "stale" (and unlink) — even
-    // though this process is alive and holding fd. The stale-clean in this
-    // function self-heals partial files via JSON.parse failure → pidAlive
-    // false, but the data loss window during that gap could cause a brief
-    // double-claim. fdatasync closes that window.
-    try { fs.fdatasyncSync(fd); } catch { /* fdatasync unsupported on platform */ }
-
-    // Reap orphan brave AFTER lock acquired.
-    reapOrphansFor(dir);
-
-    const role = (CONFIG.slotRoles || {})[dir] || "default";
-
-    function release() {
-      try { fs.closeSync(fd); } catch { /* already closed */ }
-      try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
-    }
-
-    return { dir, lock: { fd, path: lockPath }, role, release };
   }
 
   throw new Error(
     `[mcp-relay] pool exhausted for role="${requestedRole || "any"}" — ` +
     `all of ${candidates.join(", ")} are in use.`,
   );
+}
+
+/** Atomically take `lockPath` (O_CREAT|O_EXCL). Returns the claim, or null
+ *  when another process already holds it. */
+function tryClaimDir(dir, lockPath, opts = {}) {
+  let fd;
+  try {
+    // F1-10 (2026-05-10): explicit 0o600 mode on POSIX so the lock file
+    // (which contains pid + hostname + start-time) isn't world-readable
+    // on multi-user systems. Windows ignores the mode arg.
+    fd = fs.openSync(lockPath, "wx", 0o600);
+  } catch (e) {
+    if (e.code === "EEXIST") return null;
+    throw e;
+  }
+  fs.writeSync(
+    fd,
+    JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      host: os.hostname(),
+      relay: true,
+    }),
+  );
+  // V1-4: fdatasync flushes the lock contents to disk so a crash between
+  // write and the OS's lazy flush doesn't leave a zero-length / partial
+  // lock file that other relays would see as "stale" (and unlink) — even
+  // though this process is alive and holding fd. claimSlot's stale-clean
+  // only treats an unparseable lock as stale past MALFORMED_LOCK_GRACE_MS,
+  // but a crash-truncated file would still look stale after that window
+  // and cause a brief double-claim. fdatasync closes that window.
+  try { fs.fdatasyncSync(fd); } catch { /* fdatasync unsupported on platform */ }
+
+  // Reap orphan brave AFTER lock acquired.
+  (opts._reapOrphansFor || reapOrphansFor)(dir);
+
+  const role = (CONFIG.slotRoles || {})[dir] || "default";
+
+  function release() {
+    try { fs.closeSync(fd); } catch { /* already closed */ }
+    try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+  }
+
+  return { dir, lock: { fd, path: lockPath }, role, release };
 }
 
 // ───────────────────────── Profile snapshot ──────────────────────────
@@ -642,6 +746,11 @@ module.exports = {
   listBraveProcessesRaw,
   reapOrphansFor,
   isPidAlive,
+  getProcessStartTimes,
+  isLockOwnerAlive,
+  readLockState,
+  clearStaleLock,
+  userDataDirMatcher,
   braveNeedle,
   checkCookieAgeDays,
   findCookiesFile,

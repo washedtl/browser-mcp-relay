@@ -4,6 +4,7 @@ const assert = require("node:assert");
 const {
   listProcessesByCommand,
   isPidAlive,
+  getProcessStartTimes,
   parsePidPipeOutput,
 } = require("../src/process-shim.js");
 
@@ -202,26 +203,21 @@ test("isPidAlive returns false for invalid input without spawning", () => {
   assert.strictEqual(spawned, false, "no child should have been spawned for invalid pids");
 });
 
-test("isPidAlive on Win uses tasklist and parses CSV match", () => {
-  let cmdSeen, argsSeen;
-  const fakeSpawn = (cmd, args) => {
-    cmdSeen = cmd;
-    argsSeen = args;
-    return { status: 0, stdout: '"brave.exe","1234","Console","1","45,000 K"\r\n' };
-  };
-  const alive = isPidAlive(1234, { _platform: "win32", _spawnSync: fakeSpawn });
-  assert.strictEqual(cmdSeen, "tasklist");
-  assert.ok(argsSeen.includes("/fi"), "tasklist must use the /fi filter");
-  assert.ok(argsSeen.some((a) => a === "PID eq 1234"), "filter must reference the pid");
+test("W0-2: isPidAlive on Win uses signal-zero and never spawns tasklist", () => {
+  let spawned = false;
+  const fakeSpawn = () => { spawned = true; return { status: 0, stdout: "" }; };
+  let sigSeen;
+  const fakeKill = (_pid, sig) => { sigSeen = sig; };
+  const alive = isPidAlive(1234, { _platform: "win32", _spawnSync: fakeSpawn, _processKill: fakeKill });
   assert.strictEqual(alive, true);
+  assert.strictEqual(sigSeen, 0, "must probe with signal 0");
+  assert.strictEqual(spawned, false, "no child process per liveness check");
 });
 
-test('isPidAlive on Win returns false when tasklist says "no tasks running"', () => {
-  const fakeSpawn = () => ({
-    status: 0,
-    stdout: "INFO: No tasks are running which match the specified criteria.\r\n",
-  });
-  assert.strictEqual(isPidAlive(9999, { _platform: "win32", _spawnSync: fakeSpawn }), false);
+test("W0-2: isPidAlive on Win returns false on ESRCH, true on EPERM", () => {
+  const throwing = (code) => () => { throw Object.assign(new Error(code), { code }); };
+  assert.strictEqual(isPidAlive(9999, { _platform: "win32", _processKill: throwing("ESRCH") }), false);
+  assert.strictEqual(isPidAlive(4, { _platform: "win32", _processKill: throwing("EPERM") }), true);
 });
 
 test("isPidAlive on POSIX uses signal-zero (process.kill(pid, 0))", () => {
@@ -296,38 +292,76 @@ test("F1-11: isPidAlive on POSIX treats unparseable throw as alive", () => {
   );
 });
 
-test("F1-11: isPidAlive on Win returns true (fail-safe) when tasklist itself fails", () => {
-  // Spawn returned an error object — tasklist missing on PATH or wedged.
-  const fakeSpawn = () => ({
-    status: null,
-    error: Object.assign(new Error("ENOENT"), { code: "ENOENT" }),
-    stdout: "",
-    stderr: "",
-  });
-  assert.strictEqual(
-    isPidAlive(4321, { _platform: "win32", _spawnSync: fakeSpawn }),
-    true,
-  );
+test("F1-11: isPidAlive on Win treats unknown errno as alive (fail-safe)", () => {
+  const fakeKill = () => { throw Object.assign(new Error("EINVAL"), { code: "EINVAL" }); };
+  assert.strictEqual(isPidAlive(4321, { _platform: "win32", _processKill: fakeKill }), true);
 });
 
-test("F1-11: isPidAlive on Win returns true (fail-safe) when tasklist exits non-zero", () => {
-  const fakeSpawn = () => ({ status: 2, error: null, stdout: "", stderr: "" });
-  assert.strictEqual(
-    isPidAlive(4321, { _platform: "win32", _spawnSync: fakeSpawn }),
-    true,
-  );
+// ───── getProcessStartTimes ─────
+
+test("getProcessStartTimes returns an empty Map without spawning for empty/invalid input", () => {
+  let spawned = false;
+  const fakeSpawn = () => { spawned = true; return { status: 0, stdout: "" }; };
+  for (const input of [[], null, undefined, [0, -1, NaN, 1.5, "12"]]) {
+    const out = getProcessStartTimes(input, { _platform: "win32", _spawnSync: fakeSpawn });
+    assert.ok(out instanceof Map);
+    assert.strictEqual(out.size, 0);
+  }
+  assert.strictEqual(spawned, false);
 });
 
-test("F1-11: isPidAlive on Win returns true (fail-safe) when tasklist is signaled (timeout)", () => {
-  const fakeSpawn = () => ({ status: null, signal: "SIGTERM", error: null, stdout: "", stderr: "" });
-  assert.strictEqual(
-    isPidAlive(4321, { _platform: "win32", _spawnSync: fakeSpawn }),
-    true,
-  );
+test("getProcessStartTimes on Win batches all pids into ONE PowerShell call and parses ISO times", () => {
+  const calls = [];
+  const fakeSpawn = (cmd, args) => {
+    calls.push({ cmd, args });
+    return { status: 0, stdout: "123|2026-10-30T15:39:10.0448005Z\r\n456|not-a-date\r\nnoise\r\n" };
+  };
+  const out = getProcessStartTimes([123, 456, 123], { _platform: "win32", _spawnSync: fakeSpawn });
+  assert.strictEqual(calls.length, 1, "one child process for the whole batch");
+  assert.strictEqual(calls[0].cmd, "powershell");
+  assert.ok(calls[0].args.includes("-NoProfile"));
+  assert.ok(calls[0].args.some((a) => a.includes("@(123,456)")), "deduped pid list in the script");
+  assert.strictEqual(out.get(123), Date.parse("2026-10-30T15:39:10.0448005Z"));
+  assert.strictEqual(out.has(456), false, "unparseable times are omitted, not guessed");
+});
+
+test("getProcessStartTimes on POSIX uses ps lstart with LC_ALL=C", () => {
+  let seen;
+  const fakeSpawn = (cmd, args, opts) => {
+    seen = { cmd, args, opts };
+    return { status: 1, stdout: "  123 Tue Nov  3 08:07:46 2026\n" }; // exit 1: some pids gone
+  };
+  const out = getProcessStartTimes([123, 999], { _platform: "linux", _spawnSync: fakeSpawn });
+  assert.strictEqual(seen.cmd, "ps");
+  assert.deepStrictEqual(seen.args, ["-o", "pid=,lstart=", "-p", "123,999"]);
+  assert.strictEqual(seen.opts.env.LC_ALL, "C");
+  assert.strictEqual(out.get(123), Date.parse("Tue Nov  3 08:07:46 2026"));
+  assert.strictEqual(out.has(999), false);
+});
+
+test("getProcessStartTimes returns an empty Map when the probe fails", () => {
+  const fakeSpawn = () => ({ status: null, error: new Error("ETIMEDOUT"), stdout: "" });
+  assert.strictEqual(getProcessStartTimes([123], { _platform: "win32", _spawnSync: fakeSpawn }).size, 0);
 });
 
 // ───── Real-environment sanity ─────
 
 test("isPidAlive returns true for the current process (no test seam)", () => {
   assert.strictEqual(isPidAlive(process.pid), true);
+});
+
+test("isPidAlive returns false for a child process that has exited (no test seam)", () => {
+  const { spawnSync } = require("node:child_process");
+  const r = spawnSync(process.execPath, ["-e", "0"]);
+  assert.strictEqual(r.status, 0);
+  assert.strictEqual(isPidAlive(r.pid), false);
+});
+
+test("getProcessStartTimes resolves the current process's real start time (no test seam)", () => {
+  // Generous timeout: PowerShell startup measured 5-6s on a loaded machine.
+  const out = getProcessStartTimes([process.pid], { timeoutMs: 60000 });
+  const t = out.get(process.pid);
+  assert.ok(Number.isFinite(t), "own start time should resolve");
+  const expected = Date.now() - process.uptime() * 1000;
+  assert.ok(Math.abs(t - expected) < 10_000, `start time ${new Date(t).toISOString()} should be ~${new Date(expected).toISOString()}`);
 });

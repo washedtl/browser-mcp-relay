@@ -73,6 +73,7 @@ function makeSeams(overrides = {}) {
       return out;
     },
     _isPidAlive: (pid) => pid === 1111,
+    _getProcessStartTimes: () => new Map(),
     _findCookiesFile: () => null,
     _checkCookieAgeDays: () => null,
     _loadVault: () => ({

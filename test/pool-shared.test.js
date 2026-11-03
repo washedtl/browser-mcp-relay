@@ -442,3 +442,211 @@ test("V1-2: source-level guard — resolution order is env → wrapper → auto-
   assert.ok(stepOneIdx >= 0 && stepTwoIdx > stepOneIdx && stepThreeIdx > stepTwoIdx,
     "expected explicit Step 1 → Step 2 → Step 3 comment markers in resolution body");
 });
+
+// ───── W0-1: exact --user-data-dir matching (slot prefix collision) ─────
+
+test("W0-1: findBraveProcessesForDir does not match pool-10 when asked for pool-1", () => {
+  const dir = "C:\\Users\\u\\.browser-data-mcp-pool-1";
+  const stdout = [
+    `111|"C:\\brave.exe" --remote-debugging-port=9342 --user-data-dir=C:\\Users\\u\\.browser-data-mcp-pool-10 --no-first-run`,
+    `112|brave.exe --type=renderer --user-data-dir="C:\\Users\\u\\.browser-data-mcp-pool-16" --lang=en`,
+    `200|"C:\\brave.exe" --remote-debugging-port=9333 --user-data-dir=C:\\Users\\u\\.browser-data-mcp-pool-1 --no-first-run`,
+    `201|brave.exe --type=gpu-process --user-data-dir="C:\\Users\\u\\.browser-data-mcp-pool-1" --gpu-preferences=x`,
+    `202|brave.exe --type=utility --user-data-dir=C:\\Users\\u\\.browser-data-mcp-pool-1`,
+  ].join("\r\n");
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(stdout, dir, { _platform: "win32" }), [200, 201, 202]);
+});
+
+test("W0-1: user-data-dir match is case-insensitive on Windows only", () => {
+  const line = "7|brave.exe --user-data-dir=C:\\USERS\\U\\.Foo --x";
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(line, "C:\\Users\\u\\.foo", { _platform: "win32" }), [7]);
+  const posix = "8|brave --user-data-dir=/home/U/.foo --x";
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(posix, "/home/u/.foo", { _platform: "linux" }), []);
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(posix, "/home/U/.foo", { _platform: "linux" }), [8]);
+});
+
+test("W0-1: trailing separators on either side still match exactly", () => {
+  const lines = [
+    '1|brave.exe --type=renderer --user-data-dir="C:\\Pool Dirs\\pool-1\\\\" --x',
+    "2|brave.exe --user-data-dir=C:\\p\\pool-1\\ --x",
+    "3|brave.exe --user-data-dir=C:\\p\\pool-1\\sub --x",
+  ].join("\r\n");
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(lines, "C:\\Pool Dirs\\pool-1\\", { _platform: "win32" }), [1]);
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(lines, "C:\\p\\pool-1", { _platform: "win32" }), [2]);
+});
+
+test("W0-1: dir names with regex metacharacters are matched literally", () => {
+  const line = "9|brave --user-data-dir=/tmp/a+b(1).x --y\n10|brave --user-data-dir=/tmp/aab(1)Xx --y";
+  assert.deepStrictEqual(pool.findBraveProcessesForDir(line, "/tmp/a+b(1).x", { _platform: "linux" }), [9]);
+});
+
+test("W0-1: reapOrphansFor(pool-1) never taskkills pool-10's Brave", () => {
+  const killed = [];
+  const fakeSpawn = (cmd, args) => {
+    if (cmd === "powershell") {
+      return {
+        status: 0,
+        stdout:
+          "111|brave.exe --user-data-dir=C:\\p\\.browser-data-mcp-pool-10 --x\r\n" +
+          "200|brave.exe --user-data-dir=C:\\p\\.browser-data-mcp-pool-1 --x\r\n",
+      };
+    }
+    if (cmd === "taskkill") { killed.push(Number(args[args.indexOf("/PID") + 1])); return { status: 0 }; }
+    throw new Error("unexpected spawn " + cmd);
+  };
+  const n = pool.reapOrphansFor("C:\\p\\.browser-data-mcp-pool-1", { _platform: "win32", _spawnSync: fakeSpawn });
+  assert.strictEqual(n, 1);
+  assert.deepStrictEqual(killed, [200]);
+});
+
+// ───── W0-2: recycled-PID lock detection ─────
+
+test("W0-2: isLockOwnerAlive — dead pid → false", () => {
+  assert.strictEqual(pool.isLockOwnerAlive({ pid: 5, startedAt: new Date().toISOString() }, { isAlive: () => false }), false);
+});
+
+test("W0-2: isLockOwnerAlive — live pid that started AFTER the lock was written → recycled → false", () => {
+  // Live case from 2026-11-03: pool-9 lock written 10-23 by pid 8636; pid 8636
+  // later reassigned to an unrelated process created 10-30.
+  const startTimes = new Map([[8636, Date.parse("2026-10-30T15:39:26.000Z")]]);
+  assert.strictEqual(
+    pool.isLockOwnerAlive({ pid: 8636, startedAt: "2026-10-23T15:43:13.244Z" }, { startTimes, isAlive: () => true }),
+    false,
+  );
+});
+
+test("W0-2: isLockOwnerAlive tolerates a clock step of a few minutes (no false-dead)", () => {
+  // Reviewer V1-1: an NTP/VM clock step can make the reported start time land
+  // after startedAt. Within the slack window the owner must stay alive.
+  const lockedAt = Date.parse("2026-11-03T08:00:00.000Z");
+  const startTimes = new Map([[42, lockedAt + 3 * 60 * 1000]]);
+  assert.strictEqual(
+    pool.isLockOwnerAlive({ pid: 42, startedAt: new Date(lockedAt).toISOString() }, { startTimes, isAlive: () => true }),
+    true,
+  );
+});
+
+test("W0-2: isLockOwnerAlive — genuine owner (started before startedAt) → true", () => {
+  const startTimes = new Map([[38632, Date.parse("2026-10-30T15:39:10.044Z")]]);
+  assert.strictEqual(
+    pool.isLockOwnerAlive({ pid: 38632, startedAt: "2026-10-30T15:39:24.028Z" }, { startTimes, isAlive: () => true }),
+    true,
+  );
+});
+
+test("W0-2: isLockOwnerAlive fails safe (alive) when start time or startedAt is unknown", () => {
+  const isAlive = () => true;
+  assert.strictEqual(pool.isLockOwnerAlive({ pid: 1, startedAt: "2026-01-01T00:00:00Z" }, { startTimes: new Map(), isAlive }), true);
+  assert.strictEqual(pool.isLockOwnerAlive({ pid: 1 }, { startTimes: new Map([[1, Date.now()]]), isAlive }), true);
+  assert.strictEqual(pool.isLockOwnerAlive({ pid: 1, startedAt: "2026-01-01T00:00:00Z" }, { isAlive }), true);
+  assert.strictEqual(pool.isLockOwnerAlive(null, { isAlive }), false);
+});
+
+function tmpPoolDirs(n) {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-w0-"));
+  const dirs = Array.from({ length: n }, (_, i) => path.join(root, `pool-${i + 1}`));
+  for (const d of dirs) fs.mkdirSync(d);
+  return { root, dirs, lock: (d) => path.join(d, ".mcp-wrapper-lock") };
+}
+
+test("W0-2: readLockState — a malformed lock is 'young' within the grace window, 'dead' after it", () => {
+  const fs = require("node:fs");
+  const { root, dirs, lock } = tmpPoolDirs(1);
+  try {
+    fs.writeFileSync(lock(dirs[0]), "");
+    assert.strictEqual(pool.readLockState(lock(dirs[0])).state, "young");
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock(dirs[0]), old, old);
+    assert.strictEqual(pool.readLockState(lock(dirs[0])).state, "dead");
+    assert.strictEqual(pool.readLockState(lock(dirs[0]) + ".missing"), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("W0-2: clearStaleLock leaves a lock alone if another relay replaced it meanwhile", () => {
+  const fs = require("node:fs");
+  const { root, dirs, lock } = tmpPoolDirs(1);
+  try {
+    fs.writeFileSync(lock(dirs[0]), JSON.stringify({ pid: 111, startedAt: "2026-01-01T00:00:00Z" }));
+    const judged = pool.readLockState(lock(dirs[0]), { isAlive: () => false });
+    fs.writeFileSync(lock(dirs[0]), JSON.stringify({ pid: 222, startedAt: new Date().toISOString() }));
+    assert.strictEqual(pool.clearStaleLock(lock(dirs[0]), judged.raw, "test"), false);
+    assert.strictEqual(JSON.parse(fs.readFileSync(lock(dirs[0]), "utf8")).pid, 222);
+    assert.strictEqual(pool.clearStaleLock(lock(dirs[0]), fs.readFileSync(lock(dirs[0]), "utf8"), "test"), true);
+    assert.strictEqual(fs.existsSync(lock(dirs[0])), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("W0-2: claimSlot reclaims a slot whose lock PID was recycled once the pool looks full", () => {
+  const fs = require("node:fs");
+  const { root, dirs, lock } = tmpPoolDirs(2);
+  try {
+    const lockedAt = new Date(Date.now() - 3600_000).toISOString();
+    fs.writeFileSync(lock(dirs[0]), JSON.stringify({ pid: 111, startedAt: lockedAt })); // recycled
+    fs.writeFileSync(lock(dirs[1]), JSON.stringify({ pid: 222, startedAt: lockedAt })); // genuine
+    const probed = [];
+    const claim = pool.claimSlot({
+      _candidates: dirs,
+      _isPidAlive: () => true,
+      _getProcessStartTimes: (pids) => {
+        probed.push(pids);
+        return new Map([[111, Date.now() - 60_000], [222, Date.now() - 7200_000]]); // 111: reused ~59min after lock
+      },
+      _reapOrphansFor: () => 0,
+    });
+    try {
+      assert.strictEqual(claim.dir, dirs[0], "recycled-PID slot is reclaimed");
+      assert.strictEqual(JSON.parse(fs.readFileSync(lock(dirs[0]), "utf8")).pid, process.pid);
+      assert.strictEqual(JSON.parse(fs.readFileSync(lock(dirs[1]), "utf8")).pid, 222, "genuine lock untouched");
+      assert.deepStrictEqual(probed, [[111, 222]], "one batched start-time probe");
+    } finally { claim.release(); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("W0-2: claimSlot skips the start-time probe entirely when a free slot exists", () => {
+  const fs = require("node:fs");
+  const { root, dirs, lock } = tmpPoolDirs(2);
+  try {
+    fs.writeFileSync(lock(dirs[0]), JSON.stringify({ pid: 111, startedAt: new Date().toISOString() }));
+    let probed = false;
+    const claim = pool.claimSlot({
+      _candidates: dirs,
+      _isPidAlive: () => true,
+      _getProcessStartTimes: () => { probed = true; return new Map(); },
+      _reapOrphansFor: () => 0,
+    });
+    try {
+      assert.strictEqual(claim.dir, dirs[1]);
+      assert.strictEqual(probed, false);
+    } finally { claim.release(); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("W0-2: claimSlot clears dead-PID locks and reports exhaustion when every owner is genuine", () => {
+  const fs = require("node:fs");
+  const { root, dirs, lock } = tmpPoolDirs(2);
+  try {
+    const now = new Date().toISOString();
+    fs.writeFileSync(lock(dirs[0]), JSON.stringify({ pid: 111, startedAt: now }));
+    fs.writeFileSync(lock(dirs[1]), JSON.stringify({ pid: 222, startedAt: now }));
+    assert.throws(
+      () => pool.claimSlot({
+        _candidates: dirs,
+        _isPidAlive: () => true,
+        _getProcessStartTimes: () => new Map([[111, Date.now() - 1000], [222, Date.now() - 1000]]),
+        _reapOrphansFor: () => 0,
+      }),
+      /pool exhausted/,
+    );
+    const claim = pool.claimSlot({
+      _candidates: dirs,
+      _isPidAlive: (pid) => pid !== 111,
+      _getProcessStartTimes: () => new Map(),
+      _reapOrphansFor: () => 0,
+    });
+    try { assert.strictEqual(claim.dir, dirs[0], "dead-PID lock cleared in pass 1"); }
+    finally { claim.release(); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

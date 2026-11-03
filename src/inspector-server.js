@@ -120,6 +120,7 @@ function buildStatus(seams = {}) {
   const _listBraveProcessesRaw =
     seams._listBraveProcessesRaw || pool.listBraveProcessesRaw;
   const _isPidAlive = seams._isPidAlive || pool.isPidAlive;
+  const _getProcessStartTimes = seams._getProcessStartTimes || pool.getProcessStartTimes;
   const _findCookiesFile = seams._findCookiesFile || pool.findCookiesFile;
   const _checkCookieAgeDays =
     seams._checkCookieAgeDays || pool.checkCookieAgeDays;
@@ -135,26 +136,37 @@ function buildStatus(seams = {}) {
   const cfg = _loadConfig();
   const braveProcessText = _listBraveProcessesRaw();
 
+  // W0-2 (2026-11-03): read every lock up front so the recycled-PID check is
+  // ONE batched start-time probe per poll, not one per slot.
+  const readLock = (lockPath) => {
+    let exists = false;
+    try { exists = _existsFile(lockPath); } catch { exists = false; }
+    if (!exists) return { exists: false, meta: null };
+    try { return { exists: true, meta: JSON.parse(_readFile(lockPath)) }; }
+    catch { return { exists: true, meta: null, malformed: true }; }
+  };
+  const locks = (cfg.poolDirs || []).map((dir) => readLock(path.join(dir, ".mcp-wrapper-lock")));
+  const livePids = locks
+    .map((l) => l.meta && l.meta.pid)
+    .filter((p) => Number.isFinite(p) && _isPidAlive(p));
+  const startTimes = livePids.length > 0 ? _getProcessStartTimes(livePids) : new Map();
+
   const slots = (cfg.poolDirs || []).map((dir, idx) => {
     const lockPath = path.join(dir, ".mcp-wrapper-lock");
     let pid = null;
     let pidAlive = null;
     let lockHeldMs = null;
     let state = "idle";
-    let lockExists = false;
-
-    try {
-      lockExists = _existsFile(lockPath);
-    } catch {
-      lockExists = false;
-    }
+    const lock = locks[idx];
+    const lockExists = lock.exists;
 
     if (lockExists) {
       try {
-        const meta = JSON.parse(_readFile(lockPath));
+        if (lock.malformed) throw new Error("malformed lock");
+        const meta = lock.meta;
         if (meta && Number.isFinite(meta.pid)) {
           pid = meta.pid;
-          pidAlive = !!_isPidAlive(meta.pid);
+          pidAlive = pool.isLockOwnerAlive(meta, { startTimes, isAlive: _isPidAlive });
         }
         if (meta && meta.startedAt) {
           const started = Date.parse(meta.startedAt);

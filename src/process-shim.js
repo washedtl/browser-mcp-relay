@@ -10,9 +10,12 @@
 //
 //   isPidAlive(pid)
 //     Returns true iff a process with that pid is currently running.
-//     Win uses `tasklist /fi "PID eq N"`; Mac/Linux uses POSIX `process.kill(pid, 0)`
-//     (kernel signal-zero — does no work, just returns ESRCH if dead).
-//     EPERM (alive but not ours) is treated as alive.
+//     Every platform uses `process.kill(pid, 0)` (signal-zero — does no
+//     work, throws ESRCH if dead). EPERM (alive but not ours) is alive.
+//
+//   getProcessStartTimes(pids)
+//     Returns Map<pid, epochMs> of start times for the pids it could
+//     resolve. Used to tell a lock's real owner from a recycled PID.
 //
 // All public functions accept an optional `_spawnSync` test seam; tests pass
 // a fake to avoid hitting the real OS. `_platform` similarly defaults to
@@ -154,50 +157,21 @@ function parsePidPipeOutput(stdoutText) {
  *
  * @param {number} pid
  * @param {object} [opts]
- * @param {NodeJS.Platform} [opts._platform=process.platform]
- * @param {typeof spawnSync} [opts._spawnSync=spawnSync] — test seam (Win only)
- * @param {(p: number, sig: number) => void} [opts._processKill] — test seam (POSIX)
+ * @param {(p: number, sig: number) => void} [opts._processKill] — test seam
  * @returns {boolean}
  */
 function isPidAlive(pid, opts = {}) {
   if (!Number.isFinite(pid) || pid <= 0) return false;
-  const platform = opts._platform || process.platform;
 
-  if (platform === "win32") {
-    const spawn = opts._spawnSync || spawnSync;
-    const result = spawn(
-      "tasklist",
-      ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"],
-      // F1-11: short timeout + caps. Pre-fix, a wedged tasklist would
-      // hang the relay's slot-claim path indefinitely.
-      { encoding: "utf8", windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 },
-    );
-    // F1-11 (2026-05-10): fail-safe = "assume alive" when tasklist itself
-    // fails (timeout, signaled, missing on PATH, error stdout). Same
-    // rationale as the POSIX branch — stealing a live slot crashes Brave;
-    // waiting for the stale-lock TTL costs 5 minutes.
-    if (!result) return true;
-    if (result.error) return true; // ENOENT / ETIMEDOUT etc.
-    if (typeof result.signal === "string" && result.signal) return true;
-    if (result.status !== 0) {
-      // tasklist exits 0 even when no match (it prints INFO: line); a
-      // non-zero status means a real failure. Fail safe.
-      return true;
-    }
-    const stdout = result.stdout || "";
-    // F1-11 reviewer V1 (2026-05-10): empty stdout from a status-0 tasklist
-    // means *neither* the no-match INFO line nor a CSV row was emitted —
-    // genuinely ambiguous output. Fail safe (alive) rather than treating
-    // the silent path as "definitively dead." Same blast-radius logic as
-    // the rest of F1-11.
-    if (stdout.length === 0) return true;
-    // tasklist prints `INFO: No tasks are running...` to stdout when nothing
-    // matches; a real match has the pid quoted as a CSV cell.
-    return stdout.includes(`,"${pid}",`);
-  }
-
-  // POSIX: signal 0 does no work. Throws ESRCH if dead, EPERM if alive but
-  // owned by another user (still alive).
+  // Signal 0 does no work. Throws ESRCH if dead, EPERM if alive but owned
+  // by another user (still alive).
+  //
+  // W0-2 (2026-11-03): Windows uses signal-zero too. libuv's uv_kill(pid, 0)
+  // is OpenProcess + GetExitCodeProcess — no child process. The previous
+  // `tasklist` probe cost ~350-900ms per call and ran once per locked slot
+  // on every relay startup (measured: 13 locked slots ≈ 5-10s before the
+  // MCP handshake). Measured signal-zero on Win11: ~0.02ms; dead → ESRCH,
+  // protected live process (PID 4) → EPERM.
   //
   // F1-11 (2026-05-10): treat unknown errno (ENOSYS, EINVAL, EFAULT, EBUSY,
   // any future addition) as ALIVE rather than dead. Rationale: the
@@ -219,9 +193,66 @@ function isPidAlive(pid, opts = {}) {
   }
 }
 
+/**
+ * Start times of the given pids, for telling a lock's real owner apart from
+ * an unrelated process that was handed the same (recycled) PID.
+ *
+ * One child process for the whole batch: PowerShell Get-Process on Windows
+ * (~1.1s measured), `ps -o pid=,lstart=` elsewhere. Best-effort: pids it
+ * can't resolve (gone, access denied, probe failed) are simply absent from
+ * the map, and callers treat absent as "unknown", never as "dead".
+ *
+ * @param {number[]} pids
+ * @param {object} [opts]
+ * @param {NodeJS.Platform} [opts._platform=process.platform]
+ * @param {typeof spawnSync} [opts._spawnSync=spawnSync] — test seam
+ * @param {number} [opts.timeoutMs=10000] — probe timeout
+ * @returns {Map<number, number>} pid → start time (epoch ms)
+ */
+function getProcessStartTimes(pids, opts = {}) {
+  const out = new Map();
+  const ids = [...new Set((pids || []).filter((p) => Number.isInteger(p) && p > 0))];
+  if (ids.length === 0) return out;
+  const platform = opts._platform || process.platform;
+  const spawn = opts._spawnSync || spawnSync;
+  const timeout = opts.timeoutMs || 10000;
+
+  let result;
+  if (platform === "win32") {
+    // ids are validated integers, so interpolating them is injection-safe.
+    const psScript =
+      `$ErrorActionPreference='SilentlyContinue'; ` +
+      `foreach ($id in @(${ids.join(",")})) { $p = Get-Process -Id $id; ` +
+      `if ($p -and $p.StartTime) { ''+$id+'|'+$p.StartTime.ToUniversalTime().ToString('o') } }`;
+    result = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript], {
+      encoding: "utf8", windowsHide: true, timeout, maxBuffer: 1024 * 1024,
+    });
+  } else {
+    // LC_ALL=C pins lstart to the parseable "Tue Nov  3 08:07:46 2026" form.
+    result = spawn("ps", ["-o", "pid=,lstart=", "-p", ids.join(",")], {
+      encoding: "utf8", timeout, maxBuffer: 1024 * 1024,
+      env: { ...process.env, LC_ALL: "C" },
+    });
+  }
+  // ps exits 1 when some pids are gone; still parse whatever it printed.
+  if (!result || result.error || !result.stdout) return out;
+
+  for (const line of String(result.stdout).split(/\r?\n/)) {
+    const m = platform === "win32"
+      ? /^(\d+)\|(.+)$/.exec(line.trim())
+      : /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    const t = Date.parse(m[2].trim());
+    if (ids.includes(pid) && Number.isFinite(t)) out.set(pid, t);
+  }
+  return out;
+}
+
 module.exports = {
   listProcessesByCommand,
   isPidAlive,
+  getProcessStartTimes,
   // Exposed for unit tests of the parser.
   parsePidPipeOutput,
 };
