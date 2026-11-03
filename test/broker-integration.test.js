@@ -223,6 +223,10 @@ test("relay Inspector: one per broker; /api/broker shows sessions + tabs; every 
   const broker = JSON.parse((await get(port, "/api/broker")).body);
   assert.strictEqual(broker.connections.length, 2);
   assert.deepStrictEqual(broker.brave, { up: true, pid: 4242 });
+  // V2-d: the inspector's rules — no absolute paths, URLs without query / fragment
+  assert.strictEqual(broker.profileDir, "profile-unused");
+  const urls = broker.connections.flatMap((c) => c.tabs.map((x) => x.url));
+  assert.ok(urls.length > 0 && urls.every((u) => u === "about:blank"), JSON.stringify(urls)); // the fakes' about:blank#<session> loses its fragment
 
   const { events } = JSON.parse((await get(port, "/api/activity")).body);
   const requests = events.filter((e) => e.method === "tools/call");

@@ -71,6 +71,18 @@ function redactPath(p) {
   return path.basename(p);
 }
 
+/** A URL without its query and fragment (they carry tokens). */
+const stripQuery = (u) => (typeof u === "string" ? u.replace(/[?#].*$/s, "") : u);
+
+/** /api/broker: the broker's status under the inspector's rules: no absolute paths, URLs without query / fragment. */
+function redactBrokerStatus(st) {
+  return {
+    ...st,
+    profileDir: redactPath(st.profileDir),
+    connections: (st.connections || []).map((c) => ({ ...c, tabs: (c.tabs || []).map((t) => ({ ...t, url: stripQuery(t.url) })) })),
+  };
+}
+
 /** Redact any absolute-path-looking tokens inside a free-form string (e.g.
  *  an error.message that interpolates "/Users/foo/.cache" into the text).
  *  Conservative: only replaces tokens that look like absolute paths
@@ -926,7 +938,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
       "/api/activity": buildActivity,
     };
     // W2E: the broker hosts the Inspector; /api/broker is its sessions view
-    if (brokerStatus) apiBuilders["/api/broker"] = () => brokerStatus();
+    if (brokerStatus) apiBuilders["/api/broker"] = () => redactBrokerStatus(brokerStatus());
     const apiBuilder = apiBuilders[pathname];
     if (apiBuilder) {
       try {
