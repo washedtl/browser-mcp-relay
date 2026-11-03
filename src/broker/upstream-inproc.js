@@ -1,0 +1,308 @@
+// upstream-inproc.js — browser-devtools-mcp (BDMCP) in-process, for the v0.4
+// broker. Replaces the per-session upstream child: the broker owns the
+// session map and calls upstream's tool executor directly, so own-tools and
+// upstream tools act on the SAME page object.
+//
+// No bundle patch. Upstream ships hashed ESM chunks (core-XXXX.js); we find
+// the ones we need by the names in their trailing `export{...}` statement,
+// which survives hash renames, and import() them on the first loadUpstream().
+// Requiring this module is cheap: no fs work, no upstream import, env untouched.
+//
+// Contract we depend on (pinned to 0.6.12; test/upstream-contract.test.js
+// asserts every item against the installed dist):
+//   core chunk    platformInfo{toolsInfo{tools, createToolSessionContext,
+//                 createToolExecutor, executeDescription,
+//                 executeImportantDescription}}, augmentToolInputSchema,
+//                 isToolEnabled, ToolRegistry, ScenarioRun
+//   config chunk  normalizeToolName, applyNormalizedToolNamesInText,
+//                 AVAILABLE_TOOL_DOMAINS + the import-time env constants
+//   execute chunk Execute
+//   session ctx   writable `browserContext` field, `page` getter, close()
+//                 (CDP attach: closes only the page), ensureSessionPageOpen()
+//   zod v3        nested at browser-devtools-mcp/node_modules/zod
+//
+// One upstream per process: BDMCP reads BROWSER_CDP_ENDPOINT_URL once, at
+// import, and caches its CDP connection per endpoint. The broker must keep
+// Brave on the same CDP port for its whole life; loadUpstream() refuses a
+// second, different cdpUrl.
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { createRequire } = require("node:module");
+const { pathToFileURL } = require("node:url");
+
+// Design §3: forced in code so a user's env can't turn telemetry, the
+// "open chrome://inspect in your real Chrome" fallback, or output schemas on.
+const FORCED_UPSTREAM_ENV = Object.freeze({
+  TELEMETRY_ENABLE: "false",
+  BROWSER_CDP_OPEN_INSPECT: "false",
+  TOOL_OUTPUT_SCHEMA_DISABLE: "true",
+});
+
+// Export names that identify each chunk. A chunk matches when its trailing
+// export statement names all of them.
+const CHUNK_SIGNATURES = Object.freeze({
+  core: ["platformInfo", "augmentToolInputSchema", "isToolEnabled", "ToolRegistry", "ScenarioRun"],
+  config: ["normalizeToolName", "applyNormalizedToolNamesInText", "AVAILABLE_TOOL_DOMAINS", "BROWSER_CDP_CONNECT_URL",
+    "BROWSER_CDP_OPEN_INSPECT", "TOOL_OUTPUT_SCHEMA_DISABLE", "BROWSER_PERSISTENT_ENABLE"],
+  execute: ["Execute"],
+});
+
+// Scenario store CRUD: the only upstream tools that never touch the session
+// (no page, buffers, stubs or probes), so they get no tabId.
+const SESSIONLESS_TOOLS = Object.freeze(["scenario-add", "scenario-update", "scenario-delete", "scenario-list", "scenario-search"]);
+
+const TAB_ID_DESCRIPTION =
+  "Optional tab handle. Parallel subagents in one session should call tabs_new and pass the returned tabId on every call " +
+  "to get their own browser window; without it, calls share this session's main tab.";
+
+/** Names exported by the file's trailing `export{...}` statement (`a as b` → b). */
+function parseExportNames(src) {
+  const m = /export\s*\{([^}]*)\}\s*;?\s*$/.exec(src);
+  if (!m) return [];
+  return m[1].split(",").map((s) => s.trim()).filter(Boolean).map((s) => {
+    const as = /\s+as\s+(\S+)$/.exec(s);
+    return as ? as[1] : s;
+  });
+}
+
+/** The one top-level `*.js` in distDir whose exports include every name in `required`. */
+function findChunkByExports(distDir, required) {
+  const hits = [];
+  for (const f of fs.readdirSync(distDir)) {
+    if (!f.endsWith(".js")) continue;
+    const full = path.join(distDir, f);
+    if (!fs.statSync(full).isFile()) continue;
+    const names = parseExportNames(fs.readFileSync(full, "utf8"));
+    if (required.every((n) => names.includes(n))) hits.push(full);
+  }
+  const sig = `{${required.join(", ")}}`;
+  if (hits.length === 0) throw new Error(`[broker] no upstream chunk exports ${sig} in ${distDir} — browser-devtools-mcp changed shape; pin it back or update src/broker/upstream-inproc.js`);
+  if (hits.length > 1) throw new Error(`[broker] ${hits.length} upstream chunks export ${sig} in ${distDir}: ${hits.map((h) => path.basename(h)).join(", ")}`);
+  return hits[0];
+}
+
+function locateUpstreamChunks(distDir) {
+  const out = {};
+  for (const [role, required] of Object.entries(CHUNK_SIGNATURES)) out[role] = findChunkByExports(distDir, required);
+  return out;
+}
+
+/**
+ * Where browser-devtools-mcp lives. Same override as src/index.js and the
+ * W1B catalog (BROWSER_RELAY_UPSTREAM_PATH = <pkg>/dist/index.js), so the
+ * cached catalog and the in-process tools always come from one build.
+ */
+function resolveUpstreamPackage(env = process.env) {
+  let pkgJson;
+  const override = env.BROWSER_RELAY_UPSTREAM_PATH;
+  if (override) {
+    if (!fs.existsSync(override)) throw new Error(`[broker] BROWSER_RELAY_UPSTREAM_PATH="${override}" but no file at that path. Fix or unset.`);
+    pkgJson = path.join(path.dirname(path.dirname(path.resolve(override))), "package.json");
+  } else {
+    pkgJson = require.resolve("browser-devtools-mcp/package.json");
+  }
+  const pkgDir = path.dirname(pkgJson);
+  return { pkgDir, distDir: path.join(pkgDir, "dist"), require: createRequire(pkgJson) };
+}
+
+function forceUpstreamEnv(cdpUrl, env = process.env) {
+  Object.assign(env, FORCED_UPSTREAM_ENV, { BROWSER_CDP_ENDPOINT_URL: cdpUrl });
+  for (const k of Object.keys(env)) if (k.startsWith("BROWSER_PERSISTENT_")) delete env[k];
+}
+
+function assertContract(cond, what) {
+  if (!cond) throw new Error(`[broker] upstream contract broken: ${what} — browser-devtools-mcp changed shape; run test/upstream-contract.test.js`);
+}
+
+const SCOPED = Symbol("browser-mcp-relay.routesScopedToPage");
+
+/**
+ * Point `ctx.browserContext.route/unroute` at the session's page.
+ *
+ * Upstream's stub_* tools call `context.browserContext.route()` — the one CDP
+ * default context every session shares — so A's mock would be served to B.
+ * Here `browserContext` becomes an accessor returning a Proxy whose
+ * route/unroute go to `ctx.page`; everything else reaches the real context,
+ * methods bound to it.
+ *
+ * The Proxy is per page. Upstream keys its stub store by
+ * `context.browserContext` (a WeakMap), so when ensureSessionPageOpen()
+ * swaps in a new page the next access yields a fresh object, i.e. a fresh,
+ * not-yet-installed stub store that routes on the new page, instead of a
+ * store whose `installed` flag still points at the dead page.
+ *
+ * Idempotent. Assigning ctx.browserContext replaces the real context.
+ */
+function scopeRoutesToPage(ctx) {
+  if (ctx[SCOPED]) return ctx;
+  const desc = Object.getOwnPropertyDescriptor(ctx, "browserContext");
+  assertContract(desc && desc.writable && desc.configurable, "BrowserToolSessionContext.browserContext is no longer a writable field");
+  let real = desc.value;
+  let boundPage;
+  let proxy;
+  const makeProxy = () => new Proxy(real, {
+    get(target, prop) {
+      if (prop === "route") return (...a) => ctx.page.route(...a);
+      if (prop === "unroute") return (...a) => ctx.page.unroute(...a);
+      const v = Reflect.get(target, prop, target);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  Object.defineProperty(ctx, "browserContext", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      const page = ctx.page;
+      if (!proxy || page !== boundPage) {
+        boundPage = page;
+        proxy = makeProxy();
+      }
+      return proxy;
+    },
+    set(v) {
+      real = v;
+      proxy = undefined;
+    },
+  });
+  Object.defineProperty(ctx, SCOPED, { value: true });
+  return ctx;
+}
+
+let loaded = null; // { cdpUrl, promise }
+
+/**
+ * Import upstream (once per process) bound to `cdpUrl`.
+ *
+ * @param {{cdpUrl: string}} opts  http(s)://host:port (or ws(s)://) of the broker's Brave
+ * @returns {Promise<{version: string,
+ *   tools: Array<{name: string, description: string, inputShape: object, tool: object, pageTool: boolean}>,
+ *   createContext: (sessionKey: string) => Promise<object>,
+ *   execute: (ctx: object, tool: object, args: object) => Promise<object>,
+ *   Execute: Function, ScenarioRun: Function}>}
+ */
+function loadUpstream({ cdpUrl } = {}) {
+  if (typeof cdpUrl !== "string" || !/^(https?|wss?):\/\/[^/]+/.test(cdpUrl)) {
+    return Promise.reject(new Error(`[broker] loadUpstream needs cdpUrl as http(s)://host:port or ws(s)://…, got ${JSON.stringify(cdpUrl)}`));
+  }
+  if (loaded) {
+    if (loaded.cdpUrl !== cdpUrl) {
+      return Promise.reject(new Error(`[broker] upstream is already bound to ${loaded.cdpUrl}; it reads BROWSER_CDP_ENDPOINT_URL once per process, so Brave must keep that port (asked for ${cdpUrl})`));
+    }
+    return loaded.promise;
+  }
+  const promise = doLoad(cdpUrl);
+  loaded = { cdpUrl, promise };
+  // never cache a failed load: the next call retries from scratch
+  promise.catch(() => { if (loaded && loaded.promise === promise) loaded = null; });
+  return promise;
+}
+
+async function doLoad(cdpUrl) {
+  const pkg = resolveUpstreamPackage();
+  const chunks = locateUpstreamChunks(pkg.distDir);
+  forceUpstreamEnv(cdpUrl);
+  const core = await import(pathToFileURL(chunks.core).href);
+  const cfg = await import(pathToFileURL(chunks.config).href);
+  const { Execute } = await import(pathToFileURL(chunks.execute).href);
+  const { platformInfo, augmentToolInputSchema, isToolEnabled, ToolRegistry, ScenarioRun } = core;
+  const toolsInfo = platformInfo && platformInfo.toolsInfo;
+
+  assertContract(toolsInfo && Array.isArray(toolsInfo.tools), "platformInfo.toolsInfo.tools");
+  for (const fn of ["createToolSessionContext", "createToolExecutor"]) assertContract(typeof toolsInfo[fn] === "function", `platformInfo.toolsInfo.${fn}()`);
+  for (const s of ["executeDescription", "executeImportantDescription"]) assertContract(typeof toolsInfo[s] === "string", `platformInfo.toolsInfo.${s}`);
+  for (const [n, v] of Object.entries({ augmentToolInputSchema, isToolEnabled, ToolRegistry, ScenarioRun, Execute,
+    normalizeToolName: cfg.normalizeToolName, applyNormalizedToolNamesInText: cfg.applyNormalizedToolNamesInText })) {
+    assertContract(typeof v === "function", `export ${n}`);
+  }
+  // The env is read at import. If something imported these chunks earlier
+  // in this process with other env, the constants are stale: fail loudly.
+  assertContract(cfg.BROWSER_CDP_CONNECT_URL === cdpUrl, `BROWSER_CDP_CONNECT_URL is ${cfg.BROWSER_CDP_CONNECT_URL}, expected ${cdpUrl} (upstream imported before loadUpstream?)`);
+  assertContract(cfg.BROWSER_CDP_OPEN_INSPECT === false && cfg.TOOL_OUTPUT_SCHEMA_DISABLE === true && cfg.BROWSER_PERSISTENT_ENABLE === false,
+    "forced env did not reach upstream's config constants (upstream imported before loadUpstream?)");
+
+  const executor = toolsInfo.createToolExecutor();
+  assertContract(executor && typeof executor.executeTool === "function", "executor.executeTool()");
+  const z = pkg.require("zod");
+  assertContract(z && typeof z.string === "function" && z.string()._zod === undefined, "zod v3 nested under browser-devtools-mcp");
+  const tabIdShape = { tabId: z.string().optional().describe(TAB_ID_DESCRIPTION) };
+
+  // Same registration rules as upstream's own MCP server (dist/index.js
+  // _createServer), so names, descriptions and schemas match the W1B
+  // catalog served for tools/list.
+  const canonicalNames = [...toolsInfo.tools.map((t) => t.name()), "execute"];
+  const mcpText = (s) => (s ? cfg.applyNormalizedToolNamesInText(s, canonicalNames) : s);
+  const allowedDomains = cfg.AVAILABLE_TOOL_DOMAINS;
+  const registry = new ToolRegistry();
+  const upstreamTools = [];
+  for (const t of toolsInfo.tools) {
+    if (!isToolEnabled(t)) continue;
+    const domain = t.name().split("_")[0]?.toLowerCase() ?? "";
+    if (allowedDomains && !allowedDomains.has(domain)) continue;
+    registry.addTool(t);
+    upstreamTools.push(t);
+  }
+  const executeTool = new Execute(registry, mcpText(toolsInfo.executeImportantDescription), mcpText(toolsInfo.executeDescription));
+  registry.addTool(executeTool);
+  const scenarioRunTool = new ScenarioRun(registry);
+
+  const tools = [...upstreamTools, executeTool, scenarioRunTool].map((t) => {
+    const shape = augmentToolInputSchema(t.inputSchema());
+    assertContract(!Object.hasOwn(shape, "tabId"), `${t.name()} now declares its own tabId; the broker's tabId would shadow it`);
+    const pageTool = !SESSIONLESS_TOOLS.includes(t.name());
+    return {
+      name: cfg.normalizeToolName(t.name()),
+      description: mcpText(t.description()),
+      inputShape: pageTool ? { ...shape, ...tabIdShape } : shape,
+      tool: t,
+      pageTool,
+    };
+  });
+
+  // Upstream caches its CDP connection check-then-set, so concurrent first
+  // calls each open their own connection to the one Brave. Serialize
+  // context creation until a connected browser is known (again after Brave
+  // dies); after that, sessions are created in parallel.
+  let knownBrowser = null;
+  let queue = Promise.resolve();
+  const create = async (sessionKey) => {
+    const ctx = await toolsInfo.createToolSessionContext(() => sessionKey);
+    scopeRoutesToPage(ctx);
+    const b = ctx.browserContext.browser();
+    if (b) knownBrowser = b;
+    return ctx;
+  };
+  const createContext = (sessionKey) => {
+    if (knownBrowser && knownBrowser.isConnected()) return create(sessionKey);
+    const p = queue.then(() => create(sessionKey));
+    queue = p.then(() => {}, () => {});
+    return p;
+  };
+
+  // `args` must already be parsed against the tool's inputShape (McpServer
+  // does that). Do not re-parse here: upstream enum fields use .transform()
+  // ("PNG" -> "png"), so a second parse rejects them.
+  const execute = async (ctx, tool, args) => {
+    const upstreamArgs = { ...args };
+    delete upstreamArgs.tabId; // the broker's routing key, not an upstream argument
+    return executor.executeTool(ctx, tool, upstreamArgs);
+  };
+
+  const version = JSON.parse(fs.readFileSync(path.join(pkg.pkgDir, "package.json"), "utf8")).version;
+  return { version, tools, createContext, execute, Execute, ScenarioRun };
+}
+
+module.exports = {
+  loadUpstream,
+  scopeRoutesToPage,
+  // exported for tests and sibling broker modules
+  CHUNK_SIGNATURES,
+  FORCED_UPSTREAM_ENV,
+  SESSIONLESS_TOOLS,
+  parseExportNames,
+  findChunkByExports,
+  locateUpstreamChunks,
+  resolveUpstreamPackage,
+};
