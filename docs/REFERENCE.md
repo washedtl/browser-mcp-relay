@@ -10,9 +10,13 @@ The slim README at the root of the repo is for getting up and running. This file
   - [Toolsets (hidden by default)](#toolsets)
 - [Worked examples](#worked-examples)
 - [Architecture](#architecture)
+  - [Broker mode (default on Windows)](#broker-mode-default-on-windows)
+  - [Legacy mode](#legacy-mode)
 - [Configuration](#configuration)
+  - [Broker settings](#broker-settings)
 - [Modes](#modes)
-- [How the pool dance actually works](#how-the-pool-dance-actually-works)
+- [Broker lifecycle](#broker-lifecycle)
+- [Legacy mode: how the pool dance works](#legacy-mode-how-the-pool-dance-works)
 - [Optional features](#optional-features)
   - [Proxy whitelist](#proxy-whitelist)
   - [Credential vault + autofill](#credential-vault--autofill)
@@ -20,8 +24,10 @@ The slim README at the root of the repo is for getting up and running. This file
 - [Inspector](#inspector)
 - [Platform support](#platform-support)
 - [Troubleshooting](#troubleshooting)
+  - [Broker mode](#broker-mode)
 - [Diagnostic recipes](#diagnostic-recipes)
 - [Limitations](#limitations)
+  - [Broker mode: known risks](#broker-mode-known-risks)
 
 ---
 
@@ -352,6 +358,39 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
 
 ## Architecture
 
+### Broker mode (default on Windows)
+
+```
+Claude session 1 ── stdio ──▶ shim (node src/index.js, ~23 MB) ─┐
+Claude session 2 ── stdio ──▶ shim ──────────────────────────────┼─▶ \\.\pipe\browser-mcp-relay-<user>-<hash>
+Claude session N ── stdio ──▶ shim ──────────────────────────────┘          │ (one broker per user + profile)
+                                                                             ▼
+      ┌────────────── broker (node src/broker/main.js, detached, de-elevated) ──────────────┐
+      │ one MCP server per connection (cached catalog, toolsets, elicitation per session)   │
+      │ SessionRegistry: (connection, tabId) → upstream session context = one window        │
+      │ browser-devtools-mcp IN-PROCESS (loaded on the first tools/call) + the 21 own-tools │
+      │ BraveSupervisor: launch, PID, crash → relaunch, graceful close                      │
+      │ control channel (broker:status / broker:stop) · the one relay Inspector (optional)  │
+      └───────────────────────────────── CDP 127.0.0.1:<port> ─────────────────────────────┘
+                                                                             ▼
+                                  ONE Brave, ONE persistent profile (logins shared live, kept)
+```
+
+**How it works:**
+
+- 📥 `node src/index.js` reads `BROWSER_RELAY_MODE` (env, then `local-config.json`; default `broker` on Windows, `legacy` elsewhere) and becomes the **shim**. The shim loads only Node built-ins and passes the session's newline-delimited JSON-RPC through to the broker's named pipe byte for byte. The `~/.claude.json` entry doesn't change.
+- 🔑 Before forwarding anything, the shim checks that the pipe's owner knows this user's broker key (an HMAC over a nonce; the key is `broker.key` in the broker home). Something squatting the predictable pipe name gets nothing.
+- 🚀 No broker yet? The shim starts one through a detached launcher, so killing the session's process tree can't reach it. When the session is elevated, the broker starts with the desktop shell's own (non-elevated) token, and so does its Brave. Shims racing a cold start all launch one, and the pipe lets exactly one win.
+- 📋 `tools/list` comes from the cached upstream catalog, as in legacy mode, plus an optional `tabId` on every page tool. A session that never calls a tool costs the broker no upstream import and no Brave.
+- ⚙️ `tools/call` runs in the broker. Upstream's tools run in-process, through upstream's own executor and zod schemas, and own-tools run on the same page objects. Stubs (`stub_*`) and debug probes are scoped to the session's page, not the shared context.
+- 🪟 Every session tab is its **own Brave window**, cascaded and visible (`BROWSER_RELAY_BROKER_WINDOWS=offscreen` keeps them off-screen). A tab in the background of a shared window stalls screenshots; separate windows don't. A minimized window is restored before screenshot and interaction tools run.
+- 🧵 **Parallel subagents share their parent session's MCP connection**, so without `tabId` they'd drive the same tab. Each should call `tabs_new` and pass the returned `tabId` on every call.
+- 🍪 One persistent profile: a login in any session is live in every other one, and it survives restarts, because Brave itself wrote the cookies.
+
+### Legacy mode
+
+`BROWSER_RELAY_MODE=legacy` (the default on macOS and Linux): each MCP session runs its own relay, with its own Brave and its own upstream child, as before v0.4.
+
 ```
                     stdio JSON-RPC
    MCP client ───────────────────▶  browser-mcp-relay
@@ -385,7 +424,7 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
 - 🔌 Both paths attach to the same Brave instance: the upstream uses `BROWSER_CDP_CONNECT_URL`, own-tools use Playwright's `chromium.connectOverCDP` against the same port.
 - 🪶 One Brave per relay process. Brave is launched **lazily on the first `tools/call`**, not at startup.
 
-**Shutdown lifecycle (since v0.3.2):** orphan Brave processes are reaped at three points — `claimSlot` (lock-acquire), `ensureBrave` (pre-launch, `F1-16`), and `closeBrave` (shutdown via Playwright `context.close`). The pre-launch reap closes the lazy-launch gap where a previous-session Brave can squat on a claimed-but-not-yet-launched user-data-dir.
+**Legacy shutdown lifecycle (since v0.3.2):** orphan Brave processes are reaped at three points — `claimSlot` (lock-acquire), `ensureBrave` (pre-launch, `F1-16`), and `closeBrave` (shutdown via Playwright `context.close`). The pre-launch reap closes the lazy-launch gap where a previous-session Brave can squat on a claimed-but-not-yet-launched user-data-dir.
 
 ---
 
@@ -414,21 +453,93 @@ All paths the relay needs are auto-detected by default. Override them with these
 
 **Precedence:** environment variable ▸ `local-config.json` ▸ auto-detect ▸ reasonable hard-coded defaults.
 
+### Broker settings
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `BROWSER_RELAY_MODE` | `broker` on Windows, `legacy` elsewhere | `broker`: `src/index.js` is the shim and joins the shared broker. `legacy`: one relay + Brave + upstream per session (the pre-v0.4 model). On macOS and Linux the broker's unix-socket paths have not been run yet, so legacy stays the default there. |
+| `BROWSER_RELAY_BROKER_PROFILE_DIR` | `<broker home>/profile` | The broker's one persistent Brave profile. The pipe name is derived from it, so two profile dirs mean two brokers. |
+| `BROWSER_RELAY_BROKER_PIPE` | `\\.\pipe\browser-mcp-relay-<user>-<hash of user + profile>` | Override the pipe (tests use a unique one). On unix: `<tmpdir>/browser-mcp-relay-<uid>/<hash>.sock` in a private 0700 dir. |
+| `BROWSER_RELAY_BROKER_WINDOWS` | `cascade` | `cascade`: visible, stepped windows, one per session tab. `offscreen`: windows left of every display; they still render at full speed, and `browser_show` brings one into view. |
+| `BROWSER_RELAY_BROKER_IDLE_EXIT_MS` | `600000` (10 min) | The broker exits this long after its last session disconnected, closing Brave gracefully first. |
+| `BROWSER_RELAY_BROKER_BROWSER_IDLE_MS` | `1200000` (20 min) | Brave closes gracefully after this long without any tool call, even with sessions connected. The next call relaunches it (~1-2 s), and its tabs answer with a reset notice. |
+| `BROWSER_RELAY_BROKER_DEELEVATE` | on | `off` keeps a broker started from an elevated session elevated, and its Brave with it. Read by the launcher from the **process env only** (the MCP server's `env` block), not from `local-config.json`. |
+| `BROWSER_RELAY_BROKER_WATCHDOG_MS` | `60000` | A watchdog thread kills the broker if its event loop is blocked this long (e.g. a runaway `execute`); the shims then start a fresh one. Minimum 10 s; `0` turns it off. It is also off while Node's own debugger is attached. |
+| `BROWSER_RELAY_BROKER_RECYCLE_RSS_MB` | `1024` | A broker whose memory (RSS) is above this restarts itself once no tool call has run for a minute and either no session is connected or Brave has idled out (no session loses an open tab). `0` turns it off. |
+| `BROWSER_RELAY_BROKER_LOG` | `<broker home>/broker.log` | The broker log (rotated once at startup past 1 MB). The launcher also writes its warnings there; it reads this from the process env only. |
+
+The broker home is `%LOCALAPPDATA%\browser-mcp-relay\broker` on Windows, `~/Library/Application Support/browser-mcp-relay/broker` on macOS, and `$XDG_STATE_HOME/browser-mcp-relay/broker` (or `~/.local/state/…`) on Linux. It holds `broker.key`, `broker.log`, `profile/` and `work/` (the broker's working dir: relative output paths and project-scope scenarios land there).
+
+**Which settings apply in broker mode.** These work as before: `BROWSER_RELAY_BRAVE_PATH`, `BROWSER_RELAY_UPSTREAM_PATH`, `BROWSER_RELAY_PROXY_URL` (without credentials, see below), `BROWSER_HEADLESS_ENABLE`, `BROWSER_LOAD_EXTENSIONS`, `BROWSER_RELAY_TOOLSETS` (the broker's starting set; each session then enables toolsets for itself), `BROWSER_RELAY_INSPECTOR_PORT` and `_BIND`, and `BROWSER_RELAY_CATALOG_REFRESH`. Legacy-only: `BROWSER_RELAY_POOL_DIR`, `BROWSER_RELAY_POOL_SLOT`, `BROWSER_MCP_ROLE` and `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` (no pool), and `BROWSER_RELAY_VAULT_FILES` and `BROWSER_RELAY_IGNORE_HTTPS_ERRORS` (not wired into the broker yet).
+
+The broker's settings are fixed when it starts, by whichever session starts it. A session whose browser settings differ gets one warning in the broker log, and the broker keeps its own settings until it restarts (`npm run broker:stop`).
+
 ---
 
 ## Modes
 
-### 🟢 Standalone (default)
+### 🟣 Broker (default on Windows)
+
+One broker per user and profile serves every session: one Brave, one persistent profile, one window per session tab. See [Broker lifecycle](#broker-lifecycle). Set `BROWSER_RELAY_MODE=legacy` for the two modes below.
+
+### 🟢 Legacy standalone (legacy's default)
 
 One Brave per relay process. Profile stored at `<repo>/.browser-data` (or a per-user cache dir if the repo is read-only — see `BROWSER_RELAY_POOL_DIR` above for platform-specific paths). No cookie snapshot. Each `npm run setup` produces this configuration. **Recommended for first-time users.**
 
-### 🔵 Pool (opt-in)
+### 🔵 Legacy pool (opt-in)
 
 Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to claim. Pool mode uses that single dir + the slot index from `BROWSER_RELAY_POOL_SLOT` for the launch banner + CDP port (`9333 + slot - 1`). **Useful when running multiple relay processes against pre-warmed Brave profiles** — each relay claims a different dir, each gets a deterministic port.
 
 ---
 
-## How the pool dance actually works
+## Broker lifecycle
+
+### Start and join
+
+1. A session starts `node src/index.js`. In broker mode that is the shim, which connects to the broker's pipe right away, while the client is still starting.
+2. **No pipe:** the shim spawns a detached launcher (`node src/shim.js --launch …`), which starts `src/broker/main.js` and exits. The broker therefore has no live parent, and a tree-kill of the session can't take it down. When the launcher is elevated, it starts the broker with the desktop shell's token (medium integrity, no window) and an exact allowlisted env: OS basics, `BROWSER_*` and upstream's catalog variables, never e.g. API tokens meant for Claude. If that fails, the broker starts elevated, and the warning goes to the broker log and to every session it serves.
+3. **Single instance:** the pipe is the lock. A second broker's `listen` fails with `EADDRINUSE`, and it exits. Three shims racing a cold start leave exactly one broker (measured in `test/e2e-broker.test.js`).
+4. **Handshake:** the shim sends a hello with a nonce, and the broker answers with `HMAC(broker key, nonce)`. Nothing of the session is sent before that check passes.
+5. The broker serves `initialize` and `tools/list` from the cached catalog. Upstream is imported, and Brave launched, on the first `tools/call` (cold first call ≈ 2 s on a warm disk).
+
+### Sessions, windows, tabs
+
+- One MCP connection is one Claude session, and its subagents share it. The session's `main` tab is opened on its first page tool. `tabs_new` opens more, each in its own window, and returns a `tabId` that every page tool accepts. Only `tabs_new` creates tabs: an unknown `tabId` is an error.
+- `tabs_list`, `tabs_select` and `tabs_close` see only the calling session's tabs. Cookies (`cookies_*`) are shared by design: there is one profile.
+- A session's tabs close when it disconnects.
+
+### Idle, crashes, restarts
+
+| Event | What happens |
+|---|---|
+| No tool call for 20 min | Brave closes gracefully (cookies flushed). The next call relaunches it, and each tab's next result starts with a one-line *"This tab was reset because …"* notice. |
+| No session for 10 min | The broker closes Brave gracefully and exits. The next session starts a new one. |
+| Brave crashes or is killed | The broker sees the PID gone, drops every tab, and the next call relaunches Brave (measured ≈ 1.5 s) and answers with the reset notice. A hard kill can lose the last ~30 s of cookie changes; a graceful close loses nothing. |
+| The broker dies | Its Brave dies with it. Each shim reconnects, restarting the broker if needed, and replays the session's `initialize`. A request that was in flight gets *"browser broker restarted; please retry the call"*, and the next call works (measured ≈ 4.5 s, including that retry). |
+| Event loop blocked ≥ 60 s | The watchdog kills the broker, and the shims start a fresh one. |
+| Memory above 1 GB while idle | The broker restarts itself, but never under a session's open browser. |
+
+### Profile: seeded once, then Brave's own
+
+On its first start, when the profile dir doesn't exist yet, the broker seeds it **once** from the legacy pool slot whose `Default/Network/Cookies` was written most recently. It skips slots Brave runs on or a legacy relay holds. It copies `Default/` minus caches (`Cache`, `Code Cache`, `GPUCache`, `*ShaderCache`, `Dawn*Cache`, `Service Worker/CacheStorage` and `ScriptCache`, `*_crx_cache`) and old session tabs, plus `Local State` (the cookie key). The source is never modified. Brave's first launch waits for the copy, and the log names the source. Without a pool, the profile starts fresh: log in once in a session window (`browser_show` brings it forward), and the login sticks.
+
+To pick the source yourself, or to see what would be copied:
+
+```bash
+npm run migrate-profile -- --dry-run                 # the slot the broker would pick, file count, size, skipped caches
+npm run migrate-profile -- --from <profile dir>      # seed from that dir (refuses if the broker profile exists)
+```
+
+### Control and logs
+
+```bash
+npm run broker:status   # pid, uptime, pipe, profile, Brave up/pid, each session's tabs (tabId, state, URL), RSS
+npm run broker:stop     # close Brave gracefully and exit; open sessions start a new broker on their next call
+```
+
+Both authenticate with the broker key, the same way the shim does. `broker:stop` followed by any tool call is how to restart the broker, for example after changing its settings. The broker log is `<broker home>/broker.log`.
+
+## Legacy mode: how the pool dance works
 
 If you run multiple Cursor windows simultaneously, each spawns its own relay, each claims a pool slot, each launches its own Brave. Here's the full dance — useful for understanding what you're seeing in the Inspector and for debugging restart hangs.
 
@@ -644,6 +755,10 @@ Set `BROWSER_RELAY_INSPECTOR_PORT` in your MCP-client config (e.g. `~/.claude.js
 
 After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-slot Inspector page. The Activity feed populates in real time as your AI client makes tool calls.
 
+#### Hosted by the broker (broker mode)
+
+With `BROWSER_RELAY_INSPECTOR_PORT` set, the **broker** hosts the one Inspector. Legacy relays each raced for the port. The Activity feed shows every session's calls, upstream tools included, and each event carries a `conn` field naming its session. The home page gains a **Broker** section (Brave up/pid, sessions, each tab and its URL), and `GET /api/broker` returns the same JSON as `npm run broker:status`. The Host/Origin gates and the redaction rules below apply unchanged.
+
 ### Pages
 
 | | |
@@ -680,6 +795,18 @@ For code that imports `src/inspector-server.js` (or `scripts/inspector.js`) dire
 ---
 
 ## Troubleshooting
+
+### Broker mode
+
+- **What is it doing?** Run `npm run broker:status`, or read the broker log (`%LOCALAPPDATA%\browser-mcp-relay\broker\broker.log` on Windows). Shim errors go to the session's MCP stderr, prefixed `[mcp-relay shim]`.
+- **Restart it** (new settings, a wedged Brave): run `npm run broker:stop`. The next tool call in any session starts a fresh broker.
+- **"browser broker restarted; please retry the call"**: the broker died while that call was in flight. Retry it; the shim has already reconnected.
+- **"This tab was reset because …"**: Brave was relaunched (crash, idle close, broker restart). The tab's URL, console and network buffers, element refs, stubs and emulation are gone. Navigate again.
+- **"refusing \\.\pipe\…: the pipe's owner failed authentication"**: something other than your broker holds the pipe name. Close it, or set `BROWSER_RELAY_BROKER_PIPE`.
+- **"the browser broker runs elevated"** warning: de-elevation failed (no desktop shell, or UAC off), so the broker and its Brave run as administrator. A process at medium integrity can then reach an elevated Brave through the pipe.
+- **A session's settings are ignored**: the broker keeps the settings it started with. Run `npm run broker:stop`, and the next session starts a broker with its own settings.
+- **Logins missing after the switch**: the seed picks the freshest idle pool slot, and the log says which. Log in once in a session window, or stop the broker, move `profile/` away and run `npm run migrate-profile -- --from <slot>`.
+- **Back to the old model**: set `BROWSER_RELAY_MODE=legacy` and restart the MCP client.
 
 ### "Brave not found"
 
@@ -829,5 +956,14 @@ Then `Get-Content $env:USERPROFILE/.claude/scripts/browser-mcp-relay/relay-stder
 - 📜 Upstream `browser-devtools-mcp` is licensed **Elastic-2.0** — permissive but **not OSI-approved-open-source**. See [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for the full breakdown.
 - 🦁 Requires **Brave** installed locally. Other Chromium browsers may work via `BROWSER_RELAY_BRAVE_PATH` but are untested.
 - 🍪 **Standalone mode does not snapshot cookies** from another profile — first run hits login walls. Cookie snapshot is a pool-mode feature.
-- 🧍 **One Brave per relay process.** To run multiple Brave sessions in parallel, run multiple relays (each on its own slot / profile dir).
+- 🧍 **Legacy mode: one Brave per relay process.** To run multiple Brave sessions in parallel there, run multiple relays (each on its own slot / profile dir).
 - 🔐 **3 low-severity transitive `cookie<0.7.0` advisories** via `lighthouse → @sentry/node`. Fix requires `lighthouse@13`, which is a breaking dep upgrade for our `^11.0.0` pin. Tracked; not exploitable in practice for a localhost-bound dev tool. Run `npm audit` to see them; `npm audit fix --force` would resolve at the cost of a major-version upgrade.
+
+### Broker mode: known risks
+
+- **Shared blast radius.** One broker serves every session. A hung tool, a leak or a crash in it affects all sessions at once, where a legacy relay affected one. Mitigations: per-call timeouts on the data-out tools, `uncaughtException` is logged and the broker keeps serving, a watchdog for a blocked event loop, a recycle on high idle memory, and the shims reconnect within seconds.
+- **`execute` runs in-process.** Upstream's `execute` (and `scenario-run`) evaluate agent-written JavaScript inside the broker process, shared by every session. A runaway script blocks all of them until the watchdog restarts the broker.
+- **Pipe access is browser access.** Any process of yours that can open the pipe and read `broker.key` can drive the logged-in Brave. That is why the broker de-elevates; when it can't, it says so in the log and in every session.
+- **Upstream internals.** The broker imports `browser-devtools-mcp`'s bundled chunks by their export names (pinned to 0.6.12, asserted by `test/upstream-contract.test.js`). An upstream bump can break broker mode while legacy mode still works.
+- **Not in broker mode yet:** credential-vault autofill (`BROWSER_RELAY_VAULT_FILES`), authenticated proxies (a `user:pass@` proxy URL is used without its credentials, with a warning) and `BROWSER_RELAY_IGNORE_HTTPS_ERRORS`. Brave verifies TLS certificates, so a MITM debug proxy needs its CA trusted by the OS. Use legacy mode if you need these.
+- **macOS and Linux:** the broker's unix-socket paths have not been run yet; legacy stays the default there.

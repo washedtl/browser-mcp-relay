@@ -187,3 +187,43 @@ test("W1B: smoke + setup count the full catalog (all toolsets) against MIN_TOOLS
     assert.ok(liveTotal >= min, `${script} MIN_TOOLS=${min} exceeds the live catalog (${liveTotal})`);
   }
 });
+
+// ── W2E: broker mode ──
+
+test("W2E: every BROWSER_RELAY_BROKER_* setting the code reads is documented in REFERENCE.md", () => {
+  // set by the launcher for the broker it starts, never by a user
+  const INTERNAL = new Set(["BROWSER_RELAY_BROKER_LAUNCH_WARNING"]);
+  const read = new Set();
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith(".js")) for (const m of fs.readFileSync(full, "utf8").matchAll(/BROWSER_RELAY_BROKER_[A-Z_]*[A-Z]/g)) read.add(m[0]);
+    }
+  };
+  walk(path.join(REPO, "src"));
+  const missing = [...read].filter((k) => !INTERNAL.has(k) && !REFERENCE.includes(`\`${k}\``));
+  assert.ok(read.size >= 8, `expected the broker settings in src/, found ${[...read].join(", ")}`);
+  assert.deepStrictEqual(missing, [], "broker settings read in src/ but missing from REFERENCE.md");
+});
+
+test("W2E: README + REFERENCE state the default mode the code uses, and the legacy fallback", () => {
+  const { relayMode } = require("../src/index.js");
+  assert.strictEqual(relayMode({}, { platform: "win32" }), "broker");
+  assert.strictEqual(relayMode({}, { platform: "linux" }), "legacy");
+  assert.match(README, /Broker mode is the default on Windows/);
+  assert.match(README, /BROWSER_RELAY_MODE=legacy/);
+  assert.match(REFERENCE, /`BROWSER_RELAY_MODE` \| `broker` on Windows, `legacy` elsewhere/);
+  const example = JSON.parse(fs.readFileSync(path.join(REPO, "local-config.example.json"), "utf8"));
+  assert.ok("BROWSER_RELAY_MODE" in example && "_BROWSER_RELAY_MODE_doc" in example);
+});
+
+test("W2E: the broker npm scripts the docs name exist", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8"));
+  for (const script of ["broker:status", "broker:stop", "migrate-profile"]) {
+    assert.ok(pkg.scripts[script], `package.json lacks "${script}"`);
+    assert.ok(fs.existsSync(path.join(REPO, pkg.scripts[script].split(" ")[1])), `${script} points at a missing file`);
+    assert.ok(REFERENCE.includes(`npm run ${script}`), `REFERENCE.md doesn't show npm run ${script}`);
+  }
+  assert.ok(README.includes("npm run broker:status") && README.includes("npm run broker:stop"));
+});

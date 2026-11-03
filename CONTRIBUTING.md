@@ -6,24 +6,37 @@ Thanks for taking a look. This project stays small on purpose; PRs that keep the
 
 ```
 src/
-├── index.js              # entrypoint — runs the relay server; on the first
-│                         #   tool call claims a slot, launches Brave, spawns
-│                         #   the upstream child (and respawns both on death)
-├── relay-server.js       # tools/list merge + tools/call routing
+├── index.js              # entrypoint: BROWSER_RELAY_MODE=broker (Windows default)
+│                         #   runs shim.js; legacy runs the per-session relay
+│                         #   (claims a slot, launches Brave, spawns upstream)
+├── shim.js               # broker mode, per session: stdio <-> the broker's pipe
+├── broker/               # broker mode: ONE broker per user + profile
+│   ├── main.js           #   per-connection MCP servers, idle policy, status
+│   ├── pipe-server.js    #   pipe name, single-instance claim, HMAC handshake
+│   ├── sessions.js       #   (connection, tabId) -> upstream session context
+│   ├── upstream-inproc.js#   browser-devtools-mcp imported in-process
+│   ├── window-pages.js   #   one Brave window per session tab
+│   ├── brave-supervisor.js#  the one Brave: launch, crash relaunch, graceful close
+│   ├── deelevate.js      #   start the broker without admin rights
+│   ├── profile-seed.js   #   one-time profile seed from a legacy pool slot
+│   └── control.js        #   broker:status / broker:stop over the pipe
+├── relay-server.js       # tools/list merge + tools/call routing (+ traffic recording)
 ├── upstream-client.js    # JSON-RPC over stdio to browser-devtools-mcp
 ├── cdp-bridge.js         # launchBrave / closeBrave (Playwright-over-CDP)
 ├── detect-browser.js     # cross-platform Brave + profile-dir detection
 ├── process-shim.js       # cross-platform "is process alive?" + kill
 ├── pool-shared.js        # opt-in pool / standalone slot management
 ├── local-config.js       # local-config.json loader + env merge
-└── own-tools/            # the 16 first-party tools live here
+└── own-tools/            # the first-party tools live here
     ├── index.js          # registry — add new tools here
     └── <tool>.js         # one file per tool (name + schema + handler)
 test/                     # node --test runner; mirrors src/ layout
 └── own-tools/            # tests for each own-tool (shape + acts on ctx.page only)
 scripts/
 ├── setup.js              # interactive `npm run setup` wizard
-└── smoke.js              # `npm run smoke` — spawn relay + tools/list check
+├── smoke.js              # `npm run smoke` — spawn relay (legacy) + tools/list check
+├── broker-ctl.js         # `npm run broker:status` / `broker:stop`
+└── migrate-profile.js    # `npm run migrate-profile` — seed the broker profile by hand
 ```
 
 ## Add an own-tool in 5 minutes
@@ -103,7 +116,7 @@ scripts/
 - `node --test` is the runner. No mocha, no jest, no babel.
 - Prefer **test seams** over real side-effects. `src/detect-browser.js` + `test/detect-browser.test.js` show the pattern: detection takes injected `platform` + `env` + `existsSync` so the tests don't need a real Brave install.
 - Don't reach for the network in tests.
-- Don't launch Brave in tests. Bridge-missing assertions cover the unhappy path; manual `npm run smoke` covers the happy path. (The one exception, `launchBrave + connectOverCDP roundtrip` in `test/cdp-bridge.test.js`, runs only when Brave is detected — set `BROWSER_RELAY_BRAVE_PATH` to a non-existent path to skip it.)
+- Real-Brave tests (the broker's upstream, window, supervisor and end-to-end tests, plus `launchBrave + connectOverCDP roundtrip` in `test/cdp-bridge.test.js`) run only when Brave is installed, and skip cleanly otherwise. They use `test/fixtures/temp-brave.js`: a throwaway profile under `.tmp-profiles/`, an OS-assigned port, headless unless `BMR_TEST_HEADFUL=1`. Never a real profile, a real broker pipe (`browser-mcp-relay-*`) or the real broker home: broker tests use `bmr-test-*` pipes and a temp `LOCALAPPDATA`. Kill only processes your test started, and check none are left.
 - Never hardcode a port a test binds or connects to — other relays, agents and real Brave instances use the 90xx/93xx ranges. Ask the OS for one (listen on `0`, read the port, close) or bind the server under test to `0`.
 
 ## Sending PRs
