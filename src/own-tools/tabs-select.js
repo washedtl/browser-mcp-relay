@@ -1,60 +1,43 @@
-// tabs_select — bring a specific tab to the front by index.
+// tabs_select — bring one of the calling connection's tabs to the front.
 //
-// Active-page propagation: after Playwright's `bringToFront()`, we
-// navigate upstream's tracked page (via its `navigation_go-to`) to the
-// selected tab's URL. Upstream pins its `_page` reference at session
-// init and never re-evaluates it from CDP `Target.activateTarget`
-// notifications, so `bringToFront` alone leaves upstream's screenshot/
-// snapshot tools targeting whatever page upstream originally grabbed —
-// usually NOT the one the caller just selected. See
-// _propagate-active-page.js for the full investigation.
+// W2D (2026-11-03): selection is cosmetic. Tool calls act on the tab their
+// tabId names (or "main"), so nothing is "made active" and no page is
+// navigated (in broker mode a tab's page IS upstream's page). Selects by
+// tabId only: indexes shift while parallel subagents open and close tabs.
+// needsBrave:false — never creates a tab or launches the browser.
 
-const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
-const { setActivePage } = require("./_active-page.js");
+const { errorResult } = require("./_tool-args.js");
+const { pickTab, legacyNote, safeUrl } = require("./_tabs.js");
 
 module.exports = {
   name: "tabs_select",
-  description: "Bring a specific tab to the front (active page) by its index.",
+  description:
+    "Bring one of your tabs to the front. This does not change which tab later calls act on: " +
+    "pass tabId on those calls.",
   inputSchema: {
     type: "object",
-    properties: { index: { type: "integer", minimum: 0 } },
-    required: ["index"],
+    properties: { tabId: { type: "string", description: "A tabId from tabs_new / tabs_list." } },
+    required: ["tabId"],
   },
-  handler: async ({ index }) => {
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
-    const pages = bridge.context.pages();
-    // V1-5: JSON-Schema `minimum: 0` is not enforced by the MCP SDK at
-    // handler entry. Validate explicitly so bad inputs (-1, "abc", 999)
-    // produce an actionable error instead of an undefined-property crash.
-    if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
-      return {
-        content: [{ type: "text", text: `tabs_select: index out of range: ${index} (have ${pages.length} pages)` }],
-        isError: true,
-      };
+  needsBrave: false,
+  handler: async (args, ctx) => {
+    const { tab, error } = await pickTab("tabs_select", args, ctx);
+    if (error) return errorResult(error);
+    if (!tab.page) {
+      return errorResult(`tabs_select: tab "${tab.tabKey}" has no page right now (still opening, or its browser restarted); retry or call tabs_list`);
     }
-    // F1-3 (2026-05-10): track active page BEFORE bringToFront. If
-    // bringToFront rejects (page being navigated, page closed mid-call),
-    // we still track the user-intended page so subsequent own-tool calls
-    // target it correctly. Previously a rejection meant setActivePage was
-    // never called and the active page was whatever the prior caller set.
-    setActivePage(pages[index]);
-    const url = pages[index].url();
     try {
-      await pages[index].bringToFront();
+      await tab.page.bringToFront();
     } catch (e) {
-      // bringToFront is cosmetic (just visual focus); failure shouldn't
-      // block the active-page tracking. Log + continue with propagation.
+      // bringToFront is cosmetic (just visual focus); failure shouldn't fail the call.
       process.stderr.write(`[tabs_select] bringToFront failed (continuing): ${e.message}\n`);
     }
-    // Propagate to upstream so content_take-screenshot etc. target this
-    // tab's URL. Best-effort; about:blank is skipped to avoid churn.
-    const propagation = await propagateActivePageToUpstream(url);
     return {
       content: [{ type: "text", text: JSON.stringify({
-        selected: index,
-        url,
-        upstreamPropagated: propagation.propagated,
+        selected: tab.tabKey,
+        url: safeUrl(tab.page),
+        note: `Brought to the front. To act on it, pass tabId "${tab.tabKey}" on each call.`,
+        legacyMode: legacyNote(ctx.registry),
       }, null, 2) }],
     };
   },

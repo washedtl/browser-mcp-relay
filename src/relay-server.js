@@ -6,10 +6,11 @@
 //   - getUpstream(): returns the upstream MCP client. Called ONLY by
 //     tools/call for forwarded tools (~50MB node process once spawned).
 //   - ensureBrave(): launches our Brave instance via Playwright. Slow
-//     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools need the
-//     globalThis.__relayBridge handle; forwarded tools need Brave running
-//     so upstream's lazy `chromium.connectOverCDP` succeeds when its tool
-//     handler runs).
+//     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools get their ctx
+//     from the bridge it resolves; forwarded tools need Brave running so
+//     upstream's lazy `chromium.connectOverCDP` succeeds when its tool
+//     handler runs). peekBrave() returns the running bridge or null, for
+//     tools that must never launch Brave (needsBrave:false).
 //
 // tools/list (every client's first call at MCP connect) is answered from
 // the cached upstream catalog (tool-catalog.js) + own-tool definitions, so
@@ -28,6 +29,8 @@ const { EventEmitter } = require("node:events");
 const toolCatalog = require("./tool-catalog.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { toolsetOf, parseToolsets, hiddenToolMessage } = require("./own-tools/toolsets.js");
+const { toolContext } = require("./own-tools/_tool-context.js");
+const { legacyRegistry, LEGACY_CONN } = require("./own-tools/_legacy-context.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -124,6 +127,7 @@ class RelayServer {
    * @param {object} opts
    * @param {() => Promise<object>} opts.getUpstream
    * @param {() => Promise<unknown>} [opts.ensureBrave]
+   * @param {() => object|null} [opts.peekBrave] — the running bridge, without launching
    * @param {TrafficEmitter} [opts.trafficEmitter]
    * @param {() => Promise<object[]>} [opts.loadUpstreamCatalog] — raw upstream tools (test seam)
    * @param {() => unknown} [opts.notifyToolsChanged] — sends MCP notifications/tools/list_changed
@@ -134,7 +138,7 @@ class RelayServer {
    * @param {object} [opts.env] — reads BROWSER_RELAY_TOOLSETS (default: process.env + local-config.json)
    */
   constructor({
-    getUpstream, ensureBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
+    getUpstream, ensureBrave, peekBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
     elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, env,
   } = {}) {
     if (typeof getUpstream !== "function") {
@@ -145,6 +149,7 @@ class RelayServer {
     }
     this.getUpstream = getUpstream;
     this.ensureBrave = ensureBrave || null;
+    this.peekBrave = peekBrave || (() => null);
     this.env = env || applyLocalConfigToEnv(process.env);
     // Raw upstream tools (disk-cached; test seam). Loaded once, on first use.
     this.loadUpstreamCatalog = loadUpstreamCatalog || toolCatalog.loadUpstreamCatalog;
@@ -158,22 +163,22 @@ class RelayServer {
     const { sets, unknown } = parseToolsets(this.env.BROWSER_RELAY_TOOLSETS);
     if (unknown.length) logStderr(`[mcp-relay] BROWSER_RELAY_TOOLSETS: ignoring unknown toolset(s) ${unknown.join(", ")}`);
     this.enabledToolsets = new Set(sets);
-    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
+    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave, needsPage }
     // The emitter always exists (callers subscribe to it unconditionally);
     // recordTraffic decides whether handleToolsCall feeds it at all.
     this.trafficEmitter = trafficEmitter || new TrafficEmitter();
     this.recordTraffic = Boolean(recordTraffic);
   }
 
-  // needsBrave=false: relay-local tool (e.g. toolsets) — skip ensureBrave.
-  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true }) {
+  // needsBrave / needsPage: see own-tools/index.js.
+  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true, needsPage = true }) {
     if (this.ownTools.has(name)) {
       throw new Error(`relay: tool "${name}" already registered`);
     }
     if (typeof handler !== "function") {
       throw new Error(`relay: tool "${name}" handler must be a function`);
     }
-    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave });
+    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave, needsPage });
   }
 
   /** Name of the disabled toolset `toolName` belongs to, or null if it's visible. */
@@ -268,6 +273,7 @@ class RelayServer {
   }
 
   async handleToolsCall({ name, arguments: args }) {
+    const callArgs = args || {};
     const own = this.ownTools.get(name);
     const isOwn = !!own;
     const hiddenSet = this.hiddenToolsetFor(name);
@@ -296,7 +302,7 @@ class RelayServer {
         time: new Date().toISOString(),
         method: "tools/call",
         name,
-        args: forEmit(args || {}),
+        args: forEmit(callArgs),
         source: isOwn ? "own" : "upstream",
       });
     }
@@ -307,22 +313,40 @@ class RelayServer {
         // Owner rule: the agent asks the user before enabling a toolset.
         response = { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
       } else if (isOwn) {
-        // Own-tool handlers read globalThis.__relayBridge. ensureBrave
-        // populates that. Call it before invoking the handler.
-        if (own.needsBrave && this.ensureBrave) await this.ensureBrave();
+        // Legacy mode: tabs are pages of this relay's own Brave (LegacyTabs).
+        // needsBrave:false tools never launch it: without a running Brave
+        // they get just the relay.
+        const bridge = own.needsBrave ? (this.ensureBrave && await this.ensureBrave()) : this.peekBrave();
         try {
-          response = await own.handler(args || {}, this);
+          const ctx = bridge
+            ? await toolContext(legacyRegistry(bridge.context), LEGACY_CONN, own, callArgs,
+              { context: bridge.context, cdpUrl: bridge.cdpConnectUrl, relay: this })
+            : { relay: this };
+          response = await own.handler(callArgs, ctx);
         } catch (e) {
           response = {
             content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
             isError: true,
           };
         }
+      } else if (callArgs.tabId != null && callArgs.tabId !== "main") {
+        // Upstream runs in its own process here and its schemas drop tabId,
+        // so the call would silently act on the main tab.
+        response = {
+          content: [{ type: "text", text: `${name}: tabId is only supported for relay tools in this mode (upstream tools act on your main tab); omit tabId` }],
+          isError: true,
+        };
       } else {
         // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
         if (this.ensureBrave) await this.ensureBrave();
         const upstream = await this.getUpstream();
-        response = await upstream.request("tools/call", { name, arguments: args });
+        // tabId "main" is where upstream acts anyway; don't pass it on.
+        let forwardArgs = args;
+        if (callArgs.tabId != null) {
+          forwardArgs = { ...callArgs };
+          delete forwardArgs.tabId;
+        }
+        response = await upstream.request("tools/call", { name, arguments: forwardArgs });
       }
     } catch (e) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.

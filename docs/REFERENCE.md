@@ -5,7 +5,7 @@ The slim README at the root of the repo is for getting up and running. This file
 ## Contents
 
 - [Tool catalog](#tool-catalog)
-  - [First-party tools (20)](#first-party-tools-20)
+  - [First-party tools (21)](#first-party-tools-21)
   - [Forwarded upstream tools (51)](#forwarded-upstream-tools-51)
   - [Toolsets (hidden by default)](#toolsets)
 - [Worked examples](#worked-examples)
@@ -27,17 +27,17 @@ The slim README at the root of the repo is for getting up and running. This file
 
 ## Tool catalog
 
-**71 tools total = 20 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).** 22 of them are hidden by default until you enable their [toolset](#toolsets).
+**72 tools total = 21 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).** 22 of them are hidden by default until you enable their [toolset](#toolsets).
 
 Both layers are merged into a single `tools/list` response, so to your MCP client they all just look like "tools the relay provides."
 
-### First-party tools (20)
+### First-party tools (21)
 
 #### 🔬 Performance & diagnostics
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `lighthouse_audit` | Lighthouse audit against a URL | `formFactor: "desktop"\|"mobile"` | Performance regression check on a deploy |
+| `lighthouse_audit` | Lighthouse audit against a URL (never resets storage: warm-cache scores) | `formFactor: "desktop"\|"mobile"` | Performance regression check on a deploy |
 | `memory_take-heap-snapshot` | V8 heap snapshot via CDP | `outputPath`, `timeoutMs` | Memory-leak hunt on a long-running SPA |
 
 #### 📱 Device emulation
@@ -50,10 +50,13 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `tabs_list` | List open tabs by index + URL | — | "Where did I leave that page?" |
-| `tabs_new` | Open a new tab | `url` | Spawn a side-panel comparison |
-| `tabs_select` | Bring a tab to front | `index` | Switch to a specific tab before interacting |
-| `tabs_close` | Close a tab by index | `index` | Tear down workflow tabs |
+| `tabs_list` | List your tabs (this session only) with `tabId`, URL, title | — | "Where did I leave that page?" |
+| `tabs_new` | Open a new tab and return its `tabId` | `url` | Give each parallel subagent its own tab |
+| `tabs_select` | Bring one of your tabs to the front | `tabId` | Show the user a specific tab |
+| `tabs_close` | Close one of your tabs | `tabId` | Tear down workflow tabs |
+| `browser_show` | Bring your window on-screen and to the front (restores a minimized window, moves an off-screen one into view) | `tabId` | Let the user log in or pass 2FA by hand |
+
+Tools that act on a page take an optional `tabId` (from `tabs_new`); without it they act on your main tab. Only `tabs_new` opens tabs: an unknown `tabId` is an error. Tabs belong to one MCP connection: another session's tabs are never listed, selected or closed, and `tabs_list` / `tabs_select` / `tabs_close` never open a tab or launch the browser. In legacy (per-session pool) mode only the relay's own tools take `tabId` (the `tabs_new` / `tabs_select` results say so); a forwarded upstream tool called with a `tabId` other than `"main"` returns an error (it would act on your main tab). Popups never become your main tab.
 
 #### 📤 Forms, dialogs, files
 
@@ -73,9 +76,9 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `cookies_export` | Export cookies as JSON | `urls`, `domains`, `names` (filters), `outputPath` (keeps values out of the transcript) | Save an authed session for later |
-| `cookies_import` | Import cookies into the context | `cookies` or `inputPath` (a file from `cookies_export`) | Restore an authed session |
-| `stealth_apply` | Anti-detection patches (Tier 1) | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
+| `cookies_export` | Export cookies as JSON (one jar, shared by every tab and session) | `urls`, `domains`, `names` (filters), `outputPath` (keeps values out of the transcript) | Save an authed session for later |
+| `cookies_import` | Import cookies into the shared jar | `cookies` or `inputPath` (a file from `cookies_export`) | Restore an authed session |
+| `stealth_apply` | Anti-detection patches (Tier 1), all your tabs, never another session's | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
 
 #### 💾 Downloads
 
@@ -371,13 +374,13 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
                                             │ CDP (Playwright connectOverCDP)
                                             │
                                        relay's own-tools
-                                       (this repo, 20 tools)
+                                       (this repo, 21 tools)
 ```
 
 **How it works:**
 
 - 📥 The relay receives MCP messages on stdin from your client.
-- 📋 `tools/list` → serves the upstream catalog from a disk cache (`<repo>/.cache/upstream-catalog.json`, or a per-user cache dir if the repo is read-only) merged with the 20 own-tool definitions, minus hidden [toolsets](#toolsets). No Brave and no long-lived upstream child: the cache is rebuilt by a short-lived upstream spawn only when the upstream build, the bundle patch, or a catalog-shaping upstream env var changes. Upstream `outputSchema`s (~62K chars) are not sent.
+- 📋 `tools/list` → serves the upstream catalog from a disk cache (`<repo>/.cache/upstream-catalog.json`, or a per-user cache dir if the repo is read-only) merged with the 21 own-tool definitions, minus hidden [toolsets](#toolsets). No Brave and no long-lived upstream child: the cache is rebuilt by a short-lived upstream spawn only when the upstream build, the bundle patch, or a catalog-shaping upstream env var changes. Upstream `outputSchema`s (~62K chars) are not sent.
 - ⚙️ `tools/call` → either forwards to the upstream child (for the 51 forwarded tools) or runs an own-tool handler directly.
 - 🔌 Both paths attach to the same Brave instance: the upstream uses `BROWSER_CDP_CONNECT_URL`, own-tools use Playwright's `chromium.connectOverCDP` against the same port.
 - 🪶 One Brave per relay process. Brave is launched **lazily on the first `tools/call`**, not at startup.
@@ -553,7 +556,7 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 
 ## Stealth model
 
-`stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load in the active context. **Off by default** — call the tool once per session to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
+`stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load of the calling session, never another session's pages. In legacy (per-session pool) mode that is the whole browser context, so pages opened later are covered too; in shared-broker mode it is each of your open tabs (call it again after `tabs_new`; popups a tab opens are not patched). **Off by default** — call the tool once per session to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
 
 ### Tier 1+2 — what's covered (v0.3.5)
 
@@ -567,7 +570,7 @@ A credential fills only when the page is **`https://`** and its **scheme + host 
 | `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
 | `navigator.userAgentData` replaced only when it contradicts the UA | Sec-CH-UA-* JS-side fingerprinting; same generator as `emulate_device`'s HTTP client hints; Brave's native object is kept when no UA override is active |
 | `toString()` defense on patched getters | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
-| AudioBuffer `getChannelData` / `copyFromChannel` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; one per-session seed (< 1e-7) applied once per channel buffer, never cumulative or random per-call |
+| AudioBuffer `getChannelData` / `copyFromChannel` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; one seed per relay process, so every tab of the browser matches (< 1e-7), applied once per channel buffer, never cumulative or random per-call |
 
 **Tier 2** (v0.3.5 — added 2026-05-10):
 
@@ -647,7 +650,7 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 |---|---|
 | **Pool overview** (`/`) — slot grid (claimed / idle / orphan), cookie-source freshness card, vault summary. Orphan slots get a **Reap** button that clears the stale lock + kills any leftover Brave processes holding that user-data-dir. | ![Pool overview](./screenshots/01-pool-overview.png) |
 | **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode. | ![Slot detail](./screenshots/02-slot-detail.png) |
-| **Tools catalog** (`/tools`) — all 71 tools (20 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./screenshots/03-tools-catalog.png) |
+| **Tools catalog** (`/tools`) — all 72 tools (21 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./screenshots/03-tools-catalog.png) |
 | **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode. | ![Activity history](./screenshots/04-activity-history.png) |
 | **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet | ![Settings](./screenshots/06-settings.png) |
 

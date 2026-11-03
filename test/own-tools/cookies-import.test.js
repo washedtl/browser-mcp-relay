@@ -17,16 +17,13 @@ test("cookies_import has required tool shape", () => {
   assert.ok(tool.inputSchema.properties.inputPath);
 });
 
-test("cookies_import returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ cookies: [] });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|initialized|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+test("W2D: cookies_import is context-wide: needsPage false, writes ctx.context (shared by every tab)", async () => {
+  assert.strictEqual(tool.needsPage, false);
+  assert.match(tool.description, /shared by every tab and session/);
+  const jarContext = makeJarContext();
+  const r = await tool.handler({ cookies: [GOOD] }, { context: jarContext });
+  assert.deepStrictEqual(JSON.parse(r.content[0].text), { imported: 1 });
+  assert.strictEqual(jarContext.addCalls, 1);
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -51,10 +48,8 @@ function makeJarContext(initial = []) {
   };
 }
 
-async function withContext(ctx, fn) {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { context: ctx };
-  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+async function withContext(context, fn) {
+  return fn({ context });
 }
 
 const GOOD = { name: "sid", value: "SECRET-VALUE", domain: ".example.com", path: "/" };
@@ -72,24 +67,24 @@ test("W1C1: cookies_import field validators reject malformed cookies before addC
     [{ ...GOOD, sameSite: "lax" }, /\.sameSite must be 'Strict' \| 'Lax' \| 'None'/],
   ];
   for (const [bad, re] of cases) {
-    const ctx = makeJarContext();
-    await withContext(ctx, async () => {
-      const r = await tool.handler({ cookies: [GOOD, bad] });
+    const jarContext = makeJarContext();
+    await withContext(jarContext, async (ctx) => {
+      const r = await tool.handler({ cookies: [GOOD, bad] }, ctx);
       assert.strictEqual(r.isError, true, `expected isError for ${JSON.stringify(bad)}`);
       assert.match(r.content[0].text, re);
       assert.match(r.content[0].text, /cookies\[1\]/, "error names the bad index");
       assert.ok(!r.content[0].text.includes("SECRET-VALUE"), "errors never echo cookie values");
-      assert.strictEqual(ctx.addCalls, 0, "nothing is imported when any entry is invalid");
+      assert.strictEqual(jarContext.addCalls, 0, "nothing is imported when any entry is invalid");
     });
   }
 });
 
 test("W1C1: cookies_import needs exactly one of cookies / inputPath (null = omitted)", async () => {
-  await withContext(makeJarContext(), async () => {
-    const neither = await tool.handler({ cookies: null, inputPath: null });
+  await withContext(makeJarContext(), async (ctx) => {
+    const neither = await tool.handler({ cookies: null, inputPath: null }, ctx);
     assert.strictEqual(neither.isError, true);
     assert.match(neither.content[0].text, /cookies or inputPath/);
-    const both = await tool.handler({ cookies: [GOOD], inputPath: path.join(os.tmpdir(), "x.json") });
+    const both = await tool.handler({ cookies: [GOOD], inputPath: path.join(os.tmpdir(), "x.json") }, ctx);
     assert.strictEqual(both.isError, true);
     assert.match(both.content[0].text, /not both/);
   });
@@ -102,16 +97,16 @@ test("W1C1: cookies_import inputPath — relative / missing / malformed files ar
     fs.writeFileSync(bad, "{not json");
     const wrongShape = path.join(dir, "shape.json");
     fs.writeFileSync(wrongShape, JSON.stringify({ hello: 1 }));
-    await withContext(makeJarContext(), async () => {
-      const rel = await tool.handler({ inputPath: "jar.json" });
+    await withContext(makeJarContext(), async (ctx) => {
+      const rel = await tool.handler({ inputPath: "jar.json" }, ctx);
       assert.match(rel.content[0].text, /absolute/);
-      const missing = await tool.handler({ inputPath: path.join(dir, "nope.json") });
+      const missing = await tool.handler({ inputPath: path.join(dir, "nope.json") }, ctx);
       assert.strictEqual(missing.isError, true);
       assert.match(missing.content[0].text, /inputPath/);
-      const unparsable = await tool.handler({ inputPath: bad });
+      const unparsable = await tool.handler({ inputPath: bad }, ctx);
       assert.strictEqual(unparsable.isError, true);
       assert.match(unparsable.content[0].text, /JSON/);
-      const shape = await tool.handler({ inputPath: wrongShape });
+      const shape = await tool.handler({ inputPath: wrongShape }, ctx);
       assert.strictEqual(shape.isError, true);
       assert.match(shape.content[0].text, /cookies array/);
     });
@@ -125,12 +120,12 @@ test("W1C1: cookies_import accepts a bare array file (BOM tolerated)", async () 
   try {
     const file = path.join(dir, "arr.json");
     fs.writeFileSync(file, String.fromCharCode(0xfeff) + JSON.stringify([GOOD]));
-    const ctx = makeJarContext();
-    await withContext(ctx, async () => {
-      const r = await tool.handler({ inputPath: file });
+    const jarContext = makeJarContext();
+    await withContext(jarContext, async (ctx) => {
+      const r = await tool.handler({ inputPath: file }, ctx);
       assert.ok(!r.isError, r.content[0].text);
       assert.deepStrictEqual(JSON.parse(r.content[0].text), { imported: 1 });
-      assert.strictEqual(ctx.jar[0].value, "SECRET-VALUE");
+      assert.strictEqual(jarContext.jar[0].value, "SECRET-VALUE");
     });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -146,12 +141,12 @@ test("W1C1: export(outputPath) → import(inputPath) round trip restores the jar
       { name: "csrf", value: "C-456", domain: "www.amazon.com", path: "/ap", expires: 1893456000, httpOnly: false, secure: true, sameSite: "Strict" },
       { name: "other", value: "O-789", domain: ".other.com", path: "/", expires: -1, httpOnly: false, secure: false, sameSite: "None" },
     ]);
-    const exported = await withContext(source, () => exportTool.handler({ domains: ["amazon.com"], outputPath: file }));
+    const exported = await withContext(source, (ctx) => exportTool.handler({ domains: ["amazon.com"], outputPath: file }, ctx));
     assert.ok(!exported.isError, exported.content[0].text);
     assert.ok(!/S-123|C-456/.test(exported.content[0].text), "export summary must not carry values");
 
     const target = makeJarContext();
-    const imported = await withContext(target, () => tool.handler({ inputPath: file }));
+    const imported = await withContext(target, (ctx) => tool.handler({ inputPath: file }, ctx));
     assert.ok(!imported.isError, imported.content[0].text);
     assert.deepStrictEqual(JSON.parse(imported.content[0].text), { imported: 2 });
     assert.ok(!/S-123|C-456/.test(imported.content[0].text), "import result must not carry values");

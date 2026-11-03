@@ -1,15 +1,14 @@
-// storage_set-local — write keys into localStorage / sessionStorage on the
-// active page. Inverse of storage_get-local. Used to restore an authed
+// storage_set-local — write keys into localStorage / sessionStorage on
+// this tab. Inverse of storage_get-local. Used to restore an authed
 // session after a fresh navigation, or to inject test fixtures.
 
-const { withActivePage } = require("./_active-page.js");
 const { parseStore, pageOrigin } = require("./_storage-common.js");
 const { errorResult } = require("./_tool-args.js");
 
 module.exports = {
   name: "storage_set-local",
   description:
-    "Write entries ({ key: value }, strings only) into localStorage or sessionStorage on the active page's origin, " +
+    "Write entries ({ key: value }, strings only) into localStorage or sessionStorage on this tab's origin, " +
     "replacing same-name keys. clearFirst: true wipes the store first. Inverse of storage_get-local.",
   inputSchema: {
     type: "object",
@@ -24,7 +23,7 @@ module.exports = {
     },
     required: ["entries"],
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     // F0-9: null means "omitted" for store / clearFirst.
     const args = _args || {};
     const { entries, clearFirst } = args;
@@ -69,5 +68,5 @@ module.exports = {
         }),
       }],
     };
-  }),
+  },
 };

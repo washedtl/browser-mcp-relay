@@ -447,6 +447,7 @@ const OWN_TOOL_META = {
   tabs_new: { sourceFile: "tabs-new.js", category: "tabs" },
   tabs_select: { sourceFile: "tabs-select.js", category: "tabs" },
   tabs_close: { sourceFile: "tabs-close.js", category: "tabs" },
+  browser_show: { sourceFile: "browser-show.js", category: "tabs" },
   dialog_handle: { sourceFile: "dialog-handle.js", category: "forms" },
   file_upload: { sourceFile: "file-upload.js", category: "forms" },
   form_fill: { sourceFile: "form-fill.js", category: "forms" },

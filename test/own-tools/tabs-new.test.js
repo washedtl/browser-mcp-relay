@@ -1,278 +1,87 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-new.js");
+const { fakePage, fakeContext, fakeRegistry } = require("../fixtures/fake-registry.js");
+const { LegacyTabs } = require("../../src/own-tools/_legacy-context.js");
+
+const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
+const body = (r) => JSON.parse(r.content[0].text);
+const keys = async (registry, connId = "c1") => (await registry.listTabs(connId)).map((t) => t.tabKey);
 
 test("tabs_new has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_new");
   assert.strictEqual(typeof tool.description, "string");
   assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
-  assert.strictEqual(tool.inputSchema.type, "object");
+  assert.strictEqual(tool.needsPage, false, "opens its own tab; the caller's tab is not needed");
+  assert.match(tool.description, /tabId/);
+  assert.match(tool.description, /subagent/, "the parallel-subagent guidance lives here");
 });
 
-test("tabs_new returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({});
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+// W2D regression: tabs_new used to open a relay tab AND navigate upstream's
+// page to the same URL (_propagate-active-page), so every URL loaded twice,
+// in two tabs. Now the new tab is a registry tab that upstream tools use too.
+test("W2D: tabs_new loads the URL exactly once, in a new registry tab, and returns its tabId", async () => {
+  const registry = fakeRegistry();
+  const main = (await registry.getCtx("c1", "main")).page;
+  const b = body(await run({ url: "https://example.com/" }, registry));
+  assert.match(b.tabId, /^t\d+$/);
+  const page = registry.pageOf("c1", b.tabId);
+  assert.deepStrictEqual(page.gotos.map((g) => g.url), ["https://example.com/"], "one navigation");
+  assert.deepStrictEqual(main.gotos, [], "no other tab is navigated");
+  assert.strictEqual(b.url, "https://example.com/");
+  assert.strictEqual(b.navError, null);
+  assert.ok(!("upstreamPropagated" in b) && !("index" in b), "no propagation / index fields");
+  assert.match(b.note, /tabId/);
 });
 
-// Mock helper: a fake bridge with a fake context that records page operations.
-function makeFakeBridge() {
-  const pages = [];
-  const fakePage = {
-    _url: "about:blank",
-    url() { return this._url; },
-    async goto(u) { this._url = u; return null; },
+// V1-1: in legacy mode upstream tools can't take tabId, so say so.
+test("W2D: tabs_new says so in legacy mode, where only relay tools take tabId (broker: no note)", async () => {
+  const legacy = body(await run({}, new LegacyTabs(fakeContext([fakePage("https://up/")])), "legacy"));
+  assert.match(legacy.legacyMode, /only relay tools take tabId; upstream navigation_\/content_\/a11y_\/interaction_ tools act on main/);
+  assert.ok(!("legacyMode" in body(await run({}, fakeRegistry()))));
+});
+
+test("W2D: each tabs_new gets its own fresh tabId and page", async () => {
+  const registry = fakeRegistry();
+  const a = body(await run({}, registry)).tabId;
+  const b = body(await run({}, registry)).tabId;
+  assert.notStrictEqual(a, b);
+  assert.notStrictEqual(registry.pageOf("c1", a), registry.pageOf("c1", b));
+  assert.deepStrictEqual(await keys(registry), [a, b]);
+});
+
+test("W2D: tabs_new without url opens the tab and navigates nothing", async () => {
+  const registry = fakeRegistry();
+  const b = body(await run({}, registry));
+  assert.deepStrictEqual(registry.pageOf("c1", b.tabId).gotos, []);
+  assert.strictEqual(b.url, "about:blank");
+});
+
+test("W2D: tabs_new opens the tab in the calling connection only", async () => {
+  const registry = fakeRegistry();
+  const b = body(await run({}, registry, "c2"));
+  assert.deepStrictEqual(await keys(registry, "c2"), [b.tabId]);
+  assert.deepStrictEqual(await keys(registry, "c1"), []);
+});
+
+test("T0-7: tabs_new with a bad URL returns isError + navError, and the tab stays usable by its tabId", async () => {
+  const registry = fakeRegistry();
+  const getCtx = registry.getCtx;
+  registry.getCtx = async (...a) => {
+    const ctx = await getCtx(...a);
+    ctx.page.failGoto = "net::ERR_NAME_NOT_RESOLVED";
+    return ctx;
   };
-  return {
-    context: {
-      pages: () => pages,
-      newPage: async () => {
-        const p = { ...fakePage, _url: "about:blank" };
-        pages.push(p);
-        return p;
-      },
-    },
-  };
-}
-
-test("tabs_new without url: does NOT call upstream propagate", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
-  globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
-  try {
-    const result = await tool.handler({});
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false, "upstream must NOT be called when no url");
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
+  const r = await run({ url: "https://no-such-host.invalid/" }, registry);
+  assert.strictEqual(r.isError, true);
+  const b = body(r);
+  assert.match(b.navError, /ERR_NAME_NOT_RESOLVED/);
+  assert.deepStrictEqual(await keys(registry), [b.tabId], "the tab exists (close it with tabs_close)");
 });
 
-test("tabs_new with url: calls upstream navigation_go-to with that url", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let calledWith = null;
-  globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async (method, params) => {
-      calledWith = { method, params };
-      return {};
-    },
-  });
-  try {
-    const result = await tool.handler({ url: "https://example.com/foo" });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.upstreamPropagated, true);
-    assert.strictEqual(payload.url, "https://example.com/foo");
-    assert.ok(calledWith, "upstream.request must be invoked");
-    assert.strictEqual(calledWith.method, "tools/call");
-    assert.strictEqual(calledWith.params.name, "navigation_go-to");
-    assert.strictEqual(calledWith.params.arguments.url, "https://example.com/foo");
-    // Snapshot/screenshot must be disabled to keep the propagation cheap.
-    assert.strictEqual(calledWith.params.arguments.includeSnapshot, false);
-    assert.strictEqual(calledWith.params.arguments.includeScreenshot, false);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
-});
-
-test("tabs_new: upstream failure does NOT fail the tool call", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { throw new Error("upstream blew up"); },
-  });
-  try {
-    const result = await tool.handler({ url: "https://example.com/" });
-    assert.strictEqual(result.isError, undefined, "tool must succeed even if upstream fails");
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
-});
-
-test("tabs_new: about:blank URL skips upstream propagation", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
-  globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
-  try {
-    const result = await tool.handler({ url: "about:blank" });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
-});
-
-// ──────────────────────────────────────────────────────────────────
-// T0-7: bad URL returns isError + structured navError, doesn't propagate.
-// T1-10: waitUntil parameter is honored.
-// ──────────────────────────────────────────────────────────────────
-
-function makeFakeBridgeWithFailingGoto(errMsg = "net::ERR_NAME_NOT_RESOLVED") {
-  const pages = [];
-  return {
-    context: {
-      pages: () => pages,
-      newPage: async () => {
-        const p = {
-          _url: "about:blank",
-          url() { return this._url; },
-          async goto() { throw new Error(errMsg); },
-        };
-        pages.push(p);
-        return p;
-      },
-    },
-  };
-}
-
-test("T0-7: tabs_new with bad URL returns isError + navError + does NOT propagate", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
-  globalThis.__relayBridge = makeFakeBridgeWithFailingGoto();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
-  try {
-    const result = await tool.handler({ url: "https://no-such-host.invalid/" });
-    assert.strictEqual(result.isError, true);
-    const payload = JSON.parse(result.content[0].text);
-    assert.match(payload.navError, /ERR_NAME_NOT_RESOLVED|invalid/i);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false, "upstream must NOT be called when goto fails");
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
-});
-
-test("T0-7: tabs_new with bad URL still tracks the new page as active", async () => {
-  // The page exists in context.pages() even after a failed goto. setActivePage
-  // must have been called before goto so subsequent own-tools target this
-  // (orphan) tab rather than the previous active page.
-  const { getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridgeWithFailingGoto();
-  clearActivePage();
-  try {
-    await tool.handler({ url: "https://no-such-host.invalid/" });
-    const tracked = getActivePageRaw();
-    assert.ok(tracked, "active page must be set even after goto failure");
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    clearActivePage();
-  }
-});
-
-test("T1-10: tabs_new accepts waitUntil parameter and passes it to goto", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  let lastGotoOpts = null;
-  const pages = [];
-  globalThis.__relayBridge = {
-    context: {
-      pages: () => pages,
-      newPage: async () => {
-        const p = {
-          _url: "about:blank",
-          url() { return this._url; },
-          async goto(u, opts) { this._url = u; lastGotoOpts = opts; return null; },
-        };
-        pages.push(p);
-        return p;
-      },
-    },
-  };
-  try {
-    await tool.handler({ url: "https://example.com/", waitUntil: "networkidle", timeoutMs: 60000 });
-    assert.ok(lastGotoOpts, "goto must be called with options");
-    assert.strictEqual(lastGotoOpts.waitUntil, "networkidle");
-    assert.strictEqual(lastGotoOpts.timeout, 60000);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
-});
-
-// W1C2: the reported index must be the new page's real position. context.pages()
-// also gains popups the page opens during goto (window.open), so
-// `pages().length - 1` pointed at the popup, not the new tab.
-test("W1C2: tabs_new reports the new page's index, not pages().length - 1", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const pages = [{ url: () => "about:blank" }];
-  let created = null;
-  globalThis.__relayBridge = {
-    context: {
-      pages: () => pages,
-      newPage: async () => {
-        created = {
-          _url: "about:blank",
-          url() { return this._url; },
-          async goto(u) {
-            this._url = u;
-            pages.push({ url: () => "https://popup.example.com/" }); // popup opened by the page
-          },
-        };
-        pages.push(created);
-        return created;
-      },
-    },
-  };
-  try {
-    const result = await tool.handler({ url: "https://example.com/" });
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.index, pages.indexOf(created));
-    assert.strictEqual(payload.index, 1);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
-});
-
-test("W1C2 review: tabs_new reports index null when the new tab closed during goto", async () => {
-  const pages = [];
-  const page = {
-    url: () => "about:blank",
-    goto: async () => { pages.splice(pages.indexOf(page), 1); }, // tab closes itself mid-goto
-    on: () => {},
-    once: () => {},
-    isClosed: () => !pages.includes(page),
-  };
-  const context = { pages: () => pages.slice(), newPage: async () => { pages.push(page); return page; } };
-  globalThis.__relayBridge = { context };
-  const prevUp = globalThis.__relayUpstream;
-  globalThis.__relayUpstream = async () => ({ request: async () => ({ content: [] }) });
-  try {
-    const res = await tool.handler({ url: "https://example.com" });
-    const body = JSON.parse(res.content[0].text);
-    assert.strictEqual(body.index, null);
-  } finally {
-    delete globalThis.__relayBridge;
-    globalThis.__relayUpstream = prevUp;
-  }
+test("T1-10: tabs_new passes waitUntil + timeoutMs to goto", async () => {
+  const registry = fakeRegistry();
+  const b = body(await run({ url: "https://example.com/", waitUntil: "networkidle", timeoutMs: 60000 }, registry));
+  assert.deepStrictEqual(registry.pageOf("c1", b.tabId).gotos[0].opts, { waitUntil: "networkidle", timeout: 60000 });
 });

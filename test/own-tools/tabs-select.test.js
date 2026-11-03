@@ -1,160 +1,80 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-select.js");
+const { fakePage, fakeContext, fakeRegistry } = require("../fixtures/fake-registry.js");
+const { LegacyTabs } = require("../../src/own-tools/_legacy-context.js");
 
-test("tabs_select has required tool shape", () => {
-  assert.strictEqual(tool.name, "tabs_select");
-  assert.strictEqual(typeof tool.description, "string");
-  assert.strictEqual(typeof tool.inputSchema, "object");
-  assert.strictEqual(typeof tool.handler, "function");
-  assert.strictEqual(tool.inputSchema.required[0], "index");
-});
+const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
 
-test("tabs_select returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
-});
-
-// Mock helper: bridge with a fixed list of pages, each with a recordable
-// bringToFront() and a fixed url.
-function makeFakeBridge(pageUrls) {
-  const pages = pageUrls.map((u) => ({
-    _bringCalled: 0,
-    url() { return u; },
-    async bringToFront() { this._bringCalled++; },
-  }));
-  return { context: { pages: () => pages }, _pages: pages };
+// Selecting never creates a tab: getCtx is only used here to set tabs up.
+async function twoTabs() {
+  const registry = fakeRegistry();
+  await registry.getCtx("c1", "main");
+  await registry.getCtx("c1", "t1");
+  await registry.getCtx("other", "t9");
+  registry.getCtx = async () => { throw new Error("tabs_select must not call getCtx"); };
+  return registry;
 }
 
-test("tabs_select: out-of-range index returns isError", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank"]);
-  try {
-    const result = await tool.handler({ index: 5 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
+test("tabs_select has required tool shape: selects by tabId only", () => {
+  assert.strictEqual(tool.name, "tabs_select");
+  assert.strictEqual(typeof tool.description, "string");
+  assert.strictEqual(typeof tool.handler, "function");
+  assert.strictEqual(tool.needsBrave, false);
+  assert.deepStrictEqual(Object.keys(tool.inputSchema.properties), ["tabId"]);
+  assert.deepStrictEqual(tool.inputSchema.required, ["tabId"]);
 });
 
-// V1-5: JSON-Schema `minimum: 0` is not enforced by the MCP SDK at handler
-// entry. Negative / non-integer / huge index must all produce isError, not
-// an undefined-property TypeError.
-test("V1-5: tabs_select with negative index returns isError (not crash)", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
-  try {
-    const result = await tool.handler({ index: -1 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-    // bringToFront must NOT have been called on any page.
-    for (const page of globalThis.__relayBridge._pages) {
-      assert.strictEqual(page._bringCalled, 0);
-    }
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
+test("W2D: tabs_select brings the tab to the front and navigates nothing", async () => {
+  const registry = await twoTabs();
+  const r = await run({ tabId: "t1" }, registry);
+  assert.notStrictEqual(r.isError, true, r.content[0].text);
+  const b = JSON.parse(r.content[0].text);
+  assert.strictEqual(b.selected, "t1");
+  assert.match(b.note, /tabId/, "says routing is by tabId, not by selection");
+  assert.strictEqual(registry.pageOf("c1", "t1").fronted, 1);
+  assert.strictEqual(registry.pageOf("c1", "main").fronted, 0);
+  assert.deepStrictEqual(registry.pageOf("c1", "t1").gotos, []);
 });
 
-test("V1-5: tabs_select with non-integer index returns isError", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank"]);
-  try {
-    const result = await tool.handler({ index: "abc" });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
+test("W2D: tabs_select rejects an unknown tabId, another connection's, or none", async () => {
+  const registry = await twoTabs();
+  for (const [args, re] of [
+    [{ tabId: "t9" }, /^tabs_select: unknown tabId "t9"; call tabs_new or tabs_list/],
+    [{ tabId: "nope" }, /^tabs_select: unknown tabId "nope"/],
+    [{}, /^tabs_select: tabId is required/],
+    [{ index: 0 }, /^tabs_select: tabId is required/],
+  ]) {
+    const r = await run(args, registry);
+    assert.strictEqual(r.isError, true, JSON.stringify(args));
+    assert.match(r.content[0].text, re);
   }
+  assert.strictEqual(registry.pageOf("other", "t9").fronted, 0);
 });
 
-test("V1-5: tabs_select error message includes pages-count for actionability", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
-  try {
-    const result = await tool.handler({ index: 999 });
-    assert.match(result.content[0].text, /have 2 pages/);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-  }
+test("W2D: with no browser running (no registry) every tabId is unknown", async () => {
+  const r = await tool.handler({ tabId: "t1" }, {});
+  assert.match(r.content[0].text, /^tabs_select: unknown tabId "t1"/);
 });
 
-test("tabs_select: about:blank target skips upstream propagation", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "about:blank"]);
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.selected, 0);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false);
-    // bringToFront still called (Playwright-side focus)
-    assert.strictEqual(globalThis.__relayBridge._pages[0]._bringCalled, 1);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
+test("W2D: tabs_select says so in legacy mode, where only relay tools take tabId (broker: no note)", async () => {
+  const legacy = new LegacyTabs(fakeContext([fakePage("https://up/")]));
+  const r = JSON.parse((await run({ tabId: "main" }, legacy, "legacy")).content[0].text);
+  assert.match(r.legacyMode, /upstream navigation_\/content_\/a11y_\/interaction_ tools act on main/);
+  assert.ok(!("legacyMode" in JSON.parse((await run({ tabId: "t1" }, await twoTabs())).content[0].text)));
 });
 
-test("tabs_select: real URL triggers upstream navigation_go-to", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let calledWith = null;
-  globalThis.__relayBridge = makeFakeBridge([
-    "about:blank",
-    "file:///c/tmp/test.html",
-  ]);
-  globalThis.__relayUpstream = async () => ({
-    request: async (method, params) => {
-      calledWith = { method, params };
-      return {};
-    },
-  });
-  try {
-    const result = await tool.handler({ index: 1 });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.selected, 1);
-    assert.strictEqual(payload.url, "file:///c/tmp/test.html");
-    assert.strictEqual(payload.upstreamPropagated, true);
-    assert.ok(calledWith, "upstream.request must be invoked");
-    assert.strictEqual(calledWith.params.name, "navigation_go-to");
-    assert.strictEqual(calledWith.params.arguments.url, "file:///c/tmp/test.html");
-    assert.strictEqual(globalThis.__relayBridge._pages[1]._bringCalled, 1);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
+// V2-6: a listed tab can have no page (being created, or its browser restarted).
+test("W2D: tabs_select on a tab without a page is an isError", async () => {
+  const registry = { listTabs: async () => [{ tabKey: "t1", page: null }] };
+  const r = await run({ tabId: "t1" }, registry);
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /^tabs_select: tab "t1" has no page right now/);
 });
 
-test("tabs_select: upstream failure does NOT fail the tool call", async () => {
-  const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  globalThis.__relayBridge = makeFakeBridge(["https://example.com/"]);
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { throw new Error("upstream blew up"); },
-  });
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-  } finally {
-    globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
-  }
+test("tabs_select: a bringToFront failure does not fail the call (it's cosmetic)", async () => {
+  const registry = await twoTabs();
+  registry.pageOf("c1", "t1").bringToFront = async () => { throw new Error("Target closed"); };
+  const r = await run({ tabId: "t1" }, registry);
+  assert.notStrictEqual(r.isError, true);
 });

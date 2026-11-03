@@ -13,22 +13,28 @@ test("emulate_device has required tool shape", () => {
   assert.ok(tool.inputSchema.properties.network);
 });
 
-test("emulate_device returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
+// W2D: replaces "bridge missing" / "targets the active page": CDP attaches
+// to ctx.page, never to another page of the shared context.
+test("W2D: emulate_device attaches CDP to ctx.page, not to the context's other pages", async () => {
+  const mine = { once() {} };
+  const other = { once() {} };
+  let attachedTo = null;
+  const context = {
+    pages: () => [other, mine],
+    newCDPSession: async (page) => { attachedTo = page; return { send: async () => ({}), detach: async () => {} }; },
+  };
   try {
-    const result = await tool.handler({ userAgent: "test" });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
+    const result = await tool.handler({ userAgent: "test-agent" }, { page: mine, context });
+    assert.strictEqual(result.isError, undefined);
+    assert.strictEqual(attachedTo, mine);
   } finally {
-    globalThis.__relayBridge = prev;
+    PAGE_CDP_SESSIONS.delete(mine);
   }
 });
 
 // V0-3: CDP session must NOT be detached after applying overrides — detach
 // reverts every Emulation.* override the tool just set.
 test("V0-3: emulate_device does NOT detach CDP session after applying overrides", async () => {
-  const prev = globalThis.__relayBridge;
   let detachCalls = 0;
   let sentCommands = [];
   const fakePage = {
@@ -43,9 +49,9 @@ test("V0-3: emulate_device does NOT detach CDP session after applying overrides"
     pages: () => [fakePage],
     newCDPSession: async () => fakeCdp,
   };
-  globalThis.__relayBridge = { context: fakeContext };
+  const ctx = { page: fakePage, context: fakeContext };
   try {
-    const result = await tool.handler({ userAgent: "Mozilla/5.0 Test" });
+    const result = await tool.handler({ userAgent: "Mozilla/5.0 Test" }, ctx);
     assert.strictEqual(result.isError, undefined);
     // Override was sent to CDP.
     assert.ok(sentCommands.some((c) => c.method === "Network.setUserAgentOverride"),
@@ -56,12 +62,10 @@ test("V0-3: emulate_device does NOT detach CDP session after applying overrides"
   } finally {
     // Cleanup the WeakMap entry so it doesn't leak between tests.
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
 test("V0-3: emulate_device reuses cached CDP session on second call (no double-attach)", async () => {
-  const prev = globalThis.__relayBridge;
   let newSessionCalls = 0;
   const fakePage = {
     once(/* event, fn */) {},
@@ -74,15 +78,14 @@ test("V0-3: emulate_device reuses cached CDP session on second call (no double-a
     pages: () => [fakePage],
     newCDPSession: async () => { newSessionCalls++; return fakeCdp; },
   };
-  globalThis.__relayBridge = { context: fakeContext };
+  const ctx = { page: fakePage, context: fakeContext };
   try {
-    await tool.handler({ userAgent: "UA1" });
-    await tool.handler({ userAgent: "UA2" });
+    await tool.handler({ userAgent: "UA1" }, ctx);
+    await tool.handler({ userAgent: "UA2" }, ctx);
     // Single CDP session created across two tool calls — same page, cache hit.
     assert.strictEqual(newSessionCalls, 1, "expected cached session reuse on second call");
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
@@ -93,7 +96,6 @@ test("V0-3: emulate_device reuses cached CDP session on second call (no double-a
 // ──────────────────────────────────────────────────────────────────
 
 test("T1-2: emulate_device dispatches CDP commands in parallel", async () => {
-  const prev = globalThis.__relayBridge;
   // Each cdp.send takes 50ms. Sequential = ≥150ms for 3 commands; parallel ≈ 50ms.
   const fakePage = { once() {} };
   const fakeCdp = {
@@ -104,14 +106,14 @@ test("T1-2: emulate_device dispatches CDP commands in parallel", async () => {
     pages: () => [fakePage],
     newCDPSession: async () => fakeCdp,
   };
-  globalThis.__relayBridge = { context: fakeContext };
+  const ctx = { page: fakePage, context: fakeContext };
   try {
     const t0 = Date.now();
     await tool.handler({
       userAgent: "Mozilla/5.0 Test",
       viewport: { width: 1280, height: 720 },
       network: { downloadKbps: 1000 },
-    });
+    }, ctx);
     const elapsed = Date.now() - t0;
     // 4 commands (UA + setDeviceMetricsOverride + setTouchEmulationEnabled +
     // emulateNetworkConditions) at 50ms each. Parallel: ~50ms; sequential ≥200ms.
@@ -119,12 +121,10 @@ test("T1-2: emulate_device dispatches CDP commands in parallel", async () => {
       `expected parallel dispatch (≤150ms), got ${elapsed}ms — likely reverted to sequential await`);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
 test("T1-8: emulate_device always sends setTouchEmulationEnabled when viewport given", async () => {
-  const prev = globalThis.__relayBridge;
   const fakePage = { once() {} };
   const sentCommands = [];
   const fakeCdp = {
@@ -135,43 +135,40 @@ test("T1-8: emulate_device always sends setTouchEmulationEnabled when viewport g
     pages: () => [fakePage],
     newCDPSession: async () => fakeCdp,
   };
-  globalThis.__relayBridge = { context: fakeContext };
+  const ctx = { page: fakePage, context: fakeContext };
   try {
     // First call: hasTouch=true. Second call: hasTouch=false. Both must send
     // setTouchEmulationEnabled with the corresponding flag.
-    await tool.handler({ viewport: { width: 1280, height: 720, hasTouch: true } });
+    await tool.handler({ viewport: { width: 1280, height: 720, hasTouch: true } }, ctx);
     const firstTouch = sentCommands.filter((c) => c.method === "Emulation.setTouchEmulationEnabled");
     assert.strictEqual(firstTouch.length, 1, "first call must send setTouchEmulationEnabled");
     assert.strictEqual(firstTouch[0].params.enabled, true);
 
     sentCommands.length = 0;
-    await tool.handler({ viewport: { width: 1280, height: 720, hasTouch: false } });
+    await tool.handler({ viewport: { width: 1280, height: 720, hasTouch: false } }, ctx);
     const secondTouch = sentCommands.filter((c) => c.method === "Emulation.setTouchEmulationEnabled");
     assert.strictEqual(secondTouch.length, 1,
       "second call must send setTouchEmulationEnabled (was: skipped because hasTouch falsy — touch never disabled)");
     assert.strictEqual(secondTouch[0].params.enabled, false);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
 test("T1-9: emulate_device rejects viewport without width/height at entry", async () => {
-  const prev = globalThis.__relayBridge;
   const fakePage = { once() {} };
   const fakeCdp = { send: async () => {}, detach: async () => {} };
   const fakeContext = {
     pages: () => [fakePage],
     newCDPSession: async () => fakeCdp,
   };
-  globalThis.__relayBridge = { context: fakeContext };
+  const ctx = { page: fakePage, context: fakeContext };
   try {
-    const r = await tool.handler({ viewport: { mobile: true } }); // no width/height
+    const r = await tool.handler({ viewport: { mobile: true } }, ctx); // no width/height
     assert.strictEqual(r.isError, true);
     assert.match(r.content[0].text, /viewport requires both width and height/);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
@@ -228,7 +225,6 @@ test("T2-A: synthesizeUserAgentMetadata branches on platform from UA", () => {
 });
 
 test("T2-A: emulate_device's handler passes userAgentMetadata to setUserAgentOverride", async () => {
-  const prev = globalThis.__relayBridge;
   const sentCommands = [];
   const fakePage = { once() {} };
   const fakeCdp = {
@@ -236,10 +232,10 @@ test("T2-A: emulate_device's handler passes userAgentMetadata to setUserAgentOve
     detach: async () => {},
   };
   const fakeContext = { pages: () => [fakePage], newCDPSession: async () => fakeCdp };
-  globalThis.__relayBridge = { context: fakeContext };
+  const ctx = { page: fakePage, context: fakeContext };
   try {
     const TEST_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36";
-    const r = await tool.handler({ userAgent: TEST_UA });
+    const r = await tool.handler({ userAgent: TEST_UA }, ctx);
     assert.strictEqual(r.isError, undefined, "handler must not error");
     const setUA = sentCommands.find((c) => c.method === "Network.setUserAgentOverride");
     assert.ok(setUA, "must send Network.setUserAgentOverride");
@@ -253,7 +249,6 @@ test("T2-A: emulate_device's handler passes userAgentMetadata to setUserAgentOve
     assert.ok(setUA.params.userAgentMetadata.brands.length >= 2);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
@@ -285,13 +280,12 @@ test("W1D-4: description no longer claims overrides end on navigation, and docum
 });
 
 test("W1D-4: reset:true clears UA, device metrics, touch and network overrides on the active page", async () => {
-  const prev = globalThis.__relayBridge;
   const sentCommands = [];
   const fakePage = { once() {} };
   const fakeCdp = { send: async (method, params) => { sentCommands.push({ method, params }); }, detach: async () => {} };
-  globalThis.__relayBridge = { context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
+  const ctx = { page: fakePage, context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
   try {
-    const r = await tool.handler({ reset: true });
+    const r = await tool.handler({ reset: true }, ctx);
     assert.strictEqual(r.isError, undefined);
     const byMethod = Object.fromEntries(sentCommands.map((c) => [c.method, c.params]));
     // Empty UA string = "no override" in CDP; no metadata may accompany it.
@@ -305,43 +299,38 @@ test("W1D-4: reset:true clears UA, device metrics, touch and network overrides o
     assert.deepStrictEqual(body.reset.sort(), ["network", "touch", "userAgent", "viewport"]);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
 test("W1D-4: reset:true combined with an override is rejected before any CDP command", async () => {
-  const prev = globalThis.__relayBridge;
   const sentCommands = [];
   const fakePage = { once() {} };
   const fakeCdp = { send: async (method) => { sentCommands.push(method); }, detach: async () => {} };
-  globalThis.__relayBridge = { context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
+  const ctx = { page: fakePage, context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
   try {
     for (const extra of [{ userAgent: "UA" }, { viewport: { width: 400, height: 800 } }, { network: { offline: true } }]) {
-      const r = await tool.handler({ reset: true, ...extra });
+      const r = await tool.handler({ reset: true, ...extra }, ctx);
       assert.strictEqual(r.isError, true, JSON.stringify(extra));
       assert.match(r.content[0].text, /reset/);
     }
     assert.deepStrictEqual(sentCommands, []);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });
 
 test("W1D-4: a failed reset command is reported, not swallowed", async () => {
-  const prev = globalThis.__relayBridge;
   const fakePage = { once() {} };
   const fakeCdp = {
     send: async (method) => { if (method === "Emulation.clearDeviceMetricsOverride") throw new Error("boom"); },
     detach: async () => {},
   };
-  globalThis.__relayBridge = { context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
+  const ctx = { page: fakePage, context: { pages: () => [fakePage], newCDPSession: async () => fakeCdp } };
   try {
-    const r = await tool.handler({ reset: true });
+    const r = await tool.handler({ reset: true }, ctx);
     assert.strictEqual(r.isError, true);
     assert.deepStrictEqual(JSON.parse(r.content[0].text).failed, [{ name: "viewport", error: "boom" }]);
   } finally {
     PAGE_CDP_SESSIONS.delete(fakePage);
-    globalThis.__relayBridge = prev;
   }
 });

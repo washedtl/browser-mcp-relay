@@ -1,16 +1,15 @@
-// storage_clear-local — wipe localStorage / sessionStorage for the active
-// page's origin. Useful for testing fresh-user flows or recovering after a
+// storage_clear-local — wipe localStorage / sessionStorage for this tab's
+// origin. Useful for testing fresh-user flows or recovering after a
 // stuck session — the only alternative is profile reset which kills all
 // sessions across all sites.
 
-const { withActivePage } = require("./_active-page.js");
 const { parseStore, pageOrigin } = require("./_storage-common.js");
 const { errorResult } = require("./_tool-args.js");
 
 module.exports = {
   name: "storage_clear-local",
   description:
-    "Clear localStorage or sessionStorage on the active page's origin and return how many keys were removed. " +
+    "Clear localStorage or sessionStorage on this tab's origin and return how many keys were removed. " +
     "keys limits it to those keys; omit keys to clear the whole store.",
   inputSchema: {
     type: "object",
@@ -19,7 +18,7 @@ module.exports = {
       keys: { type: "array", items: { type: "string" }, description: "Remove only these keys." },
     },
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     // F0-9: store: null means "omitted". keys is the exception: this tool is
     // destructive, so keys: null is an error, never "clear everything" —
     // only leaving keys out clears the whole store.
@@ -64,5 +63,5 @@ module.exports = {
         }),
       }],
     };
-  }),
+  },
 };

@@ -7,7 +7,7 @@
 // pre-enabled with BROWSER_RELAY_TOOLSETS=debug,react (or "all").
 //
 // State lives on the RelayServer (enabledToolsets / setToolsetsEnabled);
-// the handler gets the relay as its second argument.
+// the handler reads it from ctx.relay.
 
 const TRACE_TOOLS = new Set(["o11y_get-trace-context", "o11y_new-trace-id", "o11y_set-trace-context"]);
 
@@ -68,7 +68,7 @@ const tool = {
   },
   // Relay-local: toggling visibility never needs a browser.
   needsBrave: false,
-  async handler(args, relay) {
+  async handler(args, { relay }) {
     const action = args.action || "list";
     const toolsIn = async (sets) =>
       (await relay.upstreamCatalog()).map((t) => t.name).filter((n) => sets.includes(toolsetOf(n)));

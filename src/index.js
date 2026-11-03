@@ -176,6 +176,7 @@ const SHUTDOWN_STEP_MS = 1500;
  *   ensureSlot()   claim a pool slot + snapshot the cookie source into it +
  *                  load the vault, once. Derives the CDP port.
  *   ensureBrave()  launch Brave on the slot; relaunches after Brave dies.
+ *   peekBrave()    the running Brave's bridge, or null; never launches.
  *   getUpstream()  spawn upstream against the slot's CDP port; respawns
  *                  after upstream dies or Brave is relaunched.
  *
@@ -447,10 +448,8 @@ function createLifecycle({
           // event fires for them too — autofill works for both relay-driven
           // and BDMCP-driven navigations. No-op when the vault is empty.
           attachAutofill(l.context, vault, log);
-          // Make the bridge available to own-tool handlers via globalThis.
-          // Shape: { context, cdpConnectUrl, port } — Phase C tool handlers
-          // read globalThis.__relayBridge to drive CDP operations.
-          globalThis.__relayBridge = { ...l, port };
+          // Own-tools get { page, context, cdpUrl } built from this bridge by
+          // RelayServer (own-tools/_legacy-context.js).
           bridge = l;
           // V1-5 (2026-06-01): invalidate the cached `bridge` when the
           // underlying Brave context/process dies. Without this listener, a
@@ -474,9 +473,6 @@ function createLifecycle({
             );
             bridge = null;
             braveLaunchPromise = null;
-            if (globalThis.__relayBridge && globalThis.__relayBridge.context === l.context) {
-              globalThis.__relayBridge = null;
-            }
             teardownUpstream();
           };
           l.context.on("close", () => invalidateBridge("context closed"));
@@ -556,7 +552,10 @@ function createLifecycle({
     return shutdownPromise;
   }
 
-  return { ensureBrave, getUpstream, shutdownAsync, shutdownSync };
+  // The running bridge, or null — never launches (tabs_list & co.).
+  const peekBrave = () => bridge;
+
+  return { ensureBrave, peekBrave, getUpstream, shutdownAsync, shutdownSync };
 }
 
 /**
@@ -576,6 +575,7 @@ function buildServer({ lifecycle, recordTraffic, createRelay = (opts) => new Rel
   const relay = createRelay({
     getUpstream: lifecycle.getUpstream,
     ensureBrave: lifecycle.ensureBrave,
+    peekBrave: lifecycle.peekBrave,
     // Toolsets enabled/disabled at runtime change tools/list; the client is
     // told via notifications/tools/list_changed.
     // Rejects "Not connected" once the transport closes — nothing to tell then.
@@ -646,16 +646,6 @@ function startInspectorWithRetry({ start, port, bind, retryMs = INSPECTOR_RETRY_
 
 async function main() {
   const lifecycle = createLifecycle();
-
-  // Expose getUpstream to own-tool handlers via globalThis. The tabs_new /
-  // tabs_select handlers use this to call upstream's `navigation_go-to` so
-  // upstream's tracked `_page` follows our intended active tab. Upstream's
-  // session captures one specific Playwright Page reference at CDP-attach
-  // time and never re-evaluates it from CDP `Target.*` events; calls like
-  // `bringToFront` or creating new Playwright pages do NOT update that
-  // reference. The only externally observable lever is to navigate
-  // upstream's existing page via its own forwarded tools.
-  globalThis.__relayUpstream = lifecycle.getUpstream;
 
   // Optional in-process Inspector. When BROWSER_RELAY_INSPECTOR_PORT is set
   // on the relay process, we boot the Inspector in this same Node process

@@ -1,165 +1,66 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-close.js");
+const { fakeRegistry } = require("../fixtures/fake-registry.js");
 
-test("tabs_close has required tool shape", () => {
-  assert.strictEqual(tool.name, "tabs_close");
-  assert.strictEqual(typeof tool.description, "string");
-  assert.strictEqual(typeof tool.inputSchema, "object");
-  assert.strictEqual(typeof tool.handler, "function");
-  assert.strictEqual(tool.inputSchema.required[0], "index");
-});
+const run = (args, registry, connId = "c1") => tool.handler(args, { registry, connId });
+const keys = async (registry, connId = "c1") => (await registry.listTabs(connId)).map((t) => t.tabKey);
 
-test("tabs_close returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ index: 0 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
-});
-
-// Helper: minimal bridge with closeable pages.
-function makeFakeBridge(pageUrls) {
-  const pages = pageUrls.map((u) => ({
-    _closeCalled: 0,
-    url() { return u; },
-    async close() { this._closeCalled++; },
-  }));
-  return { context: { pages: () => pages }, _pages: pages };
+// Closing never creates a tab: getCtx is only used here to set tabs up.
+async function twoTabs() {
+  const registry = fakeRegistry();
+  await registry.getCtx("c1", "main");
+  await registry.getCtx("c1", "t1");
+  await registry.getCtx("other", "t9");
+  registry.getCtx = async () => { throw new Error("tabs_close must not call getCtx"); };
+  return registry;
 }
 
-// V1-5: negative + non-integer index validation must produce isError, not
-// crash with `pages[-1].url is not a function`.
-test("V1-5: tabs_close with negative index returns isError (not crash)", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://example.com/"]);
-  try {
-    const result = await tool.handler({ index: -1 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-    for (const p of globalThis.__relayBridge._pages) {
-      assert.strictEqual(p._closeCalled, 0);
-    }
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+test("tabs_close has required tool shape: closes by tabId only", () => {
+  assert.strictEqual(tool.name, "tabs_close");
+  assert.strictEqual(typeof tool.description, "string");
+  assert.strictEqual(typeof tool.handler, "function");
+  assert.strictEqual(tool.needsBrave, false, "closing never launches the browser");
+  assert.deepStrictEqual(Object.keys(tool.inputSchema.properties), ["tabId"]);
+  assert.deepStrictEqual(tool.inputSchema.required, ["tabId"]);
 });
 
-test("V1-5: tabs_close with non-integer index returns isError", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["a", "b"]);
-  try {
-    const result = await tool.handler({ index: "xyz" });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+test("W2D: tabs_close closes the tab through the registry", async () => {
+  const registry = await twoTabs();
+  const page = registry.pageOf("c1", "t1");
+  await page.goto("https://x.example/");
+  const r = await run({ tabId: "t1" }, registry);
+  assert.notStrictEqual(r.isError, true, r.content[0].text);
+  assert.deepStrictEqual(JSON.parse(r.content[0].text), { closed: "t1", url: "https://x.example/", remaining: 1 });
+  assert.strictEqual(page.isClosed(), true);
+  assert.deepStrictEqual(await keys(registry), ["main"]);
 });
 
-test("V1-5: tabs_close with index>=length returns isError (existing behavior preserved)", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = makeFakeBridge(["a", "b"]);
-  try {
-    const result = await tool.handler({ index: 5 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /out of range/i);
-    assert.match(result.content[0].text, /have 2 pages/);
-  } finally {
-    globalThis.__relayBridge = prev;
+test("W2D: tabs_close rejects an unknown tabId, another connection's, or none; nothing is closed", async () => {
+  const registry = await twoTabs();
+  for (const [args, re] of [
+    [{ tabId: "t9" }, /^tabs_close: unknown tabId "t9"; call tabs_new or tabs_list/],
+    [{ tabId: "nope" }, /^tabs_close: unknown tabId "nope"/],
+    [{ index: 0 }, /^tabs_close: tabId is required/],
+  ]) {
+    const r = await run(args, registry);
+    assert.strictEqual(r.isError, true, JSON.stringify(args));
+    assert.match(r.content[0].text, re);
   }
+  assert.strictEqual(registry.pageOf("other", "t9").isClosed(), false);
+  assert.deepStrictEqual(await keys(registry), ["main", "t1"]);
 });
 
-// ──────────────────────────────────────────────────────────────────
-// T0-8: closing the active page must clear the active-page reference
-// so subsequent own-tool calls don't operate on a closed page.
-// ──────────────────────────────────────────────────────────────────
-
-test("T0-8: tabs_close on the ACTIVE page clears activePage reference", async () => {
-  const prev = globalThis.__relayBridge;
-  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
-  // Two pages; mark page 1 as active; close page 1 — verify activePage cleared.
-  const bridge = makeFakeBridge(["about:blank", "https://target.example.com/"]);
-  globalThis.__relayBridge = bridge;
-  const targetPage = bridge._pages[1];
-  setActivePage(targetPage);
-  try {
-    assert.strictEqual(getActivePageRaw(), targetPage, "precondition: target is the active page");
-    const result = await tool.handler({ index: 1 });
-    assert.notStrictEqual(result.isError, true);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.wasActive, true, "must report wasActive=true");
-    assert.strictEqual(getActivePageRaw(), null, "activePage must be cleared after closing the active page");
-  } finally {
-    globalThis.__relayBridge = prev;
-    clearActivePage();
-  }
+test("W2D: with no browser running (no registry) every tabId is unknown", async () => {
+  const r = await tool.handler({ tabId: "t1" }, {});
+  assert.match(r.content[0].text, /^tabs_close: unknown tabId "t1"/);
 });
 
-test("T0-8: tabs_close on a non-active page leaves activePage untouched", async () => {
-  const prev = globalThis.__relayBridge;
-  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
-  const bridge = makeFakeBridge(["about:blank", "https://target.example.com/"]);
-  globalThis.__relayBridge = bridge;
-  const activePage = bridge._pages[1];
-  setActivePage(activePage);
-  try {
-    // Close index 0 (NOT the active one).
-    const result = await tool.handler({ index: 0 });
-    assert.notStrictEqual(result.isError, true);
-    const payload = JSON.parse(result.content[0].text);
-    assert.strictEqual(payload.wasActive, false, "must report wasActive=false");
-    assert.strictEqual(getActivePageRaw(), activePage, "active page reference must be preserved");
-  } finally {
-    globalThis.__relayBridge = prev;
-    clearActivePage();
-  }
-});
-
-// W1C2: page.close() can reject (e.g. connection lost). That must come back as
-// a structured isError result, and a failed close must not drop the active-page
-// reference for a page that is still open.
-test("W1C2: tabs_close returns isError when close() rejects and keeps the active page", async () => {
-  const prev = globalThis.__relayBridge;
-  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
-  const bridge = makeFakeBridge(["about:blank", "https://target.example.com/"]);
-  const target = bridge._pages[1];
-  target.close = async () => { throw new Error("Protocol error: Connection closed"); };
-  target.isClosed = () => false;
-  globalThis.__relayBridge = bridge;
-  setActivePage(target);
-  try {
-    const result = await tool.handler({ index: 1 });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /Connection closed/);
-    assert.strictEqual(getActivePageRaw(), target, "still-open page must stay active after a failed close");
-  } finally {
-    globalThis.__relayBridge = prev;
-    clearActivePage();
-  }
-});
-
-// W1C2: the active reference is cleared after close() resolves, so a tab
-// selected while close() was in flight must not be clobbered.
-test("W1C2: tabs_close keeps a tab selected while close() was in flight", async () => {
-  const prev = globalThis.__relayBridge;
-  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
-  const bridge = makeFakeBridge(["about:blank", "https://a.example.com/", "https://b.example.com/"]);
-  const [, target, other] = bridge._pages;
-  target.close = async () => { setActivePage(other); }; // concurrent tabs_select during close
-  globalThis.__relayBridge = bridge;
-  setActivePage(target);
-  try {
-    const result = await tool.handler({ index: 1 });
-    assert.notStrictEqual(result.isError, true);
-    assert.strictEqual(JSON.parse(result.content[0].text).wasActive, true);
-    assert.strictEqual(getActivePageRaw(), other, "selection made during close() must survive");
-  } finally {
-    globalThis.__relayBridge = prev;
-    clearActivePage();
-  }
+test("W1C2: tabs_close returns isError when the registry fails to close, and the tab stays listed", async () => {
+  const registry = await twoTabs();
+  registry.closeTab = async () => { throw new Error("connection lost"); };
+  const r = await run({ tabId: "t1" }, registry);
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /^tabs_close: failed to close tab t1 \(about:blank\): connection lost/);
+  assert.deepStrictEqual(await keys(registry), ["main", "t1"]);
 });

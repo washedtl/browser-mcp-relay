@@ -10,16 +10,13 @@ test("form_fill has required tool shape", () => {
   assert.strictEqual(tool.inputSchema.required[0], "fields");
 });
 
-test("form_fill returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ fields: [{ selector: "#a", value: "x" }] });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+test("W2D: form_fill fills ctx.page only, not the context's other pages", async () => {
+  const mine = makePageWithFillRecorder();
+  const other = makePageWithFillRecorder();
+  const result = await tool.handler({ fields: [{ selector: "#a", value: "x" }] }, { page: mine.fakePage, context: { pages: () => [other.fakePage, mine.fakePage] } });
+  assert.notStrictEqual(result.isError, true, result.content[0].text);
+  assert.strictEqual(mine.calls.length, 1);
+  assert.strictEqual(other.calls.length, 0);
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -40,36 +37,25 @@ function makePageWithFillRecorder(fillImpl) {
 }
 
 test("T1-11: form_fill passes timeoutMs to page.fill", async () => {
-  const prev = globalThis.__relayBridge;
   const { fakePage, calls } = makePageWithFillRecorder();
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    await tool.handler({
-      fields: [{ selector: "#a", value: "x" }, { selector: "#b", value: "y" }],
-      timeoutMs: 7777,
-    });
-    assert.strictEqual(calls.length, 2);
-    assert.strictEqual(calls[0].opts.timeout, 7777, "first fill must use the per-call timeout");
-    assert.strictEqual(calls[1].opts.timeout, 7777);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  await tool.handler({
+    fields: [{ selector: "#a", value: "x" }, { selector: "#b", value: "y" }],
+    timeoutMs: 7777,
+  }, ctx);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].opts.timeout, 7777, "first fill must use the per-call timeout");
+  assert.strictEqual(calls[1].opts.timeout, 7777);
 });
 
 test("T1-11: form_fill default timeoutMs is 5000 (NOT Playwright default 30000)", async () => {
-  const prev = globalThis.__relayBridge;
   const { fakePage, calls } = makePageWithFillRecorder();
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    await tool.handler({ fields: [{ selector: "#a", value: "x" }] });
-    assert.strictEqual(calls[0].opts.timeout, 5000, "default per-field timeout must be 5000ms (was: implicit Playwright 30000)");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  await tool.handler({ fields: [{ selector: "#a", value: "x" }] }, ctx);
+  assert.strictEqual(calls[0].opts.timeout, 5000, "default per-field timeout must be 5000ms (was: implicit Playwright 30000)");
 });
 
 test("T1-11: form_fill continueOnError=true attempts all fields even on failure", async () => {
-  const prev = globalThis.__relayBridge;
   const calls = [];
   const fakePage = {
     url: () => "https://x",
@@ -79,29 +65,24 @@ test("T1-11: form_fill continueOnError=true attempts all fields even on failure"
       if (selector === "#bad") throw new Error("element not found");
     },
   };
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const r = await tool.handler({
-      fields: [
-        { selector: "#a", value: "x" },
-        { selector: "#bad", value: "y" },
-        { selector: "#c", value: "z" },
-      ],
-      continueOnError: true,
-    });
-    // All 3 selectors must have been attempted, even after #bad failed.
-    assert.deepStrictEqual(calls, ["#a", "#bad", "#c"]);
-    const payload = JSON.parse(r.content[0].text);
-    assert.strictEqual(payload.filledCount, 2);
-    assert.strictEqual(payload.total, 3);
-    assert.strictEqual(r.isError, true, "result still flags error if any field failed");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  const r = await tool.handler({
+    fields: [
+      { selector: "#a", value: "x" },
+      { selector: "#bad", value: "y" },
+      { selector: "#c", value: "z" },
+    ],
+    continueOnError: true,
+  }, ctx);
+  // All 3 selectors must have been attempted, even after #bad failed.
+  assert.deepStrictEqual(calls, ["#a", "#bad", "#c"]);
+  const payload = JSON.parse(r.content[0].text);
+  assert.strictEqual(payload.filledCount, 2);
+  assert.strictEqual(payload.total, 3);
+  assert.strictEqual(r.isError, true, "result still flags error if any field failed");
 });
 
 test("T1-11: form_fill continueOnError=false (default) stops at first failure", async () => {
-  const prev = globalThis.__relayBridge;
   const calls = [];
   const fakePage = {
     url: () => "https://x",
@@ -111,20 +92,16 @@ test("T1-11: form_fill continueOnError=false (default) stops at first failure", 
       if (selector === "#bad") throw new Error("element not found");
     },
   };
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    await tool.handler({
-      fields: [
-        { selector: "#a", value: "x" },
-        { selector: "#bad", value: "y" },
-        { selector: "#c", value: "z" },
-      ],
-    });
-    // Should have stopped after #bad — #c never attempted.
-    assert.deepStrictEqual(calls, ["#a", "#bad"]);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  await tool.handler({
+    fields: [
+      { selector: "#a", value: "x" },
+      { selector: "#bad", value: "y" },
+      { selector: "#c", value: "z" },
+    ],
+  }, ctx);
+  // Should have stopped after #bad — #c never attempted.
+  assert.deepStrictEqual(calls, ["#a", "#bad"]);
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -148,23 +125,18 @@ function failLikePlaywright({ selector, value, opts }) {
 
 for (const continueOnError of [false, true]) {
   test(`W1C2: form_fill error output never contains a field value (continueOnError=${continueOnError})`, async () => {
-    const prev = globalThis.__relayBridge;
     const { fakePage } = makePageWithFillRecorder(failLikePlaywright);
-    globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-    try {
-      const r = await tool.handler({
-        fields: [{ selector: "#user", value: "alice" }, { selector: "#pw", value: SECRET }],
-        continueOnError,
-      });
-      assert.strictEqual(r.isError, true);
-      const text = r.content[0].text;
-      assert.ok(!text.includes(SECRET), `value leaked into error output:\n${text}`);
-      // The diagnostic part of the message must survive redaction.
-      assert.match(text, /Timeout 5000ms exceeded/);
-      assert.match(text, /#pw/);
-    } finally {
-      globalThis.__relayBridge = prev;
-    }
+    const ctx = { page: fakePage };
+    const r = await tool.handler({
+      fields: [{ selector: "#user", value: "alice" }, { selector: "#pw", value: SECRET }],
+      continueOnError,
+    }, ctx);
+    assert.strictEqual(r.isError, true);
+    const text = r.content[0].text;
+    assert.ok(!text.includes(SECRET), `value leaked into error output:\n${text}`);
+    // The diagnostic part of the message must survive redaction.
+    assert.match(text, /Timeout 5000ms exceeded/);
+    assert.match(text, /#pw/);
   });
 }
 
@@ -173,7 +145,6 @@ for (const continueOnError of [false, true]) {
 // multi-line value (e.g. a key pasted into a textarea) leaks in pieces; and
 // blanking a 1-char value garbles the message ("Tim<redacted>out").
 test("W1C2: form_fill: element previews of a multi-line value can't leak", async () => {
-  const prev = globalThis.__relayBridge;
   const KEY = "-----BEGIN KEY-----\nAAAAsecretline1\nBBBBsecretline2\n-----END KEY-----";
   const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
     throw new Error(
@@ -183,36 +154,26 @@ test("W1C2: form_fill: element previews of a multi-line value can't leak", async
       `  - fill("${value}")\n`,
     );
   });
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] });
-    assert.strictEqual(r.isError, true);
-    const text = r.content[0].text;
-    for (const frag of ["AAAAsecretline1", "BBBBsecretline2"]) {
-      assert.ok(!text.includes(frag), `fragment ${frag} leaked:\n${text}`);
-    }
-    assert.match(text, /Timeout 5000ms exceeded/);
-  } finally {
-    globalThis.__relayBridge = prev;
+  const ctx = { page: fakePage };
+  const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] }, ctx);
+  assert.strictEqual(r.isError, true);
+  const text = r.content[0].text;
+  for (const frag of ["AAAAsecretline1", "BBBBsecretline2"]) {
+    assert.ok(!text.includes(frag), `fragment ${frag} leaked:\n${text}`);
   }
+  assert.match(text, /Timeout 5000ms exceeded/);
 });
 
 test("W1C2: form_fill keeps the error readable for very short values", async () => {
-  const prev = globalThis.__relayBridge;
   const { fakePage } = makePageWithFillRecorder(failLikePlaywright);
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const r = await tool.handler({ fields: [{ selector: "#pw", value: "e" }] });
-    assert.match(r.content[0].text, /Timeout 5000ms exceeded/);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  const r = await tool.handler({ fields: [{ selector: "#pw", value: "e" }] }, ctx);
+  assert.match(r.content[0].text, /Timeout 5000ms exceeded/);
 });
 
 // W1C2 (spec review): keep the call log's plain diagnostics (why the fill
 // failed) while dropping the lines that carry the value or element previews.
 test("W1C2: form_fill keeps call-log diagnostics but not the value-bearing lines", async () => {
-  const prev = globalThis.__relayBridge;
   const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
     throw new Error(
       `page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n` +
@@ -224,21 +185,16 @@ test("W1C2: form_fill keeps call-log diagnostics but not the value-bearing lines
       `    - element is not visible\n`,
     );
   });
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const r = await tool.handler({ fields: [{ selector: "#pw", value: SECRET }] });
-    const text = r.content[0].text;
-    assert.ok(!text.includes(SECRET), `value leaked:\n${text}`);
-    assert.match(text, /element is not visible/);
-    assert.match(text, /waiting for locator/);
-    assert.doesNotMatch(text, /locator resolved to/);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  const r = await tool.handler({ fields: [{ selector: "#pw", value: SECRET }] }, ctx);
+  const text = r.content[0].text;
+  assert.ok(!text.includes(SECRET), `value leaked:\n${text}`);
+  assert.match(text, /element is not visible/);
+  assert.match(text, /waiting for locator/);
+  assert.doesNotMatch(text, /locator resolved to/);
 });
 
 test("W1C2: form_fill drops the fill line even if Playwright escapes the value", async () => {
-  const prev = globalThis.__relayBridge;
   const VALUE = 's3cr"et-word';
   const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
     throw new Error(
@@ -247,13 +203,9 @@ test("W1C2: form_fill drops the fill line even if Playwright escapes the value",
       `    - fill(${JSON.stringify(value)})\n`,
     );
   });
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const r = await tool.handler({ fields: [{ selector: "#pw", value: VALUE }] });
-    assert.ok(!r.content[0].text.includes("et-word"), `value leaked:\n${r.content[0].text}`);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  const r = await tool.handler({ fields: [{ selector: "#pw", value: VALUE }] }, ctx);
+  assert.ok(!r.content[0].text.includes("et-word"), `value leaked:\n${r.content[0].text}`);
 });
 
 // W1C2 (re-review V0): build the error exactly like playwright-core 1.59 does —
@@ -265,7 +217,6 @@ test("W1C2: form_fill redacts a multi-line value in a real (ANSI-coloured) Playw
   const { colors } = require("playwright-core/lib/utilsBundle");
   // callLog is not in the package "exports"; load it by file path (read-only).
   const { compressCallLog } = require(path.join(path.dirname(require.resolve("playwright-core")), "lib", "server", "callLog.js"));
-  const prev = globalThis.__relayBridge;
   const KEY = "-----BEGIN KEY-----\nAAAAsecretline1\r\nBBBBsecretline2\n-----END KEY-----";
   const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
     const log = compressCallLog([
@@ -283,19 +234,15 @@ test("W1C2: form_fill redacts a multi-line value in a real (ANSI-coloured) Playw
     ]);
     throw new Error(`page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n${colors.dim(log.join("\n"))}\n`);
   });
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] });
-    const text = r.content[0].text;
-    for (const frag of ["AAAAsecretline1", "BBBBsecretline2", "END KEY"]) {
-      assert.ok(!text.includes(frag), `fragment ${frag} leaked:\n${text}`);
-    }
-    assert.match(text, /element is not visible/);
-    // compressCallLog writes a repeated block's first line as "2 × …" (no "- ").
-    assert.match(text, /2 × attempting fill action/, `repeat-block header dropped:\n${text}`);
-  } finally {
-    globalThis.__relayBridge = prev;
+  const ctx = { page: fakePage };
+  const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] }, ctx);
+  const text = r.content[0].text;
+  for (const frag of ["AAAAsecretline1", "BBBBsecretline2", "END KEY"]) {
+    assert.ok(!text.includes(frag), `fragment ${frag} leaked:\n${text}`);
   }
+  assert.match(text, /element is not visible/);
+  // compressCallLog writes a repeated block's first line as "2 × …" (no "- ").
+  assert.match(text, /2 × attempting fill action/, `repeat-block header dropped:\n${text}`);
 });
 
 test("W1C2 review: a value that itself contains ANSI codes + a '- ' line can't leak", async () => {
@@ -311,14 +258,8 @@ test("W1C2 review: a value that itself contains ANSI codes + a '- ' line can't l
       );
     },
   };
-  const context = { pages: () => [page] };
-  globalThis.__relayBridge = { context };
-  try {
-    const res = await tool.handler({ fields: [{ selector: "#pw", value: secret }] });
-    const text = res.content.map((c) => c.text).join("\n");
-    assert.ok(!text.includes("s3cretTail"), "secret tail must not appear: " + text);
-    assert.ok(text.includes("element is not visible"), "diagnostic line survives");
-  } finally {
-    delete globalThis.__relayBridge;
-  }
+  const res = await tool.handler({ fields: [{ selector: "#pw", value: secret }] }, { page });
+  const text = res.content.map((c) => c.text).join("\n");
+  assert.ok(!text.includes("s3cretTail"), "secret tail must not appear: " + text);
+  assert.ok(text.includes("element is not visible"), "diagnostic line survives");
 });

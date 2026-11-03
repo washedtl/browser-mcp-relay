@@ -1,5 +1,11 @@
-// lighthouse_audit — runs Lighthouse against a URL using the slot's CDP port.
-// Returns category scores (performance, accessibility, best-practices, seo).
+// lighthouse_audit — runs Lighthouse against a URL over the browser's CDP
+// endpoint (ctx.cdpUrl). Returns category scores (performance,
+// accessibility, best-practices, seo). Lighthouse opens its own tab, so the
+// tool needs no session page (needsPage:false).
+//
+// W2D (2026-11-03): storage reset is always off. Lighthouse's reset clears
+// the origin's service workers / Cache Storage / file systems and the whole
+// browser's HTTP cache — in the one profile every session shares.
 //
 // T0-6 / T1-1 fixes (2026-05-09):
 //   • try/catch around lighthouse() — a bad URL or dead Brave throws
@@ -7,6 +13,8 @@
 //   • lighthouse module hoisted to a memoized lazy import — was importing
 //     ~3MB CJS/ESM on every call (~80–150ms cold cost); now imports once
 //     on first call and reuses
+
+const { errorResult } = require("./_tool-args.js");
 
 // T1-1: lazy + memoized — first call pays the import cost, subsequent calls
 // reuse the resolved module. The module is ~3MB; eager loading at startup
@@ -32,12 +40,11 @@ module.exports = {
   description:
     "Run a Lighthouse audit against a URL using the relay's Brave instance. " +
     "Returns category scores (performance, accessibility, best-practices, seo). " +
-    "The audit runs against a fresh page in the relay's browser; cookies and " +
-    "extensions are inherited from the slot's profile. desktop uses Lighthouse's " +
-    "desktop config (desktop throttling + UA); mobile its default mobile emulation. " +
-    "Side effects on that shared profile: clears the audited origin's service " +
-    "workers, Cache Storage, file systems and shader cache, and wipes the whole " +
-    "HTTP cache (cookies, localStorage and IndexedDB are kept).",
+    "The audit runs in a fresh tab of the shared browser, with its cookies and " +
+    "extensions. desktop uses Lighthouse's desktop config (desktop throttling + UA); " +
+    "mobile its default mobile emulation. It does not reset storage (other sessions " +
+    "share the profile), so the origin's caches and service workers stay: scores " +
+    "reflect a warm load.",
   inputSchema: {
     type: "object",
     properties: {
@@ -56,7 +63,8 @@ module.exports = {
     },
     required: ["url"],
   },
-  handler: async (_args = {}) => {
+  needsPage: false,
+  handler: async (_args = {}, { cdpUrl }) => {
     // F0-9 reviewer V1 (2026-05-10): null-as-missing for defaulted params.
     const url = _args.url;
     const formFactor = (_args.formFactor == null) ? "desktop" : _args.formFactor;
@@ -67,13 +75,9 @@ module.exports = {
         isError: true,
       };
     }
-    const bridge = globalThis.__relayBridge;
-    if (!bridge) {
-      return {
-        content: [{ type: "text", text: "lighthouse_audit unavailable: relay bridge not initialized" }],
-        isError: true,
-      };
-    }
+    if (!cdpUrl) return errorResult("lighthouse_audit unavailable: no browser CDP endpoint");
+    const { hostname, port } = new URL(cdpUrl);
+    const probeUrl = new URL("/json/version", cdpUrl).href;
 
     // Fast-fail with an actionable error when the URL is malformed. Lighthouse
     // itself would eventually reject but with a less clear "Unable to connect"
@@ -144,20 +148,20 @@ module.exports = {
     const PROBE_ADVICE = "Brave may have crashed or hung. Retry: the relay relaunches Brave " +
       "after it sees the browser disconnect; if it keeps failing, restart the MCP server.";
     try {
-      const probeResp = await fetch(`http://127.0.0.1:${bridge.port}/json/version`, {
+      const probeResp = await fetch(probeUrl, {
         // 1.5s is enough to detect a healthy CDP endpoint without making the
         // happy path noticeably slower; Lighthouse adds tens of seconds anyway.
         signal: AbortSignal.timeout(1500),
       });
       if (!probeResp.ok) {
         return {
-          content: [{ type: "text", text: `lighthouse_audit: relay's Brave CDP endpoint http://127.0.0.1:${bridge.port}/json/version returned status ${probeResp.status}. ${PROBE_ADVICE}` }],
+          content: [{ type: "text", text: `lighthouse_audit: relay's Brave CDP endpoint ${probeUrl} returned status ${probeResp.status}. ${PROBE_ADVICE}` }],
           isError: true,
         };
       }
     } catch (e) {
       return {
-        content: [{ type: "text", text: `lighthouse_audit: cannot reach relay's Brave CDP at http://127.0.0.1:${bridge.port}: ${e.message || e}. ${PROBE_ADVICE}` }],
+        content: [{ type: "text", text: `lighthouse_audit: cannot reach relay's Brave CDP at ${cdpUrl}: ${e.message || e}. ${PROBE_ADVICE}` }],
         isError: true,
       };
     }
@@ -169,7 +173,9 @@ module.exports = {
       // Lighthouse's own desktopConfig; mobile uses the default config. Flags
       // override config settings, so none of those are passed as flags.
       result = await lighthouse(url, {
-        port: bridge.port,
+        hostname,
+        port: Number(port),
+        disableStorageReset: true,
         output: "json",
         logLevel: "error",
         onlyCategories: cats,

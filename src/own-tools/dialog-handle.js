@@ -1,5 +1,5 @@
 // dialog_handle — registers a one-shot listener for the next dialog
-// (alert/confirm/prompt) on the active page. The call blocks until a dialog,
+// (alert/confirm/prompt) on this tab. The call blocks until a dialog,
 // page close, or timeout, so the triggering action must run concurrently.
 //
 // T0-9 / T0-10 / T1-12 fixes (2026-05-09):
@@ -10,12 +10,10 @@
 //   • description corrected: "auto-dismissed" was wrong (default is `accept`,
 //     and the action parameter controls accept-vs-dismiss)
 
-const { withActivePage } = require("./_active-page.js");
-
 module.exports = {
   name: "dialog_handle",
   description:
-    "Handle the NEXT JavaScript dialog (alert/confirm/prompt) on the active page " +
+    "Handle the NEXT JavaScript dialog (alert/confirm/prompt) on this tab " +
     "per `action` (accept by default, or dismiss). This call BLOCKS until a dialog " +
     "appears, the page closes (isError + `pageClosed: true`), or timeoutMs elapses " +
     "(isError), so the action that opens the dialog must run concurrently (e.g. a " +
@@ -29,7 +27,7 @@ module.exports = {
       timeoutMs: { type: "integer", default: 30000, description: "Max wait for the dialog to appear" },
     },
   },
-  handler: async ({ action, promptText, timeoutMs } = {}) => withActivePage(async ({ page }) => {
+  handler: async ({ action, promptText, timeoutMs } = {}, { page }) => {
     // F0-9 + F0-6 (2026-05-10): defaults treat both `undefined` and `null`
     // as "missing" (JSON-RPC clients commonly send null for unset optionals;
     // JS destructure defaults only fire on undefined). Action runtime-validated
@@ -132,5 +130,5 @@ module.exports = {
       page.once("dialog", onDialog);
       page.once("close", onClose);
     });
-  }),
+  },
 };
