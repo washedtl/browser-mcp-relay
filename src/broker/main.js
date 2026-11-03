@@ -608,8 +608,8 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       { capabilities: { tools: { listChanged: true } }, instructions: SERVER_INSTRUCTIONS },
     );
     const relay = new RelayServer({
-      // upstream calls never reach RelayServer here (see the tools/call handler)
-      getUpstream: async () => { throw new Error("[broker] upstream tools are called in-process, not through RelayServer"); },
+      // upstream tools run in-process here, routed by tabId
+      callUpstream: (name, args) => callUpstream(connId, name, args),
       loadUpstreamCatalog: loadCatalog,
       // Rejects "Not connected" once the connection is gone — nothing to tell then.
       notifyToolsChanged: () => mcp.sendToolListChanged().catch(() => {}),
@@ -633,12 +633,6 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       policy.callStarted();
       try {
-        const { name } = req.params;
-        // Upstream tools go straight to the in-process path (tabId routing is
-        // ours); RelayServer keeps own-tools and the hidden-toolset gate.
-        if (!relay.ownTools.has(name) && !relay.hiddenToolsetFor(name)) {
-          return await relay.recordCall(name, req.params.arguments || {}, "upstream", () => callUpstream(connId, name, req.params.arguments));
-        }
         return await relay.handleToolsCall(req.params);
       } finally {
         policy.callEnded();

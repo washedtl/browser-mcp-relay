@@ -2,7 +2,9 @@
 // to upstream OR to our own-tool handlers based on the tool name. Merges
 // upstream's tools/list with our own tool list.
 //
-// Two async dependencies (both injected by the entrypoint):
+// Upstream tools run through callUpstream(name, args) when the caller
+// injects one (the broker: upstream in-process, routed by tabId).
+// Otherwise (legacy) through two async dependencies injected by the entrypoint:
 //   - getUpstream(): returns the upstream MCP client. Called ONLY by
 //     tools/call for forwarded tools (~50MB node process once spawned).
 //   - ensureBrave(): launches our Brave instance via Playwright. Slow
@@ -125,7 +127,9 @@ class TrafficEmitter extends EventEmitter {
 class RelayServer {
   /**
    * @param {object} opts
-   * @param {() => Promise<object>} opts.getUpstream
+   * @param {() => Promise<object>} [opts.getUpstream] — legacy: the upstream child's client
+   * @param {(name: string, args: object|undefined) => Promise<object>} [opts.callUpstream] — runs an
+   *   upstream tool and returns its CallToolResult (the broker's in-process path); one of the two is required
    * @param {() => Promise<unknown>} [opts.ensureBrave]
    * @param {() => object|null} [opts.peekBrave] — the running bridge, without launching
    * @param {TrafficEmitter} [opts.trafficEmitter]
@@ -140,16 +144,17 @@ class RelayServer {
    * @param {object} [opts.env] — reads BROWSER_RELAY_TOOLSETS (default: process.env + local-config.json)
    */
   constructor({
-    getUpstream, ensureBrave, peekBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
+    getUpstream, callUpstream, ensureBrave, peekBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
     elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, trafficConn, env,
   } = {}) {
-    if (typeof getUpstream !== "function") {
-      throw new Error("RelayServer: constructor expects { getUpstream } async function");
+    if (typeof getUpstream !== "function" && typeof callUpstream !== "function") {
+      throw new Error("RelayServer: constructor expects { getUpstream } (legacy stdio upstream) or { callUpstream } async function");
     }
     if (ensureBrave != null && typeof ensureBrave !== "function") {
       throw new Error("RelayServer: ensureBrave, if provided, must be an async function");
     }
     this.getUpstream = getUpstream;
+    this.callUpstream = callUpstream || ((name, args) => this._callStdioUpstream(name, args));
     this.ensureBrave = ensureBrave || null;
     this.peekBrave = peekBrave || (() => null);
     this.env = env || applyLocalConfigToEnv(process.env);
@@ -278,10 +283,9 @@ class RelayServer {
   /**
    * Run one tools/call (`run` returns its result), recorded as a request and
    * a response traffic event when recordTraffic is on. `source` is "own" or
-   * "upstream". The broker records its in-process upstream calls through
-   * this too.
+   * "upstream".
    */
-  async recordCall(name, args, source, run) {
+  async _recordCall(name, args, source, run) {
     // recordTraffic=false (no Inspector): no ids, events or per-call serialization.
     if (!this.recordTraffic) return run();
     const sensitive = SENSITIVE_TOOL_RE.test(name);
@@ -325,7 +329,7 @@ class RelayServer {
   async handleToolsCall({ name, arguments: args }) {
     const callArgs = args || {};
     const own = this.ownTools.get(name);
-    return this.recordCall(name, callArgs, own ? "own" : "upstream", () => this._dispatch(name, args, callArgs, own));
+    return this._recordCall(name, callArgs, own ? "own" : "upstream", () => this._dispatch(name, args, callArgs, own));
   }
 
   async _dispatch(name, args, callArgs, own) {
@@ -352,6 +356,12 @@ class RelayServer {
         };
       }
     }
+    return this.callUpstream(name, args);
+  }
+
+  /** Legacy: upstream is the child process getUpstream() returns. */
+  async _callStdioUpstream(name, args) {
+    const callArgs = args || {};
     if (callArgs.tabId != null && callArgs.tabId !== "main") {
       // Upstream runs in its own process here and its schemas drop tabId,
       // so the call would silently act on the main tab.

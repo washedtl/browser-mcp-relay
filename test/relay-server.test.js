@@ -140,6 +140,27 @@ test("RelayServer constructor throws if getUpstream is not a function", () => {
   );
 });
 
+test("W2E: an injected callUpstream(name, args) runs every upstream call (the broker's in-process path); tabId passes through", async () => {
+  const calls = [];
+  const traffic = new TrafficEmitter();
+  const relay = new RelayServer({
+    callUpstream: async (name, args) => { calls.push([name, args]); return { content: [{ type: "text", text: `ran ${name}` }] }; },
+    loadUpstreamCatalog: fakeCatalog,
+    env: {},
+    trafficEmitter: traffic,
+    trafficConn: "c7",
+  });
+  relay.registerOwnTool({ name: "own_x", description: "", inputSchema: { type: "object" }, needsBrave: false, handler: async () => ({ content: [{ type: "text", text: "own" }] }) });
+  const r = await relay.handleToolsCall({ name: "navigation_go-to", arguments: { url: "https://a/", tabId: "t1" } });
+  assert.strictEqual(r.content[0].text, "ran navigation_go-to");
+  assert.deepStrictEqual(calls, [["navigation_go-to", { url: "https://a/", tabId: "t1" }]], "tabId is the broker's to route");
+  assert.strictEqual((await relay.handleToolsCall({ name: "own_x", arguments: {} })).content[0].text, "own");
+  assert.match((await relay.handleToolsCall({ name: "debug_status", arguments: {} })).content[0].text, /hidden/i, "the toolset gate still applies");
+  assert.strictEqual(calls.length, 1);
+  const requests = traffic.getRecent().filter((e) => e.method === "tools/call");
+  assert.deepStrictEqual(requests.map((e) => [e.name, e.source, e.conn]), [["navigation_go-to", "upstream", "c7"], ["own_x", "own", "c7"], ["debug_status", "upstream", "c7"]]);
+});
+
 test("RelayServer constructor throws if ensureBrave is provided but not a function", () => {
   assert.throws(
     () => new RelayServer({ getUpstream: async () => {}, ensureBrave: "not a function" }),
