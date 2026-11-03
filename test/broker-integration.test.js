@@ -268,3 +268,32 @@ test("A8: the broker loads upstream with its own merged env (one env writer: bro
   assert.strictEqual(seen.env, env);
   assert.match(seen.cdpUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
 });
+
+// ── the CDP port: random, outside the OS ephemeral ranges ──
+
+test("chooseCdpPort: a free port in 10000-32000 (below Windows' 49152+ and Linux's 32768+ ephemeral ranges)", async () => {
+  const { chooseCdpPort, CDP_PORT_RANGE } = require("../src/broker/main.js");
+  assert.deepStrictEqual(CDP_PORT_RANGE, { min: 10000, max: 32000 });
+  for (let i = 0; i < 20; i++) {
+    const port = await chooseCdpPort();
+    assert.ok(Number.isInteger(port) && port >= 10000 && port <= 32000, `got ${port}`);
+  }
+});
+
+test("chooseCdpPort: a taken candidate is skipped (real bind test); all taken → a clear error", async (t) => {
+  const { chooseCdpPort, CDP_PORT_RANGE } = require("../src/broker/main.js");
+  const toRandom = (port) => (port - CDP_PORT_RANGE.min) / (CDP_PORT_RANGE.max - CDP_PORT_RANGE.min + 1);
+  // hold a port in the range, then make it the first candidate
+  let held = null;
+  let taken = 0;
+  for (let p = 20000; p < 20100 && !held; p++) {
+    const s = net.createServer();
+    if (await new Promise((r) => { s.once("error", () => r(false)); s.listen({ port: p, host: "127.0.0.1", exclusive: true }, () => r(true)); })) { held = s; taken = p; }
+  }
+  assert.ok(held, "could not hold a test port");
+  t.after(() => held.close());
+  const picks = [toRandom(taken), toRandom(taken + 500)];
+  const port = await chooseCdpPort({ random: () => picks.shift() });
+  assert.strictEqual(port, taken + 500, "the held candidate was skipped");
+  await assert.rejects(chooseCdpPort({ random: () => toRandom(taken) }), /no free CDP port in 10000-32000 after 20 tries/);
+});

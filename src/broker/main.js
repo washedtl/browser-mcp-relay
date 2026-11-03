@@ -206,15 +206,32 @@ class IdlePolicy {
   }
 }
 
-function pickFreePort() {
-  return new Promise((resolve, reject) => {
+// Brave's CDP port is pinned for the broker's life (upstream reads it once)
+// while Brave is down before its first launch and after every idle close. An
+// OS-assigned port comes from the ephemeral range, which outbound connections
+// reuse, so it could be taken meanwhile and force a broker restart. Pick it
+// below every default ephemeral range instead (Windows 49152-65535, Linux
+// 32768-60999).
+const CDP_PORT_RANGE = Object.freeze({ min: 10000, max: 32000 });
+const CDP_PORT_TRIES = 20;
+
+/** Can `port` be bound on 127.0.0.1 right now? (released at once) */
+function portIsFree(port) {
+  return new Promise((resolve) => {
     const srv = net.createServer();
-    srv.once("error", reject);
-    srv.listen({ port: 0, host: "127.0.0.1", exclusive: true }, () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
+    srv.once("error", () => resolve(false));
+    srv.listen({ port, host: "127.0.0.1", exclusive: true }, () => srv.close(() => resolve(true)));
   });
+}
+
+/** A random free port in CDP_PORT_RANGE (`random`: test seam). */
+async function chooseCdpPort({ random = Math.random } = {}) {
+  const { min, max } = CDP_PORT_RANGE;
+  for (let i = 0; i < CDP_PORT_TRIES; i++) {
+    const port = min + Math.floor(random() * (max - min + 1));
+    if (await portIsFree(port)) return port;
+  }
+  throw new Error(`[broker] no free CDP port in ${min}-${max} after ${CDP_PORT_TRIES} tries`);
 }
 
 /** tabId argument → registry tab key (same rules as W2D's toolContext). */
@@ -295,7 +312,7 @@ async function startBroker({ pipe, profileDir, env = process.env, log = () => {}
   const key = loadOrCreateKey(keyPath);
   // Picked before the claim: from the claim to server.on("connection")
   // nothing may await, or an early connection can be accepted unheard.
-  const port = await pickFreePort();
+  const port = await chooseCdpPort();
   const server = await claimPipe(pipe);
   if (!server) {
     let owner = await verifyPipeOwner(pipe, key);
@@ -929,6 +946,8 @@ if (require.main === module) main();
 
 module.exports = {
   startBroker,
+  chooseCdpPort,
+  CDP_PORT_RANGE,
   IdlePolicy,
   main,
   parseArgs,

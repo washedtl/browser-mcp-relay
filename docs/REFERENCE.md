@@ -519,6 +519,8 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 | Event loop blocked ≥ 60 s | The watchdog kills the broker, and the shims start a fresh one. |
 | Memory above 1 GB while idle | The broker restarts itself, but never under a session's open browser. |
 
+Brave's CDP port is a random free port in 10000–32000, fixed for the broker's life. That is below every default ephemeral range, so outbound connections can't take it while Brave is down (before its first launch, or after an idle close) and force a broker restart.
+
 ### Profile: seeded once, then Brave's own
 
 On its first start, when the profile dir doesn't exist yet, the broker seeds it **once** from the legacy pool slot whose `Default/Network/Cookies` was written most recently. It skips slots Brave runs on or a legacy relay holds. It copies `Default/` minus caches (`Cache`, `Code Cache`, `GPUCache`, `*ShaderCache`, `Dawn*Cache`, `Service Worker/CacheStorage` and `ScriptCache`, `*_crx_cache`) and old session tabs, plus `Local State` (the cookie key). The source is never modified. Brave's first launch waits for the copy, and the log names the source. Without a pool, the profile starts fresh: log in once in a session window (`browser_show` brings it forward), and the login sticks.
