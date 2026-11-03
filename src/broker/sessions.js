@@ -12,8 +12,9 @@
 //     calls would open several connections to the one Brave.
 //   - No poisoned promises: a failed creation is forgotten, so the next call
 //     retries (upstream itself caches a rejected promise forever).
-//   - Brave going down (supervisor 'down', or a cached context whose browser
-//     disconnected) drops every context. The next call on such a tab gets a
+//   - Brave going down (supervisor 'down', a cached context whose browser
+//     disconnected, or W2C's isUp() reading false: its PID is gone before
+//     either of those is processed) drops every context. The next call on such a tab gets a
 //     fresh page and, once, a reset notice to show the agent; a silent
 //     about:blank would be misread as "my page is blank".
 //   - A context that finishes creating after a reset (or after its
@@ -58,7 +59,7 @@ class SessionRegistry {
   /**
    * @param {object} opts
    * @param {{createContext: (sessionKey: string) => Promise<object>}} opts.upstream — W2B loadUpstream() result (or a lazy facade)
-   * @param {{ensure: () => Promise<object>, on?: Function}} opts.supervisor — W2C BraveSupervisor
+   * @param {{ensure: () => Promise<object>, on?: Function, isUp?: () => boolean}} opts.supervisor — W2C BraveSupervisor
    * @param {(msg: string) => void} [opts.log]
    */
   constructor({ upstream, supervisor, log } = {}) {
@@ -101,6 +102,9 @@ class SessionRegistry {
     // first upstream import): open nothing for it
     if (this._closedConns.has(connId)) return Promise.reject(new Error(`[broker] ${goneMessage(true, tabKey)}`));
     const tabs = this._tabs(connId, true);
+    // W2E: the PID died, the disconnect isn't processed yet (a cached
+    // context would hand upstream a dead browser): every tab is gone
+    if (tabs.get(tabKey)?.ctx && this._braveGone()) this.invalidateAll("the browser went down");
     const entry = tabs.get(tabKey);
     if (entry) {
       if (!entry.ctx) return entry.promise; // creation in flight: share it
@@ -162,6 +166,11 @@ class SessionRegistry {
       await closeQuietly(ctx, this._log);
       if (attempt >= 3) throw new Error(`[broker] the browser kept restarting while tab "${tabKey}" was opening; retry the call`);
     }
+  }
+
+  /** W2C's isUp() is false as soon as Brave's PID is gone, before its disconnect is processed. */
+  _braveGone() {
+    return typeof this.supervisor.isUp === "function" && !this.supervisor.isUp();
   }
 
   _serialized(fn) {
@@ -265,6 +274,7 @@ class SessionRegistry {
 
   /** An open context of any connection (none is created), or null. */
   anyOpenCtx() {
+    if (this._braveGone()) return null;
     for (const tabs of this._conns.values()) {
       for (const entry of tabs.values()) if (entry.ctx && isAlive(entry.ctx)) return entry.ctx;
     }

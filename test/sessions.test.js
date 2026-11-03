@@ -390,3 +390,110 @@ test("constructor: needs upstream.createContext and supervisor.ensure", () => {
   assert.throws(() => new SessionRegistry({ supervisor: fakeSupervisor() }), /upstream/);
   assert.throws(() => new SessionRegistry({ upstream: fakeUpstream() }), /supervisor/);
 });
+
+// ── W2E: the PID is gone before the CDP disconnect is processed ──
+//
+// W2C's isUp() reads false as soon as Brave's PID is gone; Playwright's
+// isConnected() and the supervisor's 'down' lag behind (e2e: a call 24 ms
+// after the kill got the cached context, and upstream's newPage on the dead
+// context failed with "Target page, context or browser has been closed").
+
+/** A supervisor like W2C's: isUp() PID-based; a relaunch emits the old Brave's late 'down' before it resolves. */
+function pidSupervisor() {
+  const sup = new EventEmitter();
+  Object.assign(sup, {
+    up: false,
+    pendingDown: false,
+    ensures: 0,
+    launches: 0,
+    gate: null, // optional deferred a launch waits for
+    isUp: () => sup.up,
+    async ensure() {
+      sup.ensures++;
+      if (sup.up) return { pid: sup.launches };
+      if (sup.gate) await sup.gate.promise;
+      if (sup.pendingDown) { sup.pendingDown = false; sup.emit("down", "cdp disconnected"); }
+      if (!sup.up) { sup.up = true; sup.launches++; }
+      return { pid: sup.launches };
+    },
+    // the process died; nothing has been processed yet
+    killPid() { sup.up = false; sup.pendingDown = true; },
+  });
+  return sup;
+}
+
+const deadCtx = (ctx) => {
+  ctx.page.closed = true;
+  ctx.ensureSessionPageOpen = async () => { throw new Error("browserContext.newPage: Target page, context or browser has been closed"); };
+};
+
+test("W2E: PID gone, isConnected() still true: the next call relaunches and gets a fresh tab with a reset notice, not the dead context", async () => {
+  const upstream = fakeUpstream();
+  const supervisor = pidSupervisor();
+  const registry = new SessionRegistry({ upstream, supervisor, log: () => {} });
+  const a1 = await registry.getCtx("c1");
+  const b1 = await registry.getCtx("c2");
+  supervisor.killPid();
+  deadCtx(a1);
+  deadCtx(b1);
+  assert.strictEqual(a1.browser.isConnected(), true, "the race: Playwright hasn't noticed yet");
+
+  const a2 = await registry.getCtx("c1");
+  assert.notStrictEqual(a2, a1);
+  assert.strictEqual(supervisor.launches, 2, "Brave relaunched");
+  assert.match(registry.takeResetNotice("c1", MAIN_TAB), /This tab was reset because the browser went down/);
+  assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null, "once");
+
+  // the old Brave's late 'down' came inside the relaunch: the new tab survives it
+  assert.strictEqual(await registry.getCtx("c1"), a2);
+  assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null, "no spurious second reset");
+  // the other session's tab died too: fresh on its next call, with its notice
+  const b2 = await registry.getCtx("c2");
+  assert.notStrictEqual(b2, b1);
+  assert.match(registry.takeResetNotice("c2", MAIN_TAB), /This tab was reset/);
+  assert.strictEqual(registry.anyOpenCtx() === a2 || registry.anyOpenCtx() === b2, true);
+});
+
+test("W2E: anyOpenCtx never hands out a context of a Brave whose PID is gone", async () => {
+  const supervisor = pidSupervisor();
+  const registry = new SessionRegistry({ upstream: fakeUpstream(), supervisor, log: () => {} });
+  await registry.getCtx("c1");
+  supervisor.killPid();
+  assert.strictEqual(registry.anyOpenCtx(), null);
+});
+
+test("W2E: no spurious resets while isUp() is false for a first launch or a relaunch in flight", async () => {
+  const upstream = fakeUpstream();
+  const supervisor = pidSupervisor();
+  const registry = new SessionRegistry({ upstream, supervisor, log: () => {} });
+  // first launch: isUp() false until it is done; concurrent first calls
+  supervisor.gate = deferred();
+  const first = [registry.getCtx("c1"), registry.getCtx("c2"), registry.getCtx("c1")];
+  await tick();
+  assert.strictEqual(supervisor.isUp(), false);
+  supervisor.gate.resolve();
+  const [a, b, a2] = await Promise.all(first);
+  assert.strictEqual(a, a2);
+  assert.strictEqual(upstream.calls.length, 2);
+  assert.strictEqual(await registry.getCtx("c1"), a);
+  assert.strictEqual(await registry.getCtx("c2"), b);
+  assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null);
+  assert.strictEqual(registry.takeResetNotice("c2", MAIN_TAB), null);
+
+  // relaunch in flight: contexts made against the new Brave stay
+  supervisor.killPid();
+  supervisor.gate = deferred();
+  const again = [registry.getCtx("c1"), registry.getCtx("c2")];
+  await tick();
+  supervisor.gate.resolve();
+  const [a3, b3] = await Promise.all(again);
+  assert.notStrictEqual(a3, a);
+  assert.notStrictEqual(b3, b);
+  assert.strictEqual(supervisor.launches, 2, "one relaunch for both");
+  assert.strictEqual(await registry.getCtx("c1"), a3);
+  assert.strictEqual(await registry.getCtx("c2"), b3);
+  assert.strictEqual(upstream.calls.length, 4);
+  assert.match(registry.takeResetNotice("c1", MAIN_TAB), /reset/);
+  assert.match(registry.takeResetNotice("c2", MAIN_TAB), /reset/);
+  assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null);
+});

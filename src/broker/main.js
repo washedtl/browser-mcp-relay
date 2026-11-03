@@ -385,7 +385,11 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
 
   const registry = new SessionRegistry({
     upstream: { createContext: async (sessionKey) => (await getUpstream()).up.createContext(sessionKey) },
-    supervisor: { ensure: ensureBrave, on: (event, fn) => (typeof supervisor.on === "function" ? supervisor.on(event, fn) : undefined) },
+    supervisor: {
+      ensure: ensureBrave,
+      on: (event, fn) => (typeof supervisor.on === "function" ? supervisor.on(event, fn) : undefined),
+      isUp: () => supervisor.isUp(), // PID-based: a crash shows here before its disconnect is processed
+    },
     log,
   });
 
