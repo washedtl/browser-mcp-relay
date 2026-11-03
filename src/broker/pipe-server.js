@@ -214,7 +214,7 @@ async function claimPipe(pipe) {
 
 const HELLO_TIMEOUT_MS = 5000;
 const HELLO_MAX_BYTES = 4096; // a handshake line is ~200 bytes: don't buffer a flood
-const MAX_WARNING_CHARS = 500;
+const MAX_WARNING_CHARS = 1500;
 
 /** The key file next to the broker's other state. */
 function keyFileFor(env = process.env) {
@@ -373,9 +373,10 @@ async function verifyPipeOwner(pipe, key, timeoutMs = HELLO_TIMEOUT_MS) {
 
 /**
  * Server side: answer a hello if the connection opens with one (with the
- * broker's warning, if any). Resolves { hello, rest } — hello null when the
- * first line was something else (it is then part of rest, untouched). The
- * socket is left paused.
+ * broker's warning, if any: a string, or a function of the hello for one
+ * meant for that session only). Resolves { hello, rest } — hello null when
+ * the first line was something else (it is then part of rest, untouched).
+ * The socket is left paused.
  */
 async function serverHello(sock, key, { warning = null, timeoutMs = HELLO_TIMEOUT_MS } = {}) {
   const { line, rest } = await readLine(sock, timeoutMs);
@@ -385,7 +386,8 @@ async function serverHello(sock, key, { warning = null, timeoutMs = HELLO_TIMEOU
     return { hello: null, rest: Buffer.concat([Buffer.from(line + "\n"), rest]) };
   }
   const reply = { bmr: "hello", v: 1, mac: helloMac(key, msg.nonce) };
-  if (warning) reply.warning = String(warning).slice(0, MAX_WARNING_CHARS);
+  const text = typeof warning === "function" ? warning(msg) : warning;
+  if (text) reply.warning = String(text).slice(0, MAX_WARNING_CHARS);
   sock.write(JSON.stringify(reply) + "\n");
   return { hello: msg, rest };
 }

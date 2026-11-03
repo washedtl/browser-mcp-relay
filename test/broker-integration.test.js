@@ -322,3 +322,33 @@ test("chooseCdpPort: a taken candidate is skipped (real bind test); all taken �
   assert.strictEqual(port, taken + 500, "the held candidate was skipped");
   await assert.rejects(chooseCdpPort({ random: () => toRandom(taken) }), /no free CDP port in 10000-32000 after 20 tries/);
 });
+
+// ── warnings a session hears (hello reply → its stderr + first tool result) ──
+
+async function helloWarning(pipe, settingsEnv) {
+  const { connectPipe, clientHello, settingsHash } = require("../src/broker/pipe-server.js");
+  const sock = await connectPipe(pipe);
+  try {
+    return (await clientHello(sock, KEY, { settings: settingsEnv ? settingsHash(settingsEnv, KEY) : null })).warning;
+  } finally {
+    sock.destroy();
+  }
+}
+
+test("V2-c: a session whose settings differ from the broker's is told so, in ITS hello; a matching one hears nothing", async (t) => {
+  const env = { BROWSER_RELAY_PROXY_URL: "http://127.0.0.1:1" };
+  const b = await startTestBroker(t, { env });
+  assert.strictEqual(await helloWarning(b.pipe, env), null);
+  assert.strictEqual(await helloWarning(b.pipe, null), null, "a session that sent no settings");
+  const w = await helloWarning(b.pipe, { BROWSER_RELAY_PROXY_URL: "http://127.0.0.1:2" });
+  assert.match(w, /this session's browser settings .* differ .*npm run broker:stop/);
+  assert.strictEqual(b.logs.filter((l) => /WARNING: session c\d+ has browser settings/.test(l)).length, 1, "and once in the broker log");
+});
+
+test("V1-4b: BROWSER_RELAY_VAULT_FILES set in broker mode: every session hears that autofill isn't available here", async (t) => {
+  const b = await startTestBroker(t, { env: { BROWSER_RELAY_VAULT_FILES: "C:\\x\\pw.csv" } });
+  for (let i = 0; i < 2; i++) assert.match(await helloWarning(b.pipe, null), /credential-vault autofill isn't available in broker mode; set BROWSER_RELAY_MODE=legacy if you need it/);
+  assert.strictEqual(b.logs.filter((l) => /WARNING: credential-vault autofill/.test(l)).length, 1, "logged once");
+  const quiet = await startTestBroker(t);
+  assert.strictEqual(await helloWarning(quiet.pipe, null), null);
+});

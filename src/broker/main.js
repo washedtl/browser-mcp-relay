@@ -248,6 +248,10 @@ const unknownTabMessage = (tabKey) => `unknown tabId ${JSON.stringify(tabKey)}; 
 
 const errorResult = (text) => ({ content: [{ type: "text", text }], isError: true });
 
+const SETTINGS_DIFFER_WARNING =
+  "this session's browser settings (BROWSER_*, telemetry, upstream tool options) differ from the ones the running broker " +
+  "started with, and it keeps its own: run `npm run broker:stop`, and the next tool call starts a broker with the calling session's settings";
+
 // BrowserContext members that are sync (or event APIs): not forwardable lazily
 const SYNC_CONTEXT_MEMBERS = new Set(["pages", "browser", "on", "once", "off", "addListener", "removeListener", "request", "tracing", "clock", "backgroundPages", "serviceWorkers"]);
 
@@ -567,9 +571,18 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   let accepting = true; // false once a shutdown is committed
 
   const ownSettings = settingsHash(env, key);
-  // set by the launcher when de-elevation failed: every session hears it
-  const launchWarning = env.BROWSER_RELAY_BROKER_LAUNCH_WARNING || null;
-  if (launchWarning) log(`WARNING: ${launchWarning}`);
+  // What every session hears (its stderr + its first tool result): the
+  // launcher's warning (de-elevation failed) and settings this mode ignores.
+  const brokerWarnings = [
+    env.BROWSER_RELAY_BROKER_LAUNCH_WARNING,
+    env.BROWSER_RELAY_VAULT_FILES ? "credential-vault autofill isn't available in broker mode; set BROWSER_RELAY_MODE=legacy if you need it" : null,
+  ].filter(Boolean);
+  for (const w of brokerWarnings) log(`WARNING: ${w}`);
+  // ...plus, for a session whose own settings differ, that it doesn't get them
+  const helloWarning = (hello) => [
+    ...brokerWarnings,
+    ...(hello.settings && hello.settings !== ownSettings ? [SETTINGS_DIFFER_WARNING] : []),
+  ].join(" | ") || null;
   let warnedSettings = false;
 
   function serveConnection(sock) {
@@ -596,7 +609,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
 
     // A shim opens with a hello: prove we hold this user's key (it talks to
     // nobody else), learn whether it lost an earlier broker and its settings.
-    serverHello(sock, key, { warning: launchWarning }).then(({ hello, rest }) => {
+    serverHello(sock, key, { warning: helloWarning }).then(({ hello, rest }) => {
       if (done) return undefined;
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
