@@ -106,6 +106,35 @@ test("a keyword-held domain that appears after approval waits for review: pendin
   assert.strictEqual(env.port.ofType("delta").length, 0, "neither the held nor the deny cookie is sent");
 });
 
+test("a held domain still surfaces (pending + badge) while the host is down or not installed", async () => {
+  const env = makeEnv({ cookies: [], storage: APPROVED });
+  const bridge = createBridge(env.deps());
+  await bridge.ready;
+  await env.clock.advance(10);
+  env.port.crash("Specified native messaging host not found.");
+  env.cookies.set(cookie("newbank.example"));
+  await env.clock.advance(200);
+  assert.deepStrictEqual(env.store.data.status.pending, ["newbank.example"]);
+  assert.strictEqual(env.action.state.text, "1");
+});
+
+test("a partitioned cookie blocked by a HELD top-level site puts that site up for review", async () => {
+  const env = makeEnv({ cookies: [], storage: APPROVED });
+  await syncedOnce(env);
+  env.cookies.set(cookie("widget.example", "p", { partitionKey: { topLevelSite: "https://mybank.example" } }));
+  await env.clock.advance(1000);
+  assert.deepStrictEqual(env.store.data.status.pending, ["mybank.example"]);
+  assert.strictEqual(env.port.ofType("delta").length, 0);
+});
+
+test("buildReviewModel: Will-sync totals count cookies the way the sync does (partition site included)", () => {
+  const jar = [cookie(".amazon.com"), cookie("widget.example", "p", { partitionKey: { topLevelSite: "https://chase.com" } }),
+    cookie("widget.example", "q")];
+  const m = buildReviewModel(jar, fakeClassify, S());
+  assert.strictEqual(m.totals.syncCookies, 2, "the cookie partitioned under a blocked bank site is not counted");
+  assert.strictEqual(m.totals.syncDomains, 2);
+});
+
 test("held domains the owner never saw (e.g. after a policy update) become pending during a full sync", async () => {
   const env = makeEnv({ cookies: [cookie("taxhelper.example")], storage: { settings: S() } });
   await syncedOnce(env);

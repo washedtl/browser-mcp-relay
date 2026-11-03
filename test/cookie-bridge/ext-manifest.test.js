@@ -27,9 +27,11 @@ function walk(dir) {
     e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]);
 }
 
-test("MV3 manifest: module service worker, the three permissions, all-hosts access, options page, action", () => {
+test("MV3 manifest: module service worker, the permissions, all-hosts access, options page, action", () => {
   assert.strictEqual(manifest.manifest_version, 3);
-  assert.deepStrictEqual([...manifest.permissions].sort(), ["cookies", "nativeMessaging", "storage"]);
+  // alarms: a ~25 s retry while the native host is down wakes a stopped worker
+  assert.deepStrictEqual([...manifest.permissions].sort(), ["alarms", "cookies", "nativeMessaging", "storage"]);
+  assert.strictEqual(manifest.minimum_chrome_version, "119", "cookies.getAll({partitionKey}) needs Chrome 119+");
   assert.deepStrictEqual(manifest.host_permissions, ["<all_urls>"]);
   assert.deepStrictEqual(manifest.background, { service_worker: "background.js", type: "module" });
   assert.strictEqual(manifest.options_ui.page, "options.html");

@@ -67,6 +67,12 @@ function fakeChrome(storageInit = {}) {
     },
     cookies: fakeCookies([cookie(".amazon.com"), cookie(".chase.com")]),
     storage: { local, onChanged: storageChanged },
+    alarms: {
+      onAlarm: fakeEvent(),
+      created: new Map(),
+      create(name, info) { this.created.set(name, info); return Promise.resolve(); },
+      clear(name) { return Promise.resolve(this.created.delete(name)); },
+    },
     action: {
       onClicked: fakeEvent(),
       badge: { text: "", color: null, title: "" },
@@ -114,6 +120,7 @@ test("all listeners are registered synchronously at module evaluation", async (t
   assert.strictEqual(chrome.storage.onChanged.fns.length, 1, "storage.onChanged");
   assert.strictEqual(chrome.runtime.onInstalled.fns.length, 1, "runtime.onInstalled");
   assert.strictEqual(chrome.action.onClicked.fns.length, 1, "action.onClicked");
+  assert.strictEqual(chrome.alarms.onAlarm.fns.length, 1, "alarms.onAlarm (wakes a stopped worker to retry the host)");
   assert.strictEqual(chrome.cookies.listeners.length, 1, "cookies.onChanged");
 });
 
@@ -146,6 +153,7 @@ test("approved: connects to the native host by name and says hello; lastError te
   chrome.ports[0].crash("Specified native messaging host not found.");
   await new Promise((r) => setTimeout(r, 700));
   assert.match(chrome.storage.local.data.status.error, /not found/);
+  assert.ok(chrome.alarms.created.size === 1, "a retry alarm is armed through chrome.alarms");
 });
 
 test("a policy.js that exposes classify as a global function works too", async (t) => {

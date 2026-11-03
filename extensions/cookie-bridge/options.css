@@ -1,5 +1,6 @@
 /* options.css — cookie-bridge first-run review page (W2F-ext).
-   Dark by default, system fonts, one calm accent, 4px spacing scale.
+   Dark by default, system fonts, one calm accent, 4px spacing scale
+   (1px borders and the 2px focus-ring offset are the only off-scale values).
    No external assets: everything here is self-contained. */
 
 :root {
@@ -10,8 +11,8 @@
   --line: #262b32;
   --line-strong: #333a43;
   --text: #e7ebf0;
-  --text-dim: #9aa4b0;
-  --text-faint: #6b7682;
+  --text-dim: #9aa4b0;   /* 6.5:1+ on every surface */
+  --text-faint: #85909c; /* 5.0:1+ on every surface (AA) */
   --accent: #4aa8ff;
   --accent-dim: #2b6fb3;
   --ok: #46c08a;
@@ -25,8 +26,8 @@
   --s4: 16px;
   --s5: 24px;
   --s6: 32px;
-  --radius: 10px;
-  --radius-sm: 6px;
+  --radius: 12px;
+  --radius-sm: 8px;
 
   --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, "Cascadia Code", "Segoe UI Mono", Consolas, monospace;
@@ -51,6 +52,16 @@ body {
   padding: var(--s5) var(--s4) var(--s6);
 }
 
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--s1);
+  padding: 0 var(--s1);
+}
+
 /* ── header ── */
 .page-head {
   display: flex;
@@ -72,7 +83,7 @@ body {
 .page-head h1 {
   font-size: 1.15rem;
   font-weight: 600;
-  margin: 0 0 2px;
+  margin: 0 0 var(--s1);
   text-wrap: balance;
 }
 .page-head p {
@@ -84,11 +95,12 @@ body {
 }
 
 .label-caps {
+  margin: 0;
   font-size: 0.68rem;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-dim);
 }
 
 /* ── status strip ── */
@@ -101,25 +113,33 @@ body {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  margin-bottom: var(--s4);
+  margin-bottom: var(--s2);
 }
-.status .stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.status .stat { display: flex; flex-direction: column; gap: var(--s1); min-width: 0; }
 .status .stat b {
   font-size: 0.95rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+.broker { display: inline-flex; align-items: center; gap: var(--s2); }
 .dot {
-  display: inline-block;
-  width: 8px; height: 8px;
+  flex: none;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--text-faint);
-  margin-right: 6px;
-  vertical-align: 1px;
 }
 .dot.up { background: var(--ok); }
 .dot.down { background: var(--bad); }
 .dot.paused { background: var(--warn); }
+
+.host-line {
+  margin: 0 0 var(--s4);
+  padding: 0 var(--s1);
+  font-size: 0.84rem;
+  color: var(--text-dim);
+  text-wrap: pretty;
+}
 
 /* ── action bar ── */
 .actions {
@@ -139,11 +159,14 @@ button {
   background: var(--surface-2);
   color: var(--text);
   padding: var(--s2) var(--s3);
-  transition: background 120ms, border-color 120ms, transform 80ms;
+  transition-property: background-color, border-color, transform;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.23, 1, 0.32, 1);
 }
 button:hover { background: #222832; }
-button:active { transform: scale(0.98); }
+button:active { transform: scale(0.96); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.small { padding: var(--s1) var(--s2); font-size: 0.8rem; }
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -154,28 +177,37 @@ button.primary:hover { background: #5fb3ff; }
 button.primary:disabled {
   background: var(--surface-2);
   border-color: var(--line);
-  color: var(--text-faint);
-  cursor: not-allowed;
+  color: var(--text-dim);
+  cursor: default;
+  transform: none;
 }
 
-/* pause switch */
-.switch { display: inline-flex; align-items: center; gap: var(--s2); user-select: none; }
-.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+/* pause switch: 40×24 track, 16px knob inset 4px */
+.switch { display: inline-flex; align-items: center; gap: var(--s2); position: relative; user-select: none; cursor: pointer; }
+.switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
 .switch .track {
-  width: 38px; height: 22px;
+  width: 40px;
+  height: 24px;
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--line-strong);
   position: relative;
-  transition: background 120ms, border-color 120ms;
+  pointer-events: none;
+  transition-property: background-color, border-color;
+  transition-duration: 120ms;
 }
 .switch .track::after {
   content: "";
-  position: absolute; top: 2px; left: 2px;
-  width: 16px; height: 16px;
+  position: absolute;
+  top: 3px; /* 4px from the outer edge, inside the 1px border */
+  left: 3px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   background: var(--text-dim);
-  transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), background 120ms;
+  transition-property: transform, background-color;
+  transition-duration: 160ms;
+  transition-timing-function: cubic-bezier(0.23, 1, 0.32, 1);
 }
 .switch input:checked + .track { background: var(--accent-dim); border-color: var(--accent); }
 .switch input:checked + .track::after { transform: translateX(16px); background: var(--text); }
@@ -185,7 +217,8 @@ button.primary:disabled {
 .group { margin-bottom: var(--s5); }
 .group-head {
   display: flex;
-  align-items: baseline;
+  flex-wrap: wrap;
+  align-items: center;
   gap: var(--s2);
   margin-bottom: var(--s2);
 }
@@ -221,7 +254,6 @@ button.primary:disabled {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 1px;
 }
 .row .domain .name {
   font-family: var(--mono);
@@ -239,41 +271,52 @@ button.primary:disabled {
   flex: none;
   font-size: 0.68rem;
   font-weight: 600;
+  line-height: 20px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--hold);
   border: 1px solid rgba(217, 164, 65, 0.4);
   border-radius: 999px;
-  padding: 1px 8px;
+  padding: 0 var(--s2);
 }
 
-/* per-row toggle (checkbox shown as a small switch, 40px hit area) */
-.toggle { flex: none; display: inline-flex; align-items: center; position: relative; }
+/* per-row toggle: 36×20 track, 12px knob inset 4px, 40×40 hit area */
+.toggle { flex: none; display: inline-flex; align-items: center; justify-content: center; position: relative; width: 40px; height: 40px; }
 .toggle input {
-  position: absolute; inset: 0;
-  width: 100%; height: 100%;
-  min-width: 40px; min-height: 40px;
-  margin: 0; opacity: 0; cursor: pointer;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
 }
 .toggle .track {
-  width: 34px; height: 20px;
+  width: 36px;
+  height: 20px;
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--line-strong);
   position: relative;
   pointer-events: none;
-  transition: background 120ms, border-color 120ms;
+  transition-property: background-color, border-color;
+  transition-duration: 120ms;
 }
 .toggle .track::after {
   content: "";
-  position: absolute; top: 2px; left: 2px;
-  width: 14px; height: 14px;
+  position: absolute;
+  top: 3px; /* 4px from the outer edge, inside the 1px border */
+  left: 3px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: var(--text-faint);
-  transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), background 120ms;
+  transition-property: transform, background-color;
+  transition-duration: 160ms;
+  transition-timing-function: cubic-bezier(0.23, 1, 0.32, 1);
 }
 .toggle input:checked + .track { background: var(--accent-dim); border-color: var(--accent); }
-.toggle input:checked + .track::after { transform: translateX(14px); background: var(--text); }
+.toggle input:checked + .track::after { transform: translateX(16px); background: var(--text); }
 .toggle input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .empty {
@@ -282,10 +325,12 @@ button.primary:disabled {
   font-size: 0.85rem;
 }
 .rejections {
-  margin-top: var(--s2);
+  margin: 0 0 var(--s4);
+  padding: 0 var(--s1);
   font-size: 0.78rem;
   color: var(--bad);
 }
+.rejections:empty { display: none; }
 .rejections ul { margin: var(--s1) 0 0; padding-left: var(--s4); }
 
 .footnote {
@@ -299,6 +344,6 @@ button.primary:disabled {
 
 @media (max-width: 520px) {
   .wrap { padding: var(--s4) var(--s3) var(--s5); }
-  .row { padding: var(--s3); gap: var(--s2); }
+  .row { padding: var(--s2) var(--s3); gap: var(--s2); }
   .status { gap: var(--s3); }
 }

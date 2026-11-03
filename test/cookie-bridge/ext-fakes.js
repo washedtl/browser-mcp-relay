@@ -157,7 +157,23 @@ function fakeClassify(domain) {
   if (under("chase.com") || under("paypal.com")) return { decision: "deny", category: "banking", reason: "built-in denylist" };
   if (under("accounts.google.com") || under("mail.google.com")) return { decision: "deny", category: "email-identity", reason: "built-in denylist" };
   if (/bank|wallet|tax|health/.test(d)) return { decision: "hold", category: "keyword", reason: "keyword guard" };
-  return { decision: "allow", category: null, reason: "not on a denylist" };
+  // same shape as the real policy.js: allow carries "business" or "default"
+  if (under("amazon.com") || under("github.com") || under("keepa.com")) return { decision: "allow", category: "business", reason: "business tool" };
+  return { decision: "allow", category: "default", reason: "not on a denylist" };
+}
+
+/** chrome.alarms: create/clear by name + onAlarm; fire(name) simulates Chrome waking us. */
+function fakeAlarms() {
+  const listeners = [];
+  const alarms = new Map();
+  return {
+    alarms,
+    create(name, info) { alarms.set(name, { name, ...info }); },
+    clear(name) { return alarms.delete(name); },
+    onAlarm: { addListener: (fn) => listeners.push(fn) },
+    listeners,
+    fire(name) { for (const fn of listeners) fn({ name }); },
+  };
 }
 
 /**
@@ -171,6 +187,7 @@ function makeEnv({ cookies = [], storage = {}, classify = fakeClassify } = {}) {
   env.cookies = fakeCookies(cookies);
   env.ports = [];
   env.action = fakeAction();
+  env.alarms = fakeAlarms();
   env.logs = [];
   env.classify = classify;
   env.connectNative = (name) => { const p = fakePort(name); env.ports.push(p); return p; };
@@ -180,6 +197,7 @@ function makeEnv({ cookies = [], storage = {}, classify = fakeClassify } = {}) {
     classify: env.classify,
     storage: env.store,
     action: env.action,
+    alarms: env.alarms,
     timers: { setTimeout: env.clock.setTimeout, clearTimeout: env.clock.clearTimeout },
     now: env.clock.now,
     log: (msg) => env.logs.push(String(msg)),
@@ -193,10 +211,14 @@ function makeEnv({ cookies = [], storage = {}, classify = fakeClassify } = {}) {
     env.cookies = fakeCookies(env.cookies.jar);
     env.ports.length = 0;
     env.action = fakeAction();
+    // Chrome keeps alarms across worker restarts; only the listeners die
+    const kept = env.alarms.alarms;
+    env.alarms = fakeAlarms();
+    for (const [k, v] of kept) env.alarms.alarms.set(k, v);
   };
   return env;
 }
 
 const APPROVED = { settings: { approved: true, approvedAt: 1, paused: false, overrides: {}, reviewed: {} } };
 
-module.exports = { SECRET, fakeClock, flush, fakeStorage, fakeCookies, fakePort, fakeAction, fakeClassify, cookie, makeEnv, APPROVED };
+module.exports = { SECRET, fakeClock, flush, fakeStorage, fakeCookies, fakePort, fakeAction, fakeAlarms, fakeClassify, cookie, makeEnv, APPROVED };

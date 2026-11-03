@@ -31,6 +31,10 @@
   const RECONNECT_MAX_MS = 20_000; // < 30 s so a retry lands before an idle MV3 worker is stopped
   const DELTA_DEBOUNCE_MS = 150; // coalesce a burst of onChanged into one message
   const BADGE_COLOR = "#b4531f";
+  // While the host is down a periodic alarm retries it: unlike setTimeout it
+  // survives Chrome stopping the idle worker (and wakes it back up).
+  const ALARM_NAME = "cookie-bridge-retry-host";
+  const ALARM_PERIOD_MIN = 25 / 60;
 
   const STATUS_KEY = "status";
   const SETTINGS_KEY = "settings";
@@ -135,18 +139,24 @@
     return { sync: cls.decision === "allow", userOverride: false, cls };
   }
 
-  /** Syncability of an actual cookie: a partitioned cookie also needs its top-level site syncable. */
+  /**
+   * Syncability of an actual cookie: a partitioned cookie also needs its
+   * top-level site syncable. `blockedBy` names the domain whose decision
+   * stopped it (the cookie's own domain, or the partition's top-level site),
+   * so a held top-level site can be put up for review.
+   */
   function cookieDecision(cookie, classify, settings) {
-    const own = decide(cookie.domain, classify, settings);
-    if (!own.sync) return own;
+    const ownDomain = normDomain(cookie.domain);
+    const own = decide(ownDomain, classify, settings);
+    if (!own.sync) return { ...own, blockedBy: ownDomain };
     const top = cookie.partitionKey && cookie.partitionKey.topLevelSite;
     if (top) {
       const host = siteHost(top);
       const td = decide(host, classify, settings);
-      if (!td.sync) return { sync: false, userOverride: false, cls: td.cls };
-      return { sync: true, userOverride: own.userOverride || td.userOverride, cls: own.cls };
+      if (!td.sync) return { sync: false, userOverride: false, cls: td.cls, blockedBy: host };
+      return { sync: true, userOverride: own.userOverride || td.userOverride, cls: own.cls, blockedBy: null };
     }
-    return own;
+    return { ...own, blockedBy: null };
   }
 
   function siteHost(site) {
@@ -160,7 +170,9 @@
 
   // ── batching ──────────────────────────────────────────────────────────────
 
-  function encodedSize(obj) { return Buffer.byteLength(JSON.stringify(obj), "utf8"); }
+  // UTF-8 size via TextEncoder: a service worker has no Buffer.
+  const utf8 = new TextEncoder();
+  function encodedSize(obj) { return utf8.encode(JSON.stringify(obj)).length; }
 
   /** Split cookies into batches each at or under maxBytes (a lone oversized cookie goes alone). */
   function batchCookies(cookies, maxBytes) {
@@ -219,12 +231,17 @@
       deny: rows.filter((r) => r.group === "deny").sort(cmp),
     };
     const ordered = [...groups.allow, ...groups.hold, ...groups.deny];
-    const syncRows = rows.filter((r) => r.sync);
+    // count Will-sync exactly the way the sync decides (partition site included)
+    const syncDomains = new Set();
+    let syncCookies = 0;
+    for (const c of cookies) {
+      if (cookieDecision(c, classify, s).sync) { syncCookies++; syncDomains.add(rootName(c.domain)); }
+    }
     const totals = {
       domains: rows.length,
       cookies: cookies.length,
-      syncDomains: syncRows.length,
-      syncCookies: syncRows.reduce((n, r) => n + r.cookies, 0),
+      syncDomains: syncDomains.size,
+      syncCookies,
       held: groups.hold.length,
       blocked: groups.deny.length,
     };
@@ -257,7 +274,7 @@
    * Returns { ready, stop, fullSync }.
    */
   function createBridge(deps) {
-    const { cookies, connectNative, classify, storage, action, now } = deps;
+    const { cookies, connectNative, classify, storage, action, now, alarms } = deps;
     const setTimeout = deps.timers.setTimeout;
     const clearTimeout = deps.timers.clearTimeout;
     const log = deps.log || (() => {});
@@ -280,6 +297,26 @@
 
     let booting = true; // true until storage has loaded; buffer wake events meanwhile
     const bootQueue = [];
+
+    // Unknown at boot (Chrome keeps alarms across worker restarts), so assume
+    // armed: the first sign of a healthy host clears it once.
+    let retryAlarmArmed = true;
+    function armRetryAlarm() {
+      if (!alarms) return;
+      retryAlarmArmed = true;
+      try {
+        Promise.resolve(alarms.create(ALARM_NAME, { delayInMinutes: ALARM_PERIOD_MIN, periodInMinutes: ALARM_PERIOD_MIN })).catch(() => {});
+      } catch (_) { /* best effort; setTimeout backoff still runs while the worker lives */ }
+    }
+    function clearRetryAlarm() {
+      if (!alarms || !retryAlarmArmed) return;
+      retryAlarmArmed = false;
+      try { Promise.resolve(alarms.clear(ALARM_NAME)).catch(() => {}); } catch (_) { /* best effort */ }
+    }
+    function onRetryAlarm() {
+      if (booting || stopped || !settings.approved || settings.paused || port) return;
+      connect();
+    }
 
     // status is persisted so the review page and a restarted worker can read it.
     let saveTimer = null;
@@ -319,8 +356,8 @@
       catch (e) { onDisconnect(errText(e) || "could not start native host"); return; }
       port = p;
       connectedAt = now();
-      p.onMessage.addListener(onHostMessage);
-      p.onDisconnect.addListener((arg) => onDisconnect(errText(arg)));
+      p.onMessage.addListener((msg) => { if (p === port) onHostMessage(msg); });
+      p.onDisconnect.addListener((arg) => { if (p === port) onDisconnect(errText(arg)); });
       safePost({ t: "hello", v: 1 });
       // The host asks us to resync on connect; we don't push cookies unprompted.
     }
@@ -332,6 +369,7 @@
         try { p.disconnect(); } catch (_) { /* already gone */ }
       }
       connectedAt = 0;
+      fullRun++; // a full sync still reading belongs to the old host: it must not post to a new one
       fullInFlight = false;
       pendingAcks.clear();
       deltaBuf = [];
@@ -342,12 +380,14 @@
       const wasConnectedLongEnough = connectedAt && now() - connectedAt >= 30_000;
       disconnect(reason);
       if (stopped || !settings.approved || settings.paused) {
+        clearRetryAlarm();
         setStatus({ host: settings.paused ? "paused" : "off", broker: "unknown", error: reason || status.error });
         return;
       }
       if (wasConnectedLongEnough) reconnectDelay = RECONNECT_BASE_MS;
       setStatus({ host: "retrying", broker: "unknown", error: reason || "native host disconnected" });
       scheduleReconnect();
+      armRetryAlarm();
     }
 
     function scheduleReconnect() {
@@ -367,6 +407,7 @@
     // ── host → ext ──
     function onHostMessage(msg) {
       if (!msg || typeof msg !== "object") return;
+      if (msg.t === "status" || msg.t === "resync") clearRetryAlarm(); // the host is alive
       switch (msg.t) {
         case "status":
           setStatus({ host: "connected", broker: msg.broker === "up" ? "up" : "down", error: null });
@@ -387,16 +428,19 @@
       if (typeof msg.seq !== "number" || !pendingAcks.has(msg.seq)) return;
       const info = pendingAcks.get(msg.seq);
       pendingAcks.delete(msg.seq);
-      const applied = Number.isFinite(msg.applied) ? msg.applied : 0;
-      const rejected = Array.isArray(msg.rejected) ? msg.rejected : [];
-      const patch = {
-        applied: status.applied + applied,
-        rejected: status.rejected + rejected.length,
-        inflight: pendingAcks.size,
-        lastSyncAt: now(),
-      };
-      if (rejected.length) patch.rejections = rejected.map((r) => ({ domain: normDomain(r.domain), reason: String(r.reason || "") })).slice(-50);
-      if (info.last) patch.lastFullAt = patch.lastSyncAt;
+      const patch = { inflight: pendingAcks.size };
+      if (!msg.dropped && !msg.error) {
+        const applied = Number.isFinite(msg.applied) ? msg.applied : 0;
+        const rejected = Array.isArray(msg.rejected) ? msg.rejected : [];
+        patch.applied = status.applied + applied;
+        patch.rejected = status.rejected + rejected.length;
+        patch.lastSyncAt = now();
+        if (rejected.length) {
+          const add = rejected.map((r) => ({ domain: normDomain(r && r.domain), reason: String((r && r.reason) || "") }));
+          patch.rejections = status.rejections.concat(add).slice(-50);
+        }
+        if (info.last) patch.lastFullAt = patch.lastSyncAt;
+      }
       setStatus(patch);
     }
 
@@ -405,36 +449,43 @@
       if (!port || !settings.approved || settings.paused) return;
       const run = ++fullRun;
       fullInFlight = true;
-      let all;
-      try { all = await cookies.getAll({ partitionKey: {} }); }
-      catch (e) { fullInFlight = false; setStatus({ error: "cookies.getAll failed" }); log("bridge: full sync read failed"); return; }
-      if (run !== fullRun || !port || stopped) { fullInFlight = false; return; } // superseded
+      try {
+        let all;
+        try { all = await cookies.getAll({ partitionKey: {} }); }
+        catch (_) { setStatus({ error: "cookies.getAll failed" }); log("bridge: full sync read failed"); return; }
+        if (run !== fullRun || !port || stopped) return; // superseded, or the host was replaced
 
-      const wire = [];
-      const held = [];
-      for (const c of all) {
-        const dec = cookieDecision(c, classify, settings);
-        if (dec.sync) wire.push(wireCookie(c, dec.userOverride));
-        else if (dec.cls.decision === "hold" && !settings.reviewed[rootName(c.domain)] &&
-                 !Object.prototype.hasOwnProperty.call(settings.overrides, rootName(c.domain))) held.push(rootName(c.domain));
-      }
-      updatePending(held);
+        const wire = [];
+        const held = [];
+        for (const c of all) {
+          const dec = cookieDecision(c, classify, settings);
+          if (dec.sync) wire.push(wireCookie(c, dec.userOverride));
+          else if (dec.cls.decision === "hold" && dec.blockedBy) held.push(dec.blockedBy);
+        }
+        updatePending(held);
 
-      const batches = batchCookies(wire, MAX_BATCH_BYTES);
-      if (batches.length === 0) batches.push([]);
-      let sent = 0;
-      for (let i = 0; i < batches.length; i++) {
-        if (run !== fullRun || !port) { fullInFlight = false; return; }
-        const s = ++seq;
-        const last = i === batches.length - 1;
-        pendingAcks.set(s, { last });
-        if (!safePost({ t: "full", seq: s, cookies: batches[i], last })) { fullInFlight = false; return; }
-        sent += batches[i].length;
+        const batches = batchCookies(wire, MAX_BATCH_BYTES);
+        if (batches.length === 0) batches.push([]);
+        // the counters describe the latest full sync (plus the deltas after it)
+        setStatus({ sent: 0, applied: 0, rejected: 0, rejections: [] });
+        let sent = 0;
+        for (let i = 0; i < batches.length; i++) {
+          const s = ++seq;
+          const last = i === batches.length - 1;
+          pendingAcks.set(s, { last });
+          if (!safePost({ t: "full", seq: s, cookies: batches[i], last })) return;
+          sent += batches[i].length;
+        }
+        setStatus({ sent, inflight: pendingAcks.size });
+        log(`bridge: full sync (${why}) sent ${sent} cookies in ${batches.length} batch(es)`);
+      } catch (_) {
+        setStatus({ error: "full sync failed" });
+        log("bridge: full sync failed");
+      } finally {
+        // a superseded run must not clear the flag while the newer one still reads
+        if (run === fullRun) fullInFlight = false;
       }
-      fullInFlight = false;
-      setStatus({ sent: status.sent + sent, inflight: pendingAcks.size });
-      log(`bridge: full sync (${why}) sent ${sent} cookies in ${batches.length} batch(es)`);
-      flushDeltas(); // any deltas buffered during the read go out now, after the full
+      if (run === fullRun) flushDeltas(); // deltas buffered during the read go out after the full
     }
 
     // ── live deltas ──
@@ -442,19 +493,19 @@
       // MV3 may wake the worker with this very event before storage has
       // loaded; buffer until start() has settled so it isn't lost.
       if (booting) { bootQueue.push(info); return; }
-      if (stopped || !settings.approved || settings.paused || !port) return;
+      if (stopped || !settings.approved) return;
       const cookie = info && info.cookie;
       if (!cookie) return;
       const dec = cookieDecision(cookie, classify, settings);
-      const domain = rootName(cookie.domain);
       if (!dec.sync) {
-        // a held domain changing is a reason to surface it for review
-        if (dec.cls.decision === "hold" && !settings.reviewed[domain] &&
-            !Object.prototype.hasOwnProperty.call(settings.overrides, domain) && !status.pending.includes(domain)) {
-          updatePending(status.pending.concat(domain));
+        // a new cookie on a held domain (or under a held top-level site) puts it
+        // up for review — even while the host is down or sync is paused
+        if (!info.removed && dec.cls.decision === "hold" && dec.blockedBy && !status.pending.includes(dec.blockedBy)) {
+          updatePending(status.pending.concat(dec.blockedBy));
         }
         return;
       }
+      if (settings.paused || !port) return;
       // Chrome's overwrite = a remove(cause:overwrite) then an explicit add; the
       // broker upserts, so the paired removal is noise — drop it.
       if (info.removed && info.cause === "overwrite") return;
@@ -534,14 +585,13 @@
     async function onSettingsChanged(next) {
       const prev = settings;
       settings = withDefaults(next);
-      if (!settings.approved) { disconnect("approval revoked"); setStatus({ host: "off", broker: "unknown" }); setBadge(); return; }
-      if (settings.paused) { disconnect("paused by owner"); setStatus({ host: "paused", broker: "unknown" }); setBadge(); return; }
+      if (!settings.approved) { disconnect("approval revoked"); clearRetryAlarm(); setStatus({ host: "off", broker: "unknown" }); setBadge(); return; }
+      if (settings.paused) { disconnect("paused by owner"); clearRetryAlarm(); setStatus({ host: "paused", broker: "unknown" }); setBadge(); return; }
       setBadge();
+      updatePending(status.pending); // a domain newly reviewed/allowed may clear pending
       if (!port) { connect(); return; }
       // still connected: push the effect of the owner's edits
       await reconcileRemovals(prev);
-      // a domain newly marked reviewed/allowed may clear pending
-      updatePending(status.pending);
     }
 
     // ── startup: re-read everything from storage, then act ──
@@ -564,6 +614,7 @@
     // Register listeners synchronously (before start() awaits) so a waking
     // event is never dropped while storage is still loading.
     cookies.onChanged.addListener(onCookieChanged);
+    if (alarms && alarms.onAlarm) alarms.onAlarm.addListener((a) => { if (a && a.name === ALARM_NAME) onRetryAlarm(); });
     storage.onChanged.addListener((changes, area) => {
       if (area && area !== "local") return;
       if (changes && changes[SETTINGS_KEY]) onSettingsChanged(changes[SETTINGS_KEY].newValue);
@@ -602,6 +653,8 @@
     RECONNECT_BASE_MS,
     RECONNECT_MAX_MS,
     DELTA_DEBOUNCE_MS,
+    ALARM_NAME,
+    ALARM_PERIOD_MIN,
     normDomain,
     decide,
     cookieDecision,

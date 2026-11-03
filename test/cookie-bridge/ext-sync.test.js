@@ -118,10 +118,11 @@ test("a delta burst bigger than the budget is split into several delta messages"
 test("changes that happen while a full sync is reading the jar are sent AFTER its last batch", async () => {
   const env = makeEnv({ cookies: [cookie(".amazon.com")], storage: APPROVED });
   await connected(env);
-  // hold getAll open so the change lands mid-sync
+  // hold getAll open so the change lands mid-sync; like Chrome, the jar is
+  // read when getAll is CALLED, so the mid-sync cookie is not in the full
   let release;
   const realGetAll = env.cookies.getAll;
-  env.cookies.getAll = (d) => new Promise((r) => { release = () => r(realGetAll.call(env.cookies, d)); });
+  env.cookies.getAll = (d) => { const snap = realGetAll.call(env.cookies, d); return new Promise((r) => { release = () => r(snap); }); };
   env.port.emit({ t: "resync" });
   await env.clock.advance(1);
   env.cookies.set(cookie("github.com"));
@@ -131,6 +132,44 @@ test("changes that happen while a full sync is reading the jar are sent AFTER it
   await env.clock.advance(1000);
   const types = env.port.sent.map((m) => m.t);
   assert.deepStrictEqual(types, ["hello", "full", "delta"]);
+});
+
+test("a superseded full sync can't let a delta overtake the NEWER full (the broker would delete it)", async () => {
+  const env = makeEnv({ cookies: [cookie(".amazon.com")], storage: APPROVED });
+  await connected(env);
+  const realGetAll = env.cookies.getAll;
+  const releases = [];
+  env.cookies.getAll = (d) => { const snap = realGetAll.call(env.cookies, d); return new Promise((r) => releases.push(() => r(snap))); };
+  env.port.emit({ t: "resync" });
+  env.port.emit({ t: "resync" });
+  await env.clock.advance(1);
+  releases[0](); // the older run resolves and is superseded
+  await env.clock.advance(1);
+  env.cookies.set(cookie("github.com")); // arrives while the newer run is still reading
+  await env.clock.advance(500);
+  assert.strictEqual(env.port.ofType("delta").length, 0, "delta held back while the newer full sync reads");
+  releases[1]();
+  await env.clock.advance(500);
+  assert.deepStrictEqual(env.port.sent.map((m) => m.t), ["hello", "full", "delta"]);
+  assert.deepStrictEqual(env.port.ofType("full")[0].cookies.map((c) => c.domain), [".amazon.com"]);
+  assert.strictEqual(env.port.ofType("delta")[0].changes[0].cookie.domain, "github.com");
+});
+
+test("a full sync still reading when the host is replaced sends nothing to the new host", async () => {
+  const env = makeEnv({ cookies: [cookie(".amazon.com")], storage: APPROVED });
+  await connected(env);
+  const realGetAll = env.cookies.getAll;
+  let release;
+  env.cookies.getAll = (d) => { const snap = realGetAll.call(env.cookies, d); return new Promise((r) => { release = () => r(snap); }); };
+  env.port.emit({ t: "resync" });
+  await env.clock.advance(1);
+  await env.store.set({ settings: { ...APPROVED.settings, paused: true } });
+  await env.clock.advance(1);
+  await env.store.set({ settings: { ...APPROVED.settings, paused: false } });
+  await env.clock.advance(1);
+  release();
+  await env.clock.advance(10);
+  assert.deepStrictEqual(env.port.sent.map((m) => m.t), ["hello"], "the new host gets cookies only after IT asks");
 });
 
 test("deltas are dropped while the host is disconnected (the host's resync on reconnect covers them)", async () => {

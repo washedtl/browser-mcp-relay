@@ -62,6 +62,8 @@ const deps = {
     },
   },
   action: chrome.action,
+  // retries a down native host even after Chrome stops this idle worker
+  alarms: chrome.alarms,
   timers: { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (id) => clearTimeout(id) },
   now: () => Date.now(),
   // Status lines only — never a cookie, never a value. (The one console call
