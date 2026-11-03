@@ -140,6 +140,8 @@ const DEFAULT_DEPS = {
   // W2D: the one place an own-tool call is routed to a tab
   toolContext: () => require("../own-tools/_tool-context.js"),
   loadCatalog: ({ env }) => require("../tool-catalog.js").loadUpstreamCatalog({ env }),
+  // W2F: cookies from the owner's Chrome (the cookie bridge), applied to Brave
+  cookieBridge: (opts) => new (require("../cookie-bridge/importer.js").CookieImporter)(opts),
 };
 
 /**
@@ -158,6 +160,7 @@ class IdlePolicy {
     this.connections = 0;
     this.calls = 0;
     this._exit = null;
+    this._exitAt = null; // when the armed exit timer fires (W2F notASession keeps it)
     this._browser = null;
     this._stopped = false;
     this.lastActivity = Date.now();
@@ -173,6 +176,16 @@ class IdlePolicy {
   connectionClosed() {
     this.connections = Math.max(0, this.connections - 1);
     if (this.connections === 0) this._armExit();
+  }
+
+  /**
+   * W2F: the connection just opened turned out not to be a session (the
+   * cookie bridge): undo connectionOpened, keeping the exit deadline that
+   * was running, so a bridge (re)connecting never keeps the broker alive.
+   */
+  notASession() {
+    this.connections = Math.max(0, this.connections - 1);
+    if (this.connections === 0) this._armExit(this._exitAt);
   }
 
   callStarted() {
@@ -196,10 +209,12 @@ class IdlePolicy {
     this._clear("_browser");
   }
 
-  _armExit() {
+  _armExit(at = null) {
     if (this._stopped) return;
     this._clear("_exit");
-    this._exit = setTimeout(() => { this._exit = null; this.onExitIdle(); }, this.exitIdleMs);
+    const ms = at === null ? this.exitIdleMs : Math.max(0, at - Date.now());
+    this._exitAt = Date.now() + ms;
+    this._exit = setTimeout(() => { this._exit = null; this.onExitIdle(); }, ms);
   }
 
   _clear(which) {
@@ -353,6 +368,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   const supervisor = d.createSupervisor({ profileDir, env, log, poolConfig: d.poolConfig });
   // each launch's verified pipe is what the proxy serves (503 while Brave is down)
   if (typeof supervisor.on === "function") supervisor.on("pipe", (p) => cdpProxy.setPipe(p));
+  const cookieBridge = d.cookieBridge({ supervisor, cdpUrl, log }); // W2F
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
   const placement = env.BROWSER_RELAY_BROKER_WINDOWS === "offscreen" ? "offscreen" : "cascade";
@@ -392,7 +408,9 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
 
   async function ensureBrave() {
     if (seeded) await seeded;
-    return supervisor.ensure();
+    const info = await supervisor.ensure();
+    await cookieBridge.braveReady(info); // W2F: a new Brave gets the synced cookies first (never throws)
+    return info;
   }
 
   const registry = new SessionRegistry({
@@ -573,6 +591,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
 
   // ── connections ──
   const sockets = new Set();
+  const bridgeSockets = new Set(); // W2F cookie-bridge connections: never sessions
   const sessions = new Map(); // connId → opened at (MCP sessions; not control connections)
   let connSeq = 0; // connIds: never reused within a broker (the registry remembers closed ones)
   let closing = null;
@@ -602,9 +621,11 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
 
     let mcp = null;
     let done = false;
+    let bridgeDone = null; // W2F: set when this is a cookie-bridge connection
     const onClose = () => {
       if (done) return;
       done = true;
+      if (bridgeDone) { bridgeDone(); return; }
       sockets.delete(sock);
       sessions.delete(connId);
       policy.connectionClosed();
@@ -619,6 +640,16 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     // nobody else), learn whether it lost an earlier broker and its settings.
     serverHello(sock, key, { warning: helloWarning }).then(({ hello, rest }) => {
       if (done) return undefined;
+      if (hello && hello.bridge === true) {
+        // W2F: the cookie bridge's native host. Not a session: it never keeps the broker up.
+        sockets.delete(sock);
+        bridgeSockets.add(sock);
+        policy.notASession();
+        const handlers = cookieBridge.handlers(connId);
+        bridgeDone = () => { bridgeSockets.delete(sock); handlers.close(); };
+        require("./control.js").serveBridge(sock, hello, rest, key, handlers);
+        return undefined;
+      }
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
         require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)") }, rest);
@@ -714,6 +745,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
       clearInterval(rssTimer);
       clearInterval(keyTimer);
       for (const s of sockets) s.destroy();
+      for (const s of bridgeSockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
       await cdpProxy.close();
       if (relayInspectorCtl) await relayInspectorCtl.close().catch((e) => log(`closing the relay Inspector failed: ${e.message}`));
@@ -794,6 +826,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
       })),
       rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
       relayInspector: inspector ? `http://${inspector.bind}:${inspector.port}` : null,
+      cookieBridge: cookieBridge.status(), // W2F: counts only, never values
     };
   }
 

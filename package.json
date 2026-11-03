@@ -12,7 +12,9 @@
     "capture-screenshots": "node scripts/capture-screenshots.js",
     "broker:status": "node scripts/broker-ctl.js status",
     "broker:stop": "node scripts/broker-ctl.js stop",
-    "migrate-profile": "node scripts/migrate-profile.js"
+    "migrate-profile": "node scripts/migrate-profile.js",
+    "bridge:install": "node scripts/bridge-install.js install",
+    "bridge:uninstall": "node scripts/bridge-install.js uninstall"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
