@@ -19,6 +19,11 @@
 // Deny is checked first, so a denied subdomain of a business tool
 // (aws.amazon.com) stays denied.
 //
+// Matching is per cookie domain. Denying a subdomain (aws.amazon.com,
+// pharmacy.amazon.com) stops cookies set on that host, NOT cookies set on a
+// parent domain (.amazon.com session cookies still sync, and they are what
+// signs those subdomains in). Only denying the parent would stop those.
+//
 // classify(domain) -> { decision: "allow"|"deny"|"hold", category, reason }
 
 (function (root) {
@@ -119,6 +124,10 @@
   // national government suffix (gov.uk, gouv.fr, gob.mx, govt.nz, ...).
   const DENY_TLDS = Object.freeze({ gov: "gov-tax-health", mil: "gov-tax-health", bank: "finance" });
   const GOV_SECOND_LEVEL = new Set(["gov", "gouv", "gob", "govt", "mil"]);
+  // Google's country sites share the account sign-in: google.de, google.co.uk, google.com.au
+  const GOOGLE_CC_RE = /^google\.(?:(?:co|com)\.)?[a-z]{2}$/;
+  // home / office network names: router and NAS consoles, intranets
+  const LOCAL_SUFFIXES = Object.freeze(["local", "lan", "internal", "home.arpa"]);
 
   const DENY_INDEX = new Map();
   for (const category of Object.keys(DENYLIST)) for (const d of DENYLIST[category]) DENY_INDEX.set(d, category);
@@ -158,6 +167,7 @@
     for (const s of suffixes(host)) {
       const category = DENY_INDEX.get(s);
       if (category) return result("deny", category, `Built-in denylist: ${CATEGORY_LABELS[category]} (${s})`);
+      if (GOOGLE_CC_RE.test(s)) return result("deny", "email-identity", `Built-in denylist: ${CATEGORY_LABELS["email-identity"]} (${s})`);
     }
     const tld = labels[labels.length - 1];
     if (DENY_TLDS[tld]) {
@@ -170,6 +180,10 @@
     for (const s of suffixes(host)) {
       if (BUSINESS_INDEX.has(s)) return result("allow", "business", `Business tool (${s})`);
     }
+    if (host === "localhost") return result("allow", "default", "localhost (local development)");
+    if (labels.length === 1) return result("hold", "keyword", "A single-label host (a router, NAS or intranet name): held for review");
+    const local = LOCAL_SUFFIXES.find((x) => host === x || host.endsWith(`.${x}`));
+    if (local) return result("hold", "keyword", `A local-network name (.${local}): held for review`);
     const keyword = KEYWORDS.find((k) => host.includes(k));
     if (keyword) return result("hold", "keyword", `Keyword "${keyword}" in the domain: held for review`);
     // credit-union style names: becu, alliantcu, myfcu (a label ending in "cu", not the TLD)

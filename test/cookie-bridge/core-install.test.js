@@ -98,6 +98,47 @@ test("install: writes the host manifest (stdio, allowed_origins from the key) an
   assert.ok(/Approve & start sync/.test(text), "says nothing syncs before the owner approves");
 });
 
+test("install: non-ASCII paths survive: the launcher switches cmd to UTF-8 (chcp 65001) before the node line, silently", (t) => {
+  const m = fixtureManifest(t);
+  const { result } = run(t, install, { args: { extensionManifest: m.file, nodePath: "C:\\Users\\Zoë Ünal\\node.exe" } });
+  const lines = fs.readFileSync(result.launcherFile, "utf8").split("\r\n");
+  assert.strictEqual(lines[0], "@echo off");
+  const chcp = lines.findIndex((l) => /^chcp 65001 >nul 2>&1$/.test(l));
+  const nodeLine = lines.findIndex((l) => l.includes("Zoë Ünal"));
+  assert.ok(chcp > 0 && chcp < nodeLine, lines.join("\n"));
+  assert.ok(!fs.readFileSync(result.launcherFile).subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])), "no BOM: it would break @echo off");
+});
+
+test("install: the launcher really starts node from a non-ASCII directory (as Chrome runs it)", { skip: process.platform !== "win32" && "Windows launcher", timeout: 60_000 }, async (t) => {
+  const { spawn } = require("node:child_process");
+  const { encodeMessage, MessageReader } = require("../../src/cookie-bridge/framing.js");
+  const dir = path.join(tmp(t, "nonascii"), "Zoë Ünal ✓");
+  fs.mkdirSync(dir);
+  const nodeCopy = path.join(dir, "node.exe");
+  try { fs.linkSync(process.execPath, nodeCopy); } catch { fs.copyFileSync(process.execPath, nodeCopy); }
+  const m = fixtureManifest(t);
+  const home = tmp(t, "home");
+  const { result } = run(t, install, { home, args: { extensionManifest: m.file, nodePath: nodeCopy } });
+  const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `""${result.launcherFile}" chrome-extension://${referenceId(m.key)}/ --parent-window=0"`], {
+    windowsVerbatimArguments: true,
+    env: { ...process.env, LOCALAPPDATA: home, BROWSER_RELAY_BROKER_PIPE: `\\\\.\\pipe\\bmr-test-w2f-u8-${process.pid}` },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  t.after(() => { try { child.kill(); } catch { /* gone */ } });
+  const got = [];
+  let stderr = "";
+  child.stderr.on("data", (c) => { stderr += c; });
+  const reader = new MessageReader({ onMessage: (msg) => got.push(msg) });
+  child.stdout.on("data", (c) => reader.push(c));
+  child.stdin.write(encodeMessage({ t: "hello", v: 1 }));
+  const t0 = Date.now();
+  while (!got.length && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 50));
+  assert.deepStrictEqual(got[0], { t: "status", broker: "down" }, `stderr: ${stderr}`);
+  child.stdin.end();
+  await new Promise((r) => child.once("exit", r));
+});
+
 test("install: '%' in a path is escaped for cmd", (t) => {
   const m = fixtureManifest(t);
   const { result } = run(t, install, { args: { extensionManifest: m.file, nodePath: "C:\\odd%dir\\node.exe" } });

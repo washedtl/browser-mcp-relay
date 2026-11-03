@@ -19,7 +19,7 @@ const path = require("node:path");
 
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { startBroker, IdlePolicy } = require("../../src/broker/main.js");
-const { keyFileFor, loadOrCreateKey, clientHello, connectPipe, readLine } = require("../../src/broker/pipe-server.js");
+const { keyFileFor, loadOrCreateKey, clientHello, connectPipe, readLine, serverHello } = require("../../src/broker/pipe-server.js");
 const { requestControl, openBridge, bridgeMac } = require("../../src/broker/control.js");
 const { CookieImporter } = require("../../src/cookie-bridge/importer.js");
 const fakes = require("../fixtures/broker-fakes.js");
@@ -75,7 +75,7 @@ async function startTestBroker(t, { idle = { exitMs: 60_000, browserMs: 60_000 }
       ownTools: () => [fakes.probeOwnTool, fakes.tabsNewTool, fakes.toolsetsTool],
       toolContext: fakes.fakeToolContextModule,
       loadCatalog: async () => fakes.FAKE_CATALOG,
-      cookieBridge: (opts) => new CookieImporter({ ...opts, openCdp: cdp.openCdp }),
+      cookieBridge: ({ supervisor, log }) => new CookieImporter({ supervisor, log, openCdp: cdp.openCdp }),
     },
   });
   t.after(() => handle.close("test done"));
@@ -107,27 +107,105 @@ test("bridge: authenticated cookies.full → {ok, applied, rejected}, with the r
   assert.deepStrictEqual([d.ok, d.applied], [true, 1]);
 });
 
-test("bridge: a hello whose bridgeMac is wrong is refused, and nothing is imported", async (t) => {
-  const b = await startTestBroker(t);
-  const sock = await connectPipe(b.pipe);
+/** Hello {bridge:true} → the broker's hello reply → its challenge; returns {sock, nonce, challenge}. */
+async function bridgeHandshake(t, pipe) {
+  const sock = await connectPipe(pipe);
   t.after(() => sock.destroy());
-  const { rest } = await clientHello(sock, KEY, { fields: () => ({ bridge: true, bridgeMac: "0".repeat(64) }) });
+  let nonce = null;
+  const { rest } = await clientHello(sock, KEY, { fields: (n) => { nonce = n; return { bridge: true }; } });
   if (rest.length) sock.unshift(rest);
-  const answer = readLine(sock);
-  sock.resume(); // the handshake left it paused
-  const reply = JSON.parse((await answer).line);
+  const next = readLine(sock);
+  sock.resume();
+  const { line, rest: after } = await next;
+  if (after.length) sock.unshift(after);
+  const msg = JSON.parse(line);
+  assert.match(msg.challenge, /^[0-9a-f]{32}$/);
+  return { sock, nonce, challenge: msg.challenge };
+}
+
+async function answer(sock, obj) {
+  sock.write(`${JSON.stringify(obj)}\n`);
+  const next = readLine(sock);
+  sock.resume();
+  return JSON.parse((await next).line);
+}
+
+test("bridge: a wrong answer to the broker's challenge is refused, the socket fully closed, nothing imported", async (t) => {
+  const b = await startTestBroker(t);
+  const { sock } = await bridgeHandshake(t, b.pipe);
+  let closed = false;
+  sock.on("close", () => { closed = true; });
+  const reply = await answer(sock, { bmr: "ctl", mac: "0".repeat(64) });
   assert.deepStrictEqual([reply.ok, reply.bridge], [false, undefined]);
   assert.match(reply.error, /not authenticated/);
-  sock.resume();
-  sock.write(`${JSON.stringify({ id: 1, ctl: "cookies.full", cookies: [ck()], last: true })}\n`);
-  await until(() => sock.destroyed || sock.readableEnded, 2000, "the broker to close the socket");
+  await until(() => closed, 3000, "the broker to close the refused socket");
   const s = await requestControl({ pipe: b.pipe, key: KEY, cmd: "status" });
-  assert.strictEqual(s.status.cookieBridge.cookies, 0);
+  assert.deepStrictEqual([s.status.cookieBridge.cookies, s.status.cookieBridge.bridges], [0, 0]);
+});
+
+test("bridge: a recorded challenge answer can't be replayed (the broker picks a fresh challenge each time)", async (t) => {
+  const b = await startTestBroker(t);
+  const first = await bridgeHandshake(t, b.pipe);
+  const mac = bridgeMac(KEY, first.nonce, first.challenge);
+  assert.strictEqual((await answer(first.sock, { bmr: "ctl", mac })).bridge, "ready");
+  first.sock.destroy();
+  await until(async () => (await requestControl({ pipe: b.pipe, key: KEY, cmd: "status" })).status.cookieBridge.bridges === 0, 3000, "the first bridge to go");
+  // replay: same client nonce, the old MAC, against a new challenge
+  const sock = await connectPipe(b.pipe);
+  t.after(() => sock.destroy());
+  sock.write(`${JSON.stringify({ bmr: "hello", v: 1, nonce: first.nonce, settings: null, reconnect: false, bridge: true })}\n`);
+  const hello = readLine(sock);
+  sock.resume();
+  const { line, rest } = await hello;
+  if (rest.length) sock.unshift(rest);
+  assert.strictEqual(JSON.parse(line).bmr, "hello");
+  const next = readLine(sock);
+  sock.resume();
+  const { line: chLine, rest: r2 } = await next;
+  if (r2.length) sock.unshift(r2);
+  assert.notStrictEqual(JSON.parse(chLine).challenge, first.challenge);
+  const reply = await answer(sock, { bmr: "ctl", mac });
+  assert.strictEqual(reply.ok, false);
+});
+
+test("bridge: the bridge MAC is never sent to a pipe owner that fails the broker's authentication", async (t) => {
+  // a squatter on the pipe name: wrong hello MAC, then a challenge anyway
+  const pipe = fakes.testPipe("w2f-squat");
+  const got = [];
+  const server = net.createServer((sock) => {
+    sock.on("error", () => { /* the client hangs up on us: expected */ });
+    sock.on("data", (c) => {
+      got.push(String(c));
+      if (got.length === 1) {
+        sock.write(`${JSON.stringify({ bmr: "hello", v: 1, mac: "f".repeat(64) })}\n`);
+        sock.write(`${JSON.stringify({ bmr: "ctl", challenge: "a".repeat(32) })}\n`);
+      }
+    });
+  });
+  await new Promise((r) => server.listen(pipe, r));
+  t.after(() => server.close());
+  await assert.rejects(openBridge({ pipe, key: KEY }), (e) => e.code === "EAUTH");
+  await sleep(200);
+  const all = got.join("");
+  assert.strictEqual(all.trim().split("\n").length, 1, `the client sent more than its hello: ${all}`);
+  const hello = JSON.parse(all.trim());
+  assert.strictEqual(hello.bridge, true);
+  assert.ok(!("mac" in hello) && !("bridgeMac" in hello), all);
 });
 
 test("bridge: openBridge refuses a pipe owner that doesn't know the key (EAUTH)", async (t) => {
   const b = await startTestBroker(t);
   await assert.rejects(openBridge({ pipe: b.pipe, key: Buffer.alloc(32, 7) }), (e) => e.code === "EAUTH");
+});
+
+test("bridge: one bridge at a time — a second concurrent one is refused with EBUSY and a clear error; it can connect once the first closes", async (t) => {
+  const b = await startTestBroker(t);
+  const first = await bridge(t, b.pipe);
+  await assert.rejects(openBridge({ pipe: b.pipe, key: KEY }), (e) => e.code === "EBUSY" && /already connected/.test(e.message));
+  first.close();
+  await until(async () => (await requestControl({ pipe: b.pipe, key: KEY, cmd: "status" })).status.cookieBridge.bridges === 0, 3000, "the first bridge to go");
+  const second = await bridge(t, b.pipe);
+  assert.strictEqual((await second.request({ ctl: "cookies.full", cookies: [ck()], last: true })).ok, true);
 });
 
 test("bridge: unknown commands and malformed lines get an error reply; the connection stays usable", async (t) => {
@@ -255,11 +333,87 @@ test("IdlePolicy.notASession: with a session connected nothing is armed; the ses
   p.stop();
 });
 
-test("bridgeMac: HMAC over 'bridge:<nonce>', distinct from the control MAC", () => {
+test("IdlePolicy: a session closing while a bridge hello is in flight leaves a full countdown (no instant exit)", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let exited = 0;
+  const p = new IdlePolicy({ exitIdleMs: 1000, browserIdleMs: 60_000, onExitIdle: () => { exited++; }, onBrowserIdle: () => {} });
+  p.start();
+  p.connectionOpened(); // a session, at t=0
+  t.mock.timers.tick(5000); // it stays a while: the startup deadline is long past
+  p.connectionOpened(); // a bridge's hello starts
+  p.connectionClosed(); // the session leaves meanwhile
+  p.notASession(); // the hello turns out to be the bridge
+  t.mock.timers.tick(999);
+  assert.strictEqual(exited, 0, "exited instantly on a stale deadline");
+  t.mock.timers.tick(2);
+  assert.strictEqual(exited, 1);
+  p.stop();
+});
+
+test("bridgeMac: HMAC over 'bridge:<clientNonce>:<challenge>', distinct from the control MAC", () => {
   const { ctlMac } = require("../../src/broker/control.js");
-  assert.match(bridgeMac(KEY, "n1"), /^[0-9a-f]{64}$/);
-  assert.notStrictEqual(bridgeMac(KEY, "n1"), bridgeMac(KEY, "n2"));
-  assert.notStrictEqual(bridgeMac(KEY, "n1"), ctlMac(KEY, "bridge", "n1"));
+  assert.match(bridgeMac(KEY, "n1", "c1"), /^[0-9a-f]{64}$/);
+  assert.notStrictEqual(bridgeMac(KEY, "n1", "c1"), bridgeMac(KEY, "n1", "c2"));
+  assert.notStrictEqual(bridgeMac(KEY, "n1", "c1"), bridgeMac(KEY, "n2", "c1"));
+  assert.notStrictEqual(bridgeMac(KEY, "n1", "c1"), ctlMac(KEY, "bridge", "c1"));
+});
+
+test("bridge: the broker reads no further request while one is being handled (backpressure), and answers in order", async (t) => {
+  const { serveBridge } = require("../../src/broker/control.js");
+  const pipe = fakes.testPipe("w2f-bp");
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let serverSock = null;
+  const handled = [];
+  const server = net.createServer(async (sock) => {
+    serverSock = sock;
+    const { hello, rest } = await serverHello(sock, KEY);
+    serveBridge(sock, hello, rest, KEY, () => ({
+      "cookies.full": async (msg) => { handled.push(msg.n); if (msg.n === 1) await gate; return { applied: msg.n, rejected: [] }; },
+      "cookies.delta": async () => ({ applied: 0, rejected: [] }),
+      close: () => {},
+    }));
+  });
+  await new Promise((r) => server.listen(pipe, r));
+  t.after(() => server.close());
+  const br = await openBridge({ pipe, key: KEY });
+  t.after(() => br.close());
+  const r1 = br.request({ ctl: "cookies.full", cookies: [], n: 1 });
+  const r2 = br.request({ ctl: "cookies.full", cookies: [], n: 2 });
+  await until(() => handled.length === 1, 2000, "the first request");
+  await sleep(100);
+  assert.strictEqual(serverSock.isPaused(), true, "the socket is paused while a request runs");
+  assert.deepStrictEqual(handled, [1]);
+  release();
+  assert.deepStrictEqual([(await r1).applied, (await r2).applied], [1, 2]);
+  assert.strictEqual(serverSock.isPaused(), false);
+});
+
+test("bridge: the bridge's state file lives next to the broker key (per profile), and holds no cookie value", async (t) => {
+  const pipe = fakes.testPipe("w2f-state");
+  const keyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-w2f-statekey-"));
+  t.after(() => fs.rmSync(keyDir, { recursive: true, force: true }));
+  const keyFile = path.join(keyDir, "broker.key");
+  const key = loadOrCreateKey(keyFile);
+  const handle = await startBroker({
+    pipe, profileDir: path.join(keyDir, "profile"), env: {}, keyFile, log: () => {}, idle: { exitMs: 60_000, browserMs: 60_000 }, onExit: () => {},
+    deps: {
+      createSupervisor: (opts) => fakes.fakeSupervisor(opts),
+      upstreamModule: () => fakes.fakeUpstreamModule(),
+      windowPages: () => fakes.fakeWindowPages(),
+      ownTools: () => [],
+      toolContext: fakes.fakeToolContextModule,
+      loadCatalog: async () => fakes.FAKE_CATALOG,
+    },
+  });
+  t.after(() => handle.close("test done"));
+  const br = await openBridge({ pipe, key });
+  t.after(() => br.close());
+  assert.strictEqual((await br.request({ ctl: "cookies.full", cookies: [ck()], last: true })).ok, true);
+  const { stateFileFor } = require("../../src/cookie-bridge/importer.js");
+  const file = stateFileFor(keyDir, path.join(keyDir, "profile"));
+  assert.ok(fs.existsSync(file), fs.readdirSync(keyDir).join(","));
+  assert.ok(!fs.readFileSync(file, "utf8").includes(SECRET));
 });
 
 test("bridge: a line over the size limit closes the bridge connection (no unbounded buffering)", async (t) => {

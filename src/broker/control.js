@@ -91,33 +91,58 @@ module.exports = { serveControl, requestControl, ctlMac };
 // ── W2F cookie bridge ─────────────────────────────────────────────────────
 //
 // The cookie bridge's native host (src/cookie-bridge/host.js) keeps ONE
-// long-lived connection, opened with the shim's hello plus
-//   bridge: true,  bridgeMac: HMAC-SHA256(key, "bridge:<nonce>")
-// The broker answers {"bmr":"ctl","ok":true,"bridge":"ready"}, then one
-// reply line per request line, in order:
+// long-lived connection, authenticated like a control request:
+//   host   → the shim's hello plus bridge:true (no credential yet)
+//   broker → its usual hello reply (proves the broker), then
+//            {"bmr":"ctl","challenge":<fresh nonce>}
+//   host   → {"bmr":"ctl","mac":HMAC-SHA256(key, "bridge:<hello nonce>:<challenge>")}
+//   broker → {"bmr":"ctl","ok":true,"bridge":"ready"}
+//            | {"bmr":"ctl","ok":false,"error",["code":"EBUSY"]} and closes
+// The host sends its MAC only to a pipe owner that proved the key, and the
+// broker picks the challenge, so a recorded exchange can't be replayed.
+// Then one reply line per request line, in order (the broker reads the
+// next request only after answering one):
 //   {id, ctl:"cookies.full", cookies, last} | {id, ctl:"cookies.delta", changes}
 //   → {"bmr":"ctl", id, ok:true, applied, rejected:[{domain, reason, count}]} | {…, ok:false, error}
-// A bridge connection is never an MCP session (main.js). Cookie values are
-// never echoed back.
+// A bridge connection is never an MCP session (main.js), and only one is
+// served at a time. Cookie values are never echoed back.
 
 const BRIDGE_COMMANDS = Object.freeze(["cookies.full", "cookies.delta"]);
 
-const bridgeMac = (key, nonce) => crypto.createHmac("sha256", key).update(`bridge:${nonce}`).digest("hex");
+const bridgeMac = (key, nonce, challenge) => crypto.createHmac("sha256", key).update(`bridge:${nonce}:${challenge}`).digest("hex");
 
 /**
- * Broker side: serve the bridge connection whose hello is `hello`.
- * @param {object} handlers — importer.handlers(id): {"cookies.full": fn, "cookies.delta": fn, close: fn}
+ * Broker side: challenge the bridge whose hello is `hello`, then serve it.
+ * @param {Buffer} rest — bytes that followed the hello
+ * @param {() => object} open — called once the bridge authenticated: returns the
+ *   importer's handlers {"cookies.full", "cookies.delta", close}; throws (EBUSY) to refuse it
  */
-function serveBridge(sock, hello, rest, key, handlers) {
+async function serveBridge(sock, hello, rest, key, open) {
   const { readLines } = require("../cookie-bridge/line-channel.js");
-  const reply = (obj) => { if (!sock.destroyed) sock.write(`${JSON.stringify({ bmr: "ctl", ...obj })}\n`); };
-  sock.once("close", () => handlers.close());
-  if (!macEquals(hello.bridgeMac, bridgeMac(key, String(hello.nonce)))) {
-    sock.end(`${JSON.stringify({ bmr: "ctl", ok: false, error: "bridge not authenticated" })}\n`);
+  const refuse = (obj) => sock.end(`${JSON.stringify({ bmr: "ctl", ok: false, ...obj })}\n`, () => sock.destroy());
+  const challenge = crypto.randomBytes(16).toString("hex");
+  if (rest.length) sock.unshift(rest);
+  sock.write(`${JSON.stringify({ bmr: "ctl", challenge })}\n`);
+  let answer;
+  try {
+    answer = parse(await nextLine(sock, HELLO_TIMEOUT_MS));
+  } catch {
+    sock.destroy();
     return;
   }
+  if (!answer || !macEquals(answer.mac, bridgeMac(key, String(hello.nonce), challenge))) {
+    refuse({ error: "bridge not authenticated" });
+    return;
+  }
+  let handlers;
+  try {
+    handlers = open();
+  } catch (e) {
+    refuse({ error: e.message, code: e.code });
+    return;
+  }
+  const reply = (obj) => { if (!sock.destroyed) sock.write(`${JSON.stringify({ bmr: "ctl", ...obj })}\n`); };
   reply({ ok: true, bridge: "ready" });
-  let chain = Promise.resolve();
   const dispatch = async (msg) => {
     const id = msg && typeof msg === "object" ? msg.id : undefined;
     const cmd = msg && typeof msg === "object" ? msg.ctl : undefined;
@@ -131,32 +156,50 @@ function serveBridge(sock, hello, rest, key, handlers) {
       reply({ id, ok: false, error: e.message });
     }
   };
-  readLines(sock, rest, {
-    onLine: (msg) => { chain = chain.then(() => dispatch(msg)); },
-    onMalformed: (bytes) => { chain = chain.then(() => reply({ ok: false, error: `malformed request line (${bytes} bytes)` })); },
+  // one request at a time: the socket stays paused while one is handled
+  let chain = Promise.resolve();
+  let inFlight = 0;
+  const handle = (fn) => {
+    inFlight++;
+    sock.pause();
+    chain = chain.then(fn).finally(() => {
+      if (--inFlight === 0 && !sock.destroyed) sock.resume();
+    });
+  };
+  readLines(sock, Buffer.alloc(0), {
+    onLine: (msg) => handle(() => dispatch(msg)),
+    onMalformed: (bytes) => handle(() => reply({ ok: false, error: `malformed request line (${bytes} bytes)` })),
   });
 }
 
 /**
  * Client side (the native host): open an authenticated bridge connection.
  * Resolves a BridgeClient; rejects with the connect error's code, EAUTH
- * (not this user's broker, or it refused the bridge), ECONNRESET, ETIMEDOUT.
+ * (not this user's broker, or it refused the bridge's answer), EBUSY
+ * (another bridge is connected), EPROTO (no challenge), ECONNRESET, ETIMEDOUT.
  */
 async function openBridge({ pipe, key, timeoutMs = HELLO_TIMEOUT_MS, requestTimeoutMs }) {
   const { BridgeClient } = require("../cookie-bridge/line-channel.js");
   const sock = await connectPipe(pipe);
   try {
-    const { rest } = await clientHello(sock, key, { timeoutMs, fields: (nonce) => ({ bridge: true, bridgeMac: bridgeMac(key, nonce) }) });
+    let nonce = null;
+    // throws EAUTH unless the pipe's owner proved the key: no MAC goes to a squatter
+    const { rest } = await clientHello(sock, key, { timeoutMs, fields: (n) => { nonce = n; return { bridge: true }; } });
     if (rest.length) sock.unshift(rest);
-    const readyLine = readLine(sock, timeoutMs);
-    sock.resume(); // the handshake left it paused
-    const ready = await readyLine;
-    let msg = null;
-    try { msg = JSON.parse(ready.line); } catch { /* not ours */ }
-    if (!msg || msg.ok !== true || msg.bridge !== "ready") {
-      throw Object.assign(new Error(`the broker refused the cookie bridge${msg && msg.error ? `: ${msg.error}` : ""}`), { code: "EAUTH" });
+    const challenge = parse(await nextLine(sock, timeoutMs));
+    if (!challenge || challenge.bmr !== "ctl" || typeof challenge.challenge !== "string" || !/^[0-9a-f]{32}$/.test(challenge.challenge)) {
+      throw Object.assign(new Error("the broker sent no bridge challenge (an older broker?)"), { code: "EPROTO" });
     }
-    return new BridgeClient(sock, ready.rest, { requestTimeoutMs });
+    sock.write(`${JSON.stringify({ bmr: "ctl", mac: bridgeMac(key, nonce, challenge.challenge) })}\n`);
+    const ready = readLine(sock, timeoutMs);
+    sock.resume(); // the handshake left it paused
+    const { line, rest: after } = await ready;
+    const msg = parse(line);
+    if (!msg || msg.ok !== true || msg.bridge !== "ready") {
+      const code = msg && msg.code === "EBUSY" ? "EBUSY" : "EAUTH";
+      throw Object.assign(new Error(`the broker refused the cookie bridge${msg && msg.error ? `: ${msg.error}` : ""}`), { code });
+    }
+    return new BridgeClient(sock, after, { requestTimeoutMs });
   } catch (e) {
     sock.destroy();
     throw e;

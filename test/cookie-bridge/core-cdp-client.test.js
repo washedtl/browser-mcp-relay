@@ -10,11 +10,11 @@ const { WebSocketServer } = require("ws");
 
 const { openBrowserCdp } = require("../../src/cookie-bridge/cdp-client.js");
 
-async function fakeBrowser(t, onCall) {
+async function fakeBrowser(t, onCall, { wsHost = null } = {}) {
   const server = http.createServer((req, res) => {
     if (req.url === "/json/version") {
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ Browser: "Chrome/147", webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/x` }));
+      res.end(JSON.stringify({ Browser: "Chrome/147", webSocketDebuggerUrl: `ws://${wsHost || `127.0.0.1:${server.address().port}`}/devtools/browser/x` }));
     } else {
       res.statusCode = 404;
       res.end();
@@ -69,10 +69,22 @@ test("cdp-client: a dropped connection rejects pending calls and marks it closed
   await assert.rejects(cdp.send("X.z", {}), /closed/);
 });
 
-test("cdp-client: a call with no answer times out", async (t) => {
+test("cdp-client: a call with no answer times out AND closes the connection (a hung Brave can't stall the queue call after call)", async (t) => {
   const b = await fakeBrowser(t, () => undefined);
   const cdp = await openBrowserCdp(b.url, { callTimeoutMs: 100 });
   await assert.rejects(cdp.send("Slow.call", {}), /timed out/);
+  assert.strictEqual(cdp.closed, true);
+  const t0 = Date.now();
+  await assert.rejects(cdp.send("Next.call", {}), /closed/);
+  assert.ok(Date.now() - t0 < 50, "the next call fails at once");
+});
+
+test("cdp-client: the websocket goes to the cdpUrl's own host:port, never the host /json/version names", async (t) => {
+  let calls = 0;
+  const b = await fakeBrowser(t, () => { calls++; return { result: { ok: 1 } }; }, { wsHost: "attacker.invalid:9" });
+  const cdp = await openBrowserCdp(b.url);
+  assert.deepStrictEqual(await cdp.send("X.y", {}), { ok: 1 });
+  assert.strictEqual(calls, 1);
   cdp.close();
 });
 

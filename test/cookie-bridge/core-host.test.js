@@ -119,6 +119,17 @@ test("host: full / delta are forwarded as cookies.full / cookies.delta and acked
   ]);
 });
 
+test("host: another bridge already connected (EBUSY) → 'down', a clear log line, and it keeps polling at the normal pace", async (t) => {
+  let attempts = 0;
+  const connectBroker = async () => { attempts++; throw Object.assign(new Error("the broker refused the cookie bridge: another cookie bridge is already connected"), { code: "EBUSY" }); };
+  const { chrome, logs } = startHost(t, { connectBroker });
+  chrome.send({ t: "hello", v: 1 });
+  await until(() => attempts >= 3, 2000, "polls at pollMs, not the 30 s auth back-off");
+  assert.strictEqual(ofType(chrome.got, "status").at(-1).broker, "down");
+  assert.ok(logs.some((l) => /another cookie bridge/.test(l)), logs.join("\n"));
+  assert.ok(!logs.some((l) => /no broker/.test(l)), logs.join("\n"));
+});
+
 test("host: while the broker is down, changes are dropped (acked dropped:true); the next resync covers them", async (t) => {
   const b = fakeBroker();
   const { chrome } = startHost(t, b);

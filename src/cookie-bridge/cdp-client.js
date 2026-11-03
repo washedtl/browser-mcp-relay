@@ -2,6 +2,11 @@
 // for the cookie bridge's Storage.setCookies calls (no Playwright: one
 // websocket, request/response by id). Errors carry the CDP message only,
 // never the params (they hold cookie values).
+//
+// The websocket always goes to the cdpUrl's own host:port (only the path
+// comes from /json/version), and a call that times out closes the
+// connection: a hung Brave fails the rest of the work at once instead of
+// costing a timeout per call.
 
 "use strict";
 
@@ -23,12 +28,25 @@ async function openBrowserCdp(cdpUrl, { connectTimeoutMs = DEFAULT_CONNECT_TIMEO
     throw new Error(`no CDP endpoint at ${cdpUrl} (${e.name === "TimeoutError" ? "timed out" : "fetch failed"})`);
   }
   if (!version || typeof version.webSocketDebuggerUrl !== "string") throw new Error(`no CDP browser endpoint at ${cdpUrl}`);
+  let wsPath;
+  try {
+    wsPath = new URL(version.webSocketDebuggerUrl).pathname;
+  } catch {
+    throw new Error(`no CDP browser endpoint at ${cdpUrl}`);
+  }
+  const ws = new WebSocket(`ws://${new URL(cdpUrl).host}${wsPath}`, { perMessageDeflate: false });
+  return wrapWebSocket(ws, { label: cdpUrl, connectTimeoutMs, callTimeoutMs });
+}
 
-  const ws = new WebSocket(version.webSocketDebuggerUrl, { perMessageDeflate: false });
+/**
+ * A CDP connection over an already-created browser-level websocket (also the
+ * seam for a broker that reaches Brave some other way than a TCP port).
+ */
+async function wrapWebSocket(ws, { label = "CDP", connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS } = {}) {
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { ws.terminate(); reject(new Error(`CDP websocket at ${cdpUrl} did not open within ${connectTimeoutMs} ms`)); }, connectTimeoutMs);
+    const timer = setTimeout(() => { ws.terminate(); reject(new Error(`CDP websocket at ${label} did not open within ${connectTimeoutMs} ms`)); }, connectTimeoutMs);
     ws.once("open", () => { clearTimeout(timer); resolve(); });
-    ws.once("error", (e) => { clearTimeout(timer); reject(new Error(`CDP websocket at ${cdpUrl}: ${e.code || "connect failed"}`)); });
+    ws.once("error", (e) => { clearTimeout(timer); reject(new Error(`CDP websocket at ${label}: ${e.code || "connect failed"}`)); });
   });
 
   let nextId = 1;
@@ -42,6 +60,7 @@ async function openBrowserCdp(cdpUrl, { connectTimeoutMs = DEFAULT_CONNECT_TIMEO
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(new Error(`${method}: timed out after ${callTimeoutMs} ms`));
+          conn.close(); // a Brave that stopped answering: fail the rest at once
         }, callTimeoutMs);
         pending.set(id, { method, resolve, reject, timer });
         ws.send(JSON.stringify({ id, method, params }));
@@ -76,4 +95,4 @@ async function openBrowserCdp(cdpUrl, { connectTimeoutMs = DEFAULT_CONNECT_TIMEO
   return conn;
 }
 
-module.exports = { openBrowserCdp };
+module.exports = { openBrowserCdp, wrapWebSocket };

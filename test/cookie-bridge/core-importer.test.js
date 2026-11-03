@@ -25,8 +25,12 @@ function fakeSupervisor(up = false) {
   return sup;
 }
 
-/** Records every CDP call; `refuse(param)` → true makes Storage.setCookies fail for a batch holding it. */
-function fakeCdp({ refuse = () => false, hang = false } = {}) {
+/**
+ * Records every CDP call; `refuse(param)` → true makes Storage.setCookies fail
+ * for a batch holding it. hang: openCdp never resolves; hangSend: send never
+ * answers.
+ */
+function fakeCdp({ refuse = () => false, hang = false, hangSend = false } = {}) {
   const calls = [];
   const opened = [];
   const openCdp = async (cdpUrl) => {
@@ -34,6 +38,7 @@ function fakeCdp({ refuse = () => false, hang = false } = {}) {
     const conn = {
       closed: false,
       async send(method, params) {
+        if (hangSend) return new Promise(() => {});
         const ok = !(method === "Storage.setCookies" && params.cookies.some(refuse));
         calls.push({ method, ok, params: JSON.parse(JSON.stringify(params)) });
         if (!ok) throw new Error("Invalid cookie fields");
@@ -52,7 +57,7 @@ function fakeCdp({ refuse = () => false, hang = false } = {}) {
 function make({ up = false, cdp = fakeCdp(), now = () => 1_800_000_000_000, ...opts } = {}) {
   const logs = [];
   const supervisor = fakeSupervisor(up);
-  const imp = new CookieImporter({ supervisor, cdpUrl: "http://127.0.0.1:12345", log: (m) => logs.push(m), openCdp: cdp.openCdp, now, ...opts });
+  const imp = new CookieImporter({ supervisor, log: (m) => logs.push(m), openCdp: cdp.openCdp, now, ...opts });
   return { imp, supervisor, cdp, logs };
 }
 
@@ -188,17 +193,170 @@ test("importer: an add for a deny or hold domain is rejected and never reaches B
   assert.strictEqual(cdp.calls.length, 0);
 });
 
-test("importer: a removal for a deny domain is accepted, with or without userOverride (the owner unticked a re-allowed domain)", async () => {
+test("importer: a removal for a deny domain is accepted when the bridge manages that cookie, or the removal carries userOverride", async () => {
   const { imp, cdp } = make({ up: true });
   await imp.full("b1", [ck({ domain: ".paypal.com", userOverride: true })], true);
   assert.strictEqual(imp.status().cookies, 1);
   const r = await imp.delta([
-    { removed: true, cause: "explicit", cookie: ck({ domain: ".paypal.com", userOverride: true }) },
-    { removed: true, cause: "explicit", cookie: ck({ domain: ".chase.com", name: "y" }) },
+    { removed: true, cause: "explicit", cookie: ck({ domain: ".paypal.com" }) }, // managed: accepted without the flag
+    { removed: true, cause: "explicit", cookie: ck({ domain: ".venmo.com", name: "y", userOverride: true }) }, // flagged
   ]);
   assert.deepStrictEqual(r, { applied: 2, rejected: [] });
-  assert.deepStrictEqual(cdp.expired().map((p) => [p.name, p.domain]), [["sid", ".paypal.com"], ["y", ".chase.com"]]);
+  assert.deepStrictEqual(cdp.expired().map((p) => [p.name, p.domain]), [["sid", ".paypal.com"], ["y", ".venmo.com"]]);
   assert.strictEqual(imp.status().cookies, 0);
+});
+
+test("importer: Chrome removing a deny-domain cookie the bridge never synced leaves Brave's own cookie alone", async () => {
+  const { imp, cdp } = make({ up: true });
+  const r = await imp.delta([
+    { removed: true, cause: "explicit", cookie: ck({ domain: ".chase.com", name: "y" }) },
+    { removed: true, cause: "expired", cookie: ck({ domain: ".mybank.example", name: "z" }) },
+  ]);
+  assert.strictEqual(r.applied, 0);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.domain, x.reason]), [["chase.com", "deny:finance"], ["mybank.example", "hold:keyword"]]);
+  assert.strictEqual(cdp.calls.length, 0);
+});
+
+test("importer: a partitioned cookie is also judged by its top-level site (deny/hold without userOverride → refused)", async () => {
+  const { imp, cdp } = make({ up: true });
+  const part = (over) => ck({ name: "p", sameSite: "no_restriction", partitionKey: { topLevelSite: "https://chase.com" }, ...over });
+  const r = await imp.full("b1", [part(), part({ name: "q", partitionKey: { topLevelSite: "https://amazon.com", hasCrossSiteAncestor: false } })], true);
+  assert.deepStrictEqual(r, { applied: 1, rejected: [{ domain: "chase.com", reason: "deny:finance", count: 1 }] });
+  const r2 = await imp.full("b1", [part({ userOverride: true }), part({ name: "q", partitionKey: { topLevelSite: "https://amazon.com" } })], true);
+  assert.strictEqual(r2.applied, 2);
+  assert.ok(cdp.live().some((p) => p.name === "p" && p.partitionKey.topLevelSite === "https://chase.com"));
+});
+
+test("importer: delta during a batched full sync — an add isn't swept as stale, a removal or newer value isn't undone by a later batch", async () => {
+  const { imp, cdp } = make({ up: true });
+  await imp.full("b1", [ck({ name: "a" }), ck({ name: "b" })], true);
+  // the extension read all cookies at t0 and sends them in batches; Chrome changes meanwhile
+  await imp.full("b1", [ck({ name: "a" })], false);
+  await imp.delta([
+    { removed: false, cause: "explicit", cookie: ck({ name: "x" }) }, // new in Chrome
+    { removed: true, cause: "explicit", cookie: ck({ name: "b" }) }, // gone from Chrome
+    { removed: false, cause: "explicit", cookie: ck({ name: "a", value: "newer-" + SECRET }) },
+  ]);
+  const before = cdp.live().length;
+  await imp.full("b1", [ck({ name: "b" }), ck({ name: "a" })], true); // stale reads from t0
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["b"], "x not swept, b expired once");
+  assert.strictEqual(cdp.live().length, before, "the stale b and a were not set again");
+  assert.strictEqual(cdp.live().filter((p) => p.name === "a").at(-1).value, "newer-" + SECRET);
+  assert.strictEqual(imp.status().cookies, 2); // a, x
+});
+
+test("importer: a CDP failure while Brave is up is reported as not applied, and the next ensure re-applies the snapshot", async () => {
+  let fail = true;
+  const cdp = fakeCdp();
+  const inner = cdp.openCdp;
+  cdp.openCdp = async () => { if (fail) throw new Error("connect ECONNREFUSED"); return inner(); };
+  const { imp } = make({ up: true, cdp });
+  await imp.braveReady({ pid: 5 }); // nothing to apply yet: memoized for pid 5
+  await assert.rejects(imp.full("b1", [ck()], true), (e) => /not applied/i.test(e.message) && !e.message.includes(SECRET));
+  assert.strictEqual(imp.status().cookies, 1, "kept in the snapshot");
+  fail = false;
+  await imp.braveReady({ pid: 5 }); // same Brave: applied again after the failure
+  assert.deepStrictEqual(cdp.live().map((p) => p.name), ["sid"]);
+});
+
+test("importer: a braveReady apply that fails after its timeout still clears the memo for that Brave", async () => {
+  let rejectOpen;
+  let opens = 0;
+  const cdp = fakeCdp();
+  const inner = cdp.openCdp;
+  cdp.openCdp = async () => { opens++; if (opens === 1) return new Promise((_, reject) => { rejectOpen = reject; }); return inner(); };
+  const { imp } = make({ cdp, applyTimeoutMs: 50 });
+  await imp.full("b1", [ck()], true); // Brave down: kept for the launch
+  await imp.braveReady({ pid: 8 }); // times out
+  rejectOpen(new Error("late failure"));
+  await new Promise((r) => setTimeout(r, 20));
+  await imp.braveReady({ pid: 8 });
+  assert.deepStrictEqual(cdp.live().map((p) => p.name), ["sid"]);
+});
+
+test("importer: a stuck CDP send (Brave hung mid-apply) never blocks a tool call past applyTimeoutMs", async () => {
+  const cdp = fakeCdp({ hangSend: true });
+  const { imp, supervisor } = make({ cdp, applyTimeoutMs: 100 });
+  await imp.full("b1", [ck()], true);
+  supervisor.up = true;
+  const t0 = Date.now();
+  await imp.braveReady({ pid: 4 });
+  assert.ok(Date.now() - t0 < 1000);
+});
+
+test("importer: one bridge at a time — a second concurrent bridge is refused (EBUSY) until the first closes", () => {
+  const { imp } = make();
+  const h1 = imp.handlers("b1");
+  assert.throws(() => imp.handlers("b2"), (e) => e.code === "EBUSY" && /already connected/.test(e.message));
+  h1.close();
+  assert.doesNotThrow(() => imp.handlers("b2"));
+});
+
+// ── the bridge-managed key set, persisted across broker restarts ──
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function stateDir(t) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-w2f-state-"));
+  t.after(() => fs.rmSync(d, { recursive: true, force: true }));
+  return d;
+}
+
+test("importer state: a broker restart forgets nothing — a full resync expires managed cookies Chrome no longer has", async (t) => {
+  const file = path.join(stateDir(t), "cookie-bridge-x.json");
+  const first = make({ up: true, stateFile: file });
+  await first.imp.full("b1", [
+    ck({ name: "a" }),
+    ck({ name: "b", domain: "www.shop.example", hostOnly: true }),
+    ck({ name: "c", sameSite: "no_restriction", partitionKey: { topLevelSite: "https://amazon.com" } }),
+  ], true);
+  const saved = fs.readFileSync(file, "utf8");
+  assert.ok(!saved.includes(SECRET), "never a value on disk");
+  assert.deepStrictEqual(JSON.parse(saved).managed.map((m) => m.name).sort(), ["a", "b", "c"]);
+  // the broker exits; Chrome deletes b and c meanwhile; a new broker starts
+  const second = make({ up: true, stateFile: file });
+  assert.strictEqual(second.imp.status().managed, 3);
+  await second.imp.full("b1", [ck({ name: "a" })], true);
+  assert.deepStrictEqual(second.cdp.expired().map((p) => p.name).sort(), ["b", "c"]);
+  const host = second.cdp.expired().find((p) => p.name === "b");
+  assert.deepStrictEqual([host.url, host.domain], ["https://www.shop.example/", undefined], "expired by its own identity (host-only)");
+  assert.deepStrictEqual(second.cdp.expired().find((p) => p.name === "c").partitionKey, { topLevelSite: "https://amazon.com", hasCrossSiteAncestor: false });
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).managed.map((m) => m.name), ["a"]);
+});
+
+test("importer state: deletions queued while Brave is down survive a restart and apply at the next launch", async (t) => {
+  const file = path.join(stateDir(t), "cookie-bridge-x.json");
+  const first = make({ stateFile: file }); // Brave down
+  await first.imp.full("b1", [ck({ name: "a" }), ck({ name: "b" })], true);
+  await first.imp.delta([{ removed: true, cause: "explicit", cookie: ck({ name: "a" }) }]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).pendingDeletes.map((m) => m.name), ["a"]);
+  const second = make({ stateFile: file });
+  second.supervisor.up = true;
+  await second.imp.braveReady({ pid: 1 });
+  assert.deepStrictEqual(second.cdp.expired().map((p) => p.name), ["a"]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).pendingDeletes, []);
+});
+
+test("importer state: written atomically (no temp file left), private, and a corrupt file starts empty (logged)", async (t) => {
+  const dir = stateDir(t);
+  const file = path.join(dir, "cookie-bridge-x.json");
+  const { imp } = make({ stateFile: file });
+  await imp.full("b1", [ck()], true);
+  assert.deepStrictEqual(fs.readdirSync(dir), ["cookie-bridge-x.json"]);
+  if (process.platform !== "win32") assert.strictEqual(fs.statSync(file).mode & 0o077, 0);
+  fs.writeFileSync(file, "{not json " + SECRET);
+  const again = make({ stateFile: file });
+  assert.strictEqual(again.imp.status().managed, 0);
+  assert.ok(again.logs.some((l) => /state/.test(l)), again.logs.join("\n"));
+  assert.ok(!again.logs.join("\n").includes(SECRET));
+});
+
+test("importer state: no state file is written when nothing was ever synced", (t) => {
+  const dir = stateDir(t);
+  make({ stateFile: path.join(dir, "cookie-bridge-x.json") });
+  assert.deepStrictEqual(fs.readdirSync(dir), []);
 });
 
 test("importer: a removal still has to be a well-formed cookie", async () => {

@@ -115,7 +115,10 @@ class NativeHost {
       const code = e.code || "error";
       if (code !== this._lastFailure) {
         this._lastFailure = code;
-        this._log(code === "EAUTH" ? `the broker pipe refused the bridge: ${e.message}` : `no broker (${code}); polling every ${Math.round(this._pollMs / 1000)} s`);
+        const every = `retrying every ${Math.round(this._pollMs / 1000)} s`;
+        if (code === "EAUTH") this._log(`the broker pipe refused the bridge: ${e.message}`);
+        else if (code === "EBUSY") this._log(`another cookie bridge is already connected to the broker (one Chrome profile syncs at a time); ${every}`);
+        else this._log(`no broker (${code}); ${every}`);
       }
       this._status("down");
       this._schedule(code === "EAUTH" ? Math.max(AUTH_RETRY_MS, this._pollMs) : this._pollMs);

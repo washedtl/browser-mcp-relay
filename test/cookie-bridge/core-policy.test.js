@@ -185,3 +185,24 @@ test("policy: the file runs as a plain (non-CommonJS) script and publishes globa
   assert.strictEqual(api.classify("chase.com").decision, "deny");
   assert.strictEqual(api.classify("amazon.com").decision, "allow");
 });
+
+test("policy: Google's country domains are identity too (google.<cc>, google.co.<cc>, google.com.<cc>)", () => {
+  for (const d of ["google.de", "accounts.google.de", "google.co.uk", ".google.co.uk", "mail.google.co.jp", "google.com.au", "myaccount.google.com", "accounts.youtube.com"]) {
+    assert.deepStrictEqual([d, classify(d).decision, classify(d).category], [d, "deny", "email-identity"]);
+  }
+  assert.strictEqual(decision("googleads.example"), "allow");
+  assert.strictEqual(decision("google.example.com"), "allow", "a google label under someone else's domain");
+});
+
+test("policy: .youtube.com and .amazon.com session cookies stay allowed (business use)", () => {
+  assert.strictEqual(decision(".youtube.com"), "allow");
+  assert.strictEqual(decision("www.youtube.com"), "allow");
+  assert.strictEqual(decision(".amazon.com"), "allow");
+});
+
+test("policy: single-label hosts and .local / .lan / .internal / .home.arpa are held; localhost stays allowed", () => {
+  for (const d of ["router", "nas", "intranet", "printer.local", "nas.lan", "jira.corp.internal", "gw.home.arpa"]) {
+    assert.deepStrictEqual([d, classify(d).decision], [d, "hold"]);
+  }
+  assert.strictEqual(decision("localhost"), "allow");
+});

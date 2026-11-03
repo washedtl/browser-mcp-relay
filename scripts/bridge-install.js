@@ -79,9 +79,11 @@ function install({ env = process.env, platform = process.platform, runReg = defa
   const cmdQuote = (s) => `"${String(s).replace(/%/g, "%%")}"`;
 
   fs.mkdirSync(dir, { recursive: true });
+  // UTF-8 without a BOM; chcp makes cmd read the lines after it as UTF-8 (non-ASCII paths)
   fs.writeFileSync(launcherFile, [
     "@echo off",
     "rem browser-mcp-relay cookie bridge: Chrome starts this native-messaging host (npm run bridge:install wrote it)",
+    "chcp 65001 >nul 2>&1",
     `${cmdQuote(nodePath)} ${cmdQuote(hostScript)} %*`,
     "",
   ].join("\r\n"));

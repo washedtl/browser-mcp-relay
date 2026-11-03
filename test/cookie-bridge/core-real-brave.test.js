@@ -69,7 +69,7 @@ test("real Brave: synced cookies land as Chrome had them, are sent on requests, 
     const cdpPort = await chooseCdpPort();
     const sup = realSupervisor({ port: cdpPort });
     const logs = [];
-    const imp = new CookieImporter({ supervisor: sup, cdpUrl: `http://127.0.0.1:${cdpPort}`, log: (m) => logs.push(m) });
+    const imp = new CookieImporter({ supervisor: sup, openCdp: () => openBrowserCdp(`http://127.0.0.1:${cdpPort}`), log: (m) => logs.push(m) });
     // Brave down: kept in memory only
     const r = await imp.full("b1", [
       ck(),
@@ -120,6 +120,28 @@ test("real Brave: synced cookies land as Chrome had them, are sent on requests, 
   }
 });
 
+test("real Brave: after a broker restart, the persisted identity alone (no value) deletes what Chrome no longer has", REAL, async () => {
+  const cdpPort = await chooseCdpPort();
+  const cdpUrl = `http://127.0.0.1:${cdpPort}`;
+  const sup = realSupervisor({ port: cdpPort });
+  const stateFile = path.join(tmpDir("state"), "cookie-bridge-x.json");
+  const first = new CookieImporter({ supervisor: sup, openCdp: () => openBrowserCdp(cdpUrl), stateFile });
+  await first.braveReady(await sup.ensure());
+  await first.full("b1", [
+    ck({ name: "keep" }),
+    ck({ name: "host", domain: "www.bmr-w2f.example", hostOnly: true, httpOnly: true }),
+    ck({ name: "part", sameSite: "no_restriction", partitionKey: { topLevelSite: "https://top-bmr-w2f.example" } }),
+    ck({ name: "__Host-x", domain: "www.bmr-w2f.example", hostOnly: true }),
+  ], true);
+  assert.deepStrictEqual((await braveCookies(cdpUrl)).map((c) => c.name).sort(), ["__Host-x", "host", "keep", "part"]);
+  // the broker exits (Brave closes); Chrome deletes three of them; a new broker starts
+  await sup.closeGracefully();
+  const second = new CookieImporter({ supervisor: sup, openCdp: () => openBrowserCdp(cdpUrl), stateFile });
+  await second.braveReady(await sup.ensure());
+  await second.full("b1", [ck({ name: "keep" })], true);
+  assert.deepStrictEqual((await braveCookies(cdpUrl)).map((c) => c.name), ["keep"]);
+});
+
 test("real Brave: the extension ID bridge-install derives from a manifest key is the ID Brave assigns", REAL, async () => {
   const extDir = tmpDir("ext");
   const { publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -143,4 +165,41 @@ test("real Brave: the extension ID bridge-install derives from a manifest key is
   }
   assert.ok(id, "the probe extension's service worker never showed up");
   assert.strictEqual(extensionIdFromKey(key), id);
+});
+
+const EXT_DIR = path.join(__dirname, "..", "..", "extensions", "cookie-bridge");
+const EXT_MERGED = fs.existsSync(path.join(EXT_DIR, "manifest.json")) && fs.existsSync(path.join(EXT_DIR, "background.js"));
+
+test("real Brave: the cookie-bridge extension's module service worker loads policy.js (globalThis.CookieBridgePolicy)", { ...REAL, skip: REAL.skip || (!EXT_MERGED && "W2F-ext's extension files are not in this branch yet") }, async () => {
+  const WebSocket = require("ws");
+  const sup = realSupervisor({ extensionPath: EXT_DIR });
+  const info = await sup.ensure();
+  const id = extensionIdFromKey(JSON.parse(fs.readFileSync(path.join(EXT_DIR, "manifest.json"), "utf8")).key);
+  let target = null;
+  const t0 = Date.now();
+  while (!target && Date.now() - t0 < 20_000) {
+    const list = await (await fetch(`${info.cdpUrl}/json/list`)).json();
+    target = list.find((x) => x.type === "service_worker" && x.url.startsWith(`chrome-extension://${id}/`) && x.webSocketDebuggerUrl);
+    if (!target) await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(target, `no service worker for chrome-extension://${id}/`);
+  const ws = new WebSocket(target.webSocketDebuggerUrl, { perMessageDeflate: false });
+  await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+  const evaluate = (expression) => new Promise((resolve) => {
+    const msgId = Math.floor(Math.random() * 1e9);
+    ws.on("message", function onMsg(data) {
+      const m = JSON.parse(data);
+      if (m.id === msgId) { ws.off("message", onMsg); resolve(m.result && m.result.result && m.result.result.value); }
+    });
+    ws.send(JSON.stringify({ id: msgId, method: "Runtime.evaluate", params: { expression, returnByValue: true } }));
+  });
+  try {
+    // the worker target is listed before its module script has run
+    const t1 = Date.now();
+    while ((await evaluate("typeof globalThis.CookieBridgePolicy")) !== "object" && Date.now() - t1 < 15_000) await new Promise((r) => setTimeout(r, 200));
+    const got = await evaluate(`JSON.stringify(["chase.com", "amazon.com", "mybank.example"].map((d) => globalThis.CookieBridgePolicy.classify(d).decision))`);
+    assert.strictEqual(got, JSON.stringify(["deny", "allow", "hold"]));
+  } finally {
+    ws.close();
+  }
 });

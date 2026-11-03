@@ -141,7 +141,12 @@ const DEFAULT_DEPS = {
   toolContext: () => require("../own-tools/_tool-context.js"),
   loadCatalog: ({ env }) => require("../tool-catalog.js").loadUpstreamCatalog({ env }),
   // W2F: cookies from the owner's Chrome (the cookie bridge), applied to Brave
-  cookieBridge: (opts) => new (require("../cookie-bridge/importer.js").CookieImporter)(opts),
+  // over a CDP connection the broker hands it; managed keys persist next to the key
+  cookieBridge: ({ supervisor, cdpUrl, log, stateDir, profileDir }) => {
+    const { CookieImporter, stateFileFor } = require("../cookie-bridge/importer.js");
+    const openCdp = () => require("../cookie-bridge/cdp-client.js").openBrowserCdp(cdpUrl);
+    return new CookieImporter({ supervisor, log, openCdp, stateFile: stateFileFor(stateDir, profileDir) });
+  },
 };
 
 /**
@@ -170,6 +175,9 @@ class IdlePolicy {
 
   connectionOpened() {
     this.connections++;
+    // W2F: no countdown running (someone is connected): notASession must not
+    // revive an old deadline
+    if (!this._exit) this._exitAt = null;
     this._clear("_exit");
   }
 
@@ -368,7 +376,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   const supervisor = d.createSupervisor({ profileDir, env, log, poolConfig: d.poolConfig });
   // each launch's verified pipe is what the proxy serves (503 while Brave is down)
   if (typeof supervisor.on === "function") supervisor.on("pipe", (p) => cdpProxy.setPipe(p));
-  const cookieBridge = d.cookieBridge({ supervisor, cdpUrl, log }); // W2F
+  const cookieBridge = d.cookieBridge({ supervisor, cdpUrl, log, stateDir: path.dirname(keyFile), profileDir }); // W2F
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
   const placement = env.BROWSER_RELAY_BROKER_WINDOWS === "offscreen" ? "offscreen" : "cascade";
@@ -641,14 +649,15 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     serverHello(sock, key, { warning: helloWarning }).then(({ hello, rest }) => {
       if (done) return undefined;
       if (hello && hello.bridge === true) {
-        // W2F: the cookie bridge's native host. Not a session: it never keeps the broker up.
+        // W2F: the cookie bridge's native host. Not a session: it never keeps
+        // the broker up. Its handlers exist only once it answered the challenge;
+        // bridgeSockets is only so a shutdown closes it.
         sockets.delete(sock);
         bridgeSockets.add(sock);
         policy.notASession();
-        const handlers = cookieBridge.handlers(connId);
-        bridgeDone = () => { bridgeSockets.delete(sock); handlers.close(); };
-        require("./control.js").serveBridge(sock, hello, rest, key, handlers);
-        return undefined;
+        let handlers = null;
+        bridgeDone = () => { bridgeSockets.delete(sock); if (handlers) handlers.close(); };
+        return require("./control.js").serveBridge(sock, hello, rest, key, () => (handlers = cookieBridge.handlers(connId)));
       }
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
