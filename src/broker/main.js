@@ -31,7 +31,6 @@
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
-const crypto = require("node:crypto");
 const { claimPipe, resolveEndpoint, brokerHome } = require("./pipe-server.js");
 
 const MINUTE = 60_000;
@@ -162,6 +161,9 @@ function tabKeyOf(tabId) {
 const unknownTabMessage = (tabKey) => `unknown tabId ${JSON.stringify(tabKey)}; call tabs_new or tabs_list`;
 
 const errorResult = (text) => ({ content: [{ type: "text", text }], isError: true });
+
+// BrowserContext members that are sync (or event APIs): not forwardable lazily
+const SYNC_CONTEXT_MEMBERS = new Set(["pages", "browser", "on", "once", "off", "addListener", "removeListener", "request", "tracing", "clock", "backgroundPages", "serviceWorkers"]);
 
 /**
  * Upstream's executor result → CallToolResult, as upstream's own stdio server
@@ -313,7 +315,8 @@ function serve({ server, port, pipe, profileDir, env, log, idle, onExit, d }) {
    * client: its own server side would auto-dismiss every dialog it sees and
    * repoint the context's downloads into its own temp dir.
    * Page-less tools use only async BrowserContext methods (cookies,
-   * addCookies, ...), which is all this handle forwards.
+   * addCookies, ...), which is all this handle forwards; a sync member
+   * fails loudly instead of quietly returning a Promise.
    */
   function lazySharedContext(connId) {
     let resolved = null;
@@ -324,6 +327,9 @@ function serve({ server, port, pipe, profileDir, env, log, idle, onExit, d }) {
     return new Proxy({}, {
       get(_, prop) {
         if (prop === "then" || typeof prop === "symbol") return undefined; // not a thenable
+        if (SYNC_CONTEXT_MEMBERS.has(prop)) {
+          throw new Error(`ctx.context.${prop} is not available to page-less tools in broker mode (async BrowserContext methods only); make the tool routed to get a tab's context`);
+        }
         return async (...args) => {
           const context = await resolve();
           return context[prop](...args);
@@ -385,7 +391,7 @@ function serve({ server, port, pipe, profileDir, env, log, idle, onExit, d }) {
   /**
    * An own-tool, run with the ctx W2D's toolContext builds:
    *   routed           → { page, context, sessionKey, registry, connId, cdpUrl, relay } for args.tabId's tab
-   *   needsPage:false  → { context (shared, no tab opened), registry, connId, cdpUrl, relay }
+   *   needsPage:false  → { context (shared; lazy, see lazySharedContext), registry, connId, cdpUrl, relay }
    *   needsBrave:false → never launches Brave: that ctx while Brave runs, else just { relay }
    * relay is the connection's RelayServer (per-session toolsets, elicitation,
    * list_changed). Whatever RelayServer passes as the second argument is
@@ -422,12 +428,13 @@ function serve({ server, port, pipe, profileDir, env, log, idle, onExit, d }) {
 
   // ── connections ──
   const sockets = new Set();
+  let connSeq = 0; // connIds: never reused within a broker (the registry remembers closed ones)
   let closing = null;
   let accepting = true; // false once a shutdown is committed
 
   function serveConnection(sock) {
     if (!accepting) { sock.destroy(); return; }
-    const connId = crypto.randomBytes(4).toString("hex");
+    const connId = `c${++connSeq}`;
     sockets.add(sock);
     policy.connectionOpened();
     log(`conn ${connId} open (${sockets.size} total)`);
@@ -615,7 +622,8 @@ function positiveInt(raw, fallback) {
  */
 function brokerEnv(processEnv = process.env, applyLocalConfig = require("../local-config.js").applyLocalConfigToEnv) {
   const env = applyLocalConfig(processEnv);
-  for (const [k, v] of Object.entries(env)) if (processEnv[k] === undefined && v !== undefined) processEnv[k] = v;
+  // "" counts as unset, as local-config.js treats it
+  for (const [k, v] of Object.entries(env)) if (!processEnv[k] && v) processEnv[k] = v;
   return env;
 }
 

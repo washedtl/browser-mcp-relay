@@ -21,10 +21,11 @@ const {
   claimPipe,
 } = require("../src/broker/pipe-server.js");
 
+// unix: a socket in a private (mkdtemp: 0700) dir, as claimPipe requires
 const testPipe = (tag) =>
   process.platform === "win32"
     ? `\\\\.\\pipe\\bmr-test-${tag}-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
-    : path.join(os.tmpdir(), `bmr-test-${tag}-${process.pid}-${crypto.randomBytes(4).toString("hex")}.sock`);
+    : path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bmr-test-")), `${tag}.sock`);
 
 const closeServer = (s) => new Promise((r) => s.close(() => r()));
 
@@ -98,6 +99,28 @@ test("claimPipe: the first claim listens; a second gets null (EADDRINUSE = anoth
 test("claimPipe: any other listen error rejects (it is not 'another broker')", { skip: process.platform !== "win32" && "Windows pipe names" }, async () => {
   // a mangled name (e.g. a shell ate a backslash) fails with EACCES
   await assert.rejects(claimPipe("\\.\\pipe\\bmr-test-mangled"), (e) => e.code === "EACCES" && /EACCES/.test(e.message));
+});
+
+test("claimPipe: concurrent reclaims of one stale socket leave exactly one owner, still reachable", { skip: process.platform === "win32" && "unix sockets only" }, async () => {
+  const name = testPipe("stale-race");
+  fs.writeFileSync(name, ""); // left behind by a crashed broker
+  const results = await Promise.all([claimPipe(name), claimPipe(name), claimPipe(name)]);
+  const owners = results.filter(Boolean);
+  assert.strictEqual(owners.length, 1);
+  const got = new Promise((resolve) => owners[0].once("connection", resolve));
+  const c = net.connect(name);
+  await got;
+  c.destroy();
+  await closeServer(owners[0]);
+});
+
+test("claimPipe: a reclaim lock left by a dead broker is taken over", { skip: process.platform === "win32" && "unix sockets only" }, async () => {
+  const name = testPipe("stale-lock");
+  fs.writeFileSync(name, "");
+  fs.writeFileSync(`${name}.lock`, "999999999"); // no such pid
+  const s = await claimPipe(name);
+  assert.ok(s && s.listening);
+  await closeServer(s);
 });
 
 test("claimPipe: a stale unix socket file is reclaimed", { skip: process.platform === "win32" && "unix sockets only" }, async () => {
@@ -240,7 +263,7 @@ test("tools/call: args parsed by upstream's zod shape, tabId routed to its own t
   const r = await c.callTool({ name: "content_take-screenshot", arguments: { type: "JPEG", tabId: "sub1" } });
   const exec = b.up.executed[0];
   assert.deepStrictEqual(exec.args, { type: "jpeg" }, "transformed by upstream's enum; tabId stripped");
-  assert.match(exec.sessionKey, /^[0-9a-f]{8}:sub1$/);
+  assert.match(exec.sessionKey, /^c\d+:sub1$/, "connIds are a per-broker counter, never reused");
   const body = JSON.parse(r.content[0].text);
   assert.deepStrictEqual(body, { format: "jpeg", url: `about:blank#${exec.sessionKey}` }, "_ keys and the image leave the JSON");
   assert.strictEqual(r.content[0].text, JSON.stringify(body, null, 2));
@@ -390,6 +413,18 @@ test("own tools (needsPage:false): with no tab open anywhere, the context comes 
   assert.strictEqual(b.up.contexts.length, 1, "the caller's main tab, opened on use");
 });
 
+test("own tools (needsPage:false): a sync BrowserContext member fails loudly instead of returning a Promise", async (t) => {
+  const syncUser = {
+    name: "own_sync", description: "misuses ctx.context", inputSchema: { type: "object" }, needsPage: false,
+    async handler(args, ctx) { return { content: [{ type: "text", text: String(ctx.context.pages().length) }] }; },
+  };
+  const b = await startTestBroker(t, { ownTools: [syncUser] });
+  const c = await connectClient(t, b.pipe);
+  const r = await c.callTool({ name: "own_sync", arguments: {} });
+  assert.strictEqual(r.isError, true);
+  assert.match(textOf(r), /ctx\.context\.pages is not available to page-less tools/);
+});
+
 test("own tools (needsBrave:false): never launch Brave; just { relay } while it is down, the registry & co. while it runs", async (t) => {
   const b = await startTestBroker(t);
   const c = await connectClient(t, b.pipe);
@@ -532,6 +567,9 @@ test("brokerEnv: local-config.json values reach process.env (in-process upstream
   assert.strictEqual(processEnv.BROWSER_RELAY_UPSTREAM_PATH, "C:\\x\\dist\\index.js");
   assert.strictEqual(processEnv.TOOL_NAME_PREFIX, "fromEnv");
   assert.strictEqual(env.KEEP, "env");
+  const blank = { BROWSER_RELAY_UPSTREAM_PATH: "" };
+  brokerEnv(blank, (e) => ({ ...e, BROWSER_RELAY_UPSTREAM_PATH: "C:\\y" }));
+  assert.strictEqual(blank.BROWSER_RELAY_UPSTREAM_PATH, "C:\\y", "an empty env value is unset, as local-config.js treats it");
 });
 
 test("prepareWorkDir: a broker-owned dir becomes WORKING_DIR and the cwd", (t) => {

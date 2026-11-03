@@ -46,6 +46,12 @@ function launcherArgs(brokerEntry, brokerArgs = []) {
   return [SHIM_FILE, "--launch", brokerEntry, ...brokerArgs];
 }
 
+/** Unix: a socket in a dir another local user controls must not be trusted. */
+function defaultPipeDirProblem(pipe) {
+  if (process.platform === "win32") return null; // named pipes: libuv's default DACL (same user)
+  return require("./broker/pipe-server.js").privateDirProblem(path.dirname(pipe));
+}
+
 function defaultSpawnLauncher(args) {
   spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
 }
@@ -83,6 +89,7 @@ class Shim {
    * @param {(code: number) => void} [opts.exit]
    * @param {(pipe: string) => import("net").Socket} [opts.connect]
    * @param {(args: string[]) => void} [opts.spawnLauncher]
+   * @param {(pipe: string) => string|null} [opts.pipeDirProblem] — why the socket's dir can't be trusted, or null
    * @param {number} [opts.connectTimeoutMs]
    * @param {number} [opts.respawnAfterMs]
    */
@@ -93,10 +100,11 @@ class Shim {
     exit = (code) => process.exit(code),
     connect = (p) => net.connect(p),
     spawnLauncher = defaultSpawnLauncher,
+    pipeDirProblem = defaultPipeDirProblem,
     connectTimeoutMs = CONNECT_TIMEOUT_MS,
     respawnAfterMs = RESPAWN_AFTER_MS,
   }) {
-    Object.assign(this, { pipe, brokerEntry, brokerArgs, input, output, log, exitFn: exit, connectFn: connect, spawnLauncher, connectTimeoutMs, respawnAfterMs });
+    Object.assign(this, { pipe, brokerEntry, brokerArgs, input, output, log, exitFn: exit, connectFn: connect, spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs });
     this.sock = null;
     this.connecting = null;
     this.queue = []; // client lines waiting for a broker connection
@@ -184,6 +192,9 @@ class Shim {
     let lastErr = null;
     for (let attempt = 0; Date.now() - t0 < this.connectTimeoutMs; attempt++) {
       if (this.closed) throw new Error("shim closed");
+      // waiting won't fix it, and launching a broker there would be refused too
+      const problem = this.pipeDirProblem(this.pipe);
+      if (problem) throw new Error(`refusing ${this.pipe}: ${problem} (not private)`);
       try {
         return await this._connectOnce();
       } catch (e) {

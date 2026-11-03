@@ -30,10 +30,11 @@ async function until(cond, ms = 5000, what = "condition") {
     await sleep(10);
   }
 }
+// unix: a socket in a private (mkdtemp: 0700) dir, as the broker requires
 const testPipe = (tag) =>
   process.platform === "win32"
     ? `\\\\.\\pipe\\bmr-test-${tag}-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
-    : path.join(os.tmpdir(), `bmr-test-${tag}-${process.pid}-${crypto.randomBytes(4).toString("hex")}.sock`);
+    : path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bmr-test-")), `${tag}.sock`);
 
 // ───────────────────────── a scripted fake broker ─────────────────────────
 
@@ -107,6 +108,7 @@ function shimHarness(t, pipe, opts = {}) {
     spawnLauncher: (args) => { launches.push(args); if (opts.onLaunch) opts.onLaunch(launches.length); },
     connectTimeoutMs: opts.connectTimeoutMs || 5000,
     respawnAfterMs: opts.respawnAfterMs || 5000,
+    ...(opts.pipeDirProblem ? { pipeDirProblem: opts.pipeDirProblem } : {}),
   });
   shim.start();
   t.after(() => shim.close());
@@ -280,6 +282,16 @@ test("non-JSON garbage from the client is forwarded untouched (the broker answer
   assert.deepStrictEqual(fb.received[0], { conn: 0, raw: "not json" });
   assert.strictEqual(fb.received[1].msg.id, 5);
   assert.deepStrictEqual(h.exits, []);
+});
+
+test("a socket dir that is not private (unix): the shim refuses to connect or launch, and says why", async (t) => {
+  const pipe = testPipe("squat");
+  await fakeBroker(t, pipe); // someone else's socket at our name
+  const h = shimHarness(t, pipe, { pipeDirProblem: () => "socket dir /tmp/x is owned by uid 0" });
+  h.send(INIT);
+  const r = await h.response(1);
+  assert.match(r.error.message, /not private|owned by uid 0/);
+  assert.strictEqual(h.launches.length, 0);
 });
 
 test("stdin end: the broker connection is closed and the shim exits 0", async (t) => {

@@ -83,16 +83,36 @@ function listen(server, pipe) {
   });
 }
 
-/** Unix only: the socket's dir must be ours alone (a real dir, our uid, no group/other access). */
+/**
+ * Unix only: why `dir` is not fit to hold the broker's socket (not a real
+ * dir, not ours, group/other access), or null. A missing dir is fine here
+ * (the broker creates it). Shared with the shim, which must not talk to a
+ * socket another local user could have put there.
+ */
+function privateDirProblem(dir) {
+  let st;
+  try {
+    st = fs.lstatSync(dir);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
+  if (!st.isDirectory()) return `socket dir ${dir} is not a directory (or is a symlink)`;
+  if (st.uid !== currentUid()) return `socket dir ${dir} is owned by uid ${st.uid}, not ${currentUid()}`;
+  if ((st.mode & 0o077) !== 0) return `socket dir ${dir} is open to other users (mode ${(st.mode & 0o777).toString(8)})`;
+  return null;
+}
+
+/** Unix only: create the socket dir 0700 if needed, then insist it is private. */
 function ensurePrivateDir(dir) {
   try {
     fs.mkdirSync(dir, { mode: 0o700 });
   } catch (e) {
     if (e.code !== "EEXIST") throw e;
   }
-  const st = fs.lstatSync(dir);
-  if (!st.isDirectory() || st.uid !== currentUid() || (st.mode & 0o077) !== 0) {
-    throw Object.assign(new Error(`[broker] socket dir ${dir} is not private (want a dir owned by uid ${currentUid()}, mode 0700)`), { code: "EACCES" });
+  const problem = privateDirProblem(dir);
+  if (problem) {
+    throw Object.assign(new Error(`[broker] ${problem}: not private (want a dir owned by uid ${currentUid()}, mode 0700)`), { code: "EACCES" });
   }
 }
 
@@ -105,6 +125,56 @@ function isStaleSocket(pipe) {
   });
 }
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+const RETRY = Symbol("retry");
+
+/**
+ * Unix only: replace a crashed broker's socket file. The stale check → rm →
+ * listen runs under an O_EXCL lock file: unserialized, a second broker could
+ * rm the first one's fresh socket, and libuv unlinks a socket's path when its
+ * server closes, so the loser idling out later would unlink the winner's.
+ * Resolves the server, null (another broker owns or is taking the pipe), or
+ * RETRY (a dead broker's lock was removed).
+ */
+async function reclaimStale(server, pipe) {
+  const lock = `${pipe}.lock`;
+  let fd;
+  try {
+    fd = fs.openSync(lock, "wx", 0o600);
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+    let holder = NaN;
+    try { holder = Number(fs.readFileSync(lock, "utf8")); } catch { return RETRY; } // released meanwhile
+    // an empty lock was just created and not written yet: its holder is alive
+    if (!holder || pidAlive(holder)) return null;
+    fs.rmSync(lock, { force: true }); // left by a broker that died mid-reclaim
+    return RETRY;
+  }
+  try {
+    fs.writeSync(fd, String(process.pid));
+    if (!(await isStaleSocket(pipe))) return null; // someone took it before we locked
+    fs.rmSync(pipe, { force: true });
+    try {
+      await listen(server, pipe);
+    } catch (e) {
+      if (e.code === "EADDRINUSE") return null;
+      throw e;
+    }
+    return server;
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lock, { force: true });
+  }
+}
+
 /**
  * Claim the pipe. Resolves the listening net.Server, or null when another
  * broker already owns it. Rejects on any other error.
@@ -112,26 +182,21 @@ function isStaleSocket(pipe) {
 async function claimPipe(pipe) {
   if (process.platform !== "win32") ensurePrivateDir(path.dirname(pipe));
   const server = net.createServer();
-  try {
-    await listen(server, pipe);
-  } catch (e) {
-    if (e.code !== "EADDRINUSE") {
-      e.message = `[broker] cannot listen on ${pipe}: ${e.code || e.message}`;
-      throw e;
-    }
-    if (process.platform === "win32" || !(await isStaleSocket(pipe))) return null;
-    fs.rmSync(pipe, { force: true });
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       await listen(server, pipe);
-    } catch (e2) {
-      if (e2.code === "EADDRINUSE") return null; // another broker won the reclaim
-      throw e2;
+      return server;
+    } catch (e) {
+      if (e.code !== "EADDRINUSE") {
+        e.message = `[broker] cannot listen on ${pipe}: ${e.code || e.message}`;
+        throw e;
+      }
     }
+    if (process.platform === "win32" || !(await isStaleSocket(pipe))) return null;
+    const won = await reclaimStale(server, pipe);
+    if (won !== RETRY) return won;
   }
-  // owner-only on unix (the socket lives in a shared temp dir); Windows
-  // pipes get libuv's default DACL (same user)
-  if (process.platform !== "win32") fs.chmodSync(pipe, 0o600);
-  return server;
+  return null;
 }
 
-module.exports = { pipeNameFor, resolveEndpoint, brokerHome, claimPipe, PIPE_PREFIX };
+module.exports = { pipeNameFor, resolveEndpoint, brokerHome, claimPipe, privateDirProblem, PIPE_PREFIX };
