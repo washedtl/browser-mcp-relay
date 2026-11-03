@@ -1,7 +1,17 @@
 // lighthouse_audit — runs Lighthouse against a URL over the browser's CDP
 // endpoint (ctx.cdpUrl). Returns category scores (performance,
-// accessibility, best-practices, seo). Lighthouse opens its own tab, so the
+// accessibility, best-practices, seo). Lighthouse runs in its own tab, so the
 // tool needs no session page (needsPage:false).
+//
+// W2G (2026-11-03): two endpoints.
+//   ws://…  broker mode: the broker's CDP proxy (a secret in its path; Brave
+//           has no TCP port). It serves no /json/version, so Lighthouse's
+//           own {hostname, port} connect can't use it: puppeteer-core (the
+//           copy Lighthouse imports) connects to the ws URL, opens a tab and
+//           hands it to lighthouse(); the tool closes that tab and
+//           disconnects (never browser.close(): the browser is shared).
+//   http:// legacy mode (cdp-bridge.js's port): probe /json/version, then
+//           lighthouse({hostname, port}), as before.
 //
 // W2D (2026-11-03): storage reset is always off. Lighthouse's reset clears
 // the origin's service workers / Cache Storage / file systems and the whole
@@ -14,6 +24,9 @@
 //     ~3MB CJS/ESM on every call (~80–150ms cold cost); now imports once
 //     on first call and reuses
 
+const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const { errorResult } = require("./_tool-args.js");
 
 // T1-1: lazy + memoized — first call pays the import cost, subsequent calls
@@ -33,6 +46,33 @@ function getLighthouse() {
       });
   }
   return _lhPromise;
+}
+
+/**
+ * puppeteer-core's ESM entry, resolved from lighthouse: the very module
+ * Lighthouse imports, so the page we hand it is one of its own.
+ */
+function puppeteerEntry() {
+  const { createRequire } = require("node:module");
+  const pkgJson = createRequire(require.resolve("lighthouse/package.json")).resolve("puppeteer-core/package.json");
+  const pkg = JSON.parse(fs.readFileSync(pkgJson, "utf8"));
+  const entry = pkg.exports && pkg.exports["."] && pkg.exports["."].import;
+  if (typeof entry !== "string") throw new Error(`puppeteer-core ${pkg.version} has no ESM entry at exports["."].import`);
+  return path.join(path.dirname(pkgJson), entry);
+}
+
+let _pptrPromise = null;
+function getPuppeteer() {
+  if (!_pptrPromise) {
+    _pptrPromise = Promise.resolve()
+      .then(() => import(pathToFileURL(puppeteerEntry()).href))
+      .then((m) => m.default || m)
+      .catch((e) => {
+        _pptrPromise = null;
+        throw e;
+      });
+  }
+  return _pptrPromise;
 }
 
 module.exports = {
@@ -76,8 +116,6 @@ module.exports = {
       };
     }
     if (!cdpUrl) return errorResult("lighthouse_audit unavailable: no browser CDP endpoint");
-    const { hostname, port } = new URL(cdpUrl);
-    const probeUrl = new URL("/json/version", cdpUrl).href;
 
     // Fast-fail with an actionable error when the URL is malformed. Lighthouse
     // itself would eventually reject but with a less clear "Unable to connect"
@@ -134,6 +172,40 @@ module.exports = {
       cats = onlyCategories;
     }
 
+    const flags = { disableStorageReset: true, output: "json", logLevel: "error", onlyCategories: cats, formFactor };
+    // W1C2: formFactor/screenEmulation flags alone kept the default config's
+    // mobile throttling + mobile UA on desktop runs. Desktop uses
+    // Lighthouse's own desktopConfig; mobile uses the default config. Flags
+    // override config settings, so none of those are passed as flags.
+    const config = formFactor === "desktop" ? desktopConfig : undefined;
+    const PROBE_ADVICE = "Brave may have crashed or hung. Retry: the relay relaunches Brave " +
+      "after it sees the browser disconnect; if it keeps failing, restart the MCP server.";
+
+    let result;
+    if (/^wss?:\/\//i.test(cdpUrl)) {
+      // W2G broker mode. Messages never print cdpUrl: it holds the secret.
+      let browser;
+      try {
+        browser = await (await getPuppeteer()).connect({ browserWSEndpoint: cdpUrl, defaultViewport: null });
+      } catch (e) {
+        return errorResult(`lighthouse_audit: cannot reach the relay's Brave over CDP: ${e.message || e}. ${PROBE_ADVICE}`);
+      }
+      let page = null;
+      try {
+        page = await browser.newPage();
+        result = await lighthouse(url, flags, config, page);
+      } catch (e) {
+        return errorResult(`lighthouse_audit: ${e.message || String(e)}`);
+      } finally {
+        // Given a page, Lighthouse leaves it open: close our tab, keep the shared browser.
+        if (page) await page.close().catch(() => {});
+        await browser.disconnect().catch(() => {});
+      }
+      return summarize(url, formFactor, result);
+    }
+
+    const { hostname, port } = new URL(cdpUrl);
+    const probeUrl = new URL("/json/version", cdpUrl).href;
     // T0-6: wrap the lighthouse() call in try/catch. Bad URL, unreachable host,
     // dead Brave (relay's CDP port 9333+slot not listening), Lighthouse internal
     // crashes — all surface here. Previously propagated as uncaught exceptions
@@ -145,8 +217,6 @@ module.exports = {
     // surfacing a useful error until Lighthouse itself gives up.
     // W1C2: ensureBrave() already ran for this call (relay-server does it
     // before every own-tool), so a failed probe means Brave died or hung.
-    const PROBE_ADVICE = "Brave may have crashed or hung. Retry: the relay relaunches Brave " +
-      "after it sees the browser disconnect; if it keeps failing, restart the MCP server.";
     try {
       const probeResp = await fetch(probeUrl, {
         // 1.5s is enough to detect a healthy CDP endpoint without making the
@@ -166,47 +236,42 @@ module.exports = {
       };
     }
 
-    let result;
     try {
-      // W1C2: formFactor/screenEmulation flags alone kept the default
-      // config's mobile throttling + mobile UA on desktop runs. Desktop uses
-      // Lighthouse's own desktopConfig; mobile uses the default config. Flags
-      // override config settings, so none of those are passed as flags.
-      result = await lighthouse(url, {
-        hostname,
-        port: Number(port),
-        disableStorageReset: true,
-        output: "json",
-        logLevel: "error",
-        onlyCategories: cats,
-        formFactor,
-      }, formFactor === "desktop" ? desktopConfig : undefined);
+      result = await lighthouse(url, { hostname, port: Number(port), ...flags }, config);
     } catch (e) {
       return {
         content: [{ type: "text", text: `lighthouse_audit: ${e.message || String(e)}` }],
         isError: true,
       };
     }
-
-    if (!result || !result.lhr) {
-      return {
-        content: [{ type: "text", text: "lighthouse_audit: lighthouse returned no result" }],
-        isError: true,
-      };
-    }
-    const summary = {};
-    for (const [key, cat] of Object.entries(result.lhr.categories || {})) {
-      summary[key] = {
-        score: cat.score === null ? null : Math.round(cat.score * 100),
-        title: cat.title,
-      };
-    }
-    return {
-      content: [{ type: "text", text: JSON.stringify({ url, formFactor, categories: summary, finalUrl: result.lhr.finalUrl, fetchTime: result.lhr.fetchTime }, null, 2) }],
-    };
+    return summarize(url, formFactor, result);
   },
   // Test seam: substitute the lighthouse module (null restores lazy import).
   _setLighthouseForTest(mod) {
     _lhPromise = mod ? Promise.resolve(mod) : null;
   },
+  // Test seam: substitute puppeteer-core ({connect}); null restores the lazy import.
+  _setPuppeteerForTest(mod) {
+    _pptrPromise = mod ? Promise.resolve(mod) : null;
+  },
+  _puppeteerEntry: puppeteerEntry,
 };
+
+function summarize(url, formFactor, result) {
+  if (!result || !result.lhr) {
+    return {
+      content: [{ type: "text", text: "lighthouse_audit: lighthouse returned no result" }],
+      isError: true,
+    };
+  }
+  const summary = {};
+  for (const [key, cat] of Object.entries(result.lhr.categories || {})) {
+    summary[key] = {
+      score: cat.score === null ? null : Math.round(cat.score * 100),
+      title: cat.title,
+    };
+  }
+  return {
+    content: [{ type: "text", text: JSON.stringify({ url, formFactor, categories: summary, finalUrl: result.lhr.finalUrl, fetchTime: result.lhr.fetchTime }, null, 2) }],
+  };
+}

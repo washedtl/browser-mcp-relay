@@ -349,6 +349,22 @@ async function until(cond, ms = 3000, what = "condition") {
 
 const DEFAULT_OWN_TOOLS = [probeOwnTool, tabsNewTool, cookiesTool, cdpOnlyTool, tabsListTool, toolsetsTool];
 
+// W2G: the broker's CDP URL, and what sessions / logs see instead of it
+const { fakePipeBrowser } = require("./fixtures/fake-pipe-browser.js");
+const SECRET_URL_RE = /^ws:\/\/127\.0\.0\.1:(\d+)\/([0-9a-f]{64})\/devtools\/browser$/;
+const redactedUrl = (b) => b.handle.cdpUrl.replace(/[0-9a-f]{64}/, "<redacted>");
+/** A websocket upgrade's outcome: "OPEN" or "HTTP <status>". */
+function upgrade(url) {
+  const WebSocket = require("ws");
+  return new Promise((resolve) => {
+    const ws = new WebSocket(url, { perMessageDeflate: false });
+    const done = (v) => { try { ws.terminate(); } catch { /* closed */ } resolve(v); };
+    ws.once("open", () => done("OPEN"));
+    ws.once("unexpected-response", (_req, res) => done(`HTTP ${res.statusCode}`));
+    ws.once("error", (e) => done(`error ${e.message}`));
+  });
+}
+
 async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}, loadCatalog, supervisor, recycle = null, rss, pipe: fixedPipe } = {}) {
   const pipe = fixedPipe || testPipe("broker");
   const made = [];
@@ -472,23 +488,6 @@ test("launch warning (elevated fallback): logged once, in every session's hello 
   assert.ok(!b.logs.some((l) => /settings .* differ/.test(l)));
 });
 
-test("V1-2: a CDP port taken before Brave's first launch exits the broker so the shims start one on a new port", async (t) => {
-  const b = await startTestBroker(t, {
-    supervisor: (opts) => Object.assign(fakeSupervisor(opts), {
-      async ensure() { throw new Error(`[mcp-relay] brave-supervisor: CDP port ${opts.port} is in use by another process. This broker keeps one port for its whole life`); },
-    }),
-  });
-  const c = await connectClient(t, b.pipe);
-  const r = await c.callTool({ name: "content_get-as-text", arguments: {} });
-  assert.strictEqual(r.isError, true);
-  assert.match(textOf(r), /restarting on a new port; retry the call/, "the session is told before the broker goes");
-  await until(() => b.exits.length === 1, 3000, "the broker to exit");
-  assert.match(b.exits[0], /CDP port \d+ is taken by another process/);
-  const again = await claimPipe(b.pipe);
-  assert.ok(again, "the pipe is released for a fresh broker");
-  await closeServer(again);
-});
-
 test("V1-2: other launch failures don't exit the broker", async (t) => {
   const b = await startTestBroker(t, {
     supervisor: (opts) => Object.assign(fakeSupervisor(opts), { async ensure() { throw new Error("Brave not found"); } }),
@@ -552,10 +551,99 @@ test("watchdogSetting: default 60 s, 0 turns it off, anything else at least 10 s
   assert.strictEqual(watchdogSetting("junk"), 60_000);
 });
 
-test("startBroker: the supervisor gets a fixed CDP port chosen up front", async (t) => {
+test("W2G startBroker: CDP is served only by the broker's proxy (secret ws URL); the supervisor gets no port, and its verified pipe is what the proxy serves", async (t) => {
   const b = await startTestBroker(t);
-  assert.ok(Number.isInteger(b.sup.opts.port) && b.sup.opts.port > 0);
+  const m = SECRET_URL_RE.exec(b.handle.cdpUrl);
+  assert.ok(m, b.handle.cdpUrl);
+  const port = Number(m[1]);
+  assert.strictEqual(b.sup.opts.port, undefined);
   assert.strictEqual(b.sup.opts.profileDir, path.join(os.tmpdir(), "bmr-test-profile-unused"));
+  assert.strictEqual(await upgrade(b.handle.cdpUrl), "HTTP 503", "no Brave yet");
+  const fake = fakePipeBrowser();
+  b.sup.emit("pipe", fake.pipe); // what BraveSupervisor does once a launch is verified
+  assert.strictEqual(await upgrade(b.handle.cdpUrl), "OPEN");
+  assert.strictEqual(await upgrade(`ws://127.0.0.1:${port}/devtools/browser`), "HTTP 403", "no secret");
+  assert.strictEqual((await fetch(`http://127.0.0.1:${port}/json/version`)).status, 404, "no discovery");
+  fake.crash();
+  await until(() => fake.pipe.closed, 3000, "the pipe to close");
+  assert.strictEqual(await upgrade(b.handle.cdpUrl), "HTTP 503", "Brave down again");
+});
+
+test("W2G: the broker's shutdown closes its CDP proxy (the port stops listening)", async (t) => {
+  const b = await startTestBroker(t);
+  const port = Number(SECRET_URL_RE.exec(b.handle.cdpUrl)[1]);
+  await b.handle.close("test");
+  await assert.rejects(fetch(`http://127.0.0.1:${port}/json/version`), /fetch failed/);
+});
+
+test("W2G redaction: an upstream error or result carrying the CDP URL (Playwright's call log) reaches the session without the secret", async (t) => {
+  const b = await startTestBroker(t);
+  const secret = SECRET_URL_RE.exec(b.handle.cdpUrl)[2];
+  const c = await connectClient(t, b.pipe);
+  const err = await c.callTool({ name: "navigation_go-to", arguments: { url: "leak-error://" } });
+  assert.strictEqual(err.isError, true);
+  assert.ok(textOf(err).includes(redactedUrl(b)), textOf(err));
+  const ok = await c.callTool({ name: "navigation_go-to", arguments: { url: "leak-result://" } });
+  assert.ok(!ok.isError && textOf(ok).includes(redactedUrl(b)), textOf(ok));
+  for (const r of [err, ok]) assert.ok(!JSON.stringify(r).includes(secret), JSON.stringify(r));
+  assert.ok(!b.logs.some((l) => l.includes(secret)), b.logs.join("\n"));
+});
+
+test("W2G redaction: own tools get the real CDP URL (they connect with it); their results and errors are redacted", async (t) => {
+  let seen = null;
+  const leaky = {
+    name: "own_leaky", description: "returns / throws its cdpUrl", inputSchema: { type: "object", properties: { fail: { type: "boolean" } } }, needsPage: false,
+    async handler(args, ctx) {
+      seen = ctx.cdpUrl;
+      if (args.fail) throw new Error(`connect failed: ${ctx.cdpUrl}`);
+      return { content: [{ type: "text", text: `endpoint ${ctx.cdpUrl}` }] };
+    },
+  };
+  const b = await startTestBroker(t, { ownTools: [leaky] });
+  const secret = SECRET_URL_RE.exec(b.handle.cdpUrl)[2];
+  const c = await connectClient(t, b.pipe);
+  const ok = await c.callTool({ name: "own_leaky", arguments: {} });
+  assert.strictEqual(seen, b.handle.cdpUrl, "the tool itself gets the usable URL");
+  assert.strictEqual(textOf(ok), `endpoint ${redactedUrl(b)}`);
+  const err = await c.callTool({ name: "own_leaky", arguments: { fail: true } });
+  assert.strictEqual(err.isError, true);
+  assert.ok(textOf(err).includes(`connect failed: ${redactedUrl(b)}`), textOf(err));
+  for (const r of [ok, err]) assert.ok(!JSON.stringify(r).includes(secret), JSON.stringify(r));
+});
+
+test("W2G redaction: broker log lines never carry the secret (the startup line, a context close error with the URL)", async (t) => {
+  const b = await startTestBroker(t);
+  const secret = SECRET_URL_RE.exec(b.handle.cdpUrl)[2];
+  assert.ok(b.logs.some((l) => /serving .*CDP ws:\/\/127\.0\.0\.1:\d+\/<redacted>\/devtools\/browser/.test(l)), b.logs.join("\n"));
+  const c = await connectClient(t, b.pipe);
+  await c.callTool({ name: "content_get-as-text", arguments: {} });
+  b.up.contexts[0].close = async () => { throw new Error(`Target closed; endpoint ${b.handle.cdpUrl}`); };
+  await c.close();
+  await until(() => b.logs.some((l) => /closing a session context failed/.test(l)), 3000, "the close error to be logged");
+  assert.ok(!b.logs.some((l) => l.includes(secret)), b.logs.join("\n"));
+  assert.ok(b.logs.some((l) => l.includes(redactedUrl(b))), b.logs.join("\n"));
+});
+
+test("W2G: BROWSER_CDP_ENDPOINT_URL (the secret URL) leaves process.env once upstream has loaded, and after a failed load", async (t) => {
+  delete process.env.BROWSER_CDP_ENDPOINT_URL;
+  const b = await startTestBroker(t);
+  const c = await connectClient(t, b.pipe);
+  assert.ok(!(await c.callTool({ name: "content_get-as-text", arguments: {} })).isError);
+  assert.deepStrictEqual(b.up.loads, [b.handle.cdpUrl], "upstream got the URL");
+  assert.strictEqual(process.env.BROWSER_CDP_ENDPOINT_URL, undefined);
+
+  const failing = fakeUpstreamModule();
+  failing.loadUpstream = async ({ cdpUrl }) => { process.env.BROWSER_CDP_ENDPOINT_URL = cdpUrl; throw new Error("chunk not found"); };
+  const pipe2 = testPipe("broker");
+  const b2 = await startBroker({
+    pipe: pipe2, profileDir: path.join(os.tmpdir(), "bmr-test-profile-unused"), env: {}, keyFile: KEY_FILE, log: () => {},
+    deps: { createSupervisor: (opts) => fakeSupervisor(opts), upstreamModule: () => failing, windowPages: fakeWindowPages, ownTools: () => [], toolContext: fakeToolContextModule, loadCatalog: async () => FAKE_CATALOG },
+  });
+  t.after(() => b2.close("test done"));
+  const c2 = await connectClient(t, pipe2);
+  const r = await c2.callTool({ name: "content_get-as-text", arguments: {} });
+  assert.match(textOf(r), /chunk not found/);
+  assert.strictEqual(process.env.BROWSER_CDP_ENDPOINT_URL, undefined);
 });
 
 test("tools/list: cached catalog + own tools, tabId on page tools only, hidden toolsets filtered; no Brave, no upstream", async (t) => {
@@ -598,7 +686,8 @@ test("tools/call: args parsed by upstream's zod shape, tabId routed to its own t
   await c.callTool({ name: "content_take-screenshot", arguments: {} });
   assert.deepStrictEqual(b.up.executed[1].args, { type: "png" }, "upstream's default applied");
   assert.match(b.up.executed[1].sessionKey, /:main$/);
-  assert.deepStrictEqual(b.up.loads, [`http://127.0.0.1:${b.sup.opts.port}`], "upstream loaded once, on the fixed port");
+  assert.deepStrictEqual(b.up.loads, [b.handle.cdpUrl], "upstream loaded once, on the broker's CDP proxy URL");
+  assert.match(b.handle.cdpUrl, SECRET_URL_RE);
   assert.deepStrictEqual(b.windowPages.state.installs, ["cascade"], "window-per-page installed once");
   assert.ok(b.up.order.indexOf("loadUpstream") < b.up.order.findIndex((s) => s.startsWith("createContext")));
 });
@@ -716,7 +805,7 @@ test("own tools (routed): W2D's ctx {page, context, sessionKey, registry, connId
   assert.strictEqual(got.sessionKey, `${got.connId}:sub2`);
   assert.strictEqual(got.url, `about:blank#${got.connId}:sub2`, "the same page upstream tools use");
   assert.strictEqual(got.contextSession, got.sessionKey, "context = that session's browserContext");
-  assert.strictEqual(got.cdpUrl, `http://127.0.0.1:${b.sup.opts.port}`);
+  assert.strictEqual(got.cdpUrl, redactedUrl(b), "the tool got the URL; its result is redacted");
   assert.strictEqual(got.hasRelay, true);
   assert.strictEqual(got.hasRegistry, true);
 });
@@ -745,7 +834,7 @@ test("own tools (needsPage:false): with no tab open anywhere, the context comes 
   const b = await startTestBroker(t);
   const c = await connectClient(t, b.pipe);
   const cdp = JSON.parse(textOf(await c.callTool({ name: "own_cdp", arguments: {} })));
-  assert.strictEqual(cdp.cdpUrl, `http://127.0.0.1:${b.sup.opts.port}`);
+  assert.strictEqual(cdp.cdpUrl, redactedUrl(b));
   assert.strictEqual(b.sup.launches, 1, "Brave is up for a page-less tool (lighthouse needs it)");
   assert.strictEqual(b.up.contexts.length, 0, "a tool that never touches ctx.context opens no tab");
   const got = JSON.parse(textOf(await c.callTool({ name: "own_cookies", arguments: {} })));
@@ -853,19 +942,6 @@ test("catalog: a failed load is not cached; the next tools/list retries", async 
   const { tools } = await c.listTools();
   assert.ok(tools.length > 0);
   assert.strictEqual(calls, 2);
-});
-
-test("supervisor 'fatal' (e.g. its fixed CDP port is gone): the broker shuts down so shims respawn one", async (t) => {
-  const b = await startTestBroker(t);
-  const c = await connectClient(t, b.pipe);
-  await c.callTool({ name: "content_get-as-text", arguments: {} });
-  b.sup.emit("fatal", "CDP port 9999 is in use by another process");
-  await until(() => b.exits.length === 1, 3000, "onExit");
-  assert.match(b.exits[0], /fatal.*9999/);
-  assert.ok(b.sup.closes >= 1, "Brave closed gracefully first");
-  const again = await claimPipe(b.pipe);
-  assert.ok(again, "the pipe is released");
-  await closeServer(again);
 });
 
 // ─────────────────────── result conversion (upstream parity) ───────────────────────

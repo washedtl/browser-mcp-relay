@@ -34,9 +34,12 @@
 //   zod v3        nested at browser-devtools-mcp/node_modules/zod
 //
 // One upstream per process: BDMCP reads BROWSER_CDP_ENDPOINT_URL once, at
-// import, and caches its CDP connection per endpoint. The broker must keep
-// Brave on the same CDP port for its whole life; loadUpstream() refuses a
-// second, different cdpUrl.
+// import, and caches its CDP connection per endpoint. The broker gives it the
+// one URL its CDP proxy serves for the broker's whole life (W2G:
+// ws://127.0.0.1:<port>/<secret>/devtools/browser; Brave itself has no port),
+// and deletes the variable again once upstream is imported. loadUpstream()
+// refuses a second, different cdpUrl. Its errors print a CDP URL only
+// without the secret (redactCdpUrl).
 
 "use strict";
 
@@ -45,6 +48,7 @@ const path = require("node:path");
 const { createRequire } = require("node:module");
 const { pathToFileURL } = require("node:url");
 const { applyLocalConfigToEnv } = require("../local-config.js");
+const { redactCdpUrl } = require("./cdp-proxy.js");
 
 // Forced in code so a user's env can't turn telemetry, the
 // "open chrome://inspect in your real Chrome" fallback, or output schemas on.
@@ -197,8 +201,9 @@ let loaded = null; // { cdpUrl, promise }
 /**
  * Import upstream (once per process) bound to `cdpUrl`.
  *
- * @param {{cdpUrl: string, env?: object}} opts  cdpUrl: http(s)://host:port (or ws(s)://) of the
- *   broker's Brave; env: the local-config-merged env (the broker's), for BROWSER_RELAY_UPSTREAM_PATH.
+ * @param {{cdpUrl: string, env?: object}} opts  cdpUrl: the broker's CDP proxy URL (ws://…, a
+ *   secret in its path), or http(s)://host:port; env: the local-config-merged env (the broker's),
+ *   for BROWSER_RELAY_UPSTREAM_PATH.
  *   Upstream itself reads its settings from process.env at import: the broker's brokerEnv() puts
  *   local-config.json's keys there before anything loads.
  * @returns {Promise<{version: string,
@@ -209,11 +214,11 @@ let loaded = null; // { cdpUrl, promise }
  */
 function loadUpstream({ cdpUrl, env = applyLocalConfigToEnv(process.env) } = {}) {
   if (typeof cdpUrl !== "string" || !/^(https?|wss?):\/\/[^/]+/.test(cdpUrl)) {
-    return Promise.reject(new Error(`[broker] loadUpstream needs cdpUrl as http(s)://host:port or ws(s)://…, got ${JSON.stringify(cdpUrl)}`));
+    return Promise.reject(new Error(`[broker] loadUpstream needs cdpUrl as http(s)://host:port or ws(s)://…, got ${JSON.stringify(typeof cdpUrl === "string" ? redactCdpUrl(cdpUrl) : cdpUrl)}`));
   }
   if (loaded) {
     if (loaded.cdpUrl !== cdpUrl) {
-      return Promise.reject(new Error(`[broker] upstream is already bound to ${loaded.cdpUrl}; it reads BROWSER_CDP_ENDPOINT_URL once per process, so Brave must keep that port (asked for ${cdpUrl})`));
+      return Promise.reject(new Error(`[broker] upstream is already bound to ${redactCdpUrl(loaded.cdpUrl)}; it reads BROWSER_CDP_ENDPOINT_URL once per process, so the broker must keep one CDP URL (asked for ${redactCdpUrl(cdpUrl)})`));
     }
     return loaded.promise;
   }
@@ -257,7 +262,7 @@ async function doLoad(cdpUrl, env) {
   }
   // The env is read at import. If something imported these chunks earlier
   // in this process with other env, the constants are stale: fail loudly.
-  assertContract(cfg.BROWSER_CDP_CONNECT_URL === cdpUrl, `BROWSER_CDP_CONNECT_URL is ${cfg.BROWSER_CDP_CONNECT_URL}, expected ${cdpUrl} (upstream imported before loadUpstream?)`);
+  assertContract(cfg.BROWSER_CDP_CONNECT_URL === cdpUrl, `BROWSER_CDP_CONNECT_URL is ${redactCdpUrl(cfg.BROWSER_CDP_CONNECT_URL)}, expected ${redactCdpUrl(cdpUrl)} (upstream imported before loadUpstream?)`);
   assertContract(cfg.BROWSER_CDP_OPEN_INSPECT === false && cfg.TOOL_OUTPUT_SCHEMA_DISABLE === true && cfg.BROWSER_PERSISTENT_ENABLE === false,
     "forced env did not reach upstream's config constants (upstream imported before loadUpstream?)");
 

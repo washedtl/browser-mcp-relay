@@ -7,8 +7,12 @@
 // so hidden toolsets, elicitation and tools/list_changed work per session
 // exactly as in the stdio relay. Underneath, all sessions share:
 //
-//   - ONE Brave (W2C BraveSupervisor) on a CDP port chosen here, up front:
-//     upstream reads its CDP URL once per process, so the port never changes;
+//   - ONE Brave (W2C BraveSupervisor) with CDP on a pipe, no TCP port (W2G);
+//   - ONE CDP endpoint, the broker's CdpProxy (cdp-proxy.js): bound here, up
+//     front, for the broker's life, at ws://127.0.0.1:<port>/<secret>/devtools/browser.
+//     Upstream reads its CDP URL once per process, and the URL never changes.
+//     The secret never leaves the process: logs, status and tool results are
+//     redacted;
 //   - upstream browser-devtools-mcp IN-PROCESS (W2B upstream-inproc), loaded
 //     lazily on the first tools/call;
 //   - a SessionRegistry: (connection, tabId) → upstream session context, one
@@ -29,7 +33,6 @@
 "use strict";
 
 const fs = require("node:fs");
-const net = require("node:net");
 const path = require("node:path");
 const { claimPipe, resolveEndpoint, brokerHome, keyFileFor, loadOrCreateKey, restoreKeyFile, verifyPipeOwner, serverHello, settingsHash } = require("./pipe-server.js");
 
@@ -42,8 +45,6 @@ const MIN_WATCHDOG_MS = 10_000; // shorter would kill a healthy broker busy for 
 const KEY_CHECK_MS = 30_000;
 const DEFAULT_RECYCLE_RSS_MB = 1024;
 const RECYCLE_CHECK_MS = 60_000;
-// W2C's message for a CDP port another process holds (it never switches ports)
-const PORT_IN_USE_RE = /CDP port \d+ is (?:already )?in use/i;
 
 /**
  * Watchdog, in a worker thread: one broker serves every session, and code
@@ -118,13 +119,12 @@ const NEEDS_RENDERING_RE =
   /^(?:content_take-screenshot|content_start-recording|content_save-as-pdf|a11y_take-|interaction_|navigation_|execute$|scenario-run$|o11y_get-web-vitals$|form_fill$|file_upload$|download_capture$)/;
 
 const DEFAULT_DEPS = {
-  createSupervisor: ({ profileDir, port, env, log, poolConfig }) => {
+  createSupervisor: ({ profileDir, env, log, poolConfig }) => {
     const { BraveSupervisor } = require("./brave-supervisor.js");
     // as in legacy mode (index.js): env, then the pool wrapper's, then auto-detect
     const pool = poolConfig();
     return new BraveSupervisor({
       profileDir,
-      port,
       executablePath: pool.bravePath || undefined,
       extensionPath: env.BROWSER_LOAD_EXTENSIONS || null,
       proxyUrl: env.BROWSER_RELAY_PROXY_URL || pool.proxyUrl || null,
@@ -208,34 +208,6 @@ class IdlePolicy {
   }
 }
 
-// Brave's CDP port is pinned for the broker's life (upstream reads it once)
-// while Brave is down before its first launch and after every idle close. An
-// OS-assigned port comes from the ephemeral range, which outbound connections
-// reuse, so it could be taken meanwhile and force a broker restart. Pick it
-// below every default ephemeral range instead (Windows 49152-65535, Linux
-// 32768-60999).
-const CDP_PORT_RANGE = Object.freeze({ min: 10000, max: 32000 });
-const CDP_PORT_TRIES = 20;
-
-/** Can `port` be bound on 127.0.0.1 right now? (released at once) */
-function portIsFree(port) {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.once("error", () => resolve(false));
-    srv.listen({ port, host: "127.0.0.1", exclusive: true }, () => srv.close(() => resolve(true)));
-  });
-}
-
-/** A random free port in CDP_PORT_RANGE (`random`: test seam). */
-async function chooseCdpPort({ random = Math.random } = {}) {
-  const { min, max } = CDP_PORT_RANGE;
-  for (let i = 0; i < CDP_PORT_TRIES; i++) {
-    const port = min + Math.floor(random() * (max - min + 1));
-    if (await portIsFree(port)) return port;
-  }
-  throw new Error(`[broker] no free CDP port in ${min}-${max} after ${CDP_PORT_TRIES} tries`);
-}
-
 /** tabId argument → registry tab key (same rules as W2D's toolContext). */
 function tabKeyOf(tabId) {
   const { MAIN_TAB } = require("./sessions.js");
@@ -249,6 +221,17 @@ function tabKeyOf(tabId) {
 const unknownTabMessage = (tabKey) => `unknown tabId ${JSON.stringify(tabKey)}; call tabs_new or tabs_list`;
 
 const errorResult = (text) => ({ content: [{ type: "text", text }], isError: true });
+
+/**
+ * A tools/call result with the CDP secret taken out of its text items
+ * (Playwright's call log and upstream's "[CDP connect]" errors print the
+ * whole URL). Images and other items pass as they are.
+ */
+function redactResult(result) {
+  const { redact } = require("./cdp-proxy.js");
+  if (!result || !Array.isArray(result.content)) return result;
+  return { ...result, content: result.content.map((c) => (c && typeof c.text === "string" ? { ...c, text: redact(c.text) } : c)) };
+}
 
 const SETTINGS_DIFFER_WARNING =
   "this session's browser settings (BROWSER_*, telemetry, upstream tool options) differ from the ones the running broker " +
@@ -304,7 +287,7 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {object} [opts.env] — local-config-merged env
  * @param {(msg: string) => void} [opts.log]
  * @param {{exitMs?: number, browserMs?: number}} [opts.idle]
- * @param {(reason: string) => void} [opts.onExit] — the broker has shut down by itself (idle, fatal)
+ * @param {(reason: string) => void} [opts.onExit] — the broker has shut down by itself (idle, recycle, broker:stop)
  * @param {string} [opts.keyFile] — this user's broker key (default: keyFileFor(env)); the shim passes its own
  * @param {{timeoutMs: number, logFile?: string}|null} [opts.watchdog] — kill the process if the event loop blocks this long
  * @param {{rssBytes: number, checkMs: number}|null} [opts.recycle] — exit while idle when RSS exceeds rssBytes
@@ -313,14 +296,20 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {{port: number}|null} [opts.relayInspector] — host the relay Inspector web UI on this port
  * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, toolContext, loadCatalog, rss
  */
-async function startBroker({ pipe, profileDir, env = process.env, log = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
+async function startBroker({ pipe, profileDir, env = process.env, log: rawLog = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
+  const { CdpProxy, redact } = require("./cdp-proxy.js");
+  // Every line the broker logs goes through redact(): no log carries the CDP secret.
+  const log = (m) => rawLog(redact(m));
   const keyPath = keyFile || keyFileFor(env);
   const key = loadOrCreateKey(keyPath);
-  // Picked before the claim: from the claim to server.on("connection")
+  // Bound before the claim: from the claim to server.on("connection")
   // nothing may await, or an early connection can be accepted unheard.
-  const port = await chooseCdpPort();
+  // An OS-assigned port is fine: the broker holds it for its whole life.
+  const cdpProxy = new CdpProxy({ log });
+  await cdpProxy.listen();
   const server = await claimPipe(pipe);
   if (!server) {
+    await cdpProxy.close();
     let owner = await verifyPipeOwner(pipe, key);
     if (owner === "bad") {
       // our key may be the stale one (its file was recreated): read it again, once
@@ -332,15 +321,16 @@ async function startBroker({ pipe, profileDir, env = process.env, log = () => {}
     return null;
   }
   try {
-    return serve({ server, port, key, keyFile: keyPath, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
+    return serve({ server, cdpProxy, key, keyFile: keyPath, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
   } catch (e) {
     server.close();
+    cdpProxy.close();
     throw e;
   }
 }
 
 /** Synchronous on purpose (see startBroker). */
-function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
+function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
   // Heavy requires only once we own the pipe: a losing broker exits fast.
   const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
   const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -350,12 +340,16 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   const { SessionRegistry, MAIN_TAB } = require("./sessions.js");
   const PKG = require("../../package.json");
 
-  const cdpUrl = `http://127.0.0.1:${port}`;
+  const { redact } = require("./cdp-proxy.js");
+  // The only CDP endpoint, with its secret: for upstream and own-tools, never for display.
+  const cdpUrl = cdpProxy.wsUrl;
   const startedAt = Date.now();
   // W2E: the relay Inspector's traffic feed (every session's calls), or null
   const traffic = relayInspector ? new (require("../relay-server.js").TrafficEmitter)() : null;
   let relayInspectorCtl = null;
-  const supervisor = d.createSupervisor({ profileDir, port, env, log, poolConfig: d.poolConfig });
+  const supervisor = d.createSupervisor({ profileDir, env, log, poolConfig: d.poolConfig });
+  // each launch's verified pipe is what the proxy serves (503 while Brave is down)
+  if (typeof supervisor.on === "function") supervisor.on("pipe", (p) => cdpProxy.setPipe(p));
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
   const placement = env.BROWSER_RELAY_BROKER_WINDOWS === "offscreen" ? "offscreen" : "cascade";
@@ -370,7 +364,14 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     if (!upstreamPromise) {
       upstreamPromise = (async () => {
         const t0 = Date.now();
-        const up = await upstreamModule.loadUpstream({ cdpUrl, env });
+        let up;
+        try {
+          up = await upstreamModule.loadUpstream({ cdpUrl, env });
+        } finally {
+          // Upstream read it at import (into a constant): no child process
+          // or env dump of this one should see the secret.
+          delete process.env.BROWSER_CDP_ENDPOINT_URL;
+        }
         if (!uninstallWindows) uninstallWindows = getWindowPages().installWindowPerPage({ placement }) || (() => {});
         log(`upstream ${up.version} in-process: ${up.tools.length} tools in ${Date.now() - t0} ms`);
         return { up, byName: new Map(up.tools.map((e) => [e.name, e])) };
@@ -386,22 +387,9 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     ? Promise.resolve().then(() => seedProfile({ profileDir, log })).catch((e) => log(`profile seed failed (${e.message}); starting with a fresh profile`))
     : null;
 
-  // Our fixed CDP port can be taken before Brave's first launch (W2C then
-  // fails every launch). Exit cleanly: the shims start a broker on a new port.
-  let portLost = false;
   async function ensureBrave() {
     if (seeded) await seeded;
-    try {
-      return await supervisor.ensure();
-    } catch (e) {
-      if (!PORT_IN_USE_RE.test(e.message || "")) throw e;
-      if (!portLost) {
-        portLost = true;
-        // a moment later, so this call's error still reaches its session
-        setTimeout(() => closeAndExit(`CDP port ${port} is taken by another process`), 200);
-      }
-      throw new Error(`${e.message} The broker is restarting on a new port; retry the call.`);
-    }
+    return supervisor.ensure();
   }
 
   const registry = new SessionRegistry({
@@ -501,8 +489,12 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     }
   }
 
-  /** A forwarded (upstream) tools/call, as upstream's own server would answer it. */
+  /** A forwarded (upstream) tools/call, as upstream's own server would answer it; never carries the CDP secret. */
   async function callUpstream(connId, name, rawArgs) {
+    return redactResult(await callUpstreamRaw(connId, name, rawArgs));
+  }
+
+  async function callUpstreamRaw(connId, name, rawArgs) {
     try {
       const { tabId, ...args } = rawArgs || {};
       const tabKey = tabKeyOf(tabId);
@@ -535,30 +527,41 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
    * relay is the connection's RelayServer (per-session toolsets, elicitation,
    * list_changed). Whatever RelayServer passes as the second argument is
    * ignored: its own (legacy) ctx building has no browser here.
+   * cdpUrl carries the secret (the tool connects with it); its result and
+   * error text are redacted before RelayServer (and the Inspector) sees them.
    */
   function brokerOwnTool(tool, connId, relay) {
     const routed = tool.needsBrave !== false && tool.needsPage !== false;
+    async function run(args) {
+      if (tool.needsBrave === false) {
+        if (!supervisor.isUp()) return tool.handler(args, { relay });
+        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay }));
+      }
+      if (!routed) {
+        await ensureBrave(); // e.g. lighthouse_audit drives Brave over cdpUrl
+        checkProxyCredentials();
+        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay }));
+      }
+      const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay });
+      checkProxyCredentials();
+      const tabKey = tabKeyOf(args.tabId); // toolContext validated it
+      const notice = registry.takeResetNotice(connId, tabKey);
+      if (NEEDS_RENDERING_RE.test(tool.name)) await restoreWindow(ctx.page);
+      try {
+        return withNotice(await tool.handler(args, ctx), notice);
+      } catch (e) {
+        if (notice) e.message = `${notice}\n${e.message}`;
+        throw e;
+      }
+    }
     return {
       ...tool,
       async handler(args) {
-        if (tool.needsBrave === false) {
-          if (!supervisor.isUp()) return tool.handler(args, { relay });
-          return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay }));
-        }
-        if (!routed) {
-          await ensureBrave(); // e.g. lighthouse_audit drives Brave over cdpUrl
-          checkProxyCredentials();
-          return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay }));
-        }
-        const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay });
-        checkProxyCredentials();
-        const tabKey = tabKeyOf(args.tabId); // toolContext validated it
-        const notice = registry.takeResetNotice(connId, tabKey);
-        if (NEEDS_RENDERING_RE.test(tool.name)) await restoreWindow(ctx.page);
         try {
-          return withNotice(await tool.handler(args, ctx), notice);
+          return redactResult(await run(args));
         } catch (e) {
-          if (notice) e.message = `${notice}\n${e.message}`;
+          if (e && typeof e.message === "string") e.message = redact(e.message);
+          if (e && typeof e.stack === "string") e.stack = redact(e.stack);
           throw e; // RelayServer turns it into its usual isError result
         }
       },
@@ -709,6 +712,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       clearInterval(keyTimer);
       for (const s of sockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
+      await cdpProxy.close();
       if (relayInspectorCtl) await relayInspectorCtl.close().catch((e) => log(`closing the relay Inspector failed: ${e.message}`));
       if (uninstallWindows) uninstallWindows();
       log("bye");
@@ -739,15 +743,6 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       }
     },
   });
-
-  // W2C: Brave can't come back (e.g. our fixed CDP port is taken). Exit so
-  // the shims start a fresh broker on a new port.
-  if (typeof supervisor.on === "function") {
-    supervisor.on("fatal", (why) => {
-      log(`supervisor fatal: ${why}`);
-      closeAndExit(`supervisor fatal: ${why}`);
-    });
-  }
 
   const stopWatchdog = watchdog && watchdog.timeoutMs ? startWatchdog(watchdog, log) : () => {};
   // if our key file vanishes while we run, put it back, so new sessions still match us
@@ -787,7 +782,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       uptimeS: Math.round((Date.now() - startedAt) / 1000),
       pipe,
       profileDir,
-      cdpUrl,
+      cdpUrl: redact(cdpUrl),
       brave: { up, pid: up ? supervisor.pid : null },
       connections: [...sessions].map(([id, openedAt]) => ({
         id,
@@ -905,8 +900,9 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   // One broker serves every session: a stray throw must not take them all down.
-  process.on("uncaughtException", (e) => log(`uncaughtException (still serving): ${e.stack || e.message}`));
-  process.on("unhandledRejection", (e) => log(`unhandledRejection (still serving): ${(e && e.stack) || e}`));
+  const { redact } = require("./cdp-proxy.js");
+  process.on("uncaughtException", (e) => log(redact(`uncaughtException (still serving): ${e.stack || e.message}`)));
+  process.on("unhandledRejection", (e) => log(redact(`unhandledRejection (still serving): ${(e && e.stack) || e}`)));
 
   // the relay Inspector web UI (not Node's debugger), hosted by the broker
   const inspectorPort = require("../inspector-launch.js").inspectorPortFromEnv(env, log);
@@ -931,7 +927,7 @@ async function main(argv = process.argv.slice(2)) {
       onExit: () => process.exit(0),
     });
   } catch (e) {
-    log(`fatal: ${e.stack || e.message}`);
+    log(redact(`fatal: ${e.stack || e.message}`));
     process.exit(1);
   }
   if (!handle) process.exit(0);
@@ -944,8 +940,6 @@ if (require.main === module) main();
 
 module.exports = {
   startBroker,
-  chooseCdpPort,
-  CDP_PORT_RANGE,
   IdlePolicy,
   main,
   parseArgs,

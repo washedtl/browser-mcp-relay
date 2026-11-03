@@ -255,6 +255,41 @@ test("W2E/A8: loadUpstream resolves upstream from the env it is given (the broke
   assert.strictEqual(process.env.BROWSER_RELAY_UPSTREAM_PATH, undefined, "nothing copied into process.env");
 });
 
+test("W2G: loadUpstream's two URL-printing errors never print a CDP URL's secret (already bound; imported with another URL)", () => {
+  // Each in its own process: one upstream per process. Upstream connects
+  // lazily, so neither needs a browser.
+  const inproc = JSON.stringify(path.join(REPO_ROOT, "src", "broker", "upstream-inproc.js"));
+  const A = `ws://127.0.0.1:1/${"a".repeat(64)}/devtools/browser`;
+  const B = `ws://127.0.0.1:2/${"b".repeat(64)}/devtools/browser`;
+  const scripts = {
+    "already bound": `
+      const up = require(${inproc});
+      (async () => {
+        await up.loadUpstream({ cdpUrl: ${JSON.stringify(A)} });
+        await up.loadUpstream({ cdpUrl: ${JSON.stringify(B)} }).then(() => process.stdout.write("RESOLVED"), (e) => process.stdout.write(e.message));
+      })();`,
+    "imported with another URL": `
+      const up = require(${inproc});
+      const { pathToFileURL } = require("node:url");
+      (async () => {
+        Object.assign(process.env, up.FORCED_UPSTREAM_ENV, { BROWSER_CDP_ENDPOINT_URL: ${JSON.stringify(A)} });
+        await import(pathToFileURL(up.locateUpstreamChunks(up.resolveUpstreamPackage(process.env).distDir).config).href);
+        await up.loadUpstream({ cdpUrl: ${JSON.stringify(B)} }).then(() => process.stdout.write("RESOLVED"), (e) => process.stdout.write(e.message));
+      })();`,
+  };
+  const env = { ...process.env };
+  delete env.BROWSER_CDP_ENDPOINT_URL;
+  delete env.BROWSER_RELAY_UPSTREAM_PATH;
+  for (const [what, script] of Object.entries(scripts)) {
+    const r = spawnSync(process.execPath, ["-e", script], { env, encoding: "utf8", timeout: 60000 });
+    assert.strictEqual(r.status, 0, `${what}: ${r.stderr}`);
+    const msg = r.stdout;
+    assert.match(msg, what === "already bound" ? /already bound to/ : /BROWSER_CDP_CONNECT_URL is/, `${what}: ${msg}`);
+    assert.ok(!msg.includes("a".repeat(64)) && !msg.includes("b".repeat(64)), `${what} printed a secret: ${msg}`);
+    assert.ok(msg.includes("ws://127.0.0.1:1/<redacted>/devtools/browser") && msg.includes("ws://127.0.0.1:2/<redacted>/devtools/browser"), `${what}: ${msg}`);
+  }
+});
+
 test("loadUpstream: rejects a missing or malformed cdpUrl", async () => {
   await assert.rejects(up.loadUpstream({}), /cdpUrl/);
   await assert.rejects(up.loadUpstream({ cdpUrl: "127.0.0.1:9222" }), /cdpUrl/);

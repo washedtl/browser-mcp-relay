@@ -32,6 +32,7 @@ const README = path.join(REPO, "README.md");
 const SERIAL_FILES = [
   "brave-supervisor.test.js",
   "cdp-bridge.test.js",
+  "cdp-lockdown.test.js",
   "e2e-broker.test.js",
   "shim.test.js",
   "upstream-contract.test.js",

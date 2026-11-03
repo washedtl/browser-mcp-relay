@@ -18,7 +18,10 @@
 //     registry.context — stealth_apply patches it, tabs_new/tabs_select say
 //     upstream tools ignore tabId); otherwise per-connection (broker: the
 //     BrowserContext is shared, so only the connection's own tabs are touched).
-//   • cdpUrl — the browser's http:// CDP endpoint (lighthouse_audit).
+//   • cdpUrl — the browser's CDP endpoint (lighthouse_audit). Broker mode: the
+//     broker's proxy, ws://127.0.0.1:<port>/<secret>/devtools/browser (no
+//     /json/*; never print it: the broker redacts results, logs and errors).
+//     Legacy mode: http://127.0.0.1:<port> (cdp-bridge.js).
 //   • relay — an object toolsets can drive: upstreamCatalog(),
 //     enabledToolsets (Set), setToolsetsEnabled(sets, on), askUser(params),
 //     canNotify (the RelayServer has all of these).

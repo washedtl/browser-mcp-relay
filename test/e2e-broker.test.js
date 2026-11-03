@@ -9,6 +9,10 @@
 // Skipped without Windows + Brave.
 //
 // Prints the measured numbers (cold start, recoveries, 3-session memory).
+//
+// W2G: Brave has no TCP debugging port (no LISTEN socket on any of its
+// processes); the broker's CDP proxy refuses everything without its secret;
+// no tool result, status, broker log line or shim stderr carries the secret.
 
 const test = require("node:test");
 const assert = require("node:assert");
@@ -43,6 +47,32 @@ function processes({ needle = null, pids = [] }) {
     return { pid: Number(pid), name, privateMB: Number(priv) / 1048576, wsMB: Number(ws) / 1048576, cmd: cmd.join("|") };
   }).filter((p) => p.pid !== process.pid && !p.cmd.includes("Get-CimInstance Win32_Process")); // not this query's own shell
 }
+
+/** TCP LISTEN sockets owned by these PIDs: ["pid|addr:port"]. */
+function listeners(pids) {
+  if (!pids.length) return [];
+  const ps = `Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { @(${pids.join(",")}) -contains $_.OwningProcess } | ForEach-Object { '' + $_.OwningProcess + '|' + $_.LocalAddress + ':' + $_.LocalPort }`;
+  const r = spawnSync("powershell", ["-NoProfile", "-Command", ps], { encoding: "utf8", windowsHide: true, timeout: 60000 });
+  return (r.stdout || "").split(/\r?\n/).filter(Boolean);
+}
+function listenerOwners(port) {
+  const ps = `Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | ForEach-Object { '' + $_.OwningProcess }`;
+  const r = spawnSync("powershell", ["-NoProfile", "-Command", ps], { encoding: "utf8", windowsHide: true, timeout: 60000 });
+  return (r.stdout || "").split(/\r?\n/).filter(Boolean).map(Number);
+}
+/** A websocket upgrade's outcome: "OPEN" or "HTTP <status>". */
+function wsStatus(url) {
+  const WebSocket = require("ws");
+  return new Promise((resolve) => {
+    const ws = new WebSocket(url, { perMessageDeflate: false });
+    const done = (v) => { try { ws.terminate(); } catch { /* closed */ } resolve(v); };
+    ws.once("open", () => done("OPEN"));
+    ws.once("unexpected-response", (_req, res) => done(`HTTP ${res.statusCode}`));
+    ws.once("error", (e) => done(`error ${e.message}`));
+  });
+}
+// The broker's CDP URL with its secret (it must never reach a session, status or log)
+const SECRET_URL_RE = /[0-9a-f]{64}\/devtools\/browser/i;
 
 /** A local site: cookies, per-page titles, a fetch the stub tests intercept, localStorage. */
 function startSite() {
@@ -107,7 +137,11 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     sessions.push(s);
     return s;
   }
-  const call = (s, name, args = {}) => s.client.callTool({ name, arguments: args }, undefined, { timeout: 90_000 });
+  const call = async (s, name, args = {}) => {
+    const r = await s.client.callTool({ name, arguments: args }, undefined, { timeout: 90_000 });
+    assert.doesNotMatch(JSON.stringify(r), SECRET_URL_RE, `${name}'s result carries the CDP secret`);
+    return r;
+  };
   async function textOfPage(s, args, want) {
     let last = "";
     await until(async () => {
@@ -160,6 +194,27 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
   });
 
   const [A, B, C] = [0, 1, 2].map((i) => () => sessions[i]);
+
+  await t.test("W2G: Brave has no TCP port; the broker's CDP proxy refuses all without its secret; lighthouse_audit runs through it", async () => {
+    const st = await status();
+    const m = /^ws:\/\/127\.0\.0\.1:(\d+)\/<redacted>\/devtools\/browser$/.exec(st.cdpUrl);
+    assert.ok(m, `status shows the CDP URL without its secret: ${st.cdpUrl}`);
+    const proxyPort = Number(m[1]);
+    const brave = processes({ needle: path.basename(profileDir) }).filter((x) => /^brave\.exe$/i.test(x.name));
+    assert.ok(brave.some((x) => x.pid === st.brave.pid), `the browser ${st.brave.pid} among ${brave.map((x) => x.pid)}`);
+    numbers.braveProcesses = brave.length;
+    numbers.braveListenSockets = listeners(brave.map((x) => x.pid));
+    assert.deepStrictEqual(numbers.braveListenSockets, [], "a Brave process listens on TCP");
+    assert.ok(!fs.existsSync(path.join(profileDir, "DevToolsActivePort")), "Brave opened a debugging port");
+    assert.deepStrictEqual(listenerOwners(proxyPort), [st.pid], "the CDP proxy is the broker's");
+    assert.strictEqual((await fetch(`http://127.0.0.1:${proxyPort}/json/version`)).status, 404);
+    assert.strictEqual(await wsStatus(`ws://127.0.0.1:${proxyPort}/devtools/browser`), "HTTP 403");
+    const t0 = Date.now();
+    const r = await call(A(), "lighthouse_audit", { url: `${base}/page/lighthouse`, onlyCategories: ["seo"] });
+    numbers.lighthouseMs = Date.now() - t0;
+    assert.ok(!r.isError, `${textOf(r)}\n${brokerLog()}`);
+    assert.ok(Number.isInteger(JSON.parse(textOf(r)).categories.seo.score), textOf(r));
+  });
 
   await t.test("a cookie set in session A is visible in session B (one profile)", async () => {
     assert.ok(!(await call(A(), "navigation_go-to", { url: `${base}/set?v=fromA` })).isError);
@@ -268,6 +323,11 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     numbers.idleExitMs = Date.now() - t0;
     assert.match(brokerLog(), /no connections for 4000 ms/);
     assert.match(brokerLog(), /closed gracefully/);
+    // W2G: neither broker's log nor any shim's stderr carries the CDP secret
+    const fullLog = fs.readFileSync(path.join(brokerHome(env), "broker.log"), "utf8");
+    assert.match(fullLog, /CDP ws:\/\/127\.0\.0\.1:\d+\/<redacted>\/devtools\/browser/);
+    assert.doesNotMatch(fullLog, SECRET_URL_RE);
+    for (const sess of sessions) assert.doesNotMatch(sess.stderr(), SECRET_URL_RE, sess.name);
   });
 });
 

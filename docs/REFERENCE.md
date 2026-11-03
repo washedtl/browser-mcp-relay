@@ -389,7 +389,7 @@ Claude session N ── stdio ──▶ shim ───────────�
 
 ### Legacy mode
 
-`BROWSER_RELAY_MODE=legacy` (the default on macOS and Linux): each MCP session runs its own relay, with its own Brave and its own upstream child, as before v0.4.
+`BROWSER_RELAY_MODE=legacy` (the default on macOS and Linux): each MCP session runs its own relay, with its own Brave and its own upstream child, as before v0.4. Its Brave keeps an unauthenticated TCP debugging port (`9333 + slot - 1`) that upstream attaches to; broker mode has none (see *Broker mode: known risks*).
 
 ```
                     stdio JSON-RPC
@@ -523,7 +523,7 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 
 **A graceful close** sends Brave `Browser.close` and waits up to 10 s for it to exit. Brave accepts at once (it drops the DevTools connection within ~10 ms) and then writes its cookies and settings, which took 6 s on a machine at 100% CPU. So once it has accepted, it gets up to 30 s in all before it is killed; one that ignores the close is killed at 10 s.
 
-Brave's CDP port is a random free port in 10000–32000, fixed for the broker's life. That is below every default ephemeral range, so outbound connections can't take it while Brave is down (before its first launch, or after an idle close) and force a broker restart.
+**Brave has no CDP port.** It runs with `--remote-debugging-pipe`: the broker talks to it over two pipes only it holds, and no Brave process listens on TCP (measured: 0 listening sockets on any of its processes). Upstream and the broker's own tools reach it through the broker's CDP proxy at `ws://127.0.0.1:<port>/<secret>/devtools/browser`, where `<secret>` is 256 random bits made at startup. The broker holds that port for its whole life, so a relaunched Brave sits behind the same URL. Without the exact secret path, the proxy refuses every request: all `/json/*` discovery (404), and any websocket upgrade with a wrong path, an `Origin` header (a web page) or a foreign `Host` (DNS rebinding) (403). While Brave is down it answers 503. Clients can't send `Browser.close` or `Browser.crash` to the shared Brave. The secret never leaves the broker: the log, `broker:status`, the relay Inspector and tool results show `<redacted>` in its place.
 
 ### Profile: seeded once, then Brave's own
 
@@ -916,7 +916,7 @@ Which pool slots have valid locks vs. stale ones. The relay self-heals stale loc
 
 ### Check whether a relay is actually responding
 
-If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the slot's CDP port (`9333 + slot - 1`).
+If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the slot's CDP port (`9333 + slot - 1`). Legacy mode only: in broker mode Brave has no CDP port, so use `npm run broker:status`.
 
 ```powershell
 Invoke-WebRequest -Uri "http://127.0.0.1:9333/json/version" -UseBasicParsing | Select-Object StatusCode, @{
@@ -981,7 +981,7 @@ Then `Get-Content <absolute-path>/relay-stderr.log -Tail 50 -Wait` to follow it 
 - **Shared blast radius.** One broker serves every session. A hung tool, a leak or a crash in it affects all sessions at once, where a legacy relay affected one. Mitigations: per-call timeouts on the data-out tools, `uncaughtException` is logged and the broker keeps serving, a watchdog for a blocked event loop, a recycle on high idle memory, and the next call reconnects within seconds.
 - **`execute` runs in-process.** Upstream's `execute` (and `scenario-run`) evaluate agent-written JavaScript inside the broker process, shared by every session. A runaway script blocks all of them until the watchdog restarts the broker.
 - **Pipe access is browser access.** Any process of yours that can open the pipe drives the logged-in Brave. `broker.key` only stops a fake broker from impersonating the real one; it does not keep any client out. That is why the broker de-elevates; when it can't, it says so in the log and in every session.
-- **The CDP port is unauthenticated.** While Brave is up, any local process can connect to its DevTools port, drive the logged-in Brave and read its cookies. Mitigations: the port is random (10000–32000) and bound to 127.0.0.1 only, and Brave idle-closes after 20 min. Legacy mode has the same exposure on its fixed 9333 + slot ports.
+- **CDP port: broker mode: none; legacy: unauthenticated port.** In broker mode Brave has no DevTools port (`--remote-debugging-pipe`), and CDP is served only behind the broker's secret URL (see *Idle, crashes, restarts*). A process that can read the broker's memory can find the secret, but a process running as you can read the profile on disk anyway. Legacy mode keeps an unauthenticated port: while its Brave is up, any local process can connect to the fixed `9333 + slot` port (127.0.0.1 only), drive the logged-in Brave and read its cookies.
 - **Tab scoping is a convenience, not a security boundary.** `tabId` keeps parallel agents from stepping on each other's tabs, but all sessions share one browser: `execute` runs in the broker process, and any page's `page.context()` reaches every tab.
 - **Upstream internals.** The broker imports `browser-devtools-mcp`'s bundled chunks by their export names (pinned to 0.6.12, asserted by `test/upstream-contract.test.js`). An upstream bump can break broker mode while legacy mode still works.
 - **Not in broker mode yet:** credential-vault autofill (`BROWSER_RELAY_VAULT_FILES`) and authenticated proxies (a `user:pass@` proxy URL is used without its credentials, with a warning). Use legacy mode if you need these.

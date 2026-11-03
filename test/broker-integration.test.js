@@ -61,6 +61,9 @@ async function startTestBroker(t, { seedProfile = null, relayInspector = null, s
   return { pipe, handle, logs, exits, sup: () => sup };
 }
 
+/** The secret in a test broker's CDP URL (handle.cdpUrl is in-process only). */
+const secretOf = (b) => /\/([0-9a-f]{64})\//.exec(b.handle.cdpUrl)[1];
+
 async function connectClient(t, pipe) {
   const client = new Client({ name: "integ", version: "0" });
   await client.connect(new fakes.SocketClientTransport(pipe, { hello: { key: KEY } }));
@@ -80,7 +83,7 @@ test("seed: the one-time profile seed finishes before Brave's first launch", asy
       order.push("seed:done");
     },
     supervisor: (opts) => Object.assign(fakes.fakeSupervisor(opts), {
-      async ensure() { order.push("brave:ensure"); return { cdpUrl: `http://127.0.0.1:${opts.port}`, pid: 4242 }; },
+      async ensure() { order.push("brave:ensure"); return { pid: 4242 }; },
       isUp: () => true,
     }),
   });
@@ -116,6 +119,9 @@ test("control status: connections with their tabs, Brave up + pid, pipe, profile
   assert.strictEqual(s.pid, process.pid);
   assert.strictEqual(s.pipe, b.pipe);
   assert.deepStrictEqual(s.brave, { up: true, pid: 4242 });
+  // W2G: broker:status shows where CDP is served, never the secret that opens it
+  assert.match(s.cdpUrl, /^ws:\/\/127\.0\.0\.1:\d+\/<redacted>\/devtools\/browser$/);
+  assert.ok(!JSON.stringify(r).includes(secretOf(b)), "status carries the secret");
   assert.strictEqual(s.connections.length, 1, "the control connection itself is not listed");
   assert.deepStrictEqual(s.connections[0].tabs.map((x) => [x.tabId, x.state]), [["main", "open"], ["sub1", "open"]]);
   assert.match(s.connections[0].tabs[0].url, /^about:blank#c\d+:main$/);
@@ -218,9 +224,16 @@ test("relay Inspector: one per broker; /api/broker shows sessions + tabs; every 
   const c1 = await connectClient(t, b.pipe);
   const c2 = await connectClient(t, b.pipe);
   await c1.callTool({ name: "navigation_go-to", arguments: { url: "https://a.example/" } });
-  await c2.callTool({ name: "own_probe", arguments: { v: "x" } });
+  await c2.callTool({ name: "own_probe", arguments: { v: "x" } }); // its result carries ctx.cdpUrl
+  await c1.callTool({ name: "navigation_go-to", arguments: { url: "leak-error://" } }); // an error carrying it
 
-  const broker = JSON.parse((await get(port, "/api/broker")).body);
+  const brokerRaw = (await get(port, "/api/broker")).body;
+  const broker = JSON.parse(brokerRaw);
+  // W2G: neither the status nor the traffic feed carries the CDP secret
+  assert.match(broker.cdpUrl, /\/<redacted>\/devtools\/browser$/);
+  const activityRaw = (await get(port, "/api/activity")).body;
+  for (const raw of [brokerRaw, activityRaw]) assert.ok(!raw.includes(secretOf(b)), raw.slice(0, 500));
+  assert.ok(activityRaw.includes("<redacted>"), "the leaking calls were recorded, redacted");
   assert.strictEqual(broker.connections.length, 2);
   assert.deepStrictEqual(broker.brave, { up: true, pid: 4242 });
   // V2-d: the inspector's rules — no absolute paths, URLs without query / fragment
@@ -230,7 +243,7 @@ test("relay Inspector: one per broker; /api/broker shows sessions + tabs; every 
 
   const { events } = JSON.parse((await get(port, "/api/activity")).body);
   const requests = events.filter((e) => e.method === "tools/call");
-  assert.deepStrictEqual(requests.map((e) => [e.name, e.source]).sort(), [["navigation_go-to", "upstream"], ["own_probe", "own"]]);
+  assert.deepStrictEqual(requests.map((e) => [e.name, e.source]).sort(), [["navigation_go-to", "upstream"], ["navigation_go-to", "upstream"], ["own_probe", "own"]]);
   assert.strictEqual(new Set(requests.map((e) => e.conn)).size, 2, "events say which session made them");
   assert.ok(events.some((e) => e.status === "ok"), "responses recorded too");
 
@@ -280,6 +293,7 @@ test("BROWSER_HEADLESS_ENABLE / BROWSER_RELAY_IGNORE_HTTPS_ERRORS (broker env) r
       deps: { upstreamModule: () => fakes.fakeUpstreamModule(), loadCatalog: async () => fakes.FAKE_CATALOG, ownTools: () => [], toolContext: fakes.fakeToolContextModule },
     });
     real[label] = [handle.supervisor._headless, handle.supervisor._ignoreHttpsErrors];
+    assert.strictEqual(handle.supervisor.listenerCount("pipe"), 1, "each verified launch's pipe goes to the CDP proxy");
     await handle.close("test done");
   }
   assert.deepStrictEqual(real, { on: [true, true], off: [false, false] });
@@ -311,36 +325,8 @@ test("A8: the broker loads upstream with its own merged env (one env writer: bro
   const c = await connectClient(t, b.pipe);
   await c.callTool({ name: "content_get-as-text", arguments: {} });
   assert.strictEqual(seen.env, env);
-  assert.match(seen.cdpUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
-});
-
-// ── the CDP port: random, outside the OS ephemeral ranges ──
-
-test("chooseCdpPort: a free port in 10000-32000 (below Windows' 49152+ and Linux's 32768+ ephemeral ranges)", async () => {
-  const { chooseCdpPort, CDP_PORT_RANGE } = require("../src/broker/main.js");
-  assert.deepStrictEqual(CDP_PORT_RANGE, { min: 10000, max: 32000 });
-  for (let i = 0; i < 20; i++) {
-    const port = await chooseCdpPort();
-    assert.ok(Number.isInteger(port) && port >= 10000 && port <= 32000, `got ${port}`);
-  }
-});
-
-test("chooseCdpPort: a taken candidate is skipped (real bind test); all taken → a clear error", async (t) => {
-  const { chooseCdpPort, CDP_PORT_RANGE } = require("../src/broker/main.js");
-  const toRandom = (port) => (port - CDP_PORT_RANGE.min) / (CDP_PORT_RANGE.max - CDP_PORT_RANGE.min + 1);
-  // hold a port in the range, then make it the first candidate
-  let held = null;
-  let taken = 0;
-  for (let p = 20000; p < 20100 && !held; p++) {
-    const s = net.createServer();
-    if (await new Promise((r) => { s.once("error", () => r(false)); s.listen({ port: p, host: "127.0.0.1", exclusive: true }, () => r(true)); })) { held = s; taken = p; }
-  }
-  assert.ok(held, "could not hold a test port");
-  t.after(() => held.close());
-  const picks = [toRandom(taken), toRandom(taken + 500)];
-  const port = await chooseCdpPort({ random: () => picks.shift() });
-  assert.strictEqual(port, taken + 500, "the held candidate was skipped");
-  await assert.rejects(chooseCdpPort({ random: () => toRandom(taken) }), /no free CDP port in 10000-32000 after 20 tries/);
+  assert.match(seen.cdpUrl, /^ws:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{64}\/devtools\/browser$/);
+  assert.strictEqual(seen.cdpUrl, b.handle.cdpUrl);
 });
 
 // ── warnings a session hears (hello reply → its stderr + first tool result) ──
