@@ -138,6 +138,23 @@ test("W1E-6: launchBrave with a proxy ignores HTTPS errors (MITM debug proxy)", 
   });
 });
 
+test("W2E: a REMOTE proxy (reachable, or kept while unreachable) keeps TLS verification on", async () => {
+  for (const probe of [PROXY_UP, PROXY_DOWN]) {
+    await withMockChromium(async (fresh, captured) => {
+      await fresh.launchBrave({
+        userDataDir: "/tmp/x",
+        port: 9999,
+        executablePath: "/fake/brave",
+        proxyUrl: "http://10.0.0.5:8080",
+        _probeProxy: probe,
+        _relayEnv: {},
+      });
+      assert.strictEqual(captured.launchOpts.proxy.server, "http://10.0.0.5:8080", "the remote proxy is in use");
+      assert.strictEqual(captured.launchOpts.ignoreHTTPSErrors, false);
+    });
+  }
+});
+
 test("W1E V1-2: BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true restores always-ignore without a proxy", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({
@@ -343,7 +360,8 @@ test("W1E V1-1: unreachable REMOTE proxy is kept (never silently direct) and log
       _relayEnv: {},
     });
     assert.deepStrictEqual(captured.launchOpts.proxy, { server: "http://proxy.example.net:3128", bypass: BYPASS });
-    assert.strictEqual(captured.launchOpts.ignoreHTTPSErrors, true);
+    // W2E: a remote proxy never turns certificate checks off
+    assert.strictEqual(captured.launchOpts.ignoreHTTPSErrors, false);
   }));
   assert.match(log, /WARNING/);
   assert.match(log, /NOT reachable/);

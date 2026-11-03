@@ -112,11 +112,11 @@ function cdpCallsOf(profileDir, method) {
 }
 const IGNORE_CERTS = "Security.setIgnoreCertificateErrors";
 
-test("W2E TLS: by default (no proxy, no opt-in) certificates stay verified", async () => {
+test("W2E TLS: by default (no proxy, no opt-in) certificates stay verified (set explicitly per launch)", async () => {
   const dir = tmpProfile("fake-tls-default");
   const { sup, log } = fakeSupervisor(dir);
   await sup.ensure();
-  assert.deepStrictEqual(cdpCallsOf(dir, IGNORE_CERTS), []);
+  assert.deepStrictEqual(cdpCallsOf(dir, IGNORE_CERTS).map((c) => c.params), [{ ignore: false }]);
   assert.ok(!log.lines.some((l) => /certificate/i.test(l)), log.lines.join("\n"));
 });
 
@@ -134,11 +134,34 @@ test("W2E TLS: ignoreHttpsErrors (BROWSER_RELAY_IGNORE_HTTPS_ERRORS) → ignored
   assert.ok(log.lines.some((l) => /BROWSER_RELAY_IGNORE_HTTPS_ERRORS/.test(l)));
 });
 
-test("W2E TLS: a proxy in use → ignored (its MITM certificate works); a dead loopback proxy (launched direct) → verified", async () => {
+test("W2E TLS: a REMOTE proxy (kept while unreachable, or reachable) never turns checks off: verified", async () => {
+  const dir = tmpProfile("fake-tls-proxy-remote");
+  const { sup, log } = fakeSupervisor(dir, { proxyUrl: "http://10.255.255.1:8080", proxyProbeTimeoutMs: 300 });
+  await sup.ensure();
+  assert.ok(launchesOf(dir)[0].args.includes("--proxy-server=http://10.255.255.1:8080"), "the remote proxy is in use");
+  assert.deepStrictEqual(cdpCallsOf(dir, IGNORE_CERTS).map((c) => c.params), [{ ignore: false }]);
+  assert.ok(!log.lines.some((l) => /certificate errors are ignored/.test(l)));
+});
+
+test("W2E TLS: a relaunch re-sets the checks: a loopback proxy that went down → launched direct, checks back on", async () => {
+  const dir = tmpProfile("fake-tls-relaunch");
+  const proxy = net.createServer((sock) => sock.destroy());
+  const live = await listen(proxy);
+  const { sup } = fakeSupervisor(dir, { proxyUrl: `http://127.0.0.1:${live}` });
+  const first = await sup.ensure();
+  await new Promise((r) => proxy.close(r));
+  const down = nextEvent(sup, "down");
+  process.kill(first.pid);
+  await down;
+  const second = await sup.ensure();
+  assert.deepStrictEqual(cdpCallsOf(dir, IGNORE_CERTS).map((c) => [c.pid, c.params]), [[first.pid, { ignore: true }], [second.pid, { ignore: false }]]);
+});
+
+test("W2E TLS: a LOOPBACK proxy in use → ignored (its MITM certificate works); a dead loopback proxy (launched direct) → verified", async () => {
   const deadDir = tmpProfile("fake-tls-proxy-dead");
   const { sup: s1 } = fakeSupervisor(deadDir, { proxyUrl: `http://127.0.0.1:${await deadPort()}` });
   await s1.ensure();
-  assert.deepStrictEqual(cdpCallsOf(deadDir, IGNORE_CERTS), []);
+  assert.deepStrictEqual(cdpCallsOf(deadDir, IGNORE_CERTS).map((c) => c.params), [{ ignore: false }]);
 
   const proxy = net.createServer((sock) => sock.destroy());
   const live = await listen(proxy);

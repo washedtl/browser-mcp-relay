@@ -109,6 +109,7 @@ async function launchBrave({
   // the real IP anyway). Remote + unreachable → keep it: going direct would
   // silently expose the real IP.
   let proxy = null;
+  let proxyIsLoopback = false;
   if (proxyUrl) {
     const parsed = parseProxyUrl(proxyUrl);
     const reachable = await _probeProxy(parsed.host, parsed.port, PROXY_PROBE_TIMEOUT_MS);
@@ -125,6 +126,7 @@ async function launchBrave({
         );
       }
       proxy = parsed.proxy;
+      proxyIsLoopback = isLoopbackHost(parsed.host);
       process.stderr.write(
         `[mcp-relay] proxy whitelist ACTIVE — Brave traffic routes through ${proxy.server}\n`,
       );
@@ -154,10 +156,11 @@ async function launchBrave({
     headless,
     args,
     ignoreDefaultArgs,
-    // Accept any TLS cert — ONLY while a proxy is in use (W1E-6), or when
-    // the user opts in with BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true (env or
-    // local-config.json; e.g. a corporate MITM proxy configured at the OS
-    // level). A debug proxy presents its own MITM cert, and Chromium's cert
+    // Accept any TLS cert — ONLY while a LOOPBACK proxy is in use (W1E-6;
+    // W2E: a remote proxy, e.g. a residential one, must never be able to MITM
+    // the profile holding every login), or when the user opts in with
+    // BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true (env or local-config.json; e.g. a
+    // corporate MITM proxy configured at the OS level). A debug proxy presents its own MITM cert, and Chromium's cert
     // verifier under Playwright doesn't reliably honor user-installed
     // Windows roots, so navigation through it can throw
     // ERR_CERT_AUTHORITY_INVALID even with the CA trusted at the OS level.
@@ -168,7 +171,7 @@ async function launchBrave({
     // browser. Preferred over `--ignore-certificate-errors` because that flag
     // requires `--test-type=webdriver`, which suppresses Brave's password-
     // manager UI.
-    ignoreHTTPSErrors: Boolean(proxy) || _relayEnv.BROWSER_RELAY_IGNORE_HTTPS_ERRORS === "true",
+    ignoreHTTPSErrors: proxyIsLoopback || _relayEnv.BROWSER_RELAY_IGNORE_HTTPS_ERRORS === "true",
     handleSIGINT: false,
     handleSIGTERM: false,
   };

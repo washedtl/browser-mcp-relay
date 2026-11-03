@@ -55,7 +55,8 @@ class BraveSupervisor extends EventEmitter {
    * @param {string|null} [opts.extensionPath] — unpacked extension for --load-extension
    * @param {boolean} [opts.headless=false] — --headless=new (BROWSER_HEADLESS_ENABLE, as in legacy mode)
    * @param {boolean} [opts.ignoreHttpsErrors=false] — accept any TLS certificate
-   *   (BROWSER_RELAY_IGNORE_HTTPS_ERRORS). Also on, per launch, while Brave uses a proxy.
+   *   (BROWSER_RELAY_IGNORE_HTTPS_ERRORS). Also on, per launch, while Brave uses a
+   *   LOOPBACK proxy (a local debug proxy's MITM certificate); never for a remote one.
    * @param {string|null} [opts.proxyUrl] — --proxy-server (scheme://host:port only);
    *   policy in resolveProxy(); credentials go to `proxyCredentials`
    * @param {(msg: string) => void} [opts.log] — default: stderr
@@ -218,11 +219,7 @@ class BraveSupervisor extends EventEmitter {
       throw e;
     }
     this._portUsed = true; // from here on cdpUrl is out there: the port is pinned
-    // TLS is verified by default (as in legacy mode, W1E): only the opt-in or
-    // a proxy actually in use (its MITM certificate) turns the checks off
-    if (this._ignoreHttpsErrors || proxyServer) {
-      await this._ignoreCertificateErrors(proc, this._ignoreHttpsErrors ? "BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true" : `traffic goes through proxy ${proxyServer}`);
-    }
+    await this._setCertificateChecks(proc, this._certificateChecksOffReason(proxyServer));
     this._proxyCredentials = proxy ? proxy.credentials : null;
     this._launches++;
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
@@ -314,12 +311,28 @@ class BraveSupervisor extends EventEmitter {
   }
 
   /**
-   * Security.setIgnoreCertificateErrors on our browser-level CDP session:
-   * browser-wide, for as long as that session (this launch) lives. A failure
-   * leaves certificates verified.
+   * Why TLS certificate checks go off for a launch through `proxyServer`
+   * (the proxy actually chosen, or null), or null: they stay on. Same rule as
+   * legacy mode (cdp-bridge.js): the opt-in, or a LOOPBACK proxy (a local
+   * debug proxy presenting its own certificate). A remote proxy, reachable
+   * or kept while unreachable, must never be able to MITM the profile that
+   * holds every login, so it gets verified TLS.
    */
-  async _ignoreCertificateErrors(proc, why) {
-    const r = await cdpCall(proc, "Security.setIgnoreCertificateErrors", { ignore: true });
+  _certificateChecksOffReason(proxyServer) {
+    if (this._ignoreHttpsErrors) return "BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true";
+    if (proxyServer && isLoopbackHost(parseProxyUrl(proxyServer).host)) return `local proxy ${proxyServer}`;
+    return null;
+  }
+
+  /**
+   * Security.setIgnoreCertificateErrors on our browser-level CDP session, set
+   * explicitly on every launch (re-applied after a relaunch, or cleared):
+   * browser-wide, for as long as that session (this launch) lives. A failure
+   * to turn checks off leaves certificates verified.
+   */
+  async _setCertificateChecks(proc, why) {
+    const r = await cdpCall(proc, "Security.setIgnoreCertificateErrors", { ignore: Boolean(why) });
+    if (!why) return;
     if (!r || r.error) {
       this._log(`warning: could not turn off TLS certificate checks (${why}): ${r ? r.error.message : "no CDP answer"}; certificates stay verified`);
       return;
