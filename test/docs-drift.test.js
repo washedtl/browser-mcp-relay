@@ -176,6 +176,7 @@ test("W2E: smoke checks broker mode (Windows) on a private pipe + temp profile w
   assert.match(env.BROWSER_RELAY_BROKER_PIPE, /smoke/, "a private pipe, never the real broker's");
   assert.ok(env.BROWSER_RELAY_BROKER_PROFILE_DIR.startsWith(path.normalize("/tmp/x")), "a temp profile, never the real one");
   assert.ok(Number(env.BROWSER_RELAY_BROKER_IDLE_EXIT_MS) <= 5000, "the smoke broker exits on its own right after");
+  assert.ok(env.LOCALAPPDATA === "/tmp/x" && env.XDG_STATE_HOME === "/tmp/x", "a temp broker home: never the real key or work dir");
   assert.strictEqual(smoke.modeEnv("legacy", "/tmp/x").BROWSER_RELAY_MODE, "legacy");
   const setup = fs.readFileSync(path.join(REPO, "scripts", "setup.js"), "utf8");
   assert.ok(setup.includes("smoke.smokeModes("), "setup runs smoke.js's checks");

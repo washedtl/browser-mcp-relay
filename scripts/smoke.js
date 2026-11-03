@@ -57,9 +57,9 @@ function killTree(child) {
 /**
  * The relay's env for one check. Every check counts the whole catalog (all
  * toolsets) from a refreshed catalog cache, so the upstream really starts.
- * Broker mode runs on a private pipe and an empty temp profile, and that
- * broker exits 2 s after the check: nothing is left running, and the real
- * broker (its pipe, its profile) is never touched.
+ * Broker mode runs on a private pipe, an empty temp profile and a temp
+ * broker home, and that broker exits 2 s after the check: nothing is left
+ * running, and the real broker (its pipe, profile, key) is never touched.
  */
 function modeEnv(mode, scratchDir) {
   const env = { BROWSER_RELAY_MODE: mode, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" };
@@ -71,6 +71,9 @@ function modeEnv(mode, scratchDir) {
       BROWSER_RELAY_BROKER_PROFILE_DIR: path.join(scratchDir, "profile"),
       BROWSER_RELAY_BROKER_LOG: path.join(scratchDir, "broker.log"),
       BROWSER_RELAY_BROKER_IDLE_EXIT_MS: "2000",
+      // the broker home (its key, work dir) too: never the real one under LOCALAPPDATA
+      LOCALAPPDATA: scratchDir,
+      XDG_STATE_HOME: scratchDir,
     });
   }
   return env;
