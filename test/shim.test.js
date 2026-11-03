@@ -17,8 +17,15 @@ const crypto = require("node:crypto");
 const { PassThrough } = require("node:stream");
 const { execFileSync } = require("node:child_process");
 
-const { Shim, runLauncher, launcherArgs, resolveShimOptions, SHIM_FILE, BROKER_MAIN } = require("../src/shim.js");
-const { resolveEndpoint } = require("../src/broker/pipe-server.js");
+const { Shim, runLauncher, launchEnv, launcherArgs, resolveShimOptions, onLines, SHIM_FILE, BROKER_MAIN } = require("../src/shim.js");
+const { resolveEndpoint, keyFileFor, loadOrCreateKey, helloMac, settingsHash } = require("../src/broker/pipe-server.js");
+const { quoteArg, commandLine, isElevated } = require("../src/broker/deelevate.js");
+
+// one key for the in-process tests (the fake broker below answers with it)
+const KEY_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-shim-key-"));
+const KEY_FILE = path.join(KEY_DIR, "broker.key");
+const KEY = loadOrCreateKey(KEY_FILE);
+test.after(() => fs.rmSync(KEY_DIR, { recursive: true, force: true }));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(cond, ms = 5000, what = "condition") {
@@ -46,9 +53,14 @@ function defaultReply(msg) {
   return null; // "slow" and notifications: no reply
 }
 
-async function fakeBroker(t, pipe, { reply = defaultReply } = {}) {
+/**
+ * A scripted broker. It answers the shim's hello with KEY (or, as a
+ * squatter, with garbage), records hellos apart from the JSON-RPC traffic.
+ */
+async function fakeBroker(t, pipe, { reply = defaultReply, squat = false } = {}) {
   const conns = [];
   const received = [];
+  const hellos = [];
   const server = net.createServer((sock) => {
     const conn = conns.push(sock) - 1;
     sock.setEncoding("utf8");
@@ -61,6 +73,12 @@ async function fakeBroker(t, pipe, { reply = defaultReply } = {}) {
         if (!line) continue;
         let msg;
         try { msg = JSON.parse(line); } catch { received.push({ conn, raw: line }); continue; }
+        if (msg.bmr === "hello") {
+          hellos.push({ conn, msg });
+          const mac = squat ? crypto.randomBytes(32).toString("hex") : helloMac(KEY, msg.nonce);
+          sock.write(JSON.stringify({ bmr: "hello", v: 1, mac }) + "\n");
+          continue;
+        }
         received.push({ conn, msg });
         const out = reply(msg, conn, sock);
         if (out) sock.write(JSON.stringify(out) + "\n");
@@ -73,6 +91,7 @@ async function fakeBroker(t, pipe, { reply = defaultReply } = {}) {
     server,
     conns,
     received,
+    hellos,
     send: (conn, obj) => conns[conn].write(JSON.stringify(obj) + "\n"),
     dropAll: () => { for (const c of conns) c.destroy(); },
     close: () => new Promise((r) => { fb.dropAll(); server.close(() => r()); }),
@@ -99,6 +118,8 @@ function shimHarness(t, pipe, opts = {}) {
   const launches = [];
   const shim = new Shim({
     pipe,
+    keyFile: KEY_FILE,
+    settings: opts.settings || null,
     brokerEntry: "fake-broker-entry.js",
     brokerArgs: ["--pipe", pipe],
     input,
@@ -294,6 +315,75 @@ test("a socket dir that is not private (unix): the shim refuses to connect or la
   assert.strictEqual(h.launches.length, 0);
 });
 
+test("hello: the shim sends nothing of the session's to a pipe owner without this user's key", async (t) => {
+  const pipe = testPipe("squatter");
+  const fb = await fakeBroker(t, pipe, { squat: true });
+  const h = shimHarness(t, pipe);
+  h.send(INIT);
+  const r = await h.response(1);
+  assert.match(r.error.message, /failed authentication/);
+  assert.match(r.error.message, /squatting/);
+  assert.strictEqual(fb.hellos.length, 1, "it saw only the hello");
+  assert.deepStrictEqual(fb.received, [], "no JSON-RPC message reached the squatter");
+  assert.strictEqual(h.launches.length, 0);
+});
+
+test("hello: carries the session's settings hash, and reconnect=true only after a broker was lost", async (t) => {
+  const pipe = testPipe("hello");
+  const fb = await fakeBroker(t, pipe);
+  const h = shimHarness(t, pipe, { settings: "abcd1234abcd1234" });
+  h.send(INIT);
+  await h.response(1);
+  assert.strictEqual(fb.hellos[0].msg.settings, "abcd1234abcd1234");
+  assert.strictEqual(fb.hellos[0].msg.reconnect, false);
+  assert.match(fb.hellos[0].msg.nonce, /^[0-9a-f]{32}$/);
+  fb.dropAll();
+  await until(() => fb.hellos.length === 2, 5000, "the reconnect hello");
+  assert.strictEqual(fb.hellos[1].msg.reconnect, true, "the new broker marks this session's main tab reset");
+  assert.notStrictEqual(fb.hellos[1].msg.nonce, fb.hellos[0].msg.nonce);
+});
+
+test("reconnect backoff: a broker that drops every connection at once is not hammered", async (t) => {
+  const pipe = testPipe("spin");
+  let accepted = 0;
+  const fb = await fakeBroker(t, pipe);
+  fb.server.on("connection", () => { accepted++; });
+  const h = shimHarness(t, pipe);
+  h.send(INIT);
+  await h.response(1);
+  // from now on, drop every connection right after the hello (like a broker shutting down)
+  fb.server.removeAllListeners("connection");
+  fb.server.on("connection", (sock) => {
+    accepted++;
+    sock.setEncoding("utf8");
+    sock.once("data", (d) => {
+      const nonce = JSON.parse(d.split("\n")[0]).nonce;
+      sock.end(JSON.stringify({ bmr: "hello", v: 1, mac: helloMac(KEY, nonce) }) + "\n");
+    });
+    sock.on("error", () => {});
+  });
+  fb.dropAll();
+  const before = accepted;
+  await sleep(1500);
+  const cycles = accepted - before;
+  assert.ok(cycles >= 2 && cycles <= 8, `expected a backed-off handful of reconnects in 1.5 s, got ${cycles}`);
+});
+
+test("line splitter: a 15 MB line in 8 KB chunks is split in linear time", () => {
+  const stream = new PassThrough();
+  const lines = [];
+  onLines(stream, (l) => lines.push(l));
+  const big = "x".repeat(15 * 1024 * 1024);
+  const payload = `${big}\n{"small":1}\r\n`;
+  const t0 = Date.now();
+  for (let i = 0; i < payload.length; i += 8192) stream.write(payload.slice(i, i + 8192));
+  const ms = Date.now() - t0;
+  assert.strictEqual(lines.length, 2);
+  assert.strictEqual(lines[0].length, big.length);
+  assert.strictEqual(lines[1], '{"small":1}');
+  assert.ok(ms < 1500, `took ${ms} ms (a rescanning splitter takes seconds)`);
+});
+
 test("stdin end: the broker connection is closed and the shim exits 0", async (t) => {
   const pipe = testPipe("eof");
   const fb = await fakeBroker(t, pipe);
@@ -317,12 +407,86 @@ test("stdin end before any broker connection exits 0 without launching", async (
 
 // ─────────────────────────── unit: launcher + config ───────────────────────────
 
+function launcherHarness({ elevated = false, deelevate = () => ({ pid: 1 }), env = {} } = {}) {
+  const r = { spawns: [], exits: [], logs: [], deelevated: [], files: [] };
+  runLauncher(["C:\\x\\broker.js", "--pipe", "P"], {
+    env: { SystemRoot: "C:\\Windows", PATH: "C:\\bin", LOCALAPPDATA: "C:\\Users\\fakeuser\\AppData\\Local", ...env },
+    spawnFn: (cmd, args, opts) => { r.spawns.push({ cmd, args, opts }); return { unref() {} }; },
+    exit: (c) => r.exits.push(c),
+    isElevated: () => elevated,
+    writeEnvFile: (dir, e) => { r.files.push({ dir, env: e }); return path.join(dir, "launch-x.json"); },
+    launchDeelevated: (opts) => { r.deelevated.push(opts); return deelevate(opts); },
+    log: (m) => r.logs.push(m),
+  });
+  return r;
+}
+
+test("launcher: a non-elevated launch spawns the broker with the allowlisted env only", () => {
+  const r = launcherHarness({ env: { BROWSER_RELAY_PROXY_URL: "http://p:1", TELEMETRY_ENABLE: "false", GITHUB_TOKEN: "ghp_secret", ANTHROPIC_API_KEY: "sk-secret" } });
+  assert.strictEqual(r.deelevated.length, 0);
+  assert.strictEqual(r.spawns.length, 1);
+  const env = r.spawns[0].opts.env;
+  assert.strictEqual(env.BROWSER_RELAY_PROXY_URL, "http://p:1");
+  assert.strictEqual(env.TELEMETRY_ENABLE, "false");
+  assert.strictEqual(env.SystemRoot, "C:\\Windows");
+  assert.strictEqual(env.GITHUB_TOKEN, undefined);
+  assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
+  assert.deepStrictEqual(r.exits, [0]);
+});
+
+test("launcher: elevated → the broker starts de-elevated with --env-file (its env goes in the file), no spawn", () => {
+  const r = launcherHarness({ elevated: true, env: { BROWSER_RELAY_TEST_MARK: "m", SECRET_TOKEN: "x" } });
+  assert.strictEqual(r.spawns.length, 0);
+  assert.strictEqual(r.deelevated.length, 1);
+  const { args, cwd } = r.deelevated[0];
+  assert.deepStrictEqual(args.slice(0, 3), ["C:\\x\\broker.js", "--pipe", "P"]);
+  assert.deepStrictEqual(args.slice(3), ["--env-file", path.join(r.files[0].dir, "launch-x.json")]);
+  assert.strictEqual(cwd, r.files[0].dir);
+  assert.strictEqual(r.files[0].env.BROWSER_RELAY_TEST_MARK, "m");
+  assert.strictEqual(r.files[0].env.SECRET_TOKEN, undefined);
+  assert.deepStrictEqual(r.logs, []);
+  assert.deepStrictEqual(r.exits, [0]);
+});
+
+test("launcher: when de-elevation fails it starts the broker elevated, with one clear warning", () => {
+  const r = launcherHarness({ elevated: true, deelevate: () => { throw new Error("the desktop shell runs as another user"); } });
+  assert.strictEqual(r.spawns.length, 1);
+  assert.strictEqual(r.logs.length, 1);
+  assert.match(r.logs[0], /WARNING: could not start the broker de-elevated \(the desktop shell runs as another user\); starting it elevated/);
+  assert.deepStrictEqual(r.exits, [0]);
+});
+
+test("launcher: BROWSER_RELAY_BROKER_DEELEVATE=off keeps an elevated launch elevated, silently", () => {
+  const r = launcherHarness({ elevated: true, env: { BROWSER_RELAY_BROKER_DEELEVATE: "off" } });
+  assert.strictEqual(r.deelevated.length, 0);
+  assert.strictEqual(r.spawns.length, 1);
+  assert.deepStrictEqual(r.logs, []);
+});
+
+test("launchEnv: OS basics, BROWSER_*, telemetry and upstream catalog keys; case-insensitive", () => {
+  const env = launchEnv({ Path: "p", windir: "w", browser_relay_x: "1", TOOL_NAME_PREFIX: "t", NODE_OPTIONS: "--inspect", AWS_SECRET_ACCESS_KEY: "s" });
+  assert.deepStrictEqual(Object.keys(env).sort(), ["Path", "TOOL_NAME_PREFIX", "browser_relay_x", "windir"]);
+});
+
+test("quoteArg: a Windows command line node reads back exactly", { skip: process.platform !== "win32" && "Windows command lines" }, () => {
+  const args = ["plain", "with space", 'quo"te', "trail\\", "C:\\Program Files\\x\\", "\\\\.\\pipe\\bmr", "", 'a\\"b', "x\\\\y"];
+  const script = "process.stdout.write(JSON.stringify(process.argv.slice(1)))";
+  // verbatim: the child gets exactly our command line (argv0 included)
+  const { spawnSync } = require("node:child_process");
+  const r = spawnSync(process.execPath, ["-e", quoteArg(script), ...args.map(quoteArg)], {
+    encoding: "utf8", windowsHide: true, windowsVerbatimArguments: true, argv0: quoteArg(process.execPath),
+  });
+  assert.deepStrictEqual(JSON.parse(r.stdout), args);
+  assert.strictEqual(commandLine(["a b", "c"]), '"a b" c');
+});
+
 test("runLauncher: starts the broker detached, hidden, stdio ignored, then exits", () => {
   const calls = [];
   const exits = [];
   runLauncher(["C:\\x\\broker.js", "--pipe", "P"], {
     spawnFn: (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { unref() { calls.push("unref"); } }; },
     exit: (c) => exits.push(c),
+    isElevated: () => false,
   });
   assert.strictEqual(calls[0].cmd, process.execPath);
   assert.deepStrictEqual(calls[0].args, ["C:\\x\\broker.js", "--pipe", "P"]);
@@ -333,14 +497,16 @@ test("runLauncher: starts the broker detached, hidden, stdio ignored, then exits
   assert.deepStrictEqual(exits, [0]);
 });
 
-test("resolveShimOptions: the real broker entry, and the same pipe + profile the broker derives", () => {
+test("resolveShimOptions: the real broker entry, the same pipe + profile the broker derives, the key file and settings hash", () => {
   const env = { LOCALAPPDATA: "C:\\Users\\fakeuser\\AppData\\Local", BROWSER_RELAY_BROKER_PROFILE_DIR: "D:\\prof" };
   const o = resolveShimOptions(env);
   const ep = resolveEndpoint(env);
   assert.strictEqual(o.brokerEntry, BROKER_MAIN);
   assert.ok(fs.existsSync(o.brokerEntry));
   assert.strictEqual(o.pipe, ep.pipe);
-  assert.deepStrictEqual(o.brokerArgs, ["--pipe", ep.pipe, "--profile-dir", ep.profileDir]);
+  assert.strictEqual(o.keyFile, keyFileFor(env));
+  assert.strictEqual(o.settings, settingsHash(env));
+  assert.deepStrictEqual(o.brokerArgs, ["--pipe", ep.pipe, "--profile-dir", ep.profileDir, "--key-file", keyFileFor(env)]);
 });
 
 // ──────────────── processes: real shims, real fixture broker ────────────────
@@ -375,11 +541,13 @@ function processRun(t, tag) {
   return { markerDir, pipe, brokerPids };
 }
 
-async function shimClient(t, run, { exitMs = 60_000, name = "c" } = {}) {
+async function shimClient(t, run, { exitMs = 60_000, watchdogMs = 0, name = "c", env = {} } = {}) {
   const t0 = Date.now();
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [SHIM_ENTRY, run.pipe, run.markerDir, String(exitMs)],
+    args: [SHIM_ENTRY, run.pipe, run.markerDir, String(exitMs), String(watchdogMs)],
+    // the real launcher starts the broker; de-elevation only where a test asks for it
+    env: { ...process.env, BROWSER_RELAY_BROKER_DEELEVATE: "off", BROWSER_RELAY_BROKER_LOG: path.join(run.markerDir, "broker.log"), ...env },
     stderr: "pipe",
   });
   const client = new Client({ name, version: "0" });
@@ -433,6 +601,48 @@ test("processes: tree-killing a shim leaves the broker running (it is not in the
   assert.ok(pidAlive(pid), "the broker survived");
   const b = await shimClient(t, run, { name: "B" });
   assert.strictEqual((await callJson(b, "fixture_pid")).pid, pid, "and still serves new sessions");
+});
+
+test("processes: a blocked event loop is caught by the watchdog: the broker is killed and the session recovers", async (t) => {
+  const run = processRun(t, "watchdog");
+  const c = await shimClient(t, run, { watchdogMs: 1500 });
+  const { pid: first } = await callJson(c, "fixture_pid");
+  await sleep(2500); // heartbeats flow while idle: no false kill
+  assert.ok(pidAlive(first), "an idle broker is not killed");
+  const t0 = Date.now();
+  const spun = await c.client.callTool({ name: "fixture_spin", arguments: {} }).then(() => "resolved", (e) => e);
+  assert.ok(spun instanceof Error && /browser broker restarted/.test(spun.message), String(spun));
+  const killedAfter = Date.now() - t0;
+  assert.ok(!pidAlive(first));
+  const { pid: second } = await callJson(c, "fixture_pid");
+  assert.notStrictEqual(second, first);
+  assert.match(fs.readFileSync(path.join(run.markerDir, "broker.log"), "utf8"), /watchdog: the event loop has been blocked for \d+ ms/);
+  t.diagnostic(`busy loop → broker killed and the call failed after ${killedAfter} ms (watchdog 1500 ms)`);
+});
+
+test("processes: the launched broker gets only the allowlisted env", async (t) => {
+  const run = processRun(t, "allowlist");
+  const c = await shimClient(t, run, { env: { BROWSER_RELAY_TEST_MARK: "m-1", NOT_ALLOWLISTED_SECRET: "s3cr3t" } });
+  const who = await callJson(c, "fixture_whoami");
+  assert.strictEqual(who.mark, "m-1");
+  assert.strictEqual(who.secret, null);
+});
+
+const elevatedHere = process.platform === "win32" && isElevated();
+test("processes: from an elevated session the broker runs de-elevated (medium integrity), env via the launch file", { skip: !elevatedHere && "needs an elevated Windows session" }, async (t) => {
+  const run = processRun(t, "deelevate");
+  const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-lad-"));
+  t.after(() => fs.rmSync(localAppData, { recursive: true, force: true }));
+  const c = await shimClient(t, run, {
+    env: { BROWSER_RELAY_BROKER_DEELEVATE: "auto", LOCALAPPDATA: localAppData, BROWSER_RELAY_TEST_MARK: "m-2", NOT_ALLOWLISTED_SECRET: "s3cr3t" },
+  });
+  const who = await callJson(c, "fixture_whoami");
+  assert.strictEqual(who.integrity, "Medium", "the broker is not elevated");
+  assert.strictEqual(who.mark, "m-2", "settings arrive through the launch file");
+  assert.strictEqual(who.secret, null);
+  const leftover = fs.readdirSync(path.join(localAppData, "browser-mcp-relay", "broker")).filter((n) => n.startsWith("launch-"));
+  assert.deepStrictEqual(leftover, [], "the broker deleted the launch file");
+  t.diagnostic(`broker pid ${who.pid}: ${who.integrity} integrity; connected in ${c.connectMs} ms`);
 });
 
 test("processes: the broker exits on its own after its last session leaves", async (t) => {

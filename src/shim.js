@@ -10,13 +10,18 @@
 //     launcher gone, the broker has no live parent, so a tree-kill of the
 //     shim (taskkill /T, Claude Code closing the session) can't reach it.
 //     Several shims racing a cold start each launch one; the pipe lets one
-//     broker win and the rest exit (EADDRINUSE).
+//     broker win and the rest exit (EADDRINUSE). An elevated launcher starts
+//     the broker de-elevated (broker/deelevate.js), with an allowlisted env.
+//   - Before forwarding anything, the shim checks that the pipe's owner knows
+//     this user's broker key (HMAC over a nonce, broker/pipe-server.js): a
+//     squatter on the predictable pipe name gets nothing.
 //   - Broker connection lost (crash, kill): reconnect (restarting the broker
 //     if needed), replay the client's initialize + notifications/initialized
 //     under the shim's own id and swallow that reply, then tell the client
 //     tools/list_changed. Requests that were in flight get a JSON-RPC error
 //     ("browser broker restarted; please retry the call"); an initialize
-//     still in flight is re-sent instead.
+//     still in flight is re-sent instead. A connection that dies right away
+//     (broker shutting down) backs off before the next try.
 //   - Broker unreachable: queued requests get an error; the shim stays up and
 //     tries again on the next message, so the session's MCP server survives.
 //
@@ -24,15 +29,19 @@
 
 "use strict";
 
+const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const pipeServer = require("./broker/pipe-server.js");
 
 const SHIM_FILE = __filename;
 const BROKER_MAIN = path.join(__dirname, "broker", "main.js");
 const CONNECT_TIMEOUT_MS = 30_000; // a cold broker under load needs a few seconds at most
 const RESPAWN_AFTER_MS = 5_000; // pipe still missing this long after a launch: launch again
 const EXIT_GRACE_MS = 2_000;
+const QUICK_CLOSE_MS = 250; // a connection that dies this fast with no data: back off
+const MAX_RECONNECT_DELAY_MS = 2_000;
 const RESTARTED = "browser broker restarted; please retry the call";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -49,31 +58,90 @@ function launcherArgs(brokerEntry, brokerArgs = []) {
 /** Unix: a socket in a dir another local user controls must not be trusted. */
 function defaultPipeDirProblem(pipe) {
   if (process.platform === "win32") return null; // named pipes: libuv's default DACL (same user)
-  return require("./broker/pipe-server.js").privateDirProblem(path.dirname(pipe));
+  return pipeServer.privateDirProblem(path.dirname(pipe));
 }
 
 function defaultSpawnLauncher(args) {
   spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
 }
 
-/** Launcher process: start the broker detached and hidden, then exit. */
-function runLauncher(argv, { spawnFn = spawn, exit = process.exit } = {}) {
+// The broker serves every session, so it gets only what it needs from the
+// session that happened to start it: OS basics, the relay's own settings and
+// upstream's catalog-shaping vars (never e.g. API tokens meant for Claude).
+const OS_ENV_KEYS = new Set([
+  "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP", "TMPDIR", "USERPROFILE", "USERNAME", "USERDOMAIN",
+  "HOMEDRIVE", "HOMEPATH", "HOME", "USER", "LOGNAME", "SHELL", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+  "PROGRAMW6432", "PROGRAMDATA", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMPUTERNAME", "NUMBER_OF_PROCESSORS",
+  "PROCESSOR_ARCHITECTURE", "OS", "SYSTEMDRIVE", "LANG", "TZ", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
+]);
+const ENV_ALLOW_RE = /^(?:BROWSER_.*|TELEMETRY_ENABLE|TOOL_NAME_PREFIX|AVAILABLE_TOOL_DOMAINS|TOOL_INPUT_METADATA_ENABLE|TOOL_OUTPUT_SCHEMA_DISABLE|PLATFORM|FIGMA_ACCESS_TOKEN|LC_.*|XDG_.*)$/i;
+
+/** The env a launched broker gets. */
+function launchEnv(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v !== undefined && (OS_ENV_KEYS.has(k.toUpperCase()) || ENV_ALLOW_RE.test(k))) out[k] = v;
+  }
+  return out;
+}
+
+const brokerLogFile = (env) => env.BROWSER_RELAY_BROKER_LOG || path.join(pipeServer.brokerHome(env), "broker.log");
+
+function appendLog(file, msg) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${new Date().toISOString()} [launcher ${process.pid}] ${msg}\n`);
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Launcher process: start the broker detached and hidden, then exit. When
+ * this process is elevated (Windows), the broker starts de-elevated through
+ * the desktop shell's token, its env in a private file; if that fails it
+ * starts elevated as before, with one warning in the broker log.
+ * BROWSER_RELAY_BROKER_DEELEVATE=off keeps an elevated launch elevated.
+ */
+function runLauncher(argv, {
+  spawnFn = spawn,
+  exit = process.exit,
+  env = process.env,
+  isElevated = () => require("./broker/deelevate.js").isElevated(env),
+  launchDeelevated = (opts) => require("./broker/deelevate.js").launchDeelevated(opts),
+  writeEnvFile = (dir, e) => require("./broker/deelevate.js").writeEnvFile(dir, e),
+  log = (msg) => appendLog(brokerLogFile(env), msg),
+} = {}) {
   const [brokerEntry, ...brokerArgs] = argv;
-  spawnFn(process.execPath, [brokerEntry, ...brokerArgs], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  const childEnv = launchEnv(env);
+  if (String(env.BROWSER_RELAY_BROKER_DEELEVATE || "").toLowerCase() !== "off" && isElevated()) {
+    let file = null;
+    try {
+      const home = pipeServer.brokerHome(env);
+      file = writeEnvFile(home, childEnv);
+      launchDeelevated({ args: [brokerEntry, ...brokerArgs, "--env-file", file], cwd: home, env });
+      exit(0);
+      return;
+    } catch (e) {
+      if (file) fs.rmSync(file, { force: true });
+      log(`WARNING: could not start the broker de-elevated (${e.message}); starting it elevated, so its Brave runs as administrator too`);
+    }
+  }
+  spawnFn(process.execPath, [brokerEntry, ...brokerArgs], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv }).unref();
   exit(0);
 }
 
-/** Splits a utf8 stream into lines (CRLF tolerated). */
+/** Splits a utf8 stream into lines (CRLF tolerated); scans each chunk once. */
 function onLines(stream, fn) {
   if (typeof stream.setEncoding === "function") stream.setEncoding("utf8");
-  let buf = "";
+  let parts = [];
   stream.on("data", (chunk) => {
-    buf += chunk;
-    for (let i; (i = buf.indexOf("\n")) >= 0;) {
-      const line = buf.slice(0, i).replace(/\r$/, "");
-      buf = buf.slice(i + 1);
+    let start = 0;
+    for (let i; (i = chunk.indexOf("\n", start)) >= 0; start = i + 1) {
+      parts.push(chunk.slice(start, i));
+      const line = (parts.length === 1 ? parts[0] : parts.join("")).replace(/\r$/, "");
+      parts = [];
       if (line) fn(line);
     }
+    if (start < chunk.length) parts.push(chunk.slice(start));
   });
 }
 
@@ -83,6 +151,8 @@ class Shim {
    * @param {string} opts.pipe
    * @param {string} opts.brokerEntry — script the launcher starts
    * @param {string[]} [opts.brokerArgs]
+   * @param {string} opts.keyFile — this user's broker key (created if missing)
+   * @param {string|null} [opts.settings] — settingsHash() of this session's env
    * @param {import("stream").Readable} [opts.input] — client → shim (stdin)
    * @param {import("stream").Writable} [opts.output] — shim → client (stdout)
    * @param {(msg: string) => void} [opts.log] — default: stderr
@@ -94,7 +164,7 @@ class Shim {
    * @param {number} [opts.respawnAfterMs]
    */
   constructor({
-    pipe, brokerEntry, brokerArgs = [],
+    pipe, brokerEntry, brokerArgs = [], keyFile, settings = null,
     input = process.stdin, output = process.stdout,
     log = (m) => { try { process.stderr.write(`[mcp-relay shim] ${m}\n`); } catch { /* stderr gone */ } },
     exit = (code) => process.exit(code),
@@ -104,7 +174,11 @@ class Shim {
     connectTimeoutMs = CONNECT_TIMEOUT_MS,
     respawnAfterMs = RESPAWN_AFTER_MS,
   }) {
-    Object.assign(this, { pipe, brokerEntry, brokerArgs, input, output, log, exitFn: exit, connectFn: connect, spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs });
+    Object.assign(this, {
+      pipe, brokerEntry, brokerArgs, keyFile, settings, input, output, log, exitFn: exit, connectFn: connect,
+      spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs,
+    });
+    this.key = null;
     this.sock = null;
     this.connecting = null;
     this.queue = []; // client lines waiting for a broker connection
@@ -114,6 +188,11 @@ class Shim {
     this.resendInit = false; // initialize was in flight when the broker died
     this.replayId = null;
     this.replays = 0;
+    this.everAttached = false; // a later connection is to a restarted broker
+    this.attachedAt = 0;
+    this.gotData = false;
+    this.reconnectDelay = 0;
+    this.reconnectTimer = null;
     this.ending = false; // the client went away
     this.closed = false;
     this.exited = false;
@@ -132,6 +211,7 @@ class Shim {
     this.closed = true;
     this.ending = true;
     this.exited = true;
+    clearTimeout(this.reconnectTimer);
     if (this.sock) this.sock.destroy();
   }
 
@@ -172,6 +252,8 @@ class Shim {
   }
 
   _connect() {
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     if (this.connecting || this.sock || this.closed) return;
     this.connecting = this._connectOrStart().then(
       (sock) => {
@@ -198,6 +280,10 @@ class Shim {
       try {
         return await this._connectOnce();
       } catch (e) {
+        if (e.code === "EKEY") throw e;
+        if (e.code === "EAUTH") {
+          throw new Error(`refusing ${this.pipe}: ${e.message}; another program may be squatting the pipe name (close it, or set BROWSER_RELAY_BROKER_PIPE)`);
+        }
         lastErr = e;
         const missing = e.code === "ENOENT" || e.code === "ECONNREFUSED";
         if (missing && Date.now() - lastLaunch >= this.respawnAfterMs) {
@@ -215,20 +301,46 @@ class Shim {
     throw new Error(`no broker answered on ${this.pipe} within ${this.connectTimeoutMs} ms (${lastErr ? lastErr.code || lastErr.message : "timeout"})`);
   }
 
-  _connectOnce() {
-    return new Promise((resolve, reject) => {
-      const s = this.connectFn(this.pipe);
-      const onError = (e) => { s.destroy(); reject(e); };
-      s.once("error", onError);
-      s.once("connect", () => { s.removeListener("error", onError); resolve(s); });
+  _loadKey() {
+    if (!this.key) {
+      try {
+        this.key = pipeServer.loadOrCreateKey(this.keyFile);
+      } catch (e) {
+        throw Object.assign(new Error(`cannot use the broker key file ${this.keyFile}: ${e.message}`), { code: "EKEY" });
+      }
+    }
+    return this.key;
+  }
+
+  async _connectOnce() {
+    const key = this._loadKey();
+    const s = await new Promise((resolve, reject) => {
+      const sock = this.connectFn(this.pipe);
+      const onError = (e) => { sock.destroy(); reject(e); };
+      sock.once("error", onError);
+      sock.once("connect", () => { sock.removeListener("error", onError); resolve(sock); });
     });
+    try {
+      // nothing of the session's goes out before the owner proves it is ours
+      const rest = await pipeServer.clientHello(s, key, { settings: this.settings, reconnect: this.everAttached });
+      if (rest.length) s.unshift(rest);
+      return s;
+    } catch (e) {
+      s.destroy();
+      throw e;
+    }
   }
 
   _attach(sock) {
     this.sock = sock;
+    this.everAttached = true;
+    this.attachedAt = Date.now();
+    this.gotData = false;
+    sock.on("data", () => { this.gotData = true; });
     onLines(sock, (line) => this._fromBroker(line));
     sock.on("error", () => { /* 'close' follows */ });
     sock.on("close", () => this._brokerGone(sock));
+    sock.resume(); // the handshake left it paused
     if (this.initMsg) {
       if (this.resendInit) {
         this.resendInit = false;
@@ -258,7 +370,16 @@ class Shim {
       else this._toClient({ jsonrpc: "2.0", id, error: { code: -32603, message: RESTARTED } });
     }
     this.inflight.clear();
-    this._connect();
+    // dropped right away with nothing said (e.g. a broker shutting down):
+    // don't spin connect/destroy, back off 250 ms → 2 s
+    const quick = Date.now() - this.attachedAt < QUICK_CLOSE_MS && !this.gotData;
+    this.reconnectDelay = quick ? Math.min(Math.max(QUICK_CLOSE_MS, this.reconnectDelay * 2), MAX_RECONNECT_DELAY_MS) : 0;
+    if (this.reconnectDelay) {
+      this.reconnectTimer = setTimeout(() => this._connect(), this.reconnectDelay);
+      if (this.reconnectTimer.unref) this.reconnectTimer.unref();
+    } else {
+      this._connect();
+    }
   }
 
   _unavailable(e) {
@@ -278,6 +399,7 @@ class Shim {
     if (this.ending) return;
     this.ending = true;
     this.queue.length = 0;
+    clearTimeout(this.reconnectTimer);
     if (!this.sock) {
       this.closed = true;
       this._exit(0);
@@ -296,11 +418,17 @@ class Shim {
   }
 }
 
-/** Pipe, broker entry and broker args for this env (same derivation as the broker's). */
+/** Pipe, key, broker entry and broker args for this env (same derivation as the broker's). */
 function resolveShimOptions(env) {
-  const { resolveEndpoint } = require("./broker/pipe-server.js");
-  const { pipe, profileDir } = resolveEndpoint(env);
-  return { pipe, brokerEntry: BROKER_MAIN, brokerArgs: ["--pipe", pipe, "--profile-dir", profileDir] };
+  const { pipe, profileDir } = pipeServer.resolveEndpoint(env);
+  const keyFile = pipeServer.keyFileFor(env);
+  return {
+    pipe,
+    keyFile,
+    settings: pipeServer.settingsHash(env),
+    brokerEntry: BROKER_MAIN,
+    brokerArgs: ["--pipe", pipe, "--profile-dir", profileDir, "--key-file", keyFile],
+  };
 }
 
 function main(argv = process.argv.slice(2)) {
@@ -314,4 +442,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) main();
 
-module.exports = { Shim, runLauncher, launcherArgs, resolveShimOptions, main, SHIM_FILE, BROKER_MAIN, RESTARTED };
+module.exports = { Shim, runLauncher, launchEnv, launcherArgs, resolveShimOptions, onLines, main, SHIM_FILE, BROKER_MAIN, RESTARTED };

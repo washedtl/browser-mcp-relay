@@ -199,4 +199,154 @@ async function claimPipe(pipe) {
   return null;
 }
 
-module.exports = { pipeNameFor, resolveEndpoint, brokerHome, claimPipe, privateDirProblem, PIPE_PREFIX };
+// ── Who's on the other end ───────────────────────────────────────────────
+//
+// A pipe name is predictable, so something else could create it first (on
+// Windows any local process can create any pipe name). A squatter would get
+// every tool argument (passwords, cookies) and could feed results to agents.
+// So the shim talks only to a broker that proves it knows this user's key:
+//
+//   shim   → {"bmr":"hello","v":1,"nonce":<hex>,"settings":<hash>,"reconnect":bool}
+//   broker → {"bmr":"hello","v":1,"mac":HMAC-SHA256(key, "broker:" + nonce)}
+//
+// before anything else is sent. The key lives in a user-private file under
+// brokerHome (the shim passes its path to the broker it starts).
+
+const HELLO_TIMEOUT_MS = 5000;
+
+/** The key file next to the broker's other state. */
+function keyFileFor(env = process.env) {
+  return path.join(brokerHome(env), "broker.key");
+}
+
+/**
+ * Read the 32-byte key, creating it if missing. Published atomically
+ * (tmp file + link), so a concurrent reader never sees a half-written key.
+ * @returns {Buffer}
+ */
+function loadOrCreateKey(file) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      const hex = fs.readFileSync(file, "utf8").trim();
+      if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, "hex");
+      throw Object.assign(new Error(`[broker] key file ${file} is malformed; delete it and restart`), { code: "EKEY" });
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+    fs.writeFileSync(tmp, crypto.randomBytes(32).toString("hex"), { mode: 0o600 });
+    try {
+      fs.linkSync(tmp, file); // fails if another process published first: read theirs
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+    } finally {
+      fs.rmSync(tmp, { force: true });
+    }
+  }
+  throw new Error(`[broker] could not read or create the key file ${file}`);
+}
+
+const helloMac = (key, nonce) => crypto.createHmac("sha256", key).update(`broker:${nonce}`).digest("hex");
+
+/**
+ * Read one line from `sock` (the first message of a handshake). Resolves
+ * { line, rest } with any bytes after it, or rejects on close / timeout.
+ */
+function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const done = (err, value) => {
+      clearTimeout(timer);
+      sock.removeListener("data", onData);
+      sock.removeListener("close", onClose);
+      sock.removeListener("error", onClose);
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const onData = (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const i = buf.indexOf(10);
+      if (i < 0) { chunks.push(buf); return; }
+      sock.pause();
+      chunks.push(buf.subarray(0, i));
+      done(null, { line: Buffer.concat(chunks).toString("utf8").replace(/\r$/, ""), rest: buf.subarray(i + 1) });
+    };
+    // transient (e.g. a broker shutting down), unlike a wrong answer (EAUTH)
+    const onClose = () => done(Object.assign(new Error("closed during the handshake"), { code: "ECONNRESET" }));
+    const timer = setTimeout(() => done(Object.assign(new Error(`no handshake reply within ${timeoutMs} ms`), { code: "ETIMEDOUT" })), timeoutMs);
+    sock.on("data", onData);
+    sock.once("close", onClose);
+    sock.once("error", onClose);
+  });
+}
+
+/**
+ * Client side: prove the pipe's owner knows `key`. Resolves the bytes that
+ * followed the reply (normally none); rejects with code EAUTH otherwise.
+ */
+async function clientHello(sock, key, { settings = null, reconnect = false, timeoutMs = HELLO_TIMEOUT_MS } = {}) {
+  const nonce = crypto.randomBytes(16).toString("hex");
+  sock.write(JSON.stringify({ bmr: "hello", v: 1, nonce, settings, reconnect }) + "\n");
+  const { line, rest } = await readLine(sock, timeoutMs);
+  let reply = null;
+  try { reply = JSON.parse(line); } catch { /* not ours */ }
+  const want = Buffer.from(helloMac(key, nonce), "hex");
+  const got = reply && reply.bmr === "hello" && typeof reply.mac === "string" && /^[0-9a-f]{64}$/.test(reply.mac) ? Buffer.from(reply.mac, "hex") : null;
+  if (!got || !crypto.timingSafeEqual(got, want)) {
+    throw Object.assign(new Error("the pipe's owner failed authentication (not this user's broker)"), { code: "EAUTH" });
+  }
+  return rest;
+}
+
+/**
+ * Who owns `pipe`: "ok" (a broker that knows `key`), "bad" (it answered
+ * wrong: not ours, squatted) or the error code when it could not be asked.
+ */
+async function verifyPipeOwner(pipe, key, timeoutMs = HELLO_TIMEOUT_MS) {
+  const sock = net.connect(pipe);
+  try {
+    await new Promise((resolve, reject) => { sock.once("connect", resolve); sock.once("error", reject); });
+    await clientHello(sock, key, { timeoutMs });
+    return "ok";
+  } catch (e) {
+    return e.code === "EAUTH" ? "bad" : e.code || "error";
+  } finally {
+    sock.destroy();
+  }
+}
+
+/**
+ * Server side: answer a hello if the connection opens with one. Resolves
+ * { hello, rest } — hello null when the first line was something else (it is
+ * then part of rest, untouched). The socket is left paused.
+ */
+async function serverHello(sock, key, timeoutMs = HELLO_TIMEOUT_MS) {
+  const { line, rest } = await readLine(sock, timeoutMs);
+  let msg = null;
+  try { msg = JSON.parse(line); } catch { /* not a hello */ }
+  if (!msg || msg.bmr !== "hello" || typeof msg.nonce !== "string") {
+    return { hello: null, rest: Buffer.concat([Buffer.from(line + "\n"), rest]) };
+  }
+  sock.write(JSON.stringify({ bmr: "hello", v: 1, mac: helloMac(key, msg.nonce) }) + "\n");
+  return { hello: msg, rest };
+}
+
+/**
+ * Hash of the settings a broker is started with (BROWSER_*, telemetry and
+ * upstream's catalog-shaping vars), so a session can tell whether the broker
+ * it reached was started with different ones.
+ */
+const SETTINGS_KEY_RE = /^(?:BROWSER_.*|TELEMETRY_ENABLE|TOOL_NAME_PREFIX|AVAILABLE_TOOL_DOMAINS|TOOL_INPUT_METADATA_ENABLE|TOOL_OUTPUT_SCHEMA_DISABLE|PLATFORM|FIGMA_ACCESS_TOKEN)$/i;
+function settingsHash(env) {
+  const pairs = Object.entries(env)
+    .filter(([k, v]) => SETTINGS_KEY_RE.test(k) && v !== undefined && v !== "" && !/^BROWSER_RELAY_BROKER_(?:PIPE|LOG)$/i.test(k))
+    .map(([k, v]) => [k.toUpperCase(), String(v)])
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return crypto.createHash("sha256").update(JSON.stringify(pairs)).digest("hex").slice(0, 16);
+}
+
+module.exports = {
+  pipeNameFor, resolveEndpoint, brokerHome, claimPipe, privateDirProblem, PIPE_PREFIX,
+  keyFileFor, loadOrCreateKey, helloMac, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS,
+};

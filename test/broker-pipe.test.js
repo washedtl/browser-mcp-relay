@@ -19,7 +19,20 @@ const {
   resolveEndpoint,
   brokerHome,
   claimPipe,
+  keyFileFor,
+  loadOrCreateKey,
+  helloMac,
+  clientHello,
+  serverHello,
+  verifyPipeOwner,
+  settingsHash,
 } = require("../src/broker/pipe-server.js");
+
+// test keys live here, never in the real %LOCALAPPDATA%
+const KEY_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-bp-key-"));
+const KEY_FILE = path.join(KEY_DIR, "broker.key");
+const KEY = loadOrCreateKey(KEY_FILE);
+test.after(() => fs.rmSync(KEY_DIR, { recursive: true, force: true }));
 
 // unix: a socket in a private (mkdtemp: 0700) dir, as claimPipe requires
 const testPipe = (tag) =>
@@ -145,6 +158,118 @@ test("claimPipe: connections reach the claimed server", async () => {
   }
 });
 
+// ───────────────────── key, hello, settings hash ─────────────────────
+
+test("keyFileFor: under the per-user broker home", () => {
+  const env = { LOCALAPPDATA: "C:\\Users\\fakeuser\\AppData\\Local" };
+  assert.strictEqual(keyFileFor(env), path.join(brokerHome(env), "broker.key"));
+});
+
+test("loadOrCreateKey: 32 random bytes, created once, the same on every read; a malformed file is an error", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-key-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "sub", "broker.key");
+  const a = loadOrCreateKey(file);
+  assert.strictEqual(a.length, 32);
+  assert.ok(loadOrCreateKey(file).equals(a));
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(file)), ["broker.key"], "no temp files left behind");
+  fs.writeFileSync(path.join(dir, "bad.key"), "nope");
+  assert.throws(() => loadOrCreateKey(path.join(dir, "bad.key")), /malformed/);
+});
+
+test("loadOrCreateKey: processes racing to create it all end up with one key", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-key-race-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "broker.key");
+  const { execFile } = require("node:child_process");
+  const code = `process.stdout.write(require(${JSON.stringify(path.resolve(__dirname, "../src/broker/pipe-server.js"))}).loadOrCreateKey(${JSON.stringify(file)}).toString("hex"))`;
+  const keys = await Promise.all([1, 2, 3, 4, 5].map(() => new Promise((resolve, reject) => {
+    execFile(process.execPath, ["-e", code], (err, out) => (err ? reject(err) : resolve(out)));
+  })));
+  assert.strictEqual(new Set(keys).size, 1);
+  assert.match(keys[0], /^[0-9a-f]{64}$/);
+});
+
+/** A one-off pipe server whose first connection runs `onConn(sock)`. */
+async function onePipe(t, onConn) {
+  const pipe = testPipe("hello");
+  const server = await claimPipe(pipe);
+  const socks = new Set();
+  server.on("connection", (sock) => {
+    socks.add(sock);
+    sock.on("error", () => {});
+    onConn(sock);
+  });
+  // close() waits for open connections: drop ours first
+  t.after(() => new Promise((r) => { for (const s of socks) s.destroy(); server.close(() => r()); }));
+  return pipe;
+}
+async function connectTo(pipe) {
+  const c = net.connect(pipe);
+  await new Promise((resolve, reject) => { c.once("connect", resolve); c.once("error", reject); });
+  return c;
+}
+
+test("hello: a broker holding the key passes; the bytes after the reply are kept", async (t) => {
+  let seen = null;
+  const pipe = await onePipe(t, async (sock) => {
+    const { hello, rest } = await serverHello(sock, KEY);
+    seen = { hello, rest: rest.toString() };
+    sock.write('{"after":1}\n');
+  });
+  const c = await connectTo(pipe);
+  t.after(() => c.destroy());
+  const rest = await clientHello(c, KEY, { settings: "s1", reconnect: true });
+  assert.strictEqual(seen.hello.settings, "s1");
+  assert.strictEqual(seen.hello.reconnect, true);
+  assert.strictEqual(seen.rest, "");
+  const more = rest.length ? rest.toString() : await new Promise((r) => { c.resume(); c.once("data", (d) => r(d.toString())); });
+  assert.match(more, /"after":1/);
+});
+
+test("hello: a wrong key or a garbage answer is EAUTH; silence or a hang-up is transient", async (t) => {
+  const wrongKey = Buffer.alloc(32, 7);
+  const cases = [
+    ["wrong key", async (sock) => { await serverHello(sock, wrongKey); }, "EAUTH"],
+    ["garbage", (sock) => { sock.once("data", () => sock.write('{"jsonrpc":"2.0","id":null,"error":{"code":-32700}}\n')); }, "EAUTH"],
+    ["hang-up", (sock) => { sock.once("data", () => sock.destroy()); }, "ECONNRESET"],
+    ["silence", () => {}, "ETIMEDOUT"],
+  ];
+  for (const [name, onConn, code] of cases) {
+    const pipe = await onePipe(t, onConn);
+    const c = await connectTo(pipe);
+    await assert.rejects(clientHello(c, KEY, { timeoutMs: 300 }), (e) => e.code === code, name);
+    c.destroy();
+  }
+});
+
+test("serverHello: a first line that is not a hello is handed back untouched", async (t) => {
+  let seen = null;
+  const pipe = await onePipe(t, async (sock) => { seen = await serverHello(sock, KEY); });
+  const c = await connectTo(pipe);
+  t.after(() => c.destroy());
+  c.write('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n{"x":2}\n');
+  await until(() => seen, 3000, "serverHello");
+  assert.strictEqual(seen.hello, null);
+  assert.strictEqual(seen.rest.toString(), '{"jsonrpc":"2.0","id":1,"method":"initialize"}\n{"x":2}\n');
+});
+
+test("verifyPipeOwner: ok for a broker with the key, bad for a squatter", async (t) => {
+  const good = await onePipe(t, (sock) => serverHello(sock, KEY).catch(() => {}));
+  const squat = await onePipe(t, (sock) => serverHello(sock, Buffer.alloc(32, 1)).catch(() => {}));
+  assert.strictEqual(await verifyPipeOwner(good, KEY), "ok");
+  assert.strictEqual(await verifyPipeOwner(squat, KEY), "bad");
+});
+
+test("settingsHash: the broker-relevant settings only, order- and case-insensitive", () => {
+  const base = { BROWSER_RELAY_PROXY_URL: "http://p:1", TELEMETRY_ENABLE: "false", TOOL_NAME_PREFIX: "x" };
+  const h = settingsHash(base);
+  assert.match(h, /^[0-9a-f]{16}$/);
+  assert.strictEqual(settingsHash({ tool_name_prefix: "x", TELEMETRY_ENABLE: "false", BROWSER_RELAY_PROXY_URL: "http://p:1" }), h);
+  assert.strictEqual(settingsHash({ ...base, PATH: "a", GITHUB_TOKEN: "t", BROWSER_RELAY_BROKER_PIPE: "\\\\.\\pipe\\x", BROWSER_RELAY_BROKER_LOG: "l", BROWSER_RELAY_EMPTY: "" }), h);
+  assert.notStrictEqual(settingsHash({ ...base, BROWSER_RELAY_PROXY_URL: "http://p:2" }), h);
+});
+
 // ───────────────────── broker: per-connection MCP servers ─────────────────────
 
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
@@ -177,8 +302,8 @@ async function until(cond, ms = 3000, what = "condition") {
 
 const DEFAULT_OWN_TOOLS = [probeOwnTool, tabsNewTool, cookiesTool, cdpOnlyTool, tabsListTool, toolsetsTool];
 
-async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}, loadCatalog, supervisor } = {}) {
-  const pipe = testPipe("broker");
+async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}, loadCatalog, supervisor, recycle = null, rss, pipe: fixedPipe } = {}) {
+  const pipe = fixedPipe || testPipe("broker");
   const made = [];
   const upstreamModule = fakeUpstreamModule();
   const windowPages = fakeWindowPages();
@@ -188,10 +313,13 @@ async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}
     pipe,
     profileDir: path.join(os.tmpdir(), "bmr-test-profile-unused"),
     env,
+    keyFile: KEY_FILE,
+    recycle,
     log: (m) => logs.push(m),
     idle: idle || { exitMs: 60_000, browserMs: 60_000 },
     onExit: (why) => exits.push(why),
     deps: {
+      ...(rss ? { rss } : {}),
       createSupervisor: (opts) => { const s = supervisor ? supervisor(opts) : fakeSupervisor(opts); made.push(s); return s; },
       upstreamModule: () => upstreamModule,
       windowPages: () => windowPages,
@@ -200,7 +328,7 @@ async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}
       loadCatalog: loadCatalog || (async () => FAKE_CATALOG),
     },
   });
-  t.after(() => handle.close("test done"));
+  t.after(() => handle && handle.close("test done"));
   return { pipe, handle, sup: made[0], upstreamModule, windowPages, exits, logs, up: upstreamModule.state };
 }
 
@@ -210,22 +338,118 @@ async function openTab(c, name) {
   assert.ok(!r.isError, JSON.stringify(r));
 }
 
-async function connectClient(t, pipe, { name = "test-client", capabilities = {} } = {}) {
+async function connectClient(t, pipe, { name = "test-client", capabilities = {}, hello = null } = {}) {
   const client = new Client({ name, version: "0" }, { capabilities });
-  await client.connect(new SocketClientTransport(pipe));
+  await client.connect(new SocketClientTransport(pipe, { hello }));
   t.after(() => client.close().catch(() => {}));
   return client;
 }
 
-test("startBroker: resolves null when another broker owns the pipe", async (t) => {
-  const pipe = testPipe("owned");
-  const holder = await claimPipe(pipe);
-  t.after(() => closeServer(holder));
+test("startBroker: resolves null when another broker owns the pipe (verified with the key)", async (t) => {
+  const first = await startTestBroker(t);
+  const logs = [];
   const handle = await startBroker({
-    pipe, profileDir: "unused", log: () => {},
+    pipe: first.pipe, profileDir: "unused", keyFile: KEY_FILE, log: (m) => logs.push(m),
     deps: { createSupervisor: () => { throw new Error("a losing broker must not build anything"); } },
   });
   assert.strictEqual(handle, null);
+  assert.ok(logs.some((l) => /is owned by another broker; exiting/.test(l)), logs.join("\n"));
+  assert.ok(!logs.some((l) => /WARNING/.test(l)));
+});
+
+test("startBroker: a pipe held by something without the key is reported as squatted", async (t) => {
+  const pipe = await onePipe(t, (sock) => serverHello(sock, Buffer.alloc(32, 3)).catch(() => {}));
+  const logs = [];
+  const handle = await startBroker({
+    pipe, profileDir: "unused", keyFile: KEY_FILE, log: (m) => logs.push(m),
+    deps: { createSupervisor: () => { throw new Error("must not build"); } },
+  });
+  assert.strictEqual(handle, null);
+  assert.ok(logs.some((l) => /WARNING: .* is held by something that is not this user's broker \(squatted\?\)/.test(l)), logs.join("\n"));
+});
+
+test("hello: the broker proves the key, then serves MCP on the same connection", async (t) => {
+  const b = await startTestBroker(t);
+  const c = await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({}) } });
+  assert.ok((await c.listTools()).tools.length > 0);
+  assert.ok(!b.logs.some((l) => /WARNING/.test(l)));
+});
+
+test("hello reconnect: a session that lost its previous broker gets a reset notice on its main tab", async (t) => {
+  const b = await startTestBroker(t);
+  const c = await connectClient(t, b.pipe, { hello: { key: KEY, reconnect: true } });
+  const r = await c.callTool({ name: "content_get-as-text", arguments: {} });
+  assert.match(r.content[0].text, /This tab was reset because the browser broker restarted/);
+  const again = await c.callTool({ name: "content_get-as-text", arguments: {} });
+  assert.strictEqual(again.content.length, 1, "once");
+});
+
+test("hello settings: a session whose settings differ from the broker's gets one warning in the log", async (t) => {
+  const b = await startTestBroker(t, { env: { BROWSER_RELAY_PROXY_URL: "http://p:1" } });
+  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:1" }) } });
+  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:2" }) } });
+  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:3" }) } });
+  assert.strictEqual(b.logs.filter((l) => /WARNING: session c\d+ has browser settings .* differ/.test(l)).length, 1);
+});
+
+test("V1-2: a CDP port taken before Brave's first launch exits the broker so the shims start one on a new port", async (t) => {
+  const b = await startTestBroker(t, {
+    supervisor: (opts) => Object.assign(fakeSupervisor(opts), {
+      async ensure() { throw new Error(`[mcp-relay] brave-supervisor: CDP port ${opts.port} is in use by another process. This broker keeps one port for its whole life`); },
+    }),
+  });
+  const c = await connectClient(t, b.pipe);
+  const r = await c.callTool({ name: "content_get-as-text", arguments: {} });
+  assert.strictEqual(r.isError, true);
+  assert.match(textOf(r), /restarting on a new port; retry the call/, "the session is told before the broker goes");
+  await until(() => b.exits.length === 1, 3000, "the broker to exit");
+  assert.match(b.exits[0], /CDP port \d+ is taken by another process/);
+  const again = await claimPipe(b.pipe);
+  assert.ok(again, "the pipe is released for a fresh broker");
+  await closeServer(again);
+});
+
+test("V1-2: other launch failures don't exit the broker", async (t) => {
+  const b = await startTestBroker(t, {
+    supervisor: (opts) => Object.assign(fakeSupervisor(opts), { async ensure() { throw new Error("Brave not found"); } }),
+  });
+  const c = await connectClient(t, b.pipe);
+  const r = await c.callTool({ name: "content_get-as-text", arguments: {} });
+  assert.match(textOf(r), /Brave not found/);
+  await sleep(100);
+  assert.deepStrictEqual(b.exits, []);
+});
+
+test("recycle: over the RSS limit while idle, the broker exits (gracefully) so a fresh one starts", async (t) => {
+  const b = await startTestBroker(t, { recycle: { rssBytes: 100 * 1024 * 1024, checkMs: 40 }, rss: () => 2048 * 1024 * 1024 });
+  await until(() => b.exits.length === 1, 3000, "the recycle");
+  assert.match(b.exits[0], /2048 MB RSS is over the 100 MB limit while idle/);
+});
+
+test("recycle: never while a tool call is running", async (t) => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const slow = { name: "own_slow", description: "waits", inputSchema: { type: "object" }, needsBrave: false, async handler() { await gate; return { content: [{ type: "text", text: "done" }] }; } };
+  const b = await startTestBroker(t, { ownTools: [slow], recycle: { rssBytes: 1, checkMs: 40 }, rss: () => 10 * 1024 * 1024 * 1024 });
+  const c = await connectClient(t, b.pipe);
+  const call = c.callTool({ name: "own_slow", arguments: {} });
+  await sleep(250);
+  assert.deepStrictEqual(b.exits, [], "busy: not recycled");
+  release();
+  assert.strictEqual(textOf(await call), "done");
+  await until(() => b.exits.length === 1, 3000, "the recycle once idle");
+});
+
+test("applyEnvFile: applies the launch settings and deletes the file", (t) => {
+  const { applyEnvFile } = require("../src/broker/main.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-envfile-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "launch-1.json");
+  fs.writeFileSync(file, JSON.stringify({ env: { BROWSER_RELAY_X: "1", NOT_A_STRING: 5 } }));
+  const env = {};
+  applyEnvFile(file, env);
+  assert.deepStrictEqual(env, { BROWSER_RELAY_X: "1" });
+  assert.ok(!fs.existsSync(file));
 });
 
 test("startBroker: the supervisor gets a fixed CDP port chosen up front", async (t) => {

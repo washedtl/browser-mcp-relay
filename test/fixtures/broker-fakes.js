@@ -174,25 +174,36 @@ function fakeWindowPages() {
   };
 }
 
-/** MCP client transport over a broker pipe connection (newline-delimited JSON). */
+/**
+ * MCP client transport over a broker pipe connection (newline-delimited
+ * JSON). With hello: { key, reconnect, settings } it first runs the shim's
+ * authenticated hello (pipe-server.clientHello).
+ */
 class SocketClientTransport {
-  constructor(pipe) {
+  constructor(pipe, { hello = null } = {}) {
     this.pipe = pipe;
+    this.hello = hello;
     this._buf = new ReadBuffer();
   }
-  start() {
-    return new Promise((resolve, reject) => {
-      const sock = net.connect(this.pipe);
-      this.sock = sock;
+  async start() {
+    const sock = net.connect(this.pipe);
+    this.sock = sock;
+    await new Promise((resolve, reject) => {
       sock.once("connect", () => { sock.removeListener("error", reject); resolve(); });
       sock.once("error", reject);
-      sock.on("data", (chunk) => {
-        this._buf.append(chunk);
-        for (let msg; (msg = this._buf.readMessage()) !== null;) this.onmessage && this.onmessage(msg);
-      });
-      sock.on("close", () => this.onclose && this.onclose());
-      sock.on("error", (e) => this.onerror && this.onerror(e));
     });
+    if (this.hello) {
+      const { clientHello } = require("../../src/broker/pipe-server.js");
+      const rest = await clientHello(sock, this.hello.key, this.hello);
+      if (rest.length) sock.unshift(rest);
+    }
+    sock.on("data", (chunk) => {
+      this._buf.append(chunk);
+      for (let msg; (msg = this._buf.readMessage()) !== null;) this.onmessage && this.onmessage(msg);
+    });
+    sock.on("close", () => this.onclose && this.onclose());
+    sock.on("error", (e) => this.onerror && this.onerror(e));
+    sock.resume();
   }
   async send(message) { this.sock.write(serializeMessage(message)); }
   async close() { this.sock.end(); this.sock.destroy(); }

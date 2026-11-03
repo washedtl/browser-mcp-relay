@@ -255,6 +255,14 @@ class SessionRegistry {
     return n;
   }
 
+  /**
+   * Record that this connection's tab was reset elsewhere (e.g. its session
+   * survived a broker restart): its next use carries the notice.
+   */
+  noteReset(connId, tabKey, reason) {
+    this._setNotice(connId, tabKey, reason);
+  }
+
   /** An open context of any connection (none is created), or null. */
   anyOpenCtx() {
     for (const tabs of this._conns.values()) {
