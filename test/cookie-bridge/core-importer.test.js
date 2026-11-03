@@ -619,3 +619,16 @@ test("importer: the owner's always-allow list lets a keyword-held domain in brok
   assert.deepStrictEqual(r.rejected.map((x) => [x.domain, x.reason]), [["chase.com", "deny:finance"], ["mybank.example", "hold:keyword"]]);
   assert.deepStrictEqual(imp.status().allow, ["pay.example.com", "chase.com"], "broker:status shows the list it read");
 });
+
+test("importer (V2-1): a partitioned cookie with an empty top-level site is refused, not applied unpartitioned past the site check", async () => {
+  const { imp, cdp } = make({ up: true });
+  await imp.braveReady({ pid: 1 });
+  const r = await imp.full("b1", [
+    ck({ name: "p", sameSite: "no_restriction", partitionKey: { topLevelSite: "" } }),
+    ck({ name: "q", sameSite: "no_restriction", partitionKey: {} }),
+  ], true);
+  assert.strictEqual(r.applied, 0);
+  assert.deepStrictEqual(r.rejected.map((x) => x.reason), ["malformed cookie (partitionKey)"]);
+  assert.strictEqual(r.rejected[0].count, 2);
+  assert.deepStrictEqual(cdp.live(), []);
+});

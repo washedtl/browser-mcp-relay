@@ -23,6 +23,17 @@ const IPV6_RE = /^[0-9a-f:.]+$/i;
 
 const isBool = (v) => v === undefined || typeof v === "boolean";
 
+/** A partition's top-level site as Chromium serializes it: "https://example.com" (scheme + host, nothing else). */
+function validTopLevelSite(site) {
+  if (typeof site !== "string" || !/^https?:\/\/[^\s/?#@]+$/i.test(site)) return false;
+  try {
+    const u = new URL(site);
+    return Boolean(u.hostname) && (u.hostname.includes(":") ? IPV6_RE.test(u.hostname.replace(/^\[|\]$/g, "")) : HOST_RE.test(u.hostname));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * @returns {{param: object, host: string} | {error: string}}
  */
@@ -38,12 +49,20 @@ function toCdpCookie(c) {
   if (![c.hostOnly, c.secure, c.httpOnly, c.session].every(isBool)) return { error: "malformed cookie (flags)" };
   if (c.sameSite !== undefined && !(c.sameSite in SAME_SITE)) return { error: "malformed cookie (sameSite)" };
   if (!c.session && c.expirationDate !== undefined && !Number.isFinite(c.expirationDate)) return { error: "malformed cookie (expirationDate)" };
-  if (c.partitionKey !== undefined && (c.partitionKey === null || typeof c.partitionKey !== "object")) return { error: "malformed cookie (partitionKey)" };
+  // A partitioned cookie always carries its top-level site (measured: Brave
+  // 147's chrome.cookies gives an unpartitioned one no partitionKey at all).
+  // One without a valid site would be stored unpartitioned AND skip the
+  // site's policy check (importer.js _verdict): refused.
+  if (c.partitionKey !== undefined) {
+    const k = c.partitionKey;
+    if (k === null || typeof k !== "object" || !validTopLevelSite(k.topLevelSite)) return { error: "malformed cookie (partitionKey)" };
+    if (k.hasCrossSiteAncestor !== undefined && typeof k.hasCrossSiteAncestor !== "boolean") return { error: "malformed cookie (partitionKey)" };
+  }
 
   const secure = Boolean(c.secure);
   const hostOnly = Boolean(c.hostOnly);
   const sameSite = c.sameSite === undefined ? null : SAME_SITE[c.sameSite];
-  const pk = c.partitionKey && typeof c.partitionKey.topLevelSite === "string" && c.partitionKey.topLevelSite
+  const pk = c.partitionKey
     ? { topLevelSite: c.partitionKey.topLevelSite, hasCrossSiteAncestor: Boolean(c.partitionKey.hasCrossSiteAncestor) }
     : null;
 

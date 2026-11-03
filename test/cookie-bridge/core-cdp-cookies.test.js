@@ -54,12 +54,21 @@ test("cdp-cookies: expirationDate → expires; a session cookie has no expires",
   assert.ok(!("expires" in s));
 });
 
-test("cdp-cookies: partitionKey → {topLevelSite, hasCrossSiteAncestor}; an empty one is dropped", () => {
+test("cdp-cookies (V2-1): a partitionKey without a valid topLevelSite is refused, never stored unpartitioned (it would skip the site's policy check)", () => {
+  for (const partitionKey of [{}, { topLevelSite: "" }, { topLevelSite: 5 }, { topLevelSite: "top.example" }, { topLevelSite: "https://" },
+    { topLevelSite: "https://top.example/path" }, { topLevelSite: "https://bad host.example" }, { topLevelSite: "ftp://top.example" },
+    { topLevelSite: "https://top.example", hasCrossSiteAncestor: "yes" }]) {
+    const r = toCdpCookie(base({ sameSite: "no_restriction", partitionKey }));
+    assert.strictEqual(r.error, "malformed cookie (partitionKey)", JSON.stringify(partitionKey));
+  }
+  assert.ok(!toCdpCookie(base({ sameSite: "no_restriction" })).param.partitionKey, "no partitionKey: unpartitioned (what Chrome sends for one)");
+});
+
+test("cdp-cookies: partitionKey → {topLevelSite, hasCrossSiteAncestor}", () => {
   const p = toCdpCookie(base({ sameSite: "no_restriction", partitionKey: { topLevelSite: "https://top.example" } })).param;
   assert.deepStrictEqual(p.partitionKey, { topLevelSite: "https://top.example", hasCrossSiteAncestor: false });
   const p2 = toCdpCookie(base({ partitionKey: { topLevelSite: "https://top.example", hasCrossSiteAncestor: true } })).param;
   assert.deepStrictEqual(p2.partitionKey, { topLevelSite: "https://top.example", hasCrossSiteAncestor: true });
-  assert.ok(!("partitionKey" in toCdpCookie(base({ partitionKey: {} })).param));
 });
 
 test("cdp-cookies: IPv6 / localhost hosts make a valid url", () => {
