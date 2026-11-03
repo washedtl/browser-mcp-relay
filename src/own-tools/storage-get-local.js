@@ -5,74 +5,99 @@
 // in localStorage / sessionStorage. Without this tool, those sessions can't
 // be inspected or copied between profiles even though Local Storage / Session
 // Storage IS already in the cookie-source snapshot's directory list.
+//
+// W1C1 (2026-11-03): some apps keep MBs of cache in localStorage, so a dump
+// is capped (maxBytes) and narrowable (keyFilter). Values that don't fit are
+// omitted whole (a cut-off token is worse than none) and listed by key.
 
 const { withActivePage } = require("./_active-page.js");
+const { parseStore, pageOrigin } = require("./_storage-common.js");
+const { errorResult, intArg } = require("./_tool-args.js");
+
+const DEFAULT_MAX_BYTES = 50_000;
+const MAX_OMITTED_KEYS_LISTED = 100;
 
 module.exports = {
   name: "storage_get-local",
   description:
-    "Read keys from localStorage or sessionStorage on the active page's origin. " +
-    "Returns { origin, store, entries: Record<string, string> }. " +
-    "Use `key` to fetch a single value; omit it to dump all keys. " +
-    "Auth tokens for OAuth-style apps (Discord, Notion, modern SaaS) typically " +
-    "live in localStorage rather than HTTP cookies — this is the storage-side " +
-    "complement to cookies_export.",
+    "Read localStorage or sessionStorage entries on the active page's origin (many SaaS apps keep auth tokens there, not in cookies). " +
+    "key reads one value; keyFilter (regex) narrows a dump. Values that don't fit in maxBytes are left out and listed in omittedKeys.",
   inputSchema: {
     type: "object",
     properties: {
-      store: {
-        type: "string",
-        enum: ["local", "session"],
-        default: "local",
-        description: "Which storage area to read. 'local' = localStorage, 'session' = sessionStorage.",
-      },
-      key: {
-        type: "string",
-        description: "Optional. Read just this key. Omit to dump all keys.",
+      store: { type: "string", enum: ["local", "session"], default: "local" },
+      key: { type: "string", description: "Read just this key." },
+      keyFilter: { type: "string", description: "Regex on key names." },
+      maxBytes: {
+        type: "integer", default: DEFAULT_MAX_BYTES, minimum: 1024,
+        description: "Cap on returned keys + values.",
       },
     },
   },
-  handler: async ({ store = "local", key } = {}) => withActivePage(async ({ page }) => {
-    if (store !== "local" && store !== "session") {
-      return {
-        content: [{ type: "text", text: `storage_get-local: store must be 'local' or 'session' (got ${JSON.stringify(store)})` }],
-        isError: true,
-      };
+  handler: async (_args) => withActivePage(async ({ page }) => {
+    // F0-9: null means "omitted" for every optional argument.
+    const args = _args || {};
+    const parsed = parseStore("storage_get-local", args.store);
+    if (parsed.error) return errorResult(parsed.error);
+    const store = parsed.store;
+    const { key, keyFilter } = args;
+    if (key != null && typeof key !== "string") {
+      return errorResult(`storage_get-local: key must be a string (got ${JSON.stringify(key)})`);
     }
+    if (keyFilter != null) {
+      if (typeof keyFilter !== "string") {
+        return errorResult(`storage_get-local: keyFilter must be a regex string (got ${JSON.stringify(keyFilter)})`);
+      }
+      try {
+        new RegExp(keyFilter);
+      } catch (e) {
+        return errorResult(`storage_get-local: invalid keyFilter regex: ${e.message}`);
+      }
+    }
+    const max = intArg("storage_get-local", "maxBytes", args.maxBytes, DEFAULT_MAX_BYTES, 1024);
+    if (max.error) return errorResult(max.error);
     let result;
     try {
-      result = await page.evaluate(({ store, key }) => {
+      // Filter and cap in the page so a multi-MB store never crosses CDP.
+      // Sizes are JSON-escaped lengths — what actually reaches the model.
+      result = await page.evaluate(({ store, key, keyFilter, maxBytes, maxListed }) => {
         const s = store === "session" ? sessionStorage : localStorage;
+        let keys = [];
         if (typeof key === "string") {
-          const v = s.getItem(key);
-          return { entries: v === null ? {} : { [key]: v }, count: v === null ? 0 : 1 };
+          keys = [key];
+        } else {
+          const re = typeof keyFilter === "string" ? new RegExp(keyFilter) : null;
+          for (let i = 0; i < s.length; i++) {
+            const k = s.key(i);
+            if (k != null && (!re || re.test(k))) keys.push(k);
+          }
         }
-        const out = {};
-        for (let i = 0; i < s.length; i++) {
-          const k = s.key(i);
-          if (k != null) out[k] = s.getItem(k);
+        const entries = {};
+        const omittedKeys = [];
+        let omittedCount = 0;
+        let used = 0;
+        for (const k of keys) {
+          const v = s.getItem(k);
+          if (v === null) continue;
+          const size = JSON.stringify(k).length + JSON.stringify(v).length;
+          if (used + size > maxBytes) {
+            omittedCount++;
+            if (omittedKeys.length < maxListed) omittedKeys.push(k);
+            continue;
+          }
+          entries[k] = v;
+          used += size;
         }
-        return { entries: out, count: Object.keys(out).length };
-      }, { store, key });
+        return { entries, omittedKeys, omittedCount };
+      }, { store, key, keyFilter, maxBytes: max.value, maxListed: MAX_OMITTED_KEYS_LISTED });
     } catch (e) {
-      return {
-        content: [{ type: "text", text: `storage_get-local: page.evaluate failed: ${e.message}` }],
-        isError: true,
-      };
+      return errorResult(`storage_get-local: page.evaluate failed: ${e.message}`);
     }
-    // Reviewer V1: URL("about:blank").origin is the literal string "null".
-    // Skip about:* URLs explicitly so the response shape doesn't carry an
-    // ambiguous "null" string that looks like JSON null.
-    let origin = "";
-    const rawUrl = page.url();
-    if (rawUrl && !rawUrl.startsWith("about:") && !rawUrl.startsWith("chrome:")) {
-      try { origin = new URL(rawUrl).origin; } catch { /* not a real URL */ }
+    const payload = { origin: pageOrigin(page), store, count: Object.keys(result.entries).length, entries: result.entries };
+    if (result.omittedCount > 0) {
+      payload.omittedCount = result.omittedCount;
+      payload.omittedKeys = result.omittedKeys;
     }
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ origin, store, count: result.count, entries: result.entries }, null, 2),
-      }],
-    };
+    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
   }),
 };

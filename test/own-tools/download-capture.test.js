@@ -117,3 +117,216 @@ test("F1-14: sanitizeDownloadFilename coerces non-string input safely", () => {
   assert.ok(!objOut.includes("/") && !objOut.includes("\\") && !objOut.includes(":"),
     `object coercion must not contain path separators (got ${objOut})`);
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C1 (2026-11-03): orphaned waits never surface as unhandled
+// rejections; savePath must be absolute and never silently overwrite;
+// description tells the truth about when the listener starts.
+// ──────────────────────────────────────────────────────────────────
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+// Fake page. `download` resolves waitForEvent immediately; `waitRejectMs`
+// models Playwright's waitForEvent timeout (rejects with TimeoutError).
+function makeDownloadPage({ download, waitRejectMs, click } = {}) {
+  const closeHandlers = [];
+  const page = {
+    waitCalls: [],
+    waitForEvent: (event, opts) => {
+      page.waitCalls.push(opts);
+      if (download) return Promise.resolve(download);
+      return new Promise((_, reject) => {
+        if (waitRejectMs != null) {
+          setTimeout(() => {
+            const e = new Error(`Timeout ${opts.timeout}ms exceeded while waiting for event "download"`);
+            e.name = "TimeoutError";
+            reject(e);
+          }, waitRejectMs);
+        }
+      });
+    },
+    once: (event, fn) => { if (event === "close") closeHandlers.push(fn); },
+    off: (event, fn) => {
+      const i = closeHandlers.indexOf(fn);
+      if (i >= 0) closeHandlers.splice(i, 1);
+    },
+    _close: () => { for (const fn of closeHandlers.splice(0)) fn(); },
+    click: click || (async () => undefined),
+  };
+  return page;
+}
+
+// saveAs writes like Playwright's does (copying over whatever is at the path).
+function makeDownload(name = "report.csv") {
+  const saved = [];
+  return {
+    saved,
+    suggestedFilename: () => name,
+    url: () => `https://files.example/${name}`,
+    saveAs: async (p) => { saved.push(p); fs.writeFileSync(p, "downloaded"); },
+  };
+}
+
+// Default-path downloads land in os.tmpdir(); remove what a test saved there.
+function removeSaved(download) {
+  for (const p of download.saved) fs.rmSync(p, { force: true });
+}
+
+async function onPage(page, fn) {
+  const prev = globalThis.__relayBridge;
+  globalThis.__relayBridge = { context: { pages: () => [page] } };
+  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+}
+
+async function collectUnhandled(fn, settleMs) {
+  const seen = [];
+  const onUnhandled = (reason) => seen.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await fn();
+    await new Promise((r) => setTimeout(r, settleMs));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  return seen;
+}
+
+test("W1C1: a failed click does not leave the download wait as an unhandled rejection", async () => {
+  const page = makeDownloadPage({
+    waitRejectMs: 30,
+    click: async () => { throw new Error("No node found for selector: #export"); },
+  });
+  const seen = await collectUnhandled(() => onPage(page, async () => {
+    const r = await tool.handler({ clickSelector: "#export", timeoutMs: 30 });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /click failed/);
+  }), 120);
+  assert.deepStrictEqual(seen.map(String), [], "orphaned waitForEvent rejection must be handled");
+});
+
+test("W1C1: the page closing during the click is not an unhandled rejection", async () => {
+  let page;
+  page = makeDownloadPage({
+    click: async () => { page._close(); throw new Error("Target page, context or browser has been closed"); },
+  });
+  const seen = await collectUnhandled(() => onPage(page, async () => {
+    const r = await tool.handler({ clickSelector: "#export", timeoutMs: 1000 });
+    assert.strictEqual(r.isError, true);
+  }), 50);
+  assert.deepStrictEqual(seen.map(String), [], "close-promise rejection must be handled");
+});
+
+test("W1C1: relative savePath is rejected before listening for a download", async () => {
+  const download = makeDownload();
+  const page = makeDownloadPage({ download });
+  await onPage(page, async () => {
+    const r = await tool.handler({ savePath: "exports/report.csv" });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /absolute/);
+    assert.strictEqual(page.waitCalls.length, 0, "must not start waiting");
+    assert.deepStrictEqual(download.saved, [], "must not save relative to the relay cwd");
+  });
+});
+
+test("W1C1: an existing savePath is not overwritten unless overwrite: true", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-download-"));
+  try {
+    const existing = path.join(dir, "report.csv");
+    fs.writeFileSync(existing, "keep");
+    const d1 = makeDownload();
+    const p1 = makeDownloadPage({ download: d1 });
+    await onPage(p1, async () => {
+      const r = await tool.handler({ savePath: existing });
+      assert.strictEqual(r.isError, true);
+      assert.match(r.content[0].text, /exists/);
+      assert.strictEqual(p1.waitCalls.length, 0, "checked before waiting");
+      assert.deepStrictEqual(d1.saved, []);
+    });
+    const d2 = makeDownload();
+    await onPage(makeDownloadPage({ download: d2 }), async () => {
+      const r = await tool.handler({ savePath: existing, overwrite: true });
+      assert.ok(!r.isError, r.content[0].text);
+      assert.deepStrictEqual(d2.saved, [existing]);
+      assert.strictEqual(JSON.parse(r.content[0].text).savedTo, existing);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("W1C1 V2-3: a savePath that appears while waiting is kept; the download goes to a free sibling", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-download-"));
+  try {
+    const target = path.join(dir, "report.csv");
+    const download = makeDownload();
+    const page = makeDownloadPage();
+    page.waitForEvent = async () => { fs.writeFileSync(target, "someone else's file"); return download; };
+    await onPage(page, async () => {
+      const r = await tool.handler({ savePath: target });
+      assert.ok(!r.isError, r.content[0].text);
+      const sibling = path.join(dir, "report-1.csv");
+      assert.strictEqual(JSON.parse(r.content[0].text).savedTo, sibling, "reports the path actually written");
+      assert.deepStrictEqual(download.saved, [sibling]);
+      assert.strictEqual(fs.readFileSync(target, "utf8"), "someone else's file", "the other file is untouched");
+      assert.strictEqual(fs.readFileSync(sibling, "utf8"), "downloaded");
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("W1C1 V2-3: a failed saveAs removes the placeholder it claimed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-download-"));
+  try {
+    const target = path.join(dir, "report.csv");
+    const download = makeDownload();
+    download.saveAs = async () => { throw new Error("disk full"); };
+    await onPage(makeDownloadPage({ download }), async () => {
+      const r = await tool.handler({ savePath: target });
+      assert.strictEqual(r.isError, true);
+      assert.match(r.content[0].text, /saveAs failed: disk full/);
+      assert.deepStrictEqual(fs.readdirSync(dir), [], "no empty placeholder left behind");
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("W1C1: default save path is under the OS temp dir with the sanitized name", async () => {
+  const download = makeDownload("../../evil.csv");
+  try {
+    await onPage(makeDownloadPage({ download }), async () => {
+      const r = await tool.handler({});
+      assert.ok(!r.isError, r.content[0].text);
+      const saved = download.saved[0];
+      assert.strictEqual(path.dirname(saved), os.tmpdir(), "traversal in the suggested name must not escape tmpdir");
+      assert.ok(path.basename(saved).endsWith("evil.csv"), saved);
+    });
+  } finally {
+    removeSaved(download);
+  }
+});
+
+test("W1C1: timeoutMs null → 30000 default; non-positive rejected (0 would wait forever)", async () => {
+  const download = makeDownload();
+  const page = makeDownloadPage({ download });
+  try {
+    await onPage(page, async () => {
+      const ok = await tool.handler({ timeoutMs: null });
+      assert.ok(!ok.isError, ok.content[0].text);
+      assert.strictEqual(page.waitCalls[0].timeout, 30000);
+      const zero = await tool.handler({ timeoutMs: 0 });
+      assert.strictEqual(zero.isError, true);
+      assert.match(zero.content[0].text, /timeoutMs/);
+    });
+  } finally {
+    removeSaved(download);
+  }
+});
+
+test("W1C1: description no longer says to call it AFTER triggering (the listener starts at call time)", () => {
+  assert.ok(!/call after triggering/i.test(tool.description), tool.description);
+  assert.match(tool.description, /clickSelector/);
+});

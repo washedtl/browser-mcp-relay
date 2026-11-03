@@ -1,11 +1,20 @@
-// download_capture — wait for the next download triggered by user action and
-// save it to disk. Bypasses the OS download dialog. Pair with interaction_click
-// to: click button → wait for download → save to known path.
+// download_capture — wait for the next download and save it to disk.
+// Bypasses the OS download dialog. The listener starts when the tool is
+// called and the call blocks, so the download is normally triggered by
+// clickSelector inside this same call.
+//
+// W1C1 (2026-11-03): savePath must be absolute (a relative path resolved
+// against the relay's cwd) and an existing file is only replaced with
+// overwrite: true; waits orphaned by an early return are marked handled so
+// they never surface as unhandled rejections.
 
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
 const { withActivePage } = require("./_active-page.js");
+const { errorResult, intArg, outputPathArg, writeExclusive } = require("./_tool-args.js");
+
+const noop = () => {};
 
 // F1-14 (2026-05-10): control-char range built from char codes so the source
 // file stays plain ASCII. Embedding literal U+0000..U+001F bytes into a regex
@@ -53,32 +62,37 @@ function sanitizeDownloadFilename(raw) {
 module.exports = {
   name: "download_capture",
   description:
-    "Wait for the next download event in the active page and save the file to " +
-    "disk. Returns the saved file path. Call AFTER triggering the action that " +
-    "starts the download (or use clickSelector to trigger inside this tool). " +
-    "Default save location is OS temp dir with the suggested filename.",
+    "Save the next download from the active page to disk and return its path. " +
+    "Listening starts when this tool is called and the call blocks until a download starts, " +
+    "so pass clickSelector to trigger it here; a download started before the call is missed.",
   inputSchema: {
     type: "object",
     properties: {
-      clickSelector: {
-        type: "string",
-        description: "Optional: click this selector to trigger the download.",
-      },
-      savePath: {
-        type: "string",
-        description: "Optional output file path. Default: OS temp dir + suggested filename.",
-      },
-      timeoutMs: {
-        type: "integer",
-        default: 30000,
-        description: "Max wait for download to start.",
-      },
+      clickSelector: { type: "string", description: "Selector to click to start the download." },
+      savePath: { type: "string", description: "Absolute output path (default: OS temp dir + suggested filename)." },
+      overwrite: { type: "boolean", default: false, description: "Allow replacing an existing savePath." },
+      timeoutMs: { type: "integer", default: 30000, minimum: 1, description: "Max wait for the download to start." },
     },
   },
-  handler: async ({ clickSelector, savePath, timeoutMs = 30000 }) => withActivePage(async ({ page }) => {
+  handler: async (_args) => withActivePage(async ({ page }) => {
+    // F0-9: null means "omitted".
+    const args = _args || {};
+    const { clickSelector } = args;
+    const overwrite = !!args.overwrite;
+    // Playwright treats timeout 0 as "no timeout", which would block forever.
+    const timeout = intArg("download_capture", "timeoutMs", args.timeoutMs, 30000, 1);
+    if (timeout.error) return errorResult(timeout.error);
+    const timeoutMs = timeout.value;
+    // Validate the destination before listening, so a bad path never costs
+    // the agent a triggered-but-unsaved download.
+    const save = outputPathArg("download_capture", "savePath", args.savePath, overwrite);
+    if (save.error) return errorResult(save.error);
+
     // Promise-race pattern: setup the download wait BEFORE triggering, to avoid
-    // missing fast downloads.
+    // missing fast downloads. Early returns below abandon this wait; mark it
+    // handled so its eventual timeout rejection isn't an unhandledRejection.
     const downloadPromise = page.waitForEvent("download", { timeout: timeoutMs });
+    downloadPromise.catch(noop);
 
     // T0-9: race the download wait against the page's `close` event. Without
     // this, calling tabs_close on the page mid-download (or having the page
@@ -96,6 +110,8 @@ module.exports = {
       onClose = () => reject(new Error("page closed before download started"));
       page.once("close", onClose);
     });
+    // The page can close during the click, before the race below subscribes.
+    closePromise.catch(noop);
 
     if (clickSelector) {
       try {
@@ -103,7 +119,7 @@ module.exports = {
       } catch (e) {
         // Cleanup before early-return.
         if (onClose) page.off("close", onClose);
-        return { content: [{ type: "text", text: `click failed: ${e.message}` }], isError: true };
+        return errorResult(`click failed: ${e.message}`);
       }
     }
 
@@ -138,24 +154,30 @@ module.exports = {
     // separator + control chars + leading dots + colons.
     const rawSuggested = download.suggestedFilename() || "file.bin";
     const suggested = sanitizeDownloadFilename(rawSuggested);
-    const dst = savePath || path.join(os.tmpdir(), `download-${Date.now()}-${suggested}`);
+    const dst = save.path || path.join(os.tmpdir(), `download-${Date.now()}-${suggested}`);
+    let target = dst;
+    let claimed = false;
     try {
-      // Ensure parent dir exists when caller passed a custom savePath. The
-      // default path uses os.tmpdir() which always exists, so this only
-      // matters for explicit savePath values.
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      await download.saveAs(dst);
+      if (overwrite) {
+        // Ensure parent dir exists when caller passed a custom savePath.
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+      } else {
+        // saveAs always overwrites, and up to timeoutMs passed since the
+        // up-front check: claim dst — or a free sibling if a file appeared
+        // meanwhile — with an empty placeholder that saveAs then replaces.
+        target = await writeExclusive(dst, "");
+        claimed = true;
+      }
+      await download.saveAs(target);
     } catch (e) {
-      return {
-        content: [{ type: "text", text: `saveAs failed: ${e.message}` }],
-        isError: true,
-      };
+      if (claimed) fs.rmSync(target, { force: true });
+      return errorResult(`saveAs failed: ${e.message}`);
     }
 
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({ savedTo: dst, suggestedFilename: suggested, url: download.url() }, null, 2),
+        text: JSON.stringify({ savedTo: target, suggestedFilename: suggested, url: download.url() }),
       }],
     };
   }),

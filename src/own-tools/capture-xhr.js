@@ -5,134 +5,159 @@
 // T0-1/T0-2/T0-3 fixes (2026-05-09):
 //   • split goto timeout from capture window (previously durationMs was reused
 //     as page.goto's timeout, so a slow page aborted before any XHR fired)
-//   • body fetch is fire-and-forget — pushes a Promise into a pending array so
-//     response N+1 isn't blocked behind a slow body N. Promise.allSettled at
-//     end before serializing
+//   • body fetch is fire-and-forget (now via a bounded queue) so
+//     response N+1 isn't blocked behind a slow body N. Settled at the end
+//     before serializing
 //   • bounded `captured` size with `maxResponses` cap (default 500) to prevent
 //     unbounded heap growth on chatty pages
+//
+// W1C1 (2026-11-03): the result goes straight into the model's context, so
+// inline defaults are compact (2KB bodies, ~100KB total, no headers, no
+// pretty-print); `outputPath` writes the full capture to a file instead.
+// Final body drain has a deadline (streaming responses hung the tool), the
+// URL/type filter runs before the cap, a nav timeout keeps listening, and
+// numeric arguments are range-checked against the schema.
 
 const { withActivePage } = require("./_active-page.js");
+const { errorResult, intArg, fitJson, outputPathArg, writeOutputFile } = require("./_tool-args.js");
+
+// Playwright's response.body() resolves only when the request FINISHES, so a
+// long-poll / SSE / streaming response never resolves. After the capture
+// window, bodies get this long to finish before they're reported unfinished.
+const BODY_DRAIN_MS = 2000;
+// response.body() holds the full body in memory; bound how many run at once.
+const MAX_BODY_FETCHES = 32;
+const WAIT_UNTIL = ["load", "domcontentloaded", "networkidle", "commit"];
+// Defaults by mode: inline output lands in the model's context; a file doesn't.
+const INLINE_DEFAULTS = { maxBodyBytes: 2000, maxTotalBytes: 100_000, includeHeaders: false };
+const FILE_DEFAULTS = { maxBodyBytes: 100_000, maxTotalBytes: 50_000_000, includeHeaders: true };
+const PREVIEW_LINES = 20;
 
 module.exports = {
   name: "capture_xhr",
   description:
-    "Record XHR/fetch responses observed by the active page during a navigation " +
-    "or fixed time window. Returns array of { url, status, method, contentType, " +
-    "headers, body? } per response. Useful for reverse-engineering site APIs " +
-    "while authenticated in the relay's browser session. " +
-    "When navigateToUrl is set, navTimeoutMs caps the navigation; durationMs is " +
-    "the total capture window (including the navigation time).",
+    "Record XHR/fetch responses on the active page for durationMs, optionally while navigating to navigateToUrl. " +
+    "Inline output is compact: url/status/method/contentType, bodies cut to 2KB, ~100KB total, no headers. " +
+    "Pass outputPath to write the full capture (headers, 100KB bodies) to a file and get only a summary back.",
   inputSchema: {
     type: "object",
     properties: {
-      navigateToUrl: {
-        type: "string",
-        description: "If provided, navigate the active page to this URL while capturing. Otherwise just capture for durationMs from now.",
-      },
+      navigateToUrl: { type: "string", description: "Navigate the active page here while capturing." },
       durationMs: {
-        type: "integer",
-        default: 5000,
-        minimum: 100,
-        maximum: 300000,
-        description: "Total capture window in ms (default 5s, max 5min). Also caps how long this tool blocks.",
+        type: "integer", default: 5000, minimum: 100, maximum: 300000,
+        description: "Capture window incl. navigation; the call blocks this long (+ up to 2s for bodies to finish).",
       },
       navTimeoutMs: {
-        type: "integer",
-        minimum: 100,
-        maximum: 300000,
-        description: "Optional separate cap on the page.goto timeout when navigateToUrl is set. Defaults to min(durationMs, 30000). Set higher than the durationMs only if you want to fail navigation fast then keep listening.",
+        type: "integer", minimum: 100, maximum: 300000,
+        description: "page.goto timeout (default min(durationMs, 30000)). After a nav timeout, capture continues for the rest of durationMs.",
       },
-      waitUntil: {
-        type: "string",
-        enum: ["load", "domcontentloaded", "networkidle", "commit"],
-        default: "domcontentloaded",
-        description: "Playwright navigation lifecycle when navigateToUrl is set. Default 'domcontentloaded' — 'networkidle' often hangs on chatty pages and burns the whole capture window.",
-      },
-      urlFilter: {
-        type: "string",
-        description: "Optional regex pattern (as a string) to filter URLs. Only matching responses are returned.",
-      },
-      includeBody: {
-        type: "boolean",
-        default: true,
-        description: "Whether to include response bodies (can be large).",
-      },
+      waitUntil: { type: "string", enum: WAIT_UNTIL, default: "domcontentloaded" },
+      urlFilter: { type: "string", description: "Regex; only matching URLs are recorded." },
+      includeBody: { type: "boolean", default: true },
+      includeHeaders: { type: "boolean", description: "Include response headers (default false; true with outputPath)." },
       maxBodyBytes: {
-        type: "integer",
-        default: 100000,
-        description: "Maximum body length per response (truncated if longer). Default 100KB.",
+        type: "integer", minimum: 1, maximum: 50_000_000,
+        description: "Per-body cap (default 2000; 100000 with outputPath).",
       },
-      maxResponses: {
-        type: "integer",
-        default: 500,
-        minimum: 1,
-        maximum: 5000,
-        description: "Stop recording new responses after this many. Default 500 — prevents unbounded heap on chatty pages. When the cap is hit, `truncated: true` is set on the result and any responses past the cap are dropped.",
-      },
+      maxResponses: { type: "integer", default: 500, minimum: 1, maximum: 5000 },
       maxTotalBytes: {
-        type: "integer",
-        default: 50_000_000,
-        minimum: 1024,
-        description: "Aggregate cap on captured body bytes (default 50MB). Once exceeded, headers are still recorded but bodies are skipped with `bodyError: 'aggregate cap reached'`. Belt-and-suspenders against memory balloon when maxBodyBytes × maxResponses is set high.",
+        type: "integer", minimum: 1024, maximum: 50_000_000,
+        description: "Cap on all captured bytes (default 100000; 50000000 with outputPath). Past it, bodies then responses are dropped.",
       },
+      outputPath: { type: "string", description: "Absolute path; write the full capture there as JSON." },
+      overwrite: { type: "boolean", default: false, description: "Allow replacing an existing outputPath." },
     },
   },
-  handler: async (_args = {}) => withActivePage(async ({ page }) => {
-    // F0-9 (2026-05-10): JS destructure defaults only fire on `undefined`,
-    // not `null`. JSON-RPC clients commonly serialize unset optionals as
-    // null. Apply defaults explicitly so null is treated as "missing".
-    // Also Number.isFinite-guard numeric inputs (NaN/Infinity from the
-    // wire would silently produce empty captures or hang CDP).
-    const navigateToUrl = _args.navigateToUrl ?? undefined;
-    let durationMs = _args.durationMs;
-    if (durationMs == null || !Number.isFinite(durationMs) || durationMs < 100) durationMs = 5000;
-    const navTimeoutMs = (_args.navTimeoutMs != null && Number.isFinite(_args.navTimeoutMs)) ? _args.navTimeoutMs : undefined;
-    let waitUntil = _args.waitUntil;
-    if (!["load", "domcontentloaded", "networkidle", "commit"].includes(waitUntil)) waitUntil = "domcontentloaded";
-    const urlFilter = _args.urlFilter ?? undefined;
-    const includeBody = _args.includeBody == null ? true : !!_args.includeBody;
-    let maxBodyBytes = _args.maxBodyBytes;
-    if (maxBodyBytes == null || !Number.isFinite(maxBodyBytes) || maxBodyBytes < 1) maxBodyBytes = 100000;
-    let maxResponses = _args.maxResponses;
-    if (maxResponses == null || !Number.isFinite(maxResponses) || maxResponses < 1) maxResponses = 500;
-    let maxTotalBytes = _args.maxTotalBytes;
-    if (maxTotalBytes == null || !Number.isFinite(maxTotalBytes) || maxTotalBytes < 1024) maxTotalBytes = 50_000_000;
+  handler: async (_args) => withActivePage(async ({ page }) => {
+    // F0-9: null means "omitted" for every optional argument.
+    const args = _args || {};
+    const overwrite = !!args.overwrite;
+    // Fail on a bad outputPath before the capture window, not after it.
+    const out = outputPathArg("capture_xhr", "outputPath", args.outputPath, overwrite);
+    if (out.error) return errorResult(out.error);
+    const defaults = out.path ? FILE_DEFAULTS : INLINE_DEFAULTS;
+    const n = {};
+    for (const [name, def, min, max] of [
+      ["durationMs", 5000, 100, 300000],
+      ["navTimeoutMs", undefined, 100, 300000],
+      ["maxBodyBytes", defaults.maxBodyBytes, 1, 50_000_000],
+      ["maxResponses", 500, 1, 5000],
+      ["maxTotalBytes", defaults.maxTotalBytes, 1024, 50_000_000],
+    ]) {
+      const r = intArg("capture_xhr", name, args[name], def, min, max);
+      if (r.error) return errorResult(r.error);
+      n[name] = r.value;
+    }
+    const { durationMs, navTimeoutMs, maxBodyBytes, maxResponses, maxTotalBytes } = n;
+    const waitUntil = WAIT_UNTIL.includes(args.waitUntil) ? args.waitUntil : "domcontentloaded";
+    const includeBody = args.includeBody == null ? true : !!args.includeBody;
+    const includeHeaders = args.includeHeaders == null ? defaults.includeHeaders : !!args.includeHeaders;
 
     let filter = null;
-    if (urlFilter) {
+    if (args.urlFilter) {
       try {
-        filter = new RegExp(urlFilter);
+        filter = new RegExp(args.urlFilter);
       } catch (e) {
-        return {
-          content: [{ type: "text", text: `invalid urlFilter regex: ${e.message}` }],
-          isError: true,
-        };
+        return errorResult(`invalid urlFilter regex: ${e.message}`);
       }
     }
 
     // T0-1: separate navTimeoutMs from the capture window. The default keeps
     // navigation responsive (≤30s) while the capture window can be longer for
     // post-load XHRs.
-    const effectiveNavTimeout = Number.isInteger(navTimeoutMs)
-      ? navTimeoutMs
-      : Math.min(durationMs, 30000);
+    const effectiveNavTimeout = navTimeoutMs ?? Math.min(durationMs, 30000);
 
     const captured = [];
-    const pendingBodies = []; // T0-2: parallel body fetches resolved at end
-    let truncated = false;
-    // F1-18 (2026-05-10): track aggregate body bytes captured so far so we
-    // can stop fetching bodies once we've hit the aggregate cap. This is
-    // belt-and-suspenders against the case where a caller sets
-    // maxBodyBytes × maxResponses to a multi-GB combined budget.
-    let totalBytes = 0;
+    let dropped = 0;
+    // F1-18: one budget, in JSON characters (what reaches the model), for
+    // everything kept: entry metadata + bodies. A body is charged when it
+    // settles, clipped to the room left. response.body() loads the WHOLE
+    // body into memory, so at most MAX_BODY_FETCHES run at once (the rest
+    // queue) and no fetch starts once the budget is spent.
+    let usedBytes = 0;
     let aggregateCapHit = false;
+    const bodyQueue = []; // [response, entry] waiting for a fetch slot
+    let bodiesInFlight = 0;
+    let onBodiesIdle = null; // set while draining
+
+    const capHit = (entry) => {
+      entry.bodyError = "aggregate cap reached";
+      aggregateCapHit = true;
+    };
+
+    const keepBody = (entry, buf) => {
+      const room = Math.min(maxBodyBytes, maxTotalBytes - usedBytes);
+      if (room <= 0) return capHit(entry);
+      // Decode only a prefix that is surely enough: a char is at most 4
+      // UTF-8 bytes and costs at least 1 escaped char, so a body longer than
+      // this prefix always comes back cut (with the marker).
+      const fit = fitJson(buf.toString("utf8", 0, Math.min(buf.length, 4 * room + 4)), room);
+      entry.body = fit.text;
+      usedBytes += fit.cost;
+      if (fit.cut && room < maxBodyBytes) aggregateCapHit = true;
+    };
+
+    const pumpBodies = () => {
+      while (bodiesInFlight < MAX_BODY_FETCHES && bodyQueue.length > 0) {
+        const [response, entry] = bodyQueue.shift();
+        if (usedBytes >= maxTotalBytes) {
+          capHit(entry);
+          continue;
+        }
+        bodiesInFlight++;
+        // T0-2: don't await — body N+1 must not queue behind a slow body N.
+        Promise.resolve()
+          .then(() => response.body())
+          .then((buf) => keepBody(entry, buf), (e) => { entry.bodyError = e.message || String(e); })
+          .finally(() => {
+            bodiesInFlight--;
+            pumpBodies();
+          });
+      }
+      if (onBodiesIdle && bodiesInFlight === 0 && bodyQueue.length === 0) onBodiesIdle();
+    };
 
     const onResponse = (response) => {
-      // T0-3: hard cap to prevent unbounded heap. Drop the rest, mark truncated.
-      if (captured.length >= maxResponses) {
-        truncated = true;
-        return;
-      }
       try {
         const url = response.url();
         if (filter && !filter.test(url)) return;
@@ -140,50 +165,32 @@ module.exports = {
         const resourceType = req.resourceType();
         // Limit to xhr/fetch — drop documents/scripts/stylesheets/images.
         if (resourceType !== "xhr" && resourceType !== "fetch") return;
+        // T0-3: hard cap to prevent unbounded heap. Checked only for
+        // responses we'd keep, so filtered-out traffic isn't "dropped".
+        if (captured.length >= maxResponses) {
+          dropped++;
+          return;
+        }
+        const headers = response.headers();
         const entry = {
           url,
           status: response.status(),
           method: req.method(),
-          contentType: response.headers()["content-type"] || "",
-          headers: response.headers(),
+          contentType: headers["content-type"] || "",
         };
+        if (includeHeaders) entry.headers = headers;
+        const entryBytes = JSON.stringify(entry).length;
+        if (usedBytes + entryBytes > maxTotalBytes) {
+          dropped++;
+          aggregateCapHit = true;
+          return;
+        }
+        usedBytes += entryBytes;
         // Push synchronously so ordering is preserved relative to event arrival.
         captured.push(entry);
         if (includeBody) {
-          // F1-18 (2026-05-10): if we're already over the aggregate cap,
-          // don't even fetch the body — Playwright's response.body() loads
-          // the FULL response into memory before our maxBodyBytes truncation
-          // runs, so a 50MB JSON returned by a single endpoint would balloon
-          // RSS even if maxBodyBytes is set to 100KB. Skipping the fetch
-          // keeps memory bounded by the aggregate cap regardless of
-          // maxBodyBytes / maxResponses settings.
-          if (totalBytes >= maxTotalBytes) {
-            entry.bodyError = "aggregate cap reached";
-            aggregateCapHit = true;
-          } else {
-            // T0-2: don't await here — fire-and-forget into pendingBodies. If body
-            // N is slow, body N+1's listener doesn't queue behind it. We
-            // Promise.allSettled at the end before serializing.
-            pendingBodies.push(
-              response.body()
-                .then((buf) => {
-                  const text = buf.toString("utf8");
-                  const truncatedText = text.length > maxBodyBytes
-                    ? text.slice(0, maxBodyBytes) + "...[truncated]"
-                    : text;
-                  // F1-18: charge the kept bytes (post-truncation) toward
-                  // the aggregate cap. This means a single 5GB response
-                  // truncated to 100KB only counts as 100KB — what we keep
-                  // is what bounds memory.
-                  totalBytes += truncatedText.length;
-                  entry.body = truncatedText;
-                  if (totalBytes >= maxTotalBytes) aggregateCapHit = true;
-                })
-                .catch((e) => {
-                  entry.bodyError = e.message || String(e);
-                })
-            );
-          }
+          bodyQueue.push([response, entry]);
+          pumpBodies();
         }
       } catch { /* ignore per-response errors */ }
     };
@@ -191,8 +198,7 @@ module.exports = {
     page.on("response", onResponse);
 
     // T0-9: short-circuit the wait if the page closes during capture so we
-    // don't hang the full duration on a dead page. waitWithCloseShortCircuit
-    // races a `setTimeout(durationMs)` against `page.once("close", ...)`.
+    // don't hang the full duration on a dead page.
     let pageClosedEarly = false;
     const t0 = Date.now();
     const waitWithCloseShortCircuit = (ms) => new Promise((resolve) => {
@@ -212,46 +218,71 @@ module.exports = {
 
     let navError = null;
     try {
-      if (navigateToUrl) {
-        await page.goto(navigateToUrl, { waitUntil, timeout: effectiveNavTimeout });
-        // After navigation, keep listening for the remainder of the capture
-        // window (durationMs total, minus elapsed nav time).
-        const navElapsed = Date.now() - t0;
-        const remaining = Math.max(0, durationMs - navElapsed);
-        if (remaining > 0) {
-          await waitWithCloseShortCircuit(remaining);
+      let keepListening = true;
+      if (args.navigateToUrl) {
+        try {
+          await page.goto(args.navigateToUrl, { waitUntil, timeout: effectiveNavTimeout });
+        } catch (e) {
+          // Partial capture is preserved either way. A nav TIMEOUT means the
+          // page is still loading, so keep listening for the rest of the
+          // window; any other failure (bad URL, DNS, closed page) has nothing
+          // more to capture.
+          navError = e.message;
+          keepListening = e.name === "TimeoutError";
         }
-      } else {
-        await waitWithCloseShortCircuit(durationMs);
       }
-    } catch (e) {
-      // Don't propagate the goto/timeout error — preserve partial capture.
-      // Caller still gets whatever XHRs fired before the failure.
-      navError = e.message;
+      const remaining = durationMs - (Date.now() - t0);
+      if (keepListening && remaining > 0) await waitWithCloseShortCircuit(remaining);
     } finally {
       page.off("response", onResponse);
     }
 
-    // T0-2: drain in-flight body fetches before serializing. allSettled — we
-    // tolerate body fetch failures (already captured per-entry as bodyError).
-    if (pendingBodies.length > 0) {
-      await Promise.allSettled(pendingBodies);
+    if (bodiesInFlight > 0 || bodyQueue.length > 0) {
+      let timer;
+      await Promise.race([
+        new Promise((resolve) => { onBodiesIdle = resolve; }),
+        new Promise((resolve) => { timer = setTimeout(resolve, BODY_DRAIN_MS); }),
+      ]);
+      clearTimeout(timer);
+      bodyQueue.length = 0; // start no more fetches
+      // Anything still without a body is a stream / long-poll (or queued
+      // behind them). Everything from here to serialization is synchronous,
+      // so a late settle can't race it.
+      for (const entry of captured) {
+        if (entry.body === undefined && entry.bodyError === undefined) {
+          entry.bodyError = `body not finished ${BODY_DRAIN_MS}ms after the capture window (streaming or long-poll?)`;
+        }
+      }
     }
 
+    const summary = {
+      count: captured.length,
+      capturedBytes: usedBytes,
+      aggregateCapHit,
+      truncated: dropped > 0,
+      dropped,
+      navError,
+      pageClosedEarly,
+    };
+    const isError = !!navError && captured.length === 0;
+    const full = JSON.stringify({ ...summary, responses: captured }, null, out.path ? 2 : undefined);
+    const preview = out.path && captured.slice(0, PREVIEW_LINES).map((r) => `${r.method} ${r.status} ${r.url.slice(0, 200)}`);
+    // An unfinished body() keeps its callbacks — and through them this
+    // handler's scope — alive until the stream ends. Drop the capture so
+    // only those few small entries stay reachable.
+    captured.length = 0;
+
+    if (!out.path) return { content: [{ type: "text", text: full }], isError };
+    let written;
+    try {
+      // If outputPath appeared during the capture, this writes a sibling.
+      written = await writeOutputFile(out.path, full, overwrite);
+    } catch (e) {
+      return errorResult(`capture_xhr: writing outputPath failed: ${e.message}`);
+    }
     return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          count: captured.length,
-          totalBodyBytes: totalBytes,
-          aggregateCapHit,
-          responses: captured,
-          navError,
-          truncated,
-          pageClosedEarly,
-        }, null, 2),
-      }],
-      isError: !!navError && captured.length === 0,
+      content: [{ type: "text", text: JSON.stringify({ savedTo: written.path, fileBytes: written.bytes, ...summary, preview }) }],
+      isError,
     };
   }),
 };

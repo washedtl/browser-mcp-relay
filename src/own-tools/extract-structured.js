@@ -1,49 +1,111 @@
 // extract_structured — schema-driven data extraction from the active page.
 // Schema is { fieldName: { selector, attribute?, multiple? }, ... }.
 // Uses the authed session — sees logged-in content unlike unauthenticated scrapers.
+//
+// W1C1 (2026-11-03): `multiple` + innerHTML could return MBs straight into
+// the model's context. Output is now capped: maxItems per multiple field and
+// a maxBytes budget shared fairly across fields (cut fields are listed in
+// `truncated`).
 
 const { withActivePage } = require("./_active-page.js");
+const { errorResult, intArg, fitJson } = require("./_tool-args.js");
+
+const DEFAULT_MAX_ITEMS = 100;
+const DEFAULT_MAX_BYTES = 100_000;
+
+// Runs IN THE PAGE: page.evaluate ships a function's source text, so this
+// may only use page globals plus fitJson, whose source EXTRACT_IN_PAGE
+// embeds. Each field is wrapped in try/catch so a bad selector for one field
+// doesn't kill the whole extraction — the failing field gets { __error } and
+// other fields proceed. The output cap is applied here so oversized values
+// never cross CDP. Each field may use an even split of the budget still
+// left, so one huge field can't starve the fields after it, and whatever a
+// small field doesn't use rolls over to later ones.
+function extractFields({ schema, maxItems, maxBytes }) {
+  const data = {};
+  const truncated = {};
+  const fields = Object.entries(schema);
+  let room = maxBytes;
+  const readAttr = (el, attr) => {
+    if (!el) return null;
+    // T1-4: textContent is the default — innerText forces a synchronous
+    // layout pass which becomes O(N) slow on `multiple: true` queries
+    // against big lists. textContent gives the same answer for 90%+ of
+    // scraping cases without the layout penalty. Callers who explicitly
+    // need rendered-text-only behavior (CSS-hidden content excluded)
+    // can pass attribute: "innerText".
+    if (attr === "textContent") return el.textContent;
+    if (attr === "innerText") return el.innerText;
+    if (attr === "innerHTML") return el.innerHTML;
+    if (attr === "value") return el.value;
+    return el.getAttribute(attr);
+  };
+  fields.forEach(([field, spec], i) => {
+    let share = Math.floor(room / (fields.length - i));
+    // Values are charged at their real JSON-escaped size (what reaches the
+    // model); the one that doesn't fit is clipped.
+    const take = (v) => {
+      if (typeof v !== "string") return v;
+      const fit = fitJson(v, share); // embedded by EXTRACT_IN_PAGE
+      if (fit.cut) truncated[field] = "clipped";
+      share -= fit.cost;
+      room -= fit.cost;
+      return fit.text;
+    };
+    try {
+      const attr = spec.attribute || "textContent";
+      if (spec.multiple) {
+        const els = document.querySelectorAll(spec.selector);
+        const vals = [];
+        for (const el of els) {
+          if (vals.length >= maxItems || share <= 0) break;
+          vals.push(take(readAttr(el, attr)));
+        }
+        data[field] = vals;
+        if (vals.length < els.length) truncated[field] = `kept ${vals.length} of ${els.length}`;
+      } else {
+        data[field] = take(readAttr(document.querySelector(spec.selector), attr));
+      }
+    } catch (e) {
+      data[field] = { __error: e.message };
+    }
+  });
+  return { data, truncated };
+}
+const EXTRACT_IN_PAGE = new Function("arg", `const fitJson = ${fitJson}; return (${extractFields})(arg);`);
 
 module.exports = {
   name: "extract_structured",
   description:
-    "Extract structured data from the active page using a CSS-selector schema. " +
-    "Schema shape: { fieldName: { selector: 'css', attribute?: 'textContent'|'innerText'|'innerHTML'|'href'|'src'|'value'|attr-name, multiple?: boolean } }. " +
-    "Default attribute is 'textContent' (fast, includes hidden content). Use 'innerText' explicitly when you need rendered text only (forces page layout — slow on large lists). " +
-    "Returns object with fields populated from the page. Use for authenticated/logged-in content.",
+    "Extract data from the active page with a CSS-selector schema: { field: { selector, attribute?, multiple? } }. " +
+    "attribute defaults to textContent; also innerText (rendered text only, slow on big lists), innerHTML, value, or any attribute name. " +
+    "Output is capped by maxItems (per multiple field) and maxBytes (all values); cut fields are listed in truncated.",
   inputSchema: {
     type: "object",
     properties: {
-      navigateToUrl: {
-        type: "string",
-        description: "Optional URL to navigate to before extracting.",
-      },
-      waitForSelector: {
-        type: "string",
-        description: "Optional CSS selector to wait for before extracting (ensures page is ready).",
-      },
+      navigateToUrl: { type: "string", description: "Navigate here first." },
+      waitForSelector: { type: "string", description: "Wait for this selector (30s) before extracting." },
       schema: {
         type: "object",
         minProperties: 1,
-        description: "Field schema. Each value is { selector, attribute?, multiple? }. Must have at least one field.",
         additionalProperties: {
           type: "object",
           properties: {
             selector: { type: "string" },
-            attribute: {
-              type: "string",
-              examples: ["textContent", "innerText", "innerHTML", "href", "src", "value"],
-              description: "textContent (default — fast, includes hidden content), innerText (rendered-only, forces layout), innerHTML, href, src, value, or any HTML attribute name.",
-            },
-            multiple: { type: "boolean", default: false, description: "If true, return array of all matches." },
+            attribute: { type: "string" },
+            multiple: { type: "boolean", default: false, description: "Return an array of all matches." },
           },
           required: ["selector"],
         },
       },
+      maxItems: { type: "integer", default: DEFAULT_MAX_ITEMS, minimum: 1, description: "Max matches per multiple field." },
+      maxBytes: { type: "integer", default: DEFAULT_MAX_BYTES, minimum: 1024, description: "Budget for all extracted text." },
     },
     required: ["schema"],
   },
-  handler: async ({ navigateToUrl, waitForSelector, schema }) => withActivePage(async ({ page }) => {
+  handler: async (_args) => withActivePage(async ({ page }) => {
+    const args = _args || {};
+    const { navigateToUrl, waitForSelector, schema } = args;
     // T0-5: validate schema before passing to page.evaluate. Object.entries(null)
     // throws an opaque error inside the page context that surfaces as
     // "page.evaluate failed: Cannot convert undefined or null to object" — much
@@ -96,6 +158,11 @@ module.exports = {
         };
       }
     }
+    // F0-9: null means "omitted".
+    const maxItems = intArg("extract_structured", "maxItems", args.maxItems, DEFAULT_MAX_ITEMS, 1);
+    if (maxItems.error) return errorResult(maxItems.error);
+    const maxBytes = intArg("extract_structured", "maxBytes", args.maxBytes, DEFAULT_MAX_BYTES, 1024);
+    if (maxBytes.error) return errorResult(maxBytes.error);
     if (navigateToUrl) {
       try { await page.goto(navigateToUrl, { waitUntil: "domcontentloaded" }); }
       catch (e) { return { content: [{ type: "text", text: `nav failed: ${e.message}` }], isError: true }; }
@@ -105,43 +172,10 @@ module.exports = {
       catch (e) { return { content: [{ type: "text", text: `waitForSelector "${waitForSelector}" failed: ${e.message}` }], isError: true }; }
     }
 
-    // Run extraction in page context. Each field is wrapped in try/catch so a
-    // bad selector for one field doesn't kill the whole extraction — the
-    // failing field gets { __error: "..." } and other fields proceed.
+    // Run extraction in page context (see extractFields).
     let result;
     try {
-      result = await page.evaluate((schema) => {
-        const out = {};
-        const readAttr = (el, attr) => {
-          if (!el) return null;
-          // T1-4: textContent is the default — innerText forces a synchronous
-          // layout pass which becomes O(N) slow on `multiple: true` queries
-          // against big lists. textContent gives the same answer for 90%+ of
-          // scraping cases without the layout penalty. Callers who explicitly
-          // need rendered-text-only behavior (CSS-hidden content excluded)
-          // can pass attribute: "innerText".
-          if (attr === "textContent") return el.textContent;
-          if (attr === "innerText") return el.innerText;
-          if (attr === "innerHTML") return el.innerHTML;
-          if (attr === "value") return el.value;
-          return el.getAttribute(attr);
-        };
-        for (const [field, spec] of Object.entries(schema)) {
-          try {
-            const attr = spec.attribute || "textContent";
-            if (spec.multiple) {
-              const els = Array.from(document.querySelectorAll(spec.selector));
-              out[field] = els.map((el) => readAttr(el, attr));
-            } else {
-              const el = document.querySelector(spec.selector);
-              out[field] = readAttr(el, attr);
-            }
-          } catch (e) {
-            out[field] = { __error: e.message };
-          }
-        }
-        return out;
-      }, schema);
+      result = await page.evaluate(EXTRACT_IN_PAGE, { schema, maxItems: maxItems.value, maxBytes: maxBytes.value });
     } catch (e) {
       return {
         content: [{ type: "text", text: `page.evaluate failed: ${e.message}` }],
@@ -149,11 +183,8 @@ module.exports = {
       };
     }
 
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ url: page.url(), data: result }, null, 2),
-      }],
-    };
+    const payload = { url: page.url(), data: result.data };
+    if (Object.keys(result.truncated).length > 0) payload.truncated = result.truncated;
+    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
   }),
 };

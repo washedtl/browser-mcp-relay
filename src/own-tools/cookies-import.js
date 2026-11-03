@@ -1,18 +1,45 @@
 // cookies_import — load cookies into the active context.
 // Inverse of cookies_export. For restoring saved sessions or testing flows.
+//
+// W1C1 (2026-11-03): `inputPath` reads a file written by cookies_export
+// outputPath, so cookie values never round-trip through the model.
+
+const fsp = require("node:fs/promises");
+const { errorResult, absolutePathArg } = require("./_tool-args.js");
+
+// Read a cookies_export file: { cookies: [...] } or a bare array.
+// Returns { cookies } or { error }.
+async function readCookieFile(p) {
+  let raw;
+  try {
+    raw = await fsp.readFile(p, "utf8");
+  } catch (e) {
+    return { error: `cookies_import: cannot read inputPath: ${e.message}` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+  } catch (e) {
+    return { error: `cookies_import: inputPath is not valid JSON: ${e.message}` };
+  }
+  const cookies = Array.isArray(parsed) ? parsed : parsed && parsed.cookies;
+  if (!Array.isArray(cookies)) {
+    return { error: "cookies_import: inputPath must hold a cookies array (cookies_export's { cookies: [...] } or a bare array)" };
+  }
+  return { cookies };
+}
 
 module.exports = {
   name: "cookies_import",
   description:
-    "Import cookies into the active browser context. Accepts array of cookie " +
-    "objects in Playwright format (same shape as cookies_export output). " +
-    "Cookies override existing same-name cookies for the same domain/path.",
+    "Import cookies into the browser context; same name/domain/path cookies are replaced. " +
+    "Pass cookies (Playwright format, as cookies_export returns) or inputPath (a file from cookies_export outputPath).",
   inputSchema: {
     type: "object",
     properties: {
       cookies: {
         type: "array",
-        description: "Array of cookie objects in Playwright format: { name, value, domain, path, expires?, httpOnly?, secure?, sameSite? }.",
+        description: "Cookie objects: { name, value, domain + path or url, expires?, httpOnly?, secure?, sameSite? }.",
         items: {
           type: "object",
           properties: {
@@ -24,16 +51,27 @@ module.exports = {
           required: ["name", "value"],
         },
       },
+      inputPath: { type: "string", description: "Absolute path to a cookies_export outputPath file." },
     },
-    required: ["cookies"],
   },
-  handler: async (_args = {}) => {
-    // F0-9 reviewer V1 (2026-05-10): destructure-with-default.
-    const cookies = _args.cookies;
+  handler: async (_args) => {
+    // F0-9: null means "omitted".
+    const args = _args || {};
     const bridge = globalThis.__relayBridge;
-    if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
+    if (!bridge) return errorResult("bridge missing");
+    const input = absolutePathArg("cookies_import", "inputPath", args.inputPath);
+    if (input.error) return errorResult(input.error);
+    if (args.cookies != null && input.path) return errorResult("cookies_import: pass cookies or inputPath, not both");
+    if (args.cookies == null && !input.path) return errorResult("cookies_import: pass cookies or inputPath");
+
+    let cookies = args.cookies;
+    if (input.path) {
+      const read = await readCookieFile(input.path);
+      if (read.error) return errorResult(read.error);
+      cookies = read.cookies;
+    }
     if (!Array.isArray(cookies)) {
-      return { content: [{ type: "text", text: "cookies must be an array" }], isError: true };
+      return errorResult("cookies must be an array");
     }
     // F0-5 (2026-05-10): filter null/non-object entries upfront. Without
     // this, `[null, validCookie]` propagates to addCookies which throws
@@ -50,43 +88,34 @@ module.exports = {
     for (let i = 0; i < cookies.length; i++) {
       const c = cookies[i];
       if (!c || typeof c !== "object" || Array.isArray(c)) {
-        return {
-          content: [{ type: "text", text: `cookies_import: cookies[${i}] must be a non-null object (got ${c === null ? "null" : typeof c})` }],
-          isError: true,
-        };
+        return errorResult(`cookies_import: cookies[${i}] must be a non-null object (got ${c === null ? "null" : typeof c})`);
       }
       if (typeof c.name !== "string" || typeof c.value !== "string") {
-        return {
-          content: [{ type: "text", text: `cookies_import: cookies[${i}] must have string name + value` }],
-          isError: true,
-        };
+        return errorResult(`cookies_import: cookies[${i}] must have string name + value`);
       }
       // Either url OR (domain + path) must be present per Playwright's
       // contract. We don't enforce the OR here (Playwright surfaces it
       // with a clear message) but we do reject *malformed* values.
       if (c.url !== undefined && (typeof c.url !== "string" || c.url.length === 0)) {
-        return { content: [{ type: "text", text: `cookies_import: cookies[${i}].url must be a non-empty string when provided` }], isError: true };
+        return errorResult(`cookies_import: cookies[${i}].url must be a non-empty string when provided`);
       }
       if (c.domain !== undefined && typeof c.domain !== "string") {
-        return { content: [{ type: "text", text: `cookies_import: cookies[${i}].domain must be a string when provided` }], isError: true };
+        return errorResult(`cookies_import: cookies[${i}].domain must be a string when provided`);
       }
       if (c.path !== undefined && typeof c.path !== "string") {
-        return { content: [{ type: "text", text: `cookies_import: cookies[${i}].path must be a string when provided` }], isError: true };
+        return errorResult(`cookies_import: cookies[${i}].path must be a string when provided`);
       }
       if (c.expires !== undefined && (!Number.isFinite(c.expires))) {
-        return { content: [{ type: "text", text: `cookies_import: cookies[${i}].expires must be a finite number (Unix seconds) when provided` }], isError: true };
+        return errorResult(`cookies_import: cookies[${i}].expires must be a finite number (Unix seconds) when provided`);
       }
       if (c.httpOnly !== undefined && typeof c.httpOnly !== "boolean") {
-        return { content: [{ type: "text", text: `cookies_import: cookies[${i}].httpOnly must be boolean when provided` }], isError: true };
+        return errorResult(`cookies_import: cookies[${i}].httpOnly must be boolean when provided`);
       }
       if (c.secure !== undefined && typeof c.secure !== "boolean") {
-        return { content: [{ type: "text", text: `cookies_import: cookies[${i}].secure must be boolean when provided` }], isError: true };
+        return errorResult(`cookies_import: cookies[${i}].secure must be boolean when provided`);
       }
       if (c.sameSite !== undefined && (typeof c.sameSite !== "string" || !VALID_SAMESITE.has(c.sameSite))) {
-        return {
-          content: [{ type: "text", text: `cookies_import: cookies[${i}].sameSite must be 'Strict' | 'Lax' | 'None' (got ${JSON.stringify(c.sameSite)})` }],
-          isError: true,
-        };
+        return errorResult(`cookies_import: cookies[${i}].sameSite must be 'Strict' | 'Lax' | 'None' (got ${JSON.stringify(c.sameSite)})`);
       }
     }
     try {
@@ -95,16 +124,8 @@ module.exports = {
       // Playwright throws on malformed cookies (missing domain+path or url,
       // invalid sameSite, etc.). Return structured error instead of letting
       // it propagate as an uncaught exception.
-      return {
-        content: [{ type: "text", text: `addCookies failed: ${e.message}` }],
-        isError: true,
-      };
+      return errorResult(`addCookies failed: ${e.message}`);
     }
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ imported: cookies.length }, null, 2),
-      }],
-    };
+    return { content: [{ type: "text", text: JSON.stringify({ imported: cookies.length }) }] };
   },
 };

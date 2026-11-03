@@ -266,3 +266,146 @@ test("storage_clear-local: rejects keys=non-array", async () => {
     globalThis.__relayBridge = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C1 (2026-11-03): keyFilter + maxBytes on get, null-as-missing,
+// shared store/origin helper, compact JSON.
+// ──────────────────────────────────────────────────────────────────
+
+async function onPage(page, fn) {
+  const prev = globalThis.__relayBridge;
+  withFakePage(page);
+  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+}
+const parse = (r) => JSON.parse(r.content[0].text);
+
+test("W1C1: storage_get-local keyFilter narrows a dump by regex on key names", async () => {
+  await onPage(makeFakePage({ auth_token: "t", refresh_token: "r", theme: "dark" }), async () => {
+    const p = parse(await getTool.handler({ keyFilter: "token$" }));
+    assert.deepStrictEqual(Object.keys(p.entries).sort(), ["auth_token", "refresh_token"]);
+    assert.strictEqual(p.count, 2);
+  });
+});
+
+test("W1C1: storage_get-local rejects an invalid keyFilter regex", async () => {
+  await onPage(makeFakePage({ a: "1" }), async () => {
+    const r = await getTool.handler({ keyFilter: "(" });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /keyFilter/);
+    const notString = await getTool.handler({ keyFilter: 5 });
+    assert.strictEqual(notString.isError, true, "a non-string keyFilter must not silently dump everything");
+    assert.match(notString.content[0].text, /keyFilter/);
+  });
+});
+
+test("W1C1: storage_get-local maxBytes omits values that don't fit and lists their keys", async () => {
+  const seed = { uid: "42", cache: "c".repeat(200_000), token: "abc" };
+  await onPage(makeFakePage(seed), async () => {
+    const r = await getTool.handler({});
+    assert.ok(r.content[0].text.length < 60_000, `default cap ~50KB (got ${r.content[0].text.length})`);
+    const p = parse(r);
+    assert.deepStrictEqual(p.entries, { uid: "42", token: "abc" }, "small values after a huge one are still returned");
+    assert.deepStrictEqual(p.omittedKeys, ["cache"]);
+    assert.strictEqual(p.omittedCount, 1);
+    const big = parse(await getTool.handler({ key: "cache", maxBytes: 300_000 }));
+    assert.strictEqual(big.entries.cache.length, 200_000, "raising maxBytes returns the value");
+  });
+});
+
+test("W1C1: storage_get-local omittedKeys is capped at 100 names (omittedCount has the total)", async () => {
+  const seed = {};
+  for (let i = 0; i < 300; i++) seed[`k${i}`] = "v".repeat(1000);
+  await onPage(makeFakePage(seed), async () => {
+    const p = parse(await getTool.handler({ maxBytes: 2048 }));
+    assert.strictEqual(p.count + p.omittedCount, 300);
+    assert.strictEqual(p.omittedKeys.length, 100);
+  });
+});
+
+test("W1C1: storage_get-local validates maxBytes", async () => {
+  await onPage(makeFakePage(), async () => {
+    for (const bad of [10, "big", 1.5]) {
+      const r = await getTool.handler({ maxBytes: bad });
+      assert.strictEqual(r.isError, true, JSON.stringify(bad));
+      assert.match(r.content[0].text, /maxBytes/);
+    }
+  });
+});
+
+test("W1C1: storage_* treat store: null as the default 'local' (null-as-missing)", async () => {
+  const page = makeFakePage({ a: "1" });
+  await onPage(page, async () => {
+    const g = await getTool.handler({ store: null, key: null, keyFilter: null, maxBytes: null });
+    assert.ok(!g.isError, g.content[0].text);
+    assert.strictEqual(parse(g).store, "local");
+    assert.strictEqual(parse(g).entries.a, "1");
+    const s = await setTool.handler({ store: null, entries: { b: "2" }, clearFirst: null });
+    assert.ok(!s.isError, s.content[0].text);
+    assert.strictEqual(parse(s).store, "local");
+    assert.strictEqual(parse(s).clearedFirst, false);
+    assert.strictEqual(page._localStorage.getItem("a"), "1", "clearFirst: null must not clear");
+  });
+});
+
+test("W1C1: storage_clear-local keys: null is an ERROR — a destructive tool never reads null as 'everything'", async () => {
+  const page = makeFakePage({ a: "1", b: "2" });
+  await onPage(page, async () => {
+    const r = await clearTool.handler({ store: null, keys: null });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /keys must be an array/);
+    assert.strictEqual(page._localStorage.length, 2, "nothing may be cleared");
+    const omitted = await clearTool.handler({ store: null });
+    assert.ok(!omitted.isError, omitted.content[0].text);
+    assert.strictEqual(parse(omitted).mode, "all", "omitting keys still clears the whole store");
+    assert.strictEqual(page._localStorage.length, 0);
+  });
+});
+
+test("W1C1: storage_get-local rejects a non-string key instead of dumping the store", async () => {
+  await onPage(makeFakePage({ a: "1", b: "2" }), async () => {
+    const r = await getTool.handler({ key: 123 });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /key/);
+  });
+});
+
+test("W1C1: storage_get-local maxBytes counts JSON-escaped size", async () => {
+  await onPage(makeFakePage({ quotes: '"'.repeat(30_000), small: "s" }), async () => {
+    const r = await getTool.handler({});
+    assert.ok(r.content[0].text.length <= 50_000 + 200, `escaped dump must respect maxBytes (got ${r.content[0].text.length})`);
+    assert.deepStrictEqual(parse(r).omittedKeys, ["quotes"]);
+  });
+});
+
+test("W1C1: storage_* report an empty origin for opaque-origin pages (file:, data:, chrome:)", async () => {
+  for (const url of ["file:///C:/tmp/page.html", "chrome://settings", "data:text/html,hi"]) {
+    await onPage(makeFakePage({ a: "1" }, {}, { url }), async () => {
+      assert.strictEqual(parse(await getTool.handler({})).origin, "", url);
+    });
+  }
+});
+
+test("W1C1: storage_* return compact JSON and an empty origin on about: pages", async () => {
+  await onPage(makeFakePage({ a: "1" }, {}, { url: "about:blank" }), async () => {
+    for (const r of [
+      await getTool.handler({}),
+      await setTool.handler({ entries: { b: "2" } }),
+      await clearTool.handler({ keys: ["b"] }),
+    ]) {
+      assert.ok(!r.isError, r.content[0].text);
+      assert.ok(!r.content[0].text.includes("\n"), "inline JSON must be compact");
+      assert.strictEqual(parse(r).origin, "");
+    }
+  });
+});
+
+test("W1C1: storage_* invalid store error comes from the shared helper (same text in all three)", async () => {
+  await onPage(makeFakePage(), async () => {
+    const texts = [
+      (await getTool.handler({ store: "weird" })).content[0].text,
+      (await setTool.handler({ store: "weird", entries: {} })).content[0].text,
+      (await clearTool.handler({ store: "weird" })).content[0].text,
+    ];
+    for (const t of texts) assert.match(t, /store must be 'local' or 'session' \(got "weird"\)/);
+  });
+});

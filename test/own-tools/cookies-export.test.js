@@ -67,3 +67,119 @@ test("V1-4: cookies_export with urls=undefined still returns full vault (existin
     globalThis.__relayBridge = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C1 (2026-11-03): domains / names filters, compact JSON, maxBytes,
+// outputPath (values stay out of the model's context).
+// ──────────────────────────────────────────────────────────────────
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const JAR = [
+  { name: "session-id", value: "S1", domain: ".amazon.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "Lax" },
+  { name: "ubid", value: "U1", domain: "www.amazon.com", path: "/", expires: -1, httpOnly: false, secure: true, sameSite: "Lax" },
+  { name: "session-id", value: "E1", domain: ".evilamazon.com", path: "/", expires: -1, httpOnly: false, secure: false, sameSite: "None" },
+  { name: "sid", value: "G1", domain: ".google.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "Strict" },
+];
+
+async function withJar(jar, fn) {
+  const prev = globalThis.__relayBridge;
+  globalThis.__relayBridge = { context: { cookies: async () => jar.map((c) => ({ ...c })) } };
+  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+}
+
+test("W1C1: cookies_export domains filter matches the domain and its subdomains only", async () => {
+  await withJar(JAR, async () => {
+    const r = await tool.handler({ domains: ["Amazon.com"] });
+    const p = JSON.parse(r.content[0].text);
+    assert.deepStrictEqual(p.cookies.map((c) => c.value).sort(), ["S1", "U1"], "evilamazon.com must not match amazon.com");
+    assert.strictEqual(p.count, 2);
+  });
+});
+
+test("W1C1: cookies_export names filter + combination with domains", async () => {
+  await withJar(JAR, async () => {
+    const byName = JSON.parse((await tool.handler({ names: ["session-id"] })).content[0].text);
+    assert.deepStrictEqual(byName.cookies.map((c) => c.value).sort(), ["E1", "S1"]);
+    const both = JSON.parse((await tool.handler({ names: ["session-id"], domains: [".amazon.com"] })).content[0].text);
+    assert.deepStrictEqual(both.cookies.map((c) => c.value), ["S1"]);
+  });
+});
+
+test("W1C1: cookies_export empty domains/names filter matches nothing (like urls: [])", async () => {
+  await withJar(JAR, async () => {
+    assert.strictEqual(JSON.parse((await tool.handler({ domains: [] })).content[0].text).count, 0);
+    assert.strictEqual(JSON.parse((await tool.handler({ names: [] })).content[0].text).count, 0);
+  });
+});
+
+test("W1C1: cookies_export rejects malformed domains/names", async () => {
+  await withJar(JAR, async () => {
+    for (const bad of [{ domains: "amazon.com" }, { names: [42] }, { domains: [""] }]) {
+      const r = await tool.handler(bad);
+      assert.strictEqual(r.isError, true, JSON.stringify(bad));
+      assert.match(r.content[0].text, new RegExp(Object.keys(bad)[0]));
+    }
+  });
+});
+
+test("W1C1: cookies_export output is compact JSON and null filters mean 'omitted'", async () => {
+  await withJar(JAR, async () => {
+    const r = await tool.handler({ urls: null, domains: null, names: null, maxBytes: null, outputPath: null });
+    assert.ok(!r.isError, r.content[0].text);
+    assert.ok(!r.content[0].text.includes("\n"), "inline JSON must be compact");
+    assert.strictEqual(JSON.parse(r.content[0].text).count, 4);
+  });
+});
+
+test("W1C1: cookies_export maxBytes caps inline output and says what was left out", async () => {
+  const big = [];
+  for (let i = 0; i < 200; i++) big.push({ name: `c${i}`, value: "v".repeat(400), domain: ".example.com", path: "/" });
+  await withJar(big, async () => {
+    const r = await tool.handler({ maxBytes: 5000 });
+    assert.ok(r.content[0].text.length <= 5000, `inline output must respect maxBytes (got ${r.content[0].text.length})`);
+    const p = JSON.parse(r.content[0].text);
+    assert.strictEqual(p.count, 200, "count reports all matching cookies");
+    assert.strictEqual(p.truncated, true);
+    assert.strictEqual(p.returned, p.cookies.length);
+    assert.ok(p.returned > 0 && p.returned < 200);
+  });
+});
+
+test("W1C1: cookies_export default maxBytes keeps a big jar out of the context", async () => {
+  const big = [];
+  for (let i = 0; i < 2000; i++) big.push({ name: `c${i}`, value: "v".repeat(200), domain: ".example.com", path: "/" });
+  await withJar(big, async () => {
+    const r = await tool.handler({});
+    assert.ok(r.content[0].text.length <= 50_000, `default cap ~50KB (got ${r.content[0].text.length})`);
+    assert.strictEqual(JSON.parse(r.content[0].text).truncated, true);
+  });
+});
+
+test("W1C1: cookies_export outputPath writes all cookies; values never appear inline", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-cookies-export-"));
+  try {
+    const out = path.join(dir, "jar.json");
+    await withJar(JAR, async () => {
+      const r = await tool.handler({ outputPath: out, maxBytes: 1024 });
+      assert.ok(!r.isError, r.content[0].text);
+      const p = JSON.parse(r.content[0].text);
+      assert.strictEqual(p.savedTo, out);
+      assert.strictEqual(p.count, 4);
+      for (const c of JAR) assert.ok(!r.content[0].text.includes(c.value), `value ${c.value} leaked inline`);
+      const file = JSON.parse(fs.readFileSync(out, "utf8"));
+      assert.strictEqual(file.cookies.length, 4, "file is never truncated by maxBytes");
+
+      const again = await tool.handler({ outputPath: out });
+      assert.strictEqual(again.isError, true);
+      assert.match(again.content[0].text, /exists/);
+      const rel = await tool.handler({ outputPath: "jar.json" });
+      assert.strictEqual(rel.isError, true);
+      assert.match(rel.content[0].text, /absolute/);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

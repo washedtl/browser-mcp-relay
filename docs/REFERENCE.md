@@ -66,27 +66,27 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `capture_xhr` | Record XHR/fetch responses | `urlFilter` (regex) | Reverse-engineer a site API while logged in |
+| `capture_xhr` | Record XHR/fetch responses (compact by default: 2 KB bodies, ~100 KB total, headers opt-in) | `urlFilter` (regex), `outputPath` (full capture to a file) | Reverse-engineer a site API while logged in |
 
 #### 🍪 Session & cookies
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `cookies_export` | Export cookies as JSON | `urls` (filter) | Save an authed session for later |
-| `cookies_import` | Import cookies into the context | `cookies` | Restore an authed session |
+| `cookies_export` | Export cookies as JSON | `urls`, `domains`, `names` (filters), `outputPath` (keeps values out of the transcript) | Save an authed session for later |
+| `cookies_import` | Import cookies into the context | `cookies` or `inputPath` (a file from `cookies_export`) | Restore an authed session |
 | `stealth_apply` | Anti-detection patches (Tier 1) | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
 
 #### 💾 Downloads
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `download_capture` | Wait for a download, save to disk | `clickSelector` | Trigger + save a CSV export |
+| `download_capture` | Wait for a download, save to disk (absolute `savePath`) | `clickSelector` | Trigger + save a CSV export |
 
 #### 🗄️ Storage (added in v0.3.0)
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `storage_get-local` | Read `localStorage` / `sessionStorage` keys | `store: "local"\|"session"` | Inspect OAuth tokens on Discord, Notion, Slack, etc. (auth often lives in localStorage, not cookies) |
+| `storage_get-local` | Read `localStorage` / `sessionStorage` keys | `store: "local"\|"session"`, `keyFilter` (regex) | Inspect OAuth tokens on Discord, Notion, Slack, etc. (auth often lives in localStorage, not cookies) |
 | `storage_set-local` | Write keys into `localStorage` / `sessionStorage` | `entries: { key: value }` | Restore an authed session after fresh navigation |
 | `storage_clear-local` | Clear local/session storage on the active origin | `keys` (optional filter) | Test fresh-user flows without resetting the whole profile |
 
@@ -268,13 +268,13 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
   "result": {
     "content": [{
       "type": "text",
-      "text": "[\n  { \"name\": \"session-id\", \"value\": \"<...>\", \"domain\": \".amazon.com\", \"path\": \"/\", \"httpOnly\": true, \"secure\": true, \"sameSite\": \"Lax\" },\n  { \"name\": \"ubid-main\", \"value\": \"<...>\", \"domain\": \".amazon.com\", ... }\n]"
+      "text": "{\"count\":2,\"cookies\":[{\"name\":\"session-id\",\"value\":\"<...>\",\"domain\":\".amazon.com\",\"path\":\"/\",\"httpOnly\":true,\"secure\":true,\"sameSite\":\"Lax\"},{\"name\":\"ubid-main\",\"value\":\"<...>\",\"domain\":\".amazon.com\", ... }]}"
     }]
   }
 }
 ```
 
-> Pair with `cookies_import` to restore the session later — useful for testing multi-step authed flows without re-logging in each run.
+> Pair with `cookies_import` to restore the session later — useful for testing multi-step authed flows without re-logging in each run. Prefer `outputPath` on export and `inputPath` on import so cookie values never pass through the model. Inline output is capped at `maxBytes` (default 50 KB) and flagged `truncated`.
 
 ### `extract_structured` — scrape an authed page
 
@@ -305,7 +305,7 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
   "result": {
     "content": [{
       "type": "text",
-      "text": "{\n  \"title\": \"Example Product\",\n  \"price\": \"$19.99\",\n  \"images\": [\"https://.../1.jpg\", \"https://.../2.jpg\"]\n}"
+      "text": "{\"url\":\"https://example.com/product/123\",\"data\":{\"title\":\"Example Product\",\"price\":\"$19.99\",\"images\":[\"https://.../1.jpg\",\"https://.../2.jpg\"]}}"
     }]
   }
 }
