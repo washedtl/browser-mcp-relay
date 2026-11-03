@@ -398,26 +398,35 @@ test("constructor: needs upstream.createContext and supervisor.ensure", () => {
 // after the kill got the cached context, and upstream's newPage on the dead
 // context failed with "Target page, context or browser has been closed").
 
-/** A supervisor like W2C's: isUp() PID-based; a relaunch emits the old Brave's late 'down' before it resolves. */
+/**
+ * A supervisor like W2C's: checkAlive() turns a dead PID into 'down' at once
+ * (once per launch); otherwise a relaunch emits the old Brave's late 'down'
+ * before it resolves.
+ */
 function pidSupervisor() {
   const sup = new EventEmitter();
   Object.assign(sup, {
-    up: false,
-    pendingDown: false,
+    up: false, // the supervisor's view
+    pidDead: false, // the truth
+    downs: 0,
     ensures: 0,
     launches: 0,
     gate: null, // optional deferred a launch waits for
-    isUp: () => sup.up,
+    _down(reason) { sup.up = false; sup.downs++; sup.emit("down", reason); },
+    checkAlive() {
+      if (sup.up && sup.pidDead) sup._down("exited (pid gone)");
+      return sup.up;
+    },
     async ensure() {
       sup.ensures++;
-      if (sup.up) return { pid: sup.launches };
+      if (sup.up && !sup.pidDead) return { pid: sup.launches };
       if (sup.gate) await sup.gate.promise;
-      if (sup.pendingDown) { sup.pendingDown = false; sup.emit("down", "cdp disconnected"); }
-      if (!sup.up) { sup.up = true; sup.launches++; }
+      if (sup.up) sup._down("exited (code=1)"); // nobody noticed: the exit arrives while relaunching
+      if (!sup.up) { sup.up = true; sup.pidDead = false; sup.launches++; }
       return { pid: sup.launches };
     },
     // the process died; nothing has been processed yet
-    killPid() { sup.up = false; sup.pendingDown = true; },
+    killPid() { sup.pidDead = true; },
   });
   return sup;
 }
@@ -430,7 +439,8 @@ const deadCtx = (ctx) => {
 test("W2E: PID gone, isConnected() still true: the next call relaunches and gets a fresh tab with a reset notice, not the dead context", async () => {
   const upstream = fakeUpstream();
   const supervisor = pidSupervisor();
-  const registry = new SessionRegistry({ upstream, supervisor, log: () => {} });
+  const logs = [];
+  const registry = new SessionRegistry({ upstream, supervisor, log: (m) => logs.push(m) });
   const a1 = await registry.getCtx("c1");
   const b1 = await registry.getCtx("c2");
   supervisor.killPid();
@@ -441,6 +451,8 @@ test("W2E: PID gone, isConnected() still true: the next call relaunches and gets
   const a2 = await registry.getCtx("c1");
   assert.notStrictEqual(a2, a1);
   assert.strictEqual(supervisor.launches, 2, "Brave relaunched");
+  assert.strictEqual(supervisor.downs, 1, "one transition");
+  assert.strictEqual(logs.filter((l) => /^reset \d+ tab/.test(l)).length, 1, "one invalidateAll");
   assert.match(registry.takeResetNotice("c1", MAIN_TAB), /This tab was reset because the browser went down/);
   assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null, "once");
 
@@ -462,7 +474,7 @@ test("W2E: anyOpenCtx never hands out a context of a Brave whose PID is gone", a
   assert.strictEqual(registry.anyOpenCtx(), null);
 });
 
-test("W2E: no spurious resets while isUp() is false for a first launch or a relaunch in flight", async () => {
+test("W2E: no spurious resets during a first launch or a relaunch in flight", async () => {
   const upstream = fakeUpstream();
   const supervisor = pidSupervisor();
   const registry = new SessionRegistry({ upstream, supervisor, log: () => {} });
@@ -470,7 +482,7 @@ test("W2E: no spurious resets while isUp() is false for a first launch or a rela
   supervisor.gate = deferred();
   const first = [registry.getCtx("c1"), registry.getCtx("c2"), registry.getCtx("c1")];
   await tick();
-  assert.strictEqual(supervisor.isUp(), false);
+  assert.strictEqual(supervisor.up, false);
   supervisor.gate.resolve();
   const [a, b, a2] = await Promise.all(first);
   assert.strictEqual(a, a2);

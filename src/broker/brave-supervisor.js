@@ -23,8 +23,10 @@ const KILL_WAIT_MS = 5000;
  *   ensure()          → {cdpUrl, pid}; launches if needed, concurrent calls share one launch
  *   closeGracefully() → Browser.close over CDP, kill fallback after closeTimeoutMs
  *   isUp()            → launched, CDP connected, PID alive
+ *   checkAlive()      → isUp(), after a PID found gone has gone 'down' at once
+ *   pid               → the running Brave's PID, or null
  *   proxyCredentials  → {username, password} of the proxy the last launched Brave uses, or null
- *   'down' (reason)   → once per launch that came up: "closed" | "cdp disconnected" | "exited (code=N)"
+ *   'down' (reason)   → once per launch that came up: "closed" | "cdp disconnected" | "exited (code=N)" | "exited (pid gone)"
  *   'fatal' (reason)  → a relaunch cannot get back the CDP port a Brave of
  *                       ours already served cdpUrl on (still taken after
  *                       portFreeWaitMs); ensure() rejects as well. The port
@@ -95,6 +97,24 @@ class BraveSupervisor extends EventEmitter {
   isUp() {
     const p = this._proc;
     return !!p && p.up && isPidAlive(p.pid);
+  }
+
+  /** @returns {number|null} */
+  get pid() {
+    return this.isUp() ? this._proc.pid : null;
+  }
+
+  /**
+   * W2E: Brave's PID can be gone before its process exit and CDP close are
+   * processed (they lag the death; a call 24 ms after a kill got the dead
+   * browser). Call before handing out a page: a dead Brave goes 'down' now,
+   * once (the late exit / close are then no-ops).
+   * @returns {boolean} isUp()
+   */
+  checkAlive() {
+    const p = this._proc;
+    if (p && p.up && !isPidAlive(p.pid)) this._onDown(p, p.closing ? "closed" : "exited (pid gone)");
+    return this.isUp();
   }
 
   /**

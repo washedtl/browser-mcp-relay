@@ -51,6 +51,7 @@ function fakeSupervisor(opts = {}) {
       return { cdpUrl: `http://127.0.0.1:${opts.port}`, pid: 4242 };
     },
     isUp() { return sup.up; },
+    checkAlive() { return sup.up; },
     async closeGracefully() {
       sup.closes++;
       if (!sup.up) return null;
@@ -63,6 +64,7 @@ function fakeSupervisor(opts = {}) {
       sup.emit("down", reason);
     },
   });
+  Object.defineProperty(sup, "pid", { get: () => (sup.up ? 4242 : null) });
   return sup;
 }
 

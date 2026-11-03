@@ -647,6 +647,28 @@ test("isUp() is false as soon as the PID is gone, even before any event arrives"
   assert.strictEqual(sup.isUp(), false);
 });
 
+test("W2E checkAlive(): a PID gone before its exit/disconnect is processed → 'down' at once, exactly once", async () => {
+  const dir = tmpProfile("fake-checkalive");
+  const { sup, log } = fakeSupervisor(dir);
+  const { pid } = await sup.ensure();
+  assert.strictEqual(sup.checkAlive(), true, "a live Brave: nothing happens");
+  assert.strictEqual(sup.pid, pid);
+  const downs = [];
+  sup.on("down", (r) => downs.push(r));
+  // kill and wait for the PID to die synchronously: no event can be processed in between
+  process.kill(pid, "SIGKILL");
+  for (const until = Date.now() + 5000; isAlive(pid) && Date.now() < until;) { /* spin */ }
+  assert.strictEqual(isAlive(pid), false);
+  assert.strictEqual(sup.checkAlive(), false);
+  assert.strictEqual(sup.pid, null);
+  assert.deepStrictEqual(downs, ["exited (pid gone)"], "'down' fired synchronously");
+  await sleep(500); // the exit and the CDP close arrive now: no second 'down'
+  assert.deepStrictEqual(downs, ["exited (pid gone)"]);
+  assert.strictEqual(log.lines.filter((l) => / down: /.test(l)).length, 1, "one log line");
+  const again = await sup.ensure();
+  assert.notStrictEqual(again.pid, pid, "the next ensure() relaunches");
+});
+
 test("disconnect: relaunch waits for the old PID to exit first (else Brave hands off and exits)", async () => {
   const dir = tmpProfile("fake-linger");
   let oldPid = null;

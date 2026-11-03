@@ -361,7 +361,6 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   const seeded = seedProfile
     ? Promise.resolve().then(() => seedProfile({ profileDir, log })).catch((e) => log(`profile seed failed (${e.message}); starting with a fresh profile`))
     : null;
-  let bravePid = null; // for status
 
   // Our fixed CDP port can be taken before Brave's first launch (W2C then
   // fails every launch). Exit cleanly: the shims start a broker on a new port.
@@ -369,9 +368,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   async function ensureBrave() {
     if (seeded) await seeded;
     try {
-      const info = await supervisor.ensure();
-      bravePid = info.pid;
-      return info;
+      return await supervisor.ensure();
     } catch (e) {
       if (!PORT_IN_USE_RE.test(e.message || "")) throw e;
       if (!portLost) {
@@ -388,7 +385,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     supervisor: {
       ensure: ensureBrave,
       on: (event, fn) => (typeof supervisor.on === "function" ? supervisor.on(event, fn) : undefined),
-      isUp: () => supervisor.isUp(), // PID-based: a crash shows here before its disconnect is processed
+      checkAlive: () => supervisor.checkAlive(),
     },
     log,
   });
@@ -760,7 +757,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
       pipe,
       profileDir,
       cdpUrl,
-      brave: { up, pid: up ? bravePid : null },
+      brave: { up, pid: up ? supervisor.pid : null },
       connections: [...sessions].map(([id, openedAt]) => ({
         id,
         openedAt: new Date(openedAt).toISOString(),
