@@ -34,8 +34,9 @@ src/
 test/                     # node --test runner; mirrors src/ layout
 └── own-tools/            # tests for each own-tool (shape + acts on ctx.page only)
 scripts/
+├── run-tests.js          # `npm test` — unit files in parallel, then real-Brave/e2e files one at a time
 ├── setup.js              # interactive `npm run setup` wizard
-├── smoke.js              # `npm run smoke` — tools/list check: broker (Windows, private pipe) + legacy
+├── smoke.js              # `npm run smoke` — Brave check, then tools/list: broker (Windows, private pipe) + legacy
 ├── broker-ctl.js         # `npm run broker:status` / `broker:stop`
 └── migrate-profile.js    # `npm run migrate-profile` — seed the broker profile by hand
 ```
@@ -98,7 +99,7 @@ scripts/
    });
    ```
 
-4. **Run the suite.** `npm test`. The count should be N+2.
+4. **Run the suite.** `npm test`. The total goes up by 2; `npm test -- --update-badge` writes the new count into the README badge (a full run fails while the badge is stale).
 
 5. **Restart your MCP client.** It will see the new tool in `tools/list` after the next relay launch.
 
@@ -115,6 +116,8 @@ scripts/
 ## Tests
 
 - `node --test` is the runner. No mocha, no jest, no babel.
+- `npm test` (`scripts/run-tests.js`) runs in two phases: every unit file in one parallel `node --test`, then the files in its `SERIAL_FILES` list one at a time. Those launch real Brave, real brokers and shims, or time process races, and in parallel they starve each other into timeouts on a loaded machine. A test file that uses `test/fixtures/temp-brave.js` or a real `detectBravePath()` must be in that list (`test/run-tests.test.js` checks). Extra arguments go to every `node --test` run (e.g. `npm test -- --test-name-pattern=broker`); one file alone: `node --test test/<file>.test.js`.
+- The README test badge is the total count with Brave installed (real-Brave suites only register their subtests when it is). A full run checks it when the real-Brave tests ran, and fails if it is stale: update it with `npm test -- --update-badge`.
 - Prefer **test seams** over real side-effects. `src/detect-browser.js` + `test/detect-browser.test.js` show the pattern: detection takes injected `platform` + `env` + `existsSync` so the tests don't need a real Brave install.
 - Don't reach for the network in tests.
 - Real-Brave tests (the broker's upstream, window, supervisor and end-to-end tests, plus `launchBrave + connectOverCDP roundtrip` in `test/cdp-bridge.test.js`) run only when Brave is installed, and skip cleanly otherwise. They use `test/fixtures/temp-brave.js`: a throwaway profile under `.tmp-profiles/`, an OS-assigned port, headless unless `BMR_TEST_HEADFUL=1`. Never a real profile, a real broker pipe (`browser-mcp-relay-*`) or the real broker home: broker tests use `bmr-test-*` pipes and a temp `LOCALAPPDATA`. Kill only processes your test started, and check none are left.

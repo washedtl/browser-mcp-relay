@@ -20,6 +20,7 @@ const { execFileSync } = require("node:child_process");
 const { Shim, runLauncher, launchEnv, launcherArgs, resolveShimOptions, onLines, SHIM_FILE, BROKER_MAIN } = require("../src/shim.js");
 const { resolveEndpoint, keyFileFor, loadOrCreateKey, helloMac, settingsHash } = require("../src/broker/pipe-server.js");
 const { quoteArg, commandLine, isElevated } = require("../src/broker/deelevate.js");
+const { removeDir } = require("./fixtures/temp-brave.js");
 
 // one key for the in-process tests (the fake broker below answers with it)
 const KEY_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-shim-key-"));
@@ -715,7 +716,7 @@ test("processes: from an elevated session the broker runs de-elevated (medium in
   const run = processRun(t, "deelevate");
   const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-lad-"));
   // the broker's working dir is in here; a just-killed broker may hold it a moment
-  t.after(() => fs.rmSync(localAppData, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
+  t.after(() => removeDir(localAppData));
   const c = await shimClient(t, run, {
     // W1: ~20K chars of env (over the old 32K-char env-var transport once base64'd)
     env: { BROWSER_RELAY_BROKER_DEELEVATE: "auto", LOCALAPPDATA: localAppData, BROWSER_RELAY_TEST_MARK: `m-2${"x".repeat(20_000)}`, NOT_ALLOWLISTED_SECRET: "s3cr3t" },

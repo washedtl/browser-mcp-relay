@@ -135,15 +135,15 @@ async function forceStop(child, profileDir) {
   await removeProfile(profileDir);
 }
 
-// Brave's helper processes (GPU, crashpad, utility) can hold profile files
-// for a few seconds after the main process exits. rmSync's own retry does
-// not cover EPERM on Node 24's native rm, so retry here.
-async function removeProfile(profileDir) {
-  const deadline = Date.now() + 20000;
+// Brave's helper processes (GPU, crashpad, utility), or a just-killed
+// broker, can hold files for a few seconds after the main process exits.
+// rmSync's own retry (maxRetries) does not cover EPERM on Node 24's native
+// rm, so retry here.
+async function removeDir(dir, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      fs.rmSync(profileDir, { recursive: true, force: true });
-      try { fs.rmdirSync(PROFILES_ROOT); } catch { /* other profiles still in use */ }
+      fs.rmSync(dir, { recursive: true, force: true });
       return;
     } catch (e) {
       if (!["EPERM", "EBUSY", "ENOTEMPTY", "EACCES"].includes(e.code) || Date.now() > deadline) throw e;
@@ -152,4 +152,9 @@ async function removeProfile(profileDir) {
   }
 }
 
-module.exports = { BRAVE_PATH, PROFILES_ROOT, braveAvailable, headfulRequested, launchTempBrave, makeProfileDir, removeProfile };
+async function removeProfile(profileDir) {
+  await removeDir(profileDir);
+  try { fs.rmdirSync(PROFILES_ROOT); } catch { /* other profiles still in use */ }
+}
+
+module.exports = { BRAVE_PATH, PROFILES_ROOT, braveAvailable, headfulRequested, launchTempBrave, makeProfileDir, removeProfile, removeDir };
