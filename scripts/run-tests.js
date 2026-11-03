@@ -71,9 +71,11 @@ function runNodeTest(nodeArgs, files) {
       stdio: ["inherit", "pipe", "inherit"],
       env: process.stdout.isTTY ? { ...process.env, FORCE_COLOR: process.env.FORCE_COLOR || "1" } : process.env,
     });
+    // decoded across chunk boundaries; only the tail (the summary) is kept
+    child.stdout.setEncoding("utf8");
     let out = "";
     child.stdout.on("data", (d) => {
-      out += d;
+      out = (out + d).slice(-8192);
       process.stdout.write(d);
     });
     child.on("error", (e) => {
@@ -87,11 +89,6 @@ function runNodeTest(nodeArgs, files) {
 function readBadge(readme = fs.readFileSync(README, "utf8")) {
   const m = BADGE_RE.exec(readme);
   return m ? Number(m[1]) : null;
-}
-
-/** The real-Brave tests run (and register their subtests) only where this holds. */
-function realBraveTestsRun() {
-  return require("../test/fixtures/temp-brave.js").braveAvailable();
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -116,15 +113,17 @@ async function main(argv = process.argv.slice(2)) {
 
   let badgeOk = true;
   if (total !== null && nodeArgs.length === 0) {
-    const badge = readBadge();
-    if (updateBadge) {
+    const readme = fs.readFileSync(README, "utf8");
+    const badge = readBadge(readme);
+    // the real-Brave suites register their subtests only where Brave is found
+    if (!require("../test/fixtures/temp-brave.js").braveAvailable()) {
+      process.stdout.write(`[run-tests] README test badge not ${updateBadge ? "updated" : "checked"}: the real-Brave tests were skipped (Brave not installed)\n`);
+    } else if (updateBadge) {
       if (failed) process.stdout.write("[run-tests] not updating the README badge: some tests failed\n");
       else if (badge !== total) {
-        fs.writeFileSync(README, fs.readFileSync(README, "utf8").replace(BADGE_RE, `tests-${total}%20passing`));
+        fs.writeFileSync(README, readme.replace(BADGE_RE, `tests-${total}%20passing`));
         process.stdout.write(`[run-tests] README test badge: ${badge} → ${total}\n`);
       }
-    } else if (!realBraveTestsRun()) {
-      process.stdout.write("[run-tests] README test badge not checked: the real-Brave tests were skipped (Brave not installed)\n");
     } else if (badge !== total) {
       badgeOk = false;
       process.stdout.write(`[run-tests] README test badge says ${badge}, this run counted ${total}: run \`npm test -- --update-badge\`\n`);

@@ -14,6 +14,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
+const { removeDir } = require("./remove-dir.js");
 
 const BRAVE_PATH = "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe";
 const PROFILES_ROOT = path.resolve(__dirname, "..", "..", ".tmp-profiles");
@@ -135,26 +136,11 @@ async function forceStop(child, profileDir) {
   await removeProfile(profileDir);
 }
 
-// Brave's helper processes (GPU, crashpad, utility), or a just-killed
-// broker, can hold files for a few seconds after the main process exits.
-// rmSync's own retry (maxRetries) does not cover EPERM on Node 24's native
-// rm, so retry here.
-async function removeDir(dir, timeoutMs = 20000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-      return;
-    } catch (e) {
-      if (!["EPERM", "EBUSY", "ENOTEMPTY", "EACCES"].includes(e.code) || Date.now() > deadline) throw e;
-      await sleep(500);
-    }
-  }
-}
-
+// Brave's helpers can hold profile files for a few seconds after the main
+// process exits: removeDir waits that out.
 async function removeProfile(profileDir) {
   await removeDir(profileDir);
   try { fs.rmdirSync(PROFILES_ROOT); } catch { /* other profiles still in use */ }
 }
 
-module.exports = { BRAVE_PATH, PROFILES_ROOT, braveAvailable, headfulRequested, launchTempBrave, makeProfileDir, removeProfile, removeDir };
+module.exports = { BRAVE_PATH, PROFILES_ROOT, braveAvailable, headfulRequested, launchTempBrave, makeProfileDir, removeProfile };

@@ -18,7 +18,7 @@
 // tools), so a session that never calls a tool costs no upstream import and
 // no Brave. Upstream tools run in-process with their args parsed by
 // upstream's own zod shapes; own-tools (W2D) run with the ctx W2D's
-// toolContext builds; only tabs_new opens tabs. Idle policy (design §3):
+// toolContext builds; only tabs_new opens tabs. Idle policy:
 // Brave closes after 20 min without a tool call; the broker exits after 10
 // min without connections. Both close Brave gracefully (Browser.close
 // flushes cookies; a kill loses ~30 s).
@@ -143,7 +143,7 @@ const DEFAULT_DEPS = {
 };
 
 /**
- * Two timers (design §3):
+ * Two timers:
  *   - exit: no connections for exitIdleMs → onExitIdle (armed by start() and
  *     whenever the last connection closes; any connection disarms it);
  *   - browser: no tool call for browserIdleMs → onBrowserIdle (armed when the
@@ -755,7 +755,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     }
   }, KEY_CHECK_MS);
   keyTimer.unref();
-  // §4: recycle a broker whose memory grew past the limit, while it is idle
+  // recycle a broker whose memory grew past the limit, while it is idle
   let rssTimer = null;
   if (recycle && recycle.rssBytes) {
     const rss = d.rss || (() => process.memoryUsage().rss);

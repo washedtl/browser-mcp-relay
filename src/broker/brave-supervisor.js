@@ -17,6 +17,8 @@ const { detectBravePath } = require("../detect-browser.js");
 
 const PREFIX = "[mcp-relay] brave-supervisor:";
 const KILL_WAIT_MS = 5000;
+const CLOSE_TIMEOUT_MS = 10000;
+const SHUTDOWN_GRACE_MS = 20000;
 // Chromium's exit code when another browser process holds the profile
 const RESULT_CODE_PROFILE_IN_USE = 21;
 
@@ -97,8 +99,8 @@ class BraveSupervisor extends EventEmitter {
     this._log = opts.log || ((m) => process.stderr.write(`${PREFIX} ${m}\n`));
     this._t = {
       launchTimeoutMs: opts.launchTimeoutMs || 20000,
-      closeTimeoutMs: opts.closeTimeoutMs || 10000,
-      shutdownGraceMs: opts.shutdownGraceMs || 20000,
+      closeTimeoutMs: opts.closeTimeoutMs || CLOSE_TIMEOUT_MS,
+      shutdownGraceMs: opts.shutdownGraceMs || SHUTDOWN_GRACE_MS,
       exitWaitMs: opts.exitWaitMs || 5000,
       portFreeWaitMs: opts.portFreeWaitMs || 3000,
       proxyProbeTimeoutMs: opts.proxyProbeTimeoutMs || 1500,
@@ -493,7 +495,7 @@ function profileLockHeld(profileDir, platform = process.platform) {
     return false;
   }
   const m = /^(.*)-(\d+)$/.exec(target);
-  return !!m && m[1] === os.hostname() && isPidAlive(Number(m[2]));
+  return !!m && m[1] === os.hostname() && require("../process-shim.js").isPidAlive(Number(m[2]));
 }
 
 /**
@@ -608,7 +610,7 @@ function pickFreePort() {
 }
 
 /**
- * Brave's command line. The design-§3 flag set, plus the two optional extras.
+ * Brave's command line: the broker's flag set, plus the optional extras.
  *
  * @param {object} opts
  * @param {number} opts.port — CDP port
@@ -827,4 +829,6 @@ module.exports = {
   braveEnv,
   profileLockHeld,
   findBraveOnProfile,
+  CLOSE_TIMEOUT_MS,
+  SHUTDOWN_GRACE_MS,
 };

@@ -6,7 +6,7 @@
 // its own tabId; every tab is one upstream ToolSessionContext, i.e. one page
 // in its own window (W2B's newPage hook).
 //
-// Rules this module owns (design §3/§4):
+// Rules this module owns:
 //   - Context creation is serialized (one mutex for the whole broker):
 //     upstream caches its CDP connection check-then-set, so concurrent first
 //     calls would open several connections to the one Brave.

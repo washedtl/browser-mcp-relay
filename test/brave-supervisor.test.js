@@ -24,7 +24,7 @@ const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const WebSocket = require("ws");
 const { detectBravePath } = require("../src/detect-browser.js");
-const { removeDir } = require("./fixtures/temp-brave.js");
+const { removeDir } = require("./fixtures/remove-dir.js");
 
 const {
   BraveSupervisor,
@@ -71,7 +71,7 @@ function collectLog() {
 
 // ─────────────── A. pure helpers ───────────────
 
-test("buildBraveArgs: exactly the design §3 flag set, nothing else", () => {
+test("buildBraveArgs: exactly the broker's flag set, nothing else", () => {
   const args = buildBraveArgs({ port: 9555, profileDir: "C:\\p\\broker" });
   assert.deepStrictEqual(args, [
     "--remote-debugging-port=9555",

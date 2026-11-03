@@ -128,41 +128,42 @@ test("W2P setup mode: describes broker and legacy's two setups; Enter takes brok
   assert.match(r.printed, /standalone — legacy: one Brave per session/);
   assert.match(r.printed, /pool {7}— legacy:/);
   assert.deepStrictEqual(r.asked, ["Choose mode (broker/standalone/pool): [broker] "]);
-  assert.deepStrictEqual(r.choice, { mode: "broker", relayMode: "broker", poolDir: "" });
+  assert.deepStrictEqual(r.choice, { mode: "broker", poolDir: "" });
 });
 
 test("W2P setup mode: Enter takes legacy standalone on macOS/Linux; broker there is allowed with a note", async () => {
-  assert.deepStrictEqual((await chooseMode([""], "linux")).choice, { mode: "standalone", relayMode: "legacy", poolDir: "" });
+  assert.deepStrictEqual((await chooseMode([""], "linux")).choice, { mode: "standalone", poolDir: "" });
   const b = await chooseMode(["broker"], "darwin");
-  assert.deepStrictEqual(b.choice, { mode: "broker", relayMode: "broker", poolDir: "" });
+  assert.deepStrictEqual(b.choice, { mode: "broker", poolDir: "" });
   assert.match(b.printed, /never been run on this OS/);
 });
 
 test("W2P setup mode: standalone and pool are legacy mode; an unknown answer falls back to the default", async () => {
-  assert.deepStrictEqual((await chooseMode(["standalone"], "win32")).choice, { mode: "standalone", relayMode: "legacy", poolDir: "" });
-  assert.deepStrictEqual((await chooseMode(["pool", "D:\\slot"], "win32")).choice, { mode: "pool", relayMode: "legacy", poolDir: "D:\\slot" });
+  assert.deepStrictEqual((await chooseMode(["standalone"], "win32")).choice, { mode: "standalone", poolDir: "" });
+  assert.deepStrictEqual((await chooseMode(["pool", "D:\\slot"], "win32")).choice, { mode: "pool", poolDir: "D:\\slot" });
   const u = await chooseMode(["brokr"], "win32");
-  assert.deepStrictEqual(u.choice, { mode: "broker", relayMode: "broker", poolDir: "" });
+  assert.deepStrictEqual(u.choice, { mode: "broker", poolDir: "" });
   assert.match(u.printed, /Unknown mode "brokr"; using broker/);
 });
 
 // ─────────────────── W2P: smoke needs Brave ───────────────────
 
-function smokeRun(argv, brave) {
+function smokeRun(argv, config) {
   const { run } = require("../scripts/smoke.js");
   const out = [];
   let modesRan = 0;
   const code = run({
     argv,
-    resolve: () => brave,
+    loadConfig: () => config,
     modes: async () => { modesRan++; return [{ mode: "legacy", ok: true, count: 72, reason: "", seconds: 1 }]; },
     write: (s) => out.push(s),
   });
   return code.then((c) => ({ code: c, out: out.join(""), modesRan }));
 }
+const noBrave = (message) => ({ bravePath: null, braveDetectError: new Error(message) });
 
-test("W2P smoke: no Brave → fails at once with what to do, and spawns no relay", async () => {
-  const r = await smokeRun([], { error: "Brave was not found at any standard location" });
+test("W2P smoke: no Brave → fails at once with the relay's detection error and what to do; spawns no relay", async () => {
+  const r = await smokeRun([], noBrave("Brave was not found at any standard location"));
   assert.strictEqual(r.code, 1);
   assert.strictEqual(r.modesRan, 0);
   assert.match(r.out, /✗ Smoke test FAILED: Brave not found\. Brave was not found at any standard location/);
@@ -171,7 +172,7 @@ test("W2P smoke: no Brave → fails at once with what to do, and spawns no relay
 });
 
 test("W2P smoke: Brave found → names it, then runs the checks", async () => {
-  const r = await smokeRun([], { path: "C:\\fake\\brave.exe" });
+  const r = await smokeRun([], { bravePath: "C:\\fake\\brave.exe", braveDetectError: null });
   assert.strictEqual(r.code, 0);
   assert.strictEqual(r.modesRan, 1);
   assert.match(r.out, /^\[smoke\] Brave: C:\\fake\\brave\.exe\n/);
@@ -179,17 +180,10 @@ test("W2P smoke: Brave found → names it, then runs the checks", async () => {
 });
 
 test("W2P smoke --without-brave (CI): catalog-only check, said so", async () => {
-  const r = await smokeRun(["--without-brave"], { error: "not found" });
+  const r = await smokeRun(["--without-brave"], noBrave("not found"));
   assert.strictEqual(r.code, 0);
   assert.strictEqual(r.modesRan, 1);
   assert.match(r.out, /Brave not found \(--without-brave\): checking the tool catalog only/);
-});
-
-test("W2P smoke resolveBrave: the relay's resolved path, else its detection error", () => {
-  const { resolveBrave } = require("../scripts/smoke.js");
-  assert.deepStrictEqual(resolveBrave(() => ({ bravePath: "/opt/brave", braveDetectError: null })), { path: "/opt/brave" });
-  assert.deepStrictEqual(resolveBrave(() => ({ bravePath: null, braveDetectError: new Error("no brave here") })), { error: "no brave here" });
-  assert.deepStrictEqual(resolveBrave(() => ({ bravePath: null, braveDetectError: null })), { error: "Brave was not found" });
 });
 
 // ─────────────────── package.json scripts wiring ───────────────────

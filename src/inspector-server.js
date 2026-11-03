@@ -144,6 +144,11 @@ const listBraveProcessesAsync = () =>
 const getProcessStartTimesAsync = (pids) =>
   runProbeAsync((spawn) => pool.getProcessStartTimes(pids, spawn ? { _spawnSync: spawn } : {}));
 
+/** The relay mode the Inspector shows: broker, or legacy's standalone / pool. */
+function modeOf(cfg, brokerMode) {
+  return brokerMode ? "broker" : cfg.standalone ? "standalone" : "pool";
+}
+
 /** Build the /api/status payload. Pure-ish (everything stateful is injected
  *  via the seams object). Async (W1E-2): the process probes run off the
  *  event loop; process seams may return values or promises. */
@@ -318,7 +323,7 @@ async function buildStatus(seams = {}, { brokerMode = false } = {}) {
   const ownCount = _ownTools.length;
   const forwardedCount = 51;
   const uptimeSeconds = Math.floor((_now() - _startedAt) / 1000);
-  const mode = brokerMode ? "broker" : cfg.standalone ? "standalone" : "pool";
+  const mode = modeOf(cfg, brokerMode);
 
   return {
     config: {
@@ -403,7 +408,7 @@ function buildSettings(seams = {}, { brokerMode = false } = {}) {
         ? redactPath(cfg.cookieSourceProfile)
         : null,
       cookieFreshnessWarnDays: cfg.cookieFreshnessWarnDays,
-      mode: brokerMode ? "broker" : cfg.standalone ? "standalone" : "pool",
+      mode: modeOf(cfg, brokerMode),
     },
     env: envBooleans,
     localConfigExists,

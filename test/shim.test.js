@@ -20,7 +20,7 @@ const { execFileSync } = require("node:child_process");
 const { Shim, runLauncher, launchEnv, launcherArgs, resolveShimOptions, onLines, SHIM_FILE, BROKER_MAIN } = require("../src/shim.js");
 const { resolveEndpoint, keyFileFor, loadOrCreateKey, helloMac, settingsHash } = require("../src/broker/pipe-server.js");
 const { quoteArg, commandLine, isElevated } = require("../src/broker/deelevate.js");
-const { removeDir } = require("./fixtures/temp-brave.js");
+const { removeDir } = require("./fixtures/remove-dir.js");
 
 // one key for the in-process tests (the fake broker below answers with it)
 const KEY_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-shim-key-"));

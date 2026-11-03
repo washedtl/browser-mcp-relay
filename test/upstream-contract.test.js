@@ -291,7 +291,7 @@ test.describe("loadUpstream (installed dist)", () => {
     await assert.rejects(up.loadUpstream({ cdpUrl: "http://127.0.0.1:1" }), /already bound to/);
   });
 
-  test("forces the upstream env from the design (§3) and strips BROWSER_PERSISTENT_*", () => {
+  test("forces the upstream env and strips BROWSER_PERSISTENT_*", () => {
     assert.strictEqual(process.env.TELEMETRY_ENABLE, "false");
     assert.strictEqual(process.env.BROWSER_CDP_OPEN_INSPECT, "false");
     assert.strictEqual(process.env.TOOL_OUTPUT_SCHEMA_DISABLE, "true");

@@ -23,7 +23,7 @@ test("run-tests: every test file that drives a real Brave runs in the serial pha
   const serial = new Set(runner.SERIAL_FILES);
   const real = runner.findTestFiles()
     .filter((f) => /fixtures\/temp-brave\.js|detectBravePath\(\)/.test(fs.readFileSync(f, "utf8")))
-    .map((f) => path.relative(path.join(__dirname), f).split(path.sep).join("/"));
+    .map((f) => path.relative(__dirname, f).split(path.sep).join("/"));
   assert.ok(real.includes("e2e-broker.test.js"), "the detection itself still works");
   assert.deepStrictEqual(real.filter((f) => !serial.has(f)), []);
 });

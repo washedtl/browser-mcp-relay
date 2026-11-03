@@ -46,7 +46,7 @@ const { createRequire } = require("node:module");
 const { pathToFileURL } = require("node:url");
 const { applyLocalConfigToEnv } = require("../local-config.js");
 
-// Design §3: forced in code so a user's env can't turn telemetry, the
+// Forced in code so a user's env can't turn telemetry, the
 // "open chrome://inspect in your real Chrome" fallback, or output schemas on.
 // PLATFORM is a generic name some machines set system-wide; upstream would
 // load its Node.js tool platform for PLATFORM=node.

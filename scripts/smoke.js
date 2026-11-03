@@ -98,9 +98,30 @@ async function smokeModes({ modes = SMOKE_MODES, log = () => {} } = {}) {
       results.push({ mode, ...r, seconds: (Date.now() - t0) / 1000 });
     }
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    await removeScratch(scratch, log);
   }
   return results;
+}
+
+/**
+ * The smoke broker exits 2 s after its check and may still hold its work dir
+ * in `dir` a moment longer; Node 24's rmSync doesn't retry EPERM itself.
+ * Cleanup never fails the smoke test.
+ */
+async function removeScratch(dir, log, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (e) {
+      if (Date.now() > deadline) {
+        log(`[smoke] could not remove ${dir} (${e.code}); delete it later\n`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
 }
 
 /** One check: legacy mode unless `env` says otherwise (see modeEnv). */
@@ -209,27 +230,21 @@ function report(results, write = (s) => process.stdout.write(s)) {
 }
 
 /**
- * Brave as the relay resolves it: BROWSER_RELAY_BRAVE_PATH (env or
- * local-config.json), the pool wrapper's, then auto-detect.
- * @returns {{path: string} | {error: string}}
+ * @param {object} [opts]
+ * @param {() => {bravePath: string|null, braveDetectError: Error|null}} [opts.loadConfig] — Brave
+ *   as the relay resolves it: BROWSER_RELAY_BRAVE_PATH (env or local-config.json), the pool
+ *   wrapper's, then auto-detect (braveDetectError is set whenever bravePath is null)
+ * @returns {Promise<number>} exit code
  */
-function resolveBrave(loadConfig = () => require("../src/pool-shared.js").loadConfig()) {
-  const cfg = loadConfig();
-  if (cfg.bravePath) return { path: cfg.bravePath };
-  return { error: cfg.braveDetectError ? cfg.braveDetectError.message : "Brave was not found" };
-}
-
-/** @returns {Promise<number>} exit code */
-async function run({ argv = process.argv.slice(2), resolve = resolveBrave, modes = smokeModes, write = (s) => process.stdout.write(s) } = {}) {
-  const withoutBrave = argv.includes("--without-brave");
-  const brave = resolve();
-  if (brave.path) {
-    write(`[smoke] Brave: ${brave.path}\n`);
-  } else if (withoutBrave) {
-    write(`[smoke] Brave not found (--without-brave): checking the tool catalog only; tool calls would fail. ${brave.error}\n`);
+async function run({ argv = process.argv.slice(2), loadConfig = () => require("../src/pool-shared.js").CONFIG, modes = smokeModes, write = (s) => process.stdout.write(s) } = {}) {
+  const { bravePath, braveDetectError } = loadConfig();
+  if (bravePath) {
+    write(`[smoke] Brave: ${bravePath}\n`);
+  } else if (argv.includes("--without-brave")) {
+    write(`[smoke] Brave not found (--without-brave): checking the tool catalog only; tool calls would fail. ${braveDetectError.message}\n`);
   } else {
     write(
-      `✗ Smoke test FAILED: Brave not found. ${brave.error}\n` +
+      `✗ Smoke test FAILED: Brave not found. ${braveDetectError.message}\n` +
       "  Install Brave (https://brave.com/), or set BROWSER_RELAY_BRAVE_PATH (env or local-config.json; `npm run setup` writes it), then re-run.\n",
     );
     return 1;
@@ -245,4 +260,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { smokeTest, smokeModes, modeEnv, report, killTree, resolveBrave, run, MIN_TOOLS };
+module.exports = { smokeTest, smokeModes, modeEnv, report, killTree, run, MIN_TOOLS };

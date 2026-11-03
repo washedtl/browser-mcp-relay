@@ -25,8 +25,9 @@ const { until, pidAlive, killTree, freePort } = require("./fixtures/broker-fakes
 const SKIP = !braveAvailable() && "needs Windows + Brave";
 const ENTRY = path.resolve(__dirname, "..", "src", "index.js");
 const IDLE_EXIT_MS = 4000;
-// the broker's close: up to 30 s for a Brave still shutting down on a loaded machine, then exit
-const CLOSE_BUDGET_MS = 40_000;
+// the broker's close: a Brave still shutting down on a loaded machine gets the whole budget, then the broker exits
+const { CLOSE_TIMEOUT_MS, SHUTDOWN_GRACE_MS } = require("../src/broker/brave-supervisor.js");
+const CLOSE_BUDGET_MS = CLOSE_TIMEOUT_MS + SHUTDOWN_GRACE_MS + 10_000;
 const textOf = (r) => (r.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
 
 /** [{pid, name, privateMB, wsMB, cmd}] for processes whose command line contains `needle` or whose pid is listed. */
