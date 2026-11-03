@@ -5,8 +5,9 @@ The slim README at the root of the repo is for getting up and running. This file
 ## Contents
 
 - [Tool catalog](#tool-catalog)
-  - [First-party tools (19)](#first-party-tools-19)
+  - [First-party tools (20)](#first-party-tools-20)
   - [Forwarded upstream tools (51)](#forwarded-upstream-tools-51)
+  - [Toolsets (hidden by default)](#toolsets)
 - [Worked examples](#worked-examples)
 - [Architecture](#architecture)
 - [Configuration](#configuration)
@@ -26,11 +27,11 @@ The slim README at the root of the repo is for getting up and running. This file
 
 ## Tool catalog
 
-**70 tools total = 19 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).**
+**71 tools total = 20 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).** 22 of them are hidden by default until you enable their [toolset](#toolsets).
 
 Both layers are merged into a single `tools/list` response, so to your MCP client they all just look like "tools the relay provides."
 
-### First-party tools (19)
+### First-party tools (20)
 
 #### 🔬 Performance & diagnostics
 
@@ -96,6 +97,12 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 |---|---|---|---|
 | `extract_structured` | CSS-selector-based extraction | `schema` | Scrape an authed page that public scrapers can't reach |
 
+#### 🧰 Relay control
+
+| Tool | Purpose | Notable arg | Example use case |
+|---|---|---|---|
+| `toolsets` | List / enable / disable the hidden-by-default [toolsets](#toolsets). Never launches Brave. | `action`, `sets` | Turn on `debug` after the user agrees, for a source-mapped logpoint session |
+
 > Source for each first-party tool lives at [`src/own-tools/<tool-name>.js`](../src/own-tools/).
 
 ---
@@ -123,6 +130,8 @@ Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devt
 | `content_stop-recording` | Stop recording and save the video file |
 
 #### 🐛 Live debugging probes (11)
+
+Hidden by default: `debug` [toolset](#toolsets).
 
 | Tool | Purpose |
 |---|---|
@@ -162,6 +171,8 @@ Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devt
 
 #### 📈 Observability (6)
 
+The three trace-context tools are hidden by default: `trace` [toolset](#toolsets).
+
 | Tool | Purpose |
 |---|---|
 | `o11y_get-console-messages` | Page console output |
@@ -172,6 +183,8 @@ Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devt
 | `o11y_new-trace-id` | Mint a fresh trace ID |
 
 #### ⚛️ React introspection (2)
+
+Hidden by default: `react` [toolset](#toolsets).
 
 | Tool | Purpose |
 |---|---|
@@ -189,6 +202,8 @@ Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devt
 
 #### 🎬 Scenarios (6)
 
+Hidden by default: `scenario` [toolset](#toolsets).
+
 | Tool | Purpose |
 |---|---|
 | `scenario-add` | Save a reusable JS script that orchestrates other tools |
@@ -204,6 +219,23 @@ Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devt
 |---|---|
 | `execute` | Batch-execute multiple tool calls in one request via custom JS — reduces round-trips |
 | `sync_wait-for-network-idle` | Wait until in-flight requests ≤ N for `idleMs` |
+
+### Toolsets
+
+22 forwarded tools are hidden from `tools/list` by default to save your MCP client's context (~15K chars of description + schema). They are grouped into toolsets:
+
+| Toolset | Tools | What for |
+|---|---|---|
+| `debug` | `debug_*` (11) | JS debugger probes: tracepoints, logpoints, exception points, watches, snapshots |
+| `react` | `react_*` (2) | Map DOM elements to React components and back |
+| `scenario` | `scenario-*` (6) | Save / run multi-step tool scripts |
+| `trace` | `o11y_get-trace-context`, `o11y_new-trace-id`, `o11y_set-trace-context` | OpenTelemetry trace-id context |
+
+- **Your AI asks before enabling.** The `toolsets` tool's description, and the error a hidden tool returns when called, tell the agent to ask you first and enable a group only after you agree (`toolsets {"action":"enable","sets":["debug"]}`). `{"action":"list"}` shows every group and its tools; `disable` hides a group again.
+- **You get a real prompt when your client supports it.** If the MCP client advertises the elicitation capability, `toolsets` enable shows you an approve/decline prompt naming the group, what it is for and how many tools it adds. Nothing is enabled unless you approve; on decline (or no answer within 55s) the agent is told to carry on without it. Clients without elicitation fall back to the ask-in-chat rule above.
+- **How the change reaches your client.** Enabling or disabling sends the MCP `notifications/tools/list_changed` notification (when the entrypoint wires it; otherwise the response says a restart is needed). Claude Code re-fetches `tools/list` when it gets one ([docs](https://code.claude.com/docs/en/mcp)). A client that ignores the notification keeps its old list: set `BROWSER_RELAY_TOOLSETS` instead and restart the MCP server.
+- **Pre-enable** with `BROWSER_RELAY_TOOLSETS=debug,react` (comma-separated, or `all`) in the relay's env or `local-config.json`. Unknown names are ignored with a stderr warning.
+- Hiding saves context; it is not a security boundary. Upstream's `execute` tool can still call any upstream tool by name.
 
 ---
 
@@ -339,13 +371,13 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
                                             │ CDP (Playwright connectOverCDP)
                                             │
                                        relay's own-tools
-                                       (this repo, 19 tools)
+                                       (this repo, 20 tools)
 ```
 
 **How it works:**
 
 - 📥 The relay receives MCP messages on stdin from your client.
-- 📋 `tools/list` → merges the upstream's catalog with the 19 own-tool definitions and returns one combined list.
+- 📋 `tools/list` → serves the upstream catalog from a disk cache (`<repo>/.cache/upstream-catalog.json`, or a per-user cache dir if the repo is read-only) merged with the 20 own-tool definitions, minus hidden [toolsets](#toolsets). No Brave and no long-lived upstream child: the cache is rebuilt by a short-lived upstream spawn only when the upstream build, the bundle patch, or a catalog-shaping upstream env var changes. Upstream `outputSchema`s (~62K chars) are not sent.
 - ⚙️ `tools/call` → either forwards to the upstream child (for the 51 forwarded tools) or runs an own-tool handler directly.
 - 🔌 Both paths attach to the same Brave instance: the upstream uses `BROWSER_CDP_CONNECT_URL`, own-tools use Playwright's `chromium.connectOverCDP` against the same port.
 - 🪶 One Brave per relay process. Brave is launched **lazily on the first `tools/call`**, not at startup.
@@ -374,6 +406,8 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` | `false` | Include IndexedDB in pool-mode profile snapshot (100+ MB typical). |
 | `BROWSER_RELAY_INSPECTOR_PORT` | unset | When set, the relay boots the Inspector dashboard inline on this port and pipes its live MCP-traffic stream into the `/slot/N` Inspector pages. Without this, run the Inspector separately via `npm run inspector` (no live traffic). See [Inspector](#inspector). |
 | `BROWSER_RELAY_INSPECTOR_BIND` | `127.0.0.1` | Bind address for the Inspector. Override only with care — the Inspector has no auth. |
+| `BROWSER_RELAY_TOOLSETS` | unset (all hidden) | Comma-separated [toolsets](#toolsets) to show from startup: `debug`, `react`, `scenario`, `trace`, or `all`. |
+| `BROWSER_RELAY_CATALOG_REFRESH` | unset | `true` ignores the cached upstream catalog, re-lists it from a fresh upstream spawn and rewrites the cache. `npm run smoke` and setup set it so they exercise the real upstream. |
 
 **Precedence:** environment variable ▸ `local-config.json` ▸ auto-detect ▸ reasonable hard-coded defaults.
 
@@ -405,57 +439,66 @@ Each pool dir has up to three pieces of state:
 | `<pool-dir>/Default/...` | The actual Brave user-data — cookies, localStorage, history, etc. Read by every Brave attached to this dir. |
 | Brave subtree | Main Brave process + 5–15 helper subprocesses (renderer / GPU / utility / crashpad), all with `--user-data-dir=<pool-dir>` in their command line. |
 
-### Claim sequence (when a relay starts)
+### Startup (no slot, no Brave)
+
+A relay connects to its MCP client immediately and answers `tools/list` from the cached catalog — it claims no slot, copies no profile files, and spawns neither upstream nor Brave. An idle session costs one small Node process.
+
+### Claim sequence (first tool call)
 
 ```
-1. claimSlot() iterates pool dirs in order
-2. For each candidate dir:
+1. claimSlot() pass 1 — for each pool dir in order:
    a. mkdir -p <dir> (idempotent)
-   b. If lock file exists:
-      - Read lock JSON, isPidAlive(meta.pid)
-      - If pid is dead → unlink stale lock, proceed
-      - If pid is alive → skip this dir, try next
-   c. fs.openSync(lockPath, "wx", 0o600) — atomic; if fails with EEXIST,
-      another relay raced us; skip this dir, try next
+   b. Lock file present?
+      - unparseable and older than 10 s → stale, unlink (younger = mid-write, leave it)
+      - owner PID dead (signal-zero, no child process) → stale, unlink
+      - owner PID alive → remember it, skip this dir
+      (a lock is only unlinked if it still holds the content that was judged)
+   c. fs.openSync(lockPath, "wx", 0o600) — atomic; EEXIST → skip
    d. Write the lock contents + fdatasync
-   e. reapOrphansFor(dir) — kills any Brave processes still pinned to
-      this dir (which wouldn't have a parent — squatters from a previous
-      session that closeBrave didn't cleanly tear down)
-3. If we exhausted all dirs → throw "pool exhausted"
+   e. reapOrphansFor(dir) — kills Brave processes whose command line passes
+      exactly this dir as --user-data-dir (whole-argument match: pool-1
+      never matches pool-10)
+2. Pass 2 (only if every dir looked taken): one batched start-time probe of
+   the live lock PIDs. A PID whose process started after the lock's
+   startedAt (+10 min slack for clock steps) was recycled → the lock is
+   stale; reclaim that dir.
+3. Still nothing free → the tool call fails with "pool exhausted"
+4. Profile snapshot from the cookie source + vault load (pool mode). A
+   failure here releases the claim; the next call starts over.
 ```
 
-### First tool call (lazy launch)
-
-The relay holds the lock but doesn't launch Brave at startup — only when the first `tools/call` arrives. At that point:
+### Brave launch and recovery
 
 ```
-1. ensureBrave() runs
-2. F1-16 (v0.3.2): pool.reapOrphansFor(dir) AGAIN — catches any orphan
-   that appeared on this dir AFTER claim but BEFORE first tool call
-   (lazy-launch gap; the bug that bit me on 2026-05-10)
-3. launchBrave({ userDataDir: dir, port: 9333 + slot - 1, ... })
-4. Brave subtree comes up; CDP endpoint at http://127.0.0.1:<port>
-5. waitForCdpReady polls /json/version until 200 or timeout
-6. attachAutofill listens on framenavigated for vault credentials
-7. Subsequent tool calls reuse the same Brave instance
+1. ensureBrave(): pool.reapOrphansFor(dir) again (F1-16) — catches an
+   orphan that appeared on this dir after the claim
+2. launchBrave({ userDataDir: dir, port: 9333 + slot - 1, ... })
+3. waitForCdpReady polls /json/version until 200 or timeout
+4. attachAutofill listens on framenavigated for vault credentials
+5. The upstream child is spawned on the first forwarded call, attached to
+   this Brave over CDP
+6. If Brave dies (context close / browser disconnect), the relay drops the
+   bridge AND tears down the upstream child (upstream never reconnects on
+   its own); the next tool call relaunches Brave and respawns upstream.
+   An upstream crash alone is also respawned on the next call — it no
+   longer exits the relay.
 ```
 
 ### Shutdown sequence
 
 ```
-On SIGTERM / SIGINT / upstream-child-exit:
-  1. shutdownAsync() — memoized so concurrent triggers all await one chain
-  2. releasePool() FIRST — unlinks the lock so the slot is reclaimable
-     (W1-6: if a second Ctrl-C interrupts mid-await, the slot is already
-     freed)
-  3. upstreamClient.close() — graceful TCP/stdio close
-  4. killUpstreamTree() — taskkill /F /T on the upstream BDMCP node
-     (G0-3: walks the subtree on Win; only the parent on POSIX, where
-     reparenting is graceful)
-  5. closeBrave(bridge) + inspectorHandle.close() in PARALLEL with per-
-     step timeouts (8s / 3s) — G0-7 + G1-2: prevents one wedged step
-     from blocking the whole shutdown
-  6. process.exit(128 + signal-num)
+On SIGINT (exit 130) / SIGTERM (exit 143) / stdin EOF (exit 0):
+  1. shutdownAsync() — memoized; the promise is visible before any step
+     runs, so no new slot claim or Brave relaunch can start
+  2. In PARALLEL, each capped at 1.5 s (the MCP SDK client gives a stdio
+     server ~2 s between closing stdin and a hard kill on Windows):
+     - closeBrave(bridge); on timeout, reapOrphansFor(slot dir) kills our
+       Brave synchronously by user-data-dir
+     - killProcessTree(upstream) — async taskkill /F /T on Windows
+     - inspector close
+  3. releasePool() LAST — the lock is never free while our Brave still
+     holds the dir (a second Ctrl-C mid-shutdown still releases it via
+     process.on("exit"); W0 clears dead/recycled locks anyway)
 
 On Windows TerminateProcess (force-quit Cursor, blue screen, power loss):
   - Only process.on("exit") fires → shutdownSync() runs
@@ -604,13 +647,13 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 |---|---|
 | **Pool overview** (`/`) — slot grid (claimed / idle / orphan), cookie-source freshness card, vault summary. Orphan slots get a **Reap** button that clears the stale lock + kills any leftover Brave processes holding that user-data-dir. | ![Pool overview](./screenshots/01-pool-overview.png) |
 | **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode. | ![Slot detail](./screenshots/02-slot-detail.png) |
-| **Tools catalog** (`/tools`) — all 70 tools (19 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./screenshots/03-tools-catalog.png) |
+| **Tools catalog** (`/tools`) — all 71 tools (20 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./screenshots/03-tools-catalog.png) |
 | **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode. | ![Activity history](./screenshots/04-activity-history.png) |
 | **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet | ![Settings](./screenshots/06-settings.png) |
 
 **Host + Origin gate (DNS rebinding).** Every HTTP request and WebSocket upgrade must carry a `Host` of `localhost`, `127.0.0.1`, `[::1]` (or the IP the connection arrived on, for an explicit `BROWSER_RELAY_INSPECTOR_BIND`) **on the inspector's own port**; anything else gets 403. So a port-remapped SSH tunnel (`-L 9999:127.0.0.1:9091`), a LAN hostname (`http://mydesktop:9091`) or a reverse proxy is rejected — reach it by `localhost` / IP on the same port. A browser `Origin` must be the inspector's own origin (`http://localhost:<port>` or `http://127.0.0.1:<port>`); another local port is a different origin. The only mutating endpoint (`POST /api/slots/N/reap`) requires that Origin to be present — curl-style clients may call the read-only GETs without one. Reap decides from a fresh status, answers 409 if the slot's lock changed while it was being checked, removes the lock only if it is still the one judged stale, and reports `lockCleared` in its response.
 
-> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. **Treat the inspector port as if it had your bearer tokens on it** — `tools/call` arguments routinely contain auth tokens, URLs of authed sessions, the cookies your AI is sending, etc. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). Defenses in place: localhost-only bind, Host allowlist on every request (DNS rebinding), exact own-origin check on the WS upgrade and on every mutating POST, `X-Frame-Options: DENY` + `frame-ancestors 'none'` (clickjacking gate), a CSP with no `'unsafe-inline'`, `Cache-Control: no-store` on every API response and the activity export, path-traversal hard stop, 64 KB WS frame cap + 1 MB back-pressure cap. The standalone inspector keeps only the vault's counts in memory, never the passwords.
+> ⚠️ **Security:** The inspector binds to **`127.0.0.1` only by default** and has **no authentication**. Only the local user can reach it. Anyone with shell access to your machine — or any process running locally — can read pool state, vault file paths, and tool counts. The WebSocket streams every `tools/call` request + response; in-process mode means *anyone with localhost access can see what your AI is doing in real time*. **Treat the inspector port as if it had your bearer tokens on it** — `tools/call` arguments routinely contain auth tokens, URLs of authed sessions, the cookies your AI is sending, etc. Don't expose it via SSH tunnels, ngrok, or `BROWSER_RELAY_INSPECTOR_BIND=0.0.0.0` unless you know what you're doing. **Kill the server when you're done** (Ctrl+C). In the traffic feed, every string value in the args and results of `cookies_export`, `cookies_import`, `storage_*`, `form_fill` and `interaction_fill` is replaced with `[redacted]`, and for every tool the values of `Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key` and `Proxy-Authorization` (any case, any depth, including inside JSON result text) are redacted; everything else is recorded as-is. Defenses in place: localhost-only bind, Host allowlist on every request (DNS rebinding), exact own-origin check on the WS upgrade and on every mutating POST, `X-Frame-Options: DENY` + `frame-ancestors 'none'` (clickjacking gate), a CSP with no `'unsafe-inline'`, `Cache-Control: no-store` on every API response and the activity export, path-traversal hard stop, 64 KB WS frame cap + 1 MB back-pressure cap. The standalone inspector keeps only the vault's counts in memory, never the passwords.
 
 #### Module API changes (2026-11)
 
@@ -658,7 +701,7 @@ npm install
 
 ### Smoke test fails: "tool count too low"
 
-The relay started but returned fewer than 60 tools. Check the relay's stderr output for upstream-spawn errors, or the smoke script's stderr tail.
+The relay started but returned fewer than 60 tools (smoke and setup run it with `BROWSER_RELAY_TOOLSETS=all`, so hidden toolsets count). Check the relay's stderr output for upstream catalog-fetch errors (`[mcp-relay] upstream catalog fetch failed`), or the smoke script's stderr tail.
 
 ### "Tools appear in `tools/list` but `tools/call` hangs"
 

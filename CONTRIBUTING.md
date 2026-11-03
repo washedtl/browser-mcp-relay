@@ -6,8 +6,9 @@ Thanks for taking a look. This project stays small on purpose; PRs that keep the
 
 ```
 src/
-├── index.js              # entrypoint — claims a slot, lazy-launches Brave,
-│                         #   spawns the upstream child, runs the relay server
+├── index.js              # entrypoint — runs the relay server; on the first
+│                         #   tool call claims a slot, launches Brave, spawns
+│                         #   the upstream child (and respawns both on death)
 ├── relay-server.js       # tools/list merge + tools/call routing
 ├── upstream-client.js    # JSON-RPC over stdio to browser-devtools-mcp
 ├── cdp-bridge.js         # launchBrave / closeBrave (Playwright-over-CDP)

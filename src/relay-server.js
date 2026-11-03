@@ -3,27 +3,31 @@
 // upstream's tools/list with our own tool list.
 //
 // Two async dependencies (both injected by the entrypoint):
-//   - getUpstream(): returns the upstream MCP client. Called by tools/list
-//     AND tools/call. Cheap once cached. Spawning upstream is fast (~50MB
-//     node process); upstream's tools/list returns its static catalog
-//     without needing a browser.
+//   - getUpstream(): returns the upstream MCP client. Called ONLY by
+//     tools/call for forwarded tools (~50MB node process once spawned).
 //   - ensureBrave(): launches our Brave instance via Playwright. Slow
 //     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools need the
 //     globalThis.__relayBridge handle; forwarded tools need Brave running
 //     so upstream's lazy `chromium.connectOverCDP` succeeds when its tool
 //     handler runs).
 //
-// Splitting these means tools/list (Cursor's first call at MCP connect)
-// does NOT trigger Brave launch. Brave only spins up when something
-// actually needs to drive a browser.
+// tools/list (every client's first call at MCP connect) is answered from
+// the cached upstream catalog (tool-catalog.js) + own-tool definitions, so
+// it spawns neither upstream nor Brave.
 //
 // W10: trafficEmitter — every handleToolsCall fires `request` and `response`
 // events. The in-process Inspector subscribes to these for live traffic
 // streaming. Standalone Inspector ignores it (no subscriber). The emitter
 // also keeps a 200-event ring buffer so new WS subscribers can backfill
-// without missing context.
+// without missing context. With recordTraffic=false (no in-process
+// Inspector) none of this runs. Events for secret-bearing tools (cookies,
+// storage, form fills) are redacted before they are recorded, and
+// credential headers are redacted in every event.
 
 const { EventEmitter } = require("node:events");
+const toolCatalog = require("./tool-catalog.js");
+const { applyLocalConfigToEnv } = require("./local-config.js");
+const { toolsetOf, parseToolsets, hiddenToolMessage } = require("./own-tools/toolsets.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -48,6 +52,52 @@ function truncateForEmit(value, max = MAX_TRAFFIC_BODY_CHARS) {
   return s.slice(0, max - TRUNCATED_MARKER.length) + TRUNCATED_MARKER;
 }
 
+// Tools whose args/results carry secrets (cookie values, storage tokens,
+// typed passwords). Their traffic events keep the structure and numbers /
+// booleans; every string becomes "[redacted]".
+const SENSITIVE_TOOL_RE = /^(?:cookies_export|cookies_import|form_fill|interaction_fill|storage_.+)$/;
+const REDACTED = "[redacted]";
+
+function redactStrings(value) {
+  if (typeof value === "string") return REDACTED;
+  if (Array.isArray(value)) return value.map(redactStrings);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = redactStrings(v);
+    return out;
+  }
+  return value;
+}
+
+// Credential headers, redacted in EVERY recorded event: as object keys at
+// any depth (any case) and as "key": "value" pairs inside JSON text (tool
+// results usually carry their data as JSON in content[].text).
+const SECRET_HEADERS = ["authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"];
+const SECRET_HEADER_SET = new Set(SECRET_HEADERS);
+const SECRET_HEADER_IN_TEXT_RE = new RegExp(`("(?:${SECRET_HEADERS.join("|")})"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, "gi");
+
+function redactSecretHeaders(value) {
+  if (typeof value === "string") return value.replace(SECRET_HEADER_IN_TEXT_RE, `$1"${REDACTED}"`);
+  if (Array.isArray(value)) return value.map(redactSecretHeaders);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SECRET_HEADER_SET.has(k.toLowerCase()) ? REDACTED : redactSecretHeaders(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+// Our own deadline for an elicitation prompt — under the MCP SDK's 60s
+// default request timeout, so a slow user ends up as "no answer" (nothing
+// enabled) rather than as an SDK error (which means "client can't prompt").
+const ELICIT_TIMEOUT_MS = 55_000;
+
+function logStderr(msg) {
+  try { process.stderr.write(msg + "\n"); } catch { /* stderr itself is gone */ }
+}
+
 class TrafficEmitter extends EventEmitter {
   constructor({ capacity = TRAFFIC_RING_CAPACITY } = {}) {
     super();
@@ -70,7 +120,23 @@ class TrafficEmitter extends EventEmitter {
 }
 
 class RelayServer {
-  constructor({ getUpstream, ensureBrave, trafficEmitter } = {}) {
+  /**
+   * @param {object} opts
+   * @param {() => Promise<object>} opts.getUpstream
+   * @param {() => Promise<unknown>} [opts.ensureBrave]
+   * @param {TrafficEmitter} [opts.trafficEmitter]
+   * @param {() => Promise<object[]>} [opts.loadUpstreamCatalog] — raw upstream tools (test seam)
+   * @param {() => unknown} [opts.notifyToolsChanged] — sends MCP notifications/tools/list_changed
+   * @param {(params: {message: string, requestedSchema: object}, opts: {signal: AbortSignal}) => Promise<object|null>} [opts.elicit]
+   *        — MCP elicitation (user prompt); resolves null when the client can't prompt
+   * @param {number} [opts.elicitTimeoutMs]
+   * @param {boolean} [opts.recordTraffic=true] — false: no traffic ring buffer / events (no Inspector)
+   * @param {object} [opts.env] — reads BROWSER_RELAY_TOOLSETS (default: process.env + local-config.json)
+   */
+  constructor({
+    getUpstream, ensureBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
+    elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, env,
+  } = {}) {
     if (typeof getUpstream !== "function") {
       throw new Error("RelayServer: constructor expects { getUpstream } async function");
     }
@@ -79,30 +145,104 @@ class RelayServer {
     }
     this.getUpstream = getUpstream;
     this.ensureBrave = ensureBrave || null;
-    this.ownTools = new Map(); // name → { name, description, inputSchema, handler }
-    // Traffic emitter is always present so call sites don't need null-guards.
-    // If the caller doesn't pass one, we make our own (no subscribers = no
-    // visible behavior change).
+    this.env = env || applyLocalConfigToEnv(process.env);
+    // Raw upstream tools (disk-cached; test seam). Loaded once, on first use.
+    this.loadUpstreamCatalog = loadUpstreamCatalog || toolCatalog.loadUpstreamCatalog;
+    this._catalogPromise = null;
+    // canNotify: whether a tools/list_changed can actually reach the client.
+    this.canNotify = typeof notifyToolsChanged === "function";
+    this.notifyToolsChanged = this.canNotify ? notifyToolsChanged : () => {};
+    this.elicit = typeof elicit === "function" ? elicit : null;
+    this.elicitTimeoutMs = elicitTimeoutMs;
+    // Hidden-by-default tool groups (own-tools/toolsets.js) the user enabled.
+    const { sets, unknown } = parseToolsets(this.env.BROWSER_RELAY_TOOLSETS);
+    if (unknown.length) logStderr(`[mcp-relay] BROWSER_RELAY_TOOLSETS: ignoring unknown toolset(s) ${unknown.join(", ")}`);
+    this.enabledToolsets = new Set(sets);
+    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
+    // The emitter always exists (callers subscribe to it unconditionally);
+    // recordTraffic decides whether handleToolsCall feeds it at all.
     this.trafficEmitter = trafficEmitter || new TrafficEmitter();
+    this.recordTraffic = Boolean(recordTraffic);
   }
 
-  registerOwnTool({ name, description, inputSchema, handler }) {
+  // needsBrave=false: relay-local tool (e.g. toolsets) — skip ensureBrave.
+  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true }) {
     if (this.ownTools.has(name)) {
       throw new Error(`relay: tool "${name}" already registered`);
     }
     if (typeof handler !== "function") {
       throw new Error(`relay: tool "${name}" handler must be a function`);
     }
-    this.ownTools.set(name, { name, description, inputSchema, handler });
+    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave });
+  }
+
+  /** Name of the disabled toolset `toolName` belongs to, or null if it's visible. */
+  hiddenToolsetFor(toolName) {
+    const set = toolsetOf(toolName);
+    return set && !this.enabledToolsets.has(set) ? set : null;
+  }
+
+  /** Enable/disable toolsets; returns the ones that changed and, if any did,
+   *  tells the client to re-fetch tools/list. */
+  setToolsetsEnabled(sets, enabled) {
+    const changed = sets.filter((s) => this.enabledToolsets.has(s) !== enabled);
+    for (const s of changed) {
+      if (enabled) this.enabledToolsets.add(s);
+      else this.enabledToolsets.delete(s);
+    }
+    if (changed.length) {
+      // Best-effort: a client that never gets the notification still sees
+      // the change on its next tools/list.
+      Promise.resolve()
+        .then(() => this.notifyToolsChanged())
+        .catch((e) => logStderr(`[mcp-relay] tools/list_changed notification failed: ${e.message}`));
+    }
+    return changed;
+  }
+
+  /**
+   * Show the user an approve/decline prompt via MCP elicitation.
+   * Resolves the client's result ({ action: "accept" | "decline" | "cancel" }),
+   * { action: "timeout" } when nobody answered in time (the request is
+   * aborted), or null when no prompt is possible (no elicit option, the
+   * client lacks the capability, or elicit threw).
+   */
+  async askUser(params) {
+    if (!this.elicit) return null;
+    const controller = new AbortController();
+    let timer;
+    const timedOut = new Promise((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve({ action: "timeout" }); }, this.elicitTimeoutMs);
+    });
+    try {
+      const answer = await Promise.race([
+        Promise.resolve().then(() => this.elicit(params, { signal: controller.signal })),
+        timedOut,
+      ]);
+      return answer || null;
+    } catch (e) {
+      logStderr(`[mcp-relay] elicitation unavailable (${e.message}); falling back to ask-in-chat`);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Upstream tools as served on the wire (trimmed). Memoized; a failed load is retried. */
+  upstreamCatalog() {
+    if (!this._catalogPromise) {
+      this._catalogPromise = Promise.resolve()
+        .then(() => this.loadUpstreamCatalog({ env: this.env }))
+        .then((tools) => tools.map(toolCatalog.servedTool))
+        .catch((e) => { this._catalogPromise = null; throw e; });
+    }
+    return this._catalogPromise;
   }
 
   async handleToolsList() {
-    // tools/list does NOT need Brave. Upstream's catalog is static (registered
-    // at upstream startup), and own-tool definitions are static. We only need
-    // upstream spawned to ask it for its catalog — that's it.
-    const upstream = await this.getUpstream();
-    const upstreamResponse = await upstream.request("tools/list", {});
-    const upstreamTools = upstreamResponse.tools || [];
+    // Neither Brave nor the upstream child: upstream's catalog comes from the
+    // disk cache, own-tool definitions are static.
+    const upstreamTools = await this.upstreamCatalog();
     const ownTools = Array.from(this.ownTools.values()).map(({ name, description, inputSchema }) => ({
       name, description, inputSchema,
     }));
@@ -113,47 +253,65 @@ class RelayServer {
         );
       }
     }
-    return { tools: [...upstreamTools, ...ownTools] };
+    const visible = (t) => !this.hiddenToolsetFor(t.name);
+    return { tools: [...upstreamTools.filter(visible), ...ownTools.filter(visible)] };
+  }
+
+  /** Push + emit one traffic event. emit() rethrows a listener's throw; a
+   *  busted Inspector subscriber must not take out a tool call (V1-5: log it). */
+  _emitTraffic(kind, evt) {
+    this.trafficEmitter.push(evt);
+    try { this.trafficEmitter.emit(kind, evt); }
+    catch (emitErr) {
+      logStderr(`[mcp-relay] traffic-emitter "${kind}" subscriber threw: ${emitErr.stack || emitErr.message}`);
+    }
   }
 
   async handleToolsCall({ name, arguments: args }) {
     const own = this.ownTools.get(name);
     const isOwn = !!own;
-    const id = this.trafficEmitter.nextId();
-    const startTime = Date.now();
+    const hiddenSet = this.hiddenToolsetFor(name);
+    // recordTraffic=false (no Inspector): no ids, events or per-call serialization.
+    const record = this.recordTraffic;
+    const sensitive = SENSITIVE_TOOL_RE.test(name);
+    const forEmit = (v) => truncateForEmit(sensitive ? redactStrings(v) : redactSecretHeaders(v));
+    const id = record ? this.trafficEmitter.nextId() : 0;
     const startHr = process.hrtime.bigint();
+    const recordResponse = (status, body) => {
+      if (!record) return;
+      this._emitTraffic("response", {
+        id,
+        time: new Date().toISOString(),
+        status,
+        durationMs: Number(process.hrtime.bigint() - startHr) / 1_000_000,
+        response: forEmit(body),
+      });
+    };
 
     // Emit `request` BEFORE forwarding/handling. Inspector buffers this so
     // the activity feed can show "in-flight" until the response lands.
-    const requestEvent = {
-      id,
-      time: new Date(startTime).toISOString(),
-      method: "tools/call",
-      name,
-      args: truncateForEmit(args || {}),
-      source: isOwn ? "own" : "upstream",
-    };
-    this.trafficEmitter.push(requestEvent);
-    // emit() throws back to the caller if a listener throws — wrap in
-    // try/catch so a busted Inspector subscriber can't take out a tool call.
-    try { this.trafficEmitter.emit("request", requestEvent); }
-    catch (emitErr) {
-      // V1-5: don't drop subscriber errors silently — a broken Inspector
-      // subscriber is a real bug we want to see in stderr, not invisible.
-      try {
-        process.stderr.write(`[mcp-relay] traffic-emitter "request" subscriber threw: ${emitErr.stack || emitErr.message}\n`);
-      } catch { /* stderr itself is gone — give up */ }
+    if (record) {
+      this._emitTraffic("request", {
+        id,
+        time: new Date().toISOString(),
+        method: "tools/call",
+        name,
+        args: forEmit(args || {}),
+        source: isOwn ? "own" : "upstream",
+      });
     }
 
-    let status = "ok";
     let response;
     try {
-      if (isOwn) {
+      if (hiddenSet) {
+        // Owner rule: the agent asks the user before enabling a toolset.
+        response = { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
+      } else if (isOwn) {
         // Own-tool handlers read globalThis.__relayBridge. ensureBrave
-        // populates that. Always call it before invoking the handler.
-        if (this.ensureBrave) await this.ensureBrave();
+        // populates that. Call it before invoking the handler.
+        if (own.needsBrave && this.ensureBrave) await this.ensureBrave();
         try {
-          response = await own.handler(args || {});
+          response = await own.handler(args || {}, this);
         } catch (e) {
           response = {
             content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
@@ -166,46 +324,12 @@ class RelayServer {
         const upstream = await this.getUpstream();
         response = await upstream.request("tools/call", { name, arguments: args });
       }
-      if (response && response.isError) status = "error";
     } catch (e) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.
-      status = "error";
-      const durationMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;
-      const responseEvent = {
-        id,
-        time: new Date().toISOString(),
-        status,
-        durationMs,
-        response: truncateForEmit({ error: e.message }),
-      };
-      this.trafficEmitter.push(responseEvent);
-      try { this.trafficEmitter.emit("response", responseEvent); }
-    catch (emitErr) {
-      // V1-5: surface subscriber errors instead of swallowing.
-      try {
-        process.stderr.write(`[mcp-relay] traffic-emitter "response" subscriber threw: ${emitErr.stack || emitErr.message}\n`);
-      } catch { /* stderr itself is gone */ }
-    }
+      recordResponse("error", { error: e.message });
       throw e;
     }
-
-    const durationMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;
-    const responseEvent = {
-      id,
-      time: new Date().toISOString(),
-      status,
-      durationMs,
-      response: truncateForEmit(response),
-    };
-    this.trafficEmitter.push(responseEvent);
-    try { this.trafficEmitter.emit("response", responseEvent); }
-    catch (emitErr) {
-      // V1-5: surface subscriber errors instead of swallowing.
-      try {
-        process.stderr.write(`[mcp-relay] traffic-emitter "response" subscriber threw: ${emitErr.stack || emitErr.message}\n`);
-      } catch { /* stderr itself is gone */ }
-    }
-
+    recordResponse(response && response.isError ? "error" : "ok", response);
     return response;
   }
 }

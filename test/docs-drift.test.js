@@ -27,9 +27,13 @@ const REFERENCE = fs.readFileSync(path.join(REPO, "docs", "REFERENCE.md"), "utf8
 const ownTools = require("../src/own-tools/index.js").tools;
 const forwarded = require("../scripts/inspector-forwarded-tools.js").tools;
 
+const { toolsetOf } = require("../src/own-tools/toolsets.js");
+
 const liveOwn = ownTools.length;
 const liveForwarded = forwarded.length;
 const liveTotal = liveOwn + liveForwarded;
+// W1B: forwarded tools hidden from tools/list until their toolset is enabled.
+const liveHidden = forwarded.filter((t) => toolsetOf(t.name)).length;
 
 // Helper: count how many distinct N-values appear in `text` matching the
 // pattern `(\d+)\s*<context>`. Returns the first numeric capture.
@@ -154,4 +158,25 @@ test("F1-19: package.json version matches the latest annotated git tag", () => {
   const cmp = pM - tM || pm - tm || pp - tp;
   assert.ok(cmp >= 0,
     `package.json version (${pkgSemver}) is BEHIND latest tag (${latestTag}) — this means a release was tagged but package.json was reverted. Fix the bump.`);
+});
+
+test("W1B: README + REFERENCE state the live hidden-by-default count", () => {
+  for (const [doc, text] of [["README.md", README], ["docs/REFERENCE.md", REFERENCE]]) {
+    const m = text.match(/(\d+)\s+(?:[a-z-]+\s+){0,3}hidden by default/i);
+    assert.ok(m, `${doc} must say how many tools are hidden by default`);
+    assert.strictEqual(parseInt(m[1], 10), liveHidden,
+      `${doc} claims ${m[1]} hidden-by-default tools; live = ${liveHidden}`);
+  }
+});
+
+test("W1B: smoke + setup count the full catalog (all toolsets) against MIN_TOOLS", () => {
+  for (const script of ["smoke.js", "setup.js"]) {
+    const src = fs.readFileSync(path.join(REPO, "scripts", script), "utf8");
+    assert.match(src, /BROWSER_RELAY_TOOLSETS:\s*"all"/,
+      `${script} must spawn the relay with BROWSER_RELAY_TOOLSETS=all — hidden toolsets would drop tools/list below MIN_TOOLS`);
+    assert.match(src, /BROWSER_RELAY_CATALOG_REFRESH:\s*"true"/,
+      `${script} must force a catalog refresh so it exercises the real upstream, not just the cache file`);
+    const min = parseInt(src.match(/const MIN_TOOLS = (\d+)/)[1], 10);
+    assert.ok(liveTotal >= min, `${script} MIN_TOOLS=${min} exceeds the live catalog (${liveTotal})`);
+  }
 });

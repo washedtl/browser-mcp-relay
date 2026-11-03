@@ -17,10 +17,17 @@ class FakeUpstream {
   close() {}
 }
 
+// Upstream catalog as the relay serves it from the disk cache (tool-catalog.js).
+// tools/list must come from here, never from the live upstream child.
+const CATALOG = [
+  { name: "navigation_go-to", description: "navigate", inputSchema: { type: "object" } },
+];
+const fakeCatalog = async () => CATALOG;
+
 // Default makeRelay: relay with upstream getter only (no Brave). Used by tests
 // that don't care about the Brave-launch path.
 function makeRelay(upstream = new FakeUpstream()) {
-  return new RelayServer({ getUpstream: async () => upstream });
+  return new RelayServer({ getUpstream: async () => upstream, loadUpstreamCatalog: fakeCatalog, env: {} });
 }
 
 // makeRelayWithBrave: tracks how many times each lifecycle function fires.
@@ -29,6 +36,8 @@ function makeRelayWithBrave(upstream = new FakeUpstream()) {
   const relay = new RelayServer({
     getUpstream: async () => { counters.getUpstream++; return upstream; },
     ensureBrave: async () => { counters.ensureBrave++; },
+    loadUpstreamCatalog: fakeCatalog,
+    env: {},
   });
   return { relay, counters };
 }
@@ -138,11 +147,57 @@ test("RelayServer constructor throws if ensureBrave is provided but not a functi
   );
 });
 
-test("RelayServer.handleToolsList does NOT call ensureBrave (cheap path)", async () => {
+test("RelayServer.handleToolsList does NOT call ensureBrave or getUpstream (cached catalog)", async () => {
   const { relay, counters } = makeRelayWithBrave();
   await relay.handleToolsList();
-  assert.strictEqual(counters.getUpstream, 1, "getUpstream should be called for tools/list");
+  assert.strictEqual(counters.getUpstream, 0, "W1B: tools/list is served from the cached catalog — it must NOT spawn the upstream child");
   assert.strictEqual(counters.ensureBrave, 0, "ensureBrave must NOT fire on tools/list — that's the whole point of splitting");
+});
+
+test("RelayServer.handleToolsList serves upstream tools without outputSchema/execution", async () => {
+  const relay = new RelayServer({
+    getUpstream: async () => { throw new Error("must not be called"); },
+    loadUpstreamCatalog: async () => [{
+      name: "content_get-as-text", description: "text", inputSchema: { type: "object" },
+      annotations: { readOnlyHint: true },
+      outputSchema: { type: "object" }, execution: { taskSupport: "forbidden" },
+    }],
+    env: {},
+  });
+  const { tools } = await relay.handleToolsList();
+  assert.deepStrictEqual(tools, [{
+    name: "content_get-as-text", description: "text", inputSchema: { type: "object" },
+    annotations: { readOnlyHint: true },
+  }]);
+});
+
+test("RelayServer passes its env to the catalog loader (one resolved env per relay)", async () => {
+  const env = { BROWSER_RELAY_UPSTREAM_PATH: "/x/index.js" };
+  let seen;
+  const relay = new RelayServer({
+    getUpstream: async () => new FakeUpstream(),
+    loadUpstreamCatalog: async (opts) => { seen = opts; return CATALOG; },
+    env,
+  });
+  await relay.handleToolsList();
+  assert.strictEqual(seen.env, env);
+});
+
+test("RelayServer.handleToolsList loads the catalog once, and retries after a failed load", async () => {
+  let calls = 0;
+  const relay = new RelayServer({
+    getUpstream: async () => new FakeUpstream(),
+    loadUpstreamCatalog: async () => {
+      calls++;
+      if (calls === 1) throw new Error("spawn failed");
+      return CATALOG;
+    },
+    env: {},
+  });
+  await assert.rejects(relay.handleToolsList(), /spawn failed/);
+  await relay.handleToolsList();
+  await relay.handleToolsList();
+  assert.strictEqual(calls, 2, "one failed load + one successful load; later lists reuse it");
 });
 
 test("RelayServer.handleToolsCall calls ensureBrave for own-tools", async () => {
@@ -167,7 +222,7 @@ test("RelayServer.handleToolsCall calls ensureBrave for forwarded tools", async 
 test("RelayServer works without ensureBrave (Brave-less mode for testing)", async () => {
   // Backwards-compat: if entrypoint passes only getUpstream, relay still works.
   // ensureBrave is just skipped on tools/call.
-  const relay = new RelayServer({ getUpstream: async () => new FakeUpstream() });
+  const relay = new RelayServer({ getUpstream: async () => new FakeUpstream(), env: {} });
   const result = await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
   assert.strictEqual(result.content[0].text, "forwarded navigation_go-to");
 });
@@ -193,6 +248,7 @@ test("RelayServer.handleToolsCall calls ensureBrave BEFORE own-tool handler (ord
   const relay = new RelayServer({
     getUpstream: async () => new FakeUpstream(),
     ensureBrave: async () => { order.push("ensureBrave"); },
+    env: {},
   });
   relay.registerOwnTool({
     name: "ours",
@@ -220,6 +276,7 @@ test("RelayServer.handleToolsCall calls ensureBrave BEFORE forwarding to upstrea
   const relay = new RelayServer({
     getUpstream: async () => upstream,
     ensureBrave: async () => { order.push("ensureBrave"); },
+    env: {},
   });
   await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
   assert.deepStrictEqual(order, ["ensureBrave", "upstream.tools/call"], "ensureBrave must complete before forwarding");
@@ -324,7 +381,7 @@ test("RelayServer.handleToolsCall truncates oversized response in emit", async (
     },
     close() {},
   };
-  const relay = new RelayServer({ getUpstream: async () => upstream });
+  const relay = new RelayServer({ getUpstream: async () => upstream, env: {} });
   const events = [];
   relay.trafficEmitter.on("response", (e) => events.push(e));
   const callerSawResponse = await relay.handleToolsCall({ name: "big_tool", arguments: {} });
@@ -347,6 +404,7 @@ test("RelayServer accepts an injected trafficEmitter", async () => {
       close() {},
     }),
     trafficEmitter: ee,
+    env: {},
   });
   assert.strictEqual(relay.trafficEmitter, ee);
   await relay.handleToolsCall({ name: "t", arguments: {} });
@@ -394,10 +452,140 @@ test("RelayServer.handleToolsCall: throwing subscriber on error path also doesn'
     },
     close() {},
   };
-  const relay = new RelayServer({ getUpstream: async () => upstream });
+  const relay = new RelayServer({ getUpstream: async () => upstream, env: {} });
   relay.trafficEmitter.on("response", () => { throw new Error("subscriber boom"); });
   await assert.rejects(
     () => relay.handleToolsCall({ name: "x", arguments: {} }),
     /upstream-down/,
   );
+});
+
+// ─── W1B: recordTraffic + redaction ──────────────────────────────────
+
+test("recordTraffic:false — no ring buffer, no events, no JSON.stringify of args/responses", async () => {
+  let stringified = 0;
+  const response = { content: [{ type: "text", text: "ok" }], toJSON() { stringified++; return { content: this.content }; } };
+  const relay = new RelayServer({
+    getUpstream: async () => ({ request: async () => response }),
+    loadUpstreamCatalog: fakeCatalog,
+    recordTraffic: false,
+    env: {},
+  });
+  const events = [];
+  relay.trafficEmitter.on("request", (e) => events.push(e));
+  relay.trafficEmitter.on("response", (e) => events.push(e));
+  const args = { url: "about:blank", toJSON() { stringified++; return { url: this.url }; } };
+  const out = await relay.handleToolsCall({ name: "navigation_go-to", arguments: args });
+  assert.strictEqual(out, response, "caller still gets the response");
+  assert.strictEqual(relay.trafficEmitter.getRecent().length, 0, "no ring buffer entries");
+  assert.strictEqual(events.length, 0, "no request/response events");
+  assert.strictEqual(stringified, 0, "no per-call serialization when traffic recording is off");
+});
+
+test("recordTraffic:false — forwarded errors still propagate without being recorded", async () => {
+  const relay = new RelayServer({
+    getUpstream: async () => ({ request: async () => { throw new Error("upstream-down"); } }),
+    loadUpstreamCatalog: fakeCatalog,
+    recordTraffic: false,
+    env: {},
+  });
+  await assert.rejects(relay.handleToolsCall({ name: "navigation_go-to", arguments: {} }), /upstream-down/);
+  assert.strictEqual(relay.trafficEmitter.getRecent().length, 0);
+});
+
+test("recordTraffic defaults to true (events recorded)", async () => {
+  const relay = makeRelay();
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: {} });
+  assert.strictEqual(relay.trafficEmitter.getRecent().length, 2);
+});
+
+// Secrets each sensitive tool carries in args or results.
+const SECRET = "s3cr3t-value-123";
+const SENSITIVE_CASES = [
+  { name: "cookies_import", args: { cookies: [{ name: "sid", value: SECRET, domain: ".example.com", path: "/" }] } },
+  { name: "cookies_export", args: { urls: ["https://example.com"] }, result: `[{"name":"sid","value":"${SECRET}"}]` },
+  { name: "storage_get-local", args: { store: "local", key: "token" }, result: `{"token":"${SECRET}"}` },
+  { name: "storage_set-local", args: { store: "local", entries: { token: SECRET, type: SECRET } } },
+  { name: "storage_clear-local", args: { keys: [SECRET] } },
+  { name: "form_fill", args: { fields: [{ selector: "#pw", value: SECRET }], timeoutMs: 5000 } },
+  { name: "interaction_fill", args: { selector: "#pw", value: SECRET }, upstream: true },
+];
+
+for (const c of SENSITIVE_CASES) {
+  test(`redaction: ${c.name} secrets never reach traffic events; the caller still gets them`, async () => {
+    const result = { content: [{ type: "text", text: c.result || `echo ${SECRET}` }] };
+    const relay = new RelayServer({
+      getUpstream: async () => ({ request: async () => result }),
+      loadUpstreamCatalog: fakeCatalog,
+      env: {},
+    });
+    if (!c.upstream) relay.registerOwnTool({ name: c.name, description: "", inputSchema: {}, handler: async () => result });
+    const out = await relay.handleToolsCall({ name: c.name, arguments: c.args });
+    assert.ok(JSON.stringify(out).includes(SECRET), "caller must get the real result");
+    const events = JSON.stringify(relay.trafficEmitter.getRecent());
+    assert.ok(!events.includes(SECRET), `secret leaked into traffic events: ${events}`);
+    assert.match(events, /\[redacted\]/);
+    const [req, res] = relay.trafficEmitter.getRecent();
+    assert.strictEqual(req.name, c.name);
+    assert.strictEqual(res.response.content.length, 1, "content structure stays readable");
+  });
+}
+
+test("redaction: numbers/booleans and structure survive (timeoutMs, isError, field count)", async () => {
+  const relay = makeRelay();
+  relay.registerOwnTool({
+    name: "form_fill", description: "", inputSchema: {},
+    handler: async () => { throw new Error(`could not fill ${SECRET}`); },
+  });
+  await relay.handleToolsCall({ name: "form_fill", arguments: { fields: [{ selector: "#a", value: SECRET }, { selector: "#b", value: SECRET }], timeoutMs: 5000 } });
+  const [req, res] = relay.trafficEmitter.getRecent();
+  assert.strictEqual(req.args.fields.length, 2);
+  assert.strictEqual(req.args.timeoutMs, 5000);
+  assert.strictEqual(res.response.isError, true);
+  assert.ok(!JSON.stringify(res).includes(SECRET), "own-tool error text is redacted too");
+});
+
+test("redaction: non-sensitive tools are recorded verbatim", async () => {
+  const relay = makeRelay();
+  await relay.handleToolsCall({ name: "navigation_go-to", arguments: { url: "https://example.com/?q=1" } });
+  assert.deepStrictEqual(relay.trafficEmitter.getRecent()[0].args, { url: "https://example.com/?q=1" });
+});
+
+// ─── V2-1: credential headers redacted in every recorded event ───────
+
+test("header redaction: authorization/cookie/set-cookie/x-api-key/proxy-authorization values never reach events, at any depth, any case", async () => {
+  const data = {
+    requests: [{
+      request: { url: "https://api.example.com/v1", headers: { Authorization: `Bearer ${SECRET}`, Accept: "*/*", "X-API-Key": SECRET } },
+      response: { status: 200, headers: { "set-cookie": `sid=${SECRET}; HttpOnly`, "content-type": "application/json" } },
+    }],
+  };
+  // Upstream returns the same data twice: pretty JSON text + structuredContent.
+  const result = { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], structuredContent: data };
+  const relay = new RelayServer({ getUpstream: async () => ({ request: async () => result }), loadUpstreamCatalog: fakeCatalog, env: {} });
+  const args = { headers: { COOKIE: `a=${SECRET}`, "Proxy-Authorization": `Basic ${SECRET}` }, author: "keep-me" };
+  const out = await relay.handleToolsCall({ name: "o11y_get-http-requests", arguments: args });
+  assert.strictEqual(out, result, "caller gets the untouched result");
+  assert.ok(JSON.stringify(out).includes(SECRET));
+  const events = JSON.stringify(relay.trafficEmitter.getRecent());
+  assert.ok(!events.includes(SECRET), `credential header leaked into traffic events: ${events}`);
+  const [req, res] = relay.trafficEmitter.getRecent();
+  assert.strictEqual(req.args.author, "keep-me", "non-header keys are untouched");
+  assert.strictEqual(req.args.headers.COOKIE, "[redacted]");
+  assert.strictEqual(res.response.structuredContent.requests[0].request.headers.Accept, "*/*");
+  assert.strictEqual(res.response.structuredContent.requests[0].request.url, "https://api.example.com/v1");
+  assert.ok(res.response.content[0].text.includes('"content-type": "application/json"'), "other headers in JSON text survive");
+  assert.ok(res.response.content[0].text.includes('"Authorization": "[redacted]"'));
+});
+
+test("header redaction: compact JSON text from own tools (capture_xhr) is covered too", async () => {
+  const relay = makeRelay();
+  relay.registerOwnTool({
+    name: "capture_xhr", description: "", inputSchema: {},
+    handler: async () => ({ content: [{ type: "text", text: JSON.stringify([{ headers: { cookie: SECRET, "x-api-key": SECRET, accept: "x" } }]) }] }),
+  });
+  await relay.handleToolsCall({ name: "capture_xhr", arguments: {} });
+  const events = JSON.stringify(relay.trafficEmitter.getRecent());
+  assert.ok(!events.includes(SECRET), events);
+  assert.ok(events.includes('\\"accept\\":\\"x\\"'), "non-credential header kept");
 });

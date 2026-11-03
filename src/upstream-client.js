@@ -32,6 +32,14 @@ class UpstreamClient {
     readable.on("data", this._dataHandler);
     readable.on("close", this._closeHandler);
     readable.on("error", this._errorHandler);
+    // Writing to a dead child's stdin raises EPIPE as an 'error' event; with
+    // no listener that is an uncaught exception that kills the relay (which
+    // now survives upstream death and respawns it). Treat it as a transport
+    // error. Deliberately never detached: buffered writes can still fail
+    // after close().
+    if (writable && typeof writable.on === "function") {
+      writable.on("error", this._errorHandler);
+    }
   }
 
   _onData(chunk) {

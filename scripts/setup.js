@@ -300,7 +300,8 @@ function step8_printMcpSnippet() {
 
 /**
  * Spawn `node src/index.js`, send a single tools/list JSON-RPC request over
- * stdin, and wait for a reply. Verify ≥50 tools (51 forwarded + 16 own = 67).
+ * stdin, and wait for a reply. Verify the tool count clears MIN_TOOLS (run with
+ * BROWSER_RELAY_TOOLSETS=all so hidden toolsets are counted).
  * Kill the relay regardless of outcome. Returns { ok, count, reason }.
  *
  * Self-contained — does NOT require any of the relay's modules itself, so
@@ -311,7 +312,9 @@ function step9_smokeTest({ timeoutMs = 30000 } = {}) {
     process.stdout.write("[setup] Running smoke test (spawning relay, calling tools/list)...\n");
     const child = spawn(process.execPath, [RELAY_ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      // Count the whole catalog, including the hidden-by-default toolsets,
+      // and refresh the cached upstream catalog so the upstream really starts.
+      env: { ...process.env, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
     });
 
     let resolved = false;
@@ -449,7 +452,7 @@ async function main() {
     "Next steps:",
     "  1. Paste the MCP snippet above into your Claude Code config (~/.claude.json).",
     "  2. Restart Cursor / Claude Code.",
-    "  3. The relay's tools should appear (browser-devtools-mcp + 16 own-tools).",
+    "  3. The relay's tools should appear (browser-devtools-mcp tools + the relay's own tools).",
     "  4. Re-run `npm run smoke` anytime to verify the relay still launches cleanly.",
     "",
   ].join("\n"));

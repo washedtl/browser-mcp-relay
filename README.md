@@ -8,8 +8,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-436%20passing-brightgreen.svg)](#)
-[![Tools](https://img.shields.io/badge/tools-70%20%2851%20forwarded%20%2B%2019%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
+[![Tests](https://img.shields.io/badge/tests-763%20passing-brightgreen.svg)](#)
+[![Tools](https://img.shields.io/badge/tools-71%20%2851%20forwarded%20%2B%2020%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](docs/REFERENCE.md#platform-support)
 
 </div>
@@ -20,7 +20,7 @@
 
 When you ask Claude or Cursor to *"check what's on this page"*, *"fill out this form"*, or *"run Lighthouse on production"* — your AI doesn't actually have a browser. It needs a tool that drives one.
 
-`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the [Model Context Protocol](https://modelcontextprotocol.io/), and turns them into actual browser actions. Your AI gets **70 commands** ("tools") it can call; the relay does the work behind the scenes.
+`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the [Model Context Protocol](https://modelcontextprotocol.io/), and turns them into actual browser actions. Your AI gets **71 commands** ("tools") it can call; the relay does the work behind the scenes.
 
 ## What you can ask your AI to do
 
@@ -35,7 +35,9 @@ When you ask Claude or Cursor to *"check what's on this page"*, *"fill out this 
 | 💾 **Save outputs** | Capture downloads, record video, save heap snapshots |
 | 🔍 **Extract data** | CSS-selector schema → JSON, even from authed pages |
 
-For the full 70-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
+For the full 71-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
+
+**22 specialist tools are hidden by default** to keep your AI's context lean: `debug` (JS debugger probes), `react` (component ↔ DOM lookup), `scenario` (saved multi-step scripts) and `trace` (OpenTelemetry trace ids). When a task would clearly benefit from one, your AI asks you first (clients with MCP elicitation also show you an approve/decline prompt), then turns it on with the `toolsets` tool. To keep a group on, set `BROWSER_RELAY_TOOLSETS=debug,react` (or `all`) in the relay's env or `local-config.json`. Details: [`docs/REFERENCE.md#toolsets`](docs/REFERENCE.md#toolsets).
 
 ## Quick start
 
@@ -50,7 +52,7 @@ The setup wizard:
 
 1. Auto-detects your Brave install + profile dir
 2. Writes a gitignored `local-config.json`
-3. Runs a smoke test (spawns the relay, expects ≥60 tools)
+3. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools)
 4. Prints a paste-ready snippet for your MCP client config
 
 Paste the printed snippet into your MCP client's config file (`~/.claude.json` for Claude Code; `mcp.json` for Cursor) and restart the client. **Under two minutes on a clean machine.**
@@ -61,7 +63,7 @@ To re-verify anytime:
 
 ```bash
 npm run smoke
-# → ✓ Relay healthy. 70 tools available (≥60). 3.2s
+# → ✓ Relay healthy. 71 tools available (≥60). 3.2s
 ```
 
 ## The Inspector
@@ -75,7 +77,7 @@ npm run inspector
 | Page | What you see |
 |---|---|
 | **Pool overview** | Slot grid (claimed / idle / orphan), cookie freshness, vault summary |
-| **Tools catalog** | All 70 tools with filter + per-tool detail |
+| **Tools catalog** | All 71 tools with filter + per-tool detail |
 | **Slot detail** | Live request/response feed with timing, args, and full payloads |
 | **Activity history** | Cross-slot ring buffer of the last ~200 tool calls |
 | **Settings** | Resolved config + paste-ready `local-config.json` snippet |
@@ -88,13 +90,13 @@ For inspector details (in-process vs standalone modes, security defenses, screen
 
 ```
    MCP client ──stdio──▶ browser-mcp-relay ──▶ ┬─▶ browser-devtools-mcp (51 tools, forwarded)
-   (Claude/Cursor)                              └─▶ relay's own tools (19 tools, this repo)
+   (Claude/Cursor)                              └─▶ relay's own tools (20 tools, this repo)
                                                        │
                                                        ▼
                                                      Brave (one per relay; lazy-launched)
 ```
 
-The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **19 of its own** into a single 70-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
+The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **20 of its own** into a single 71-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
 
 For the full architecture deep-dive, configuration env vars, modes, optional features (proxy whitelist, credential vault, autofill), troubleshooting, and worked examples, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 

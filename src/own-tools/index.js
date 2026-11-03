@@ -32,6 +32,8 @@ const tools = [
   require("./storage-get-local.js"),
   require("./storage-set-local.js"),
   require("./storage-clear-local.js"),
+  // Relay-local (no Brave): shows/hides the hidden-by-default tool groups.
+  require("./toolsets.js").tool,
 ];
 
 module.exports = { tools };

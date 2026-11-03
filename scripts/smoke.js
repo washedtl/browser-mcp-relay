@@ -2,7 +2,7 @@
 // scripts/smoke.js — non-interactive smoke test.
 //
 // Spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
-// waits for the response, verifies ≥60 tools (51 forwarded + 19 own = 70),
+// waits for the response, verifies ≥60 tools (51 forwarded + 20 own = 71),
 // kills the relay, exits 0 on success / non-zero on failure.
 //
 // For CI / sanity checks. <60 seconds. No prompts. Reads local-config.json
@@ -15,7 +15,7 @@ const { spawn, execSync } = require("node:child_process");
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_ENTRY = path.join(REPO_ROOT, "src", "index.js");
 // W0-9 (2026-05-09): bumped from 50 → 60. Expectation today is 51 forwarded
-// + 19 own = 70. The previous 50 threshold allowed ~34/51 forwarded missing
+// + 20 own = 71 (smoke enables every toolset). The previous 50 threshold allowed ~34/51 forwarded missing
 // (2/3 of the catalog) and still reported "healthy" — false positive. 60
 // catches catastrophic upstream-tool registration failures while still
 // tolerating minor upstream churn (one new tool added, one renamed).
@@ -54,7 +54,9 @@ function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [RELAY_ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      // Count the whole catalog, including the hidden-by-default toolsets,
+      // and refresh the cached upstream catalog so the upstream really starts.
+      env: { ...process.env, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
     });
 
     let resolved = false;

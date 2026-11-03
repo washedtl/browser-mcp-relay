@@ -215,6 +215,30 @@ test("V0-7: close() removes listeners from the readable", () => {
   assert.strictEqual(readable.listenerCount("error"), 0, "error listener should be removed");
 });
 
+// ──────────────────────────────────────────────────────────────────
+// W1A: the relay now survives upstream death (respawns lazily instead of
+// exiting). Writing to a dead child's stdin raises EPIPE as an 'error'
+// event on the writable; with no listener that is an uncaught exception
+// that takes the whole relay down. It must reject in-flight requests
+// instead — and stay handled after close(), since buffered writes can
+// fail after a teardown.
+// ──────────────────────────────────────────────────────────────────
+
+test("W1A: writable 'error' (EPIPE from a dead child) rejects pending requests instead of crashing", async () => {
+  const { PassThrough } = require("node:stream");
+  const readable = new PassThrough();
+  const writable = new PassThrough();
+  const client = new UpstreamClient(readable, writable);
+  const pending = client.request("tools/call", {}, 5000);
+  writable.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+  await assert.rejects(pending, /EPIPE/);
+  assert.strictEqual(client.closed, true);
+  await assert.rejects(client.request("tools/list", {}, 1000), /closed/i);
+  // A late EPIPE after close() must also be absorbed.
+  client.close();
+  writable.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+});
+
 test("V0-7: _onClose is idempotent (double-fire safe)", () => {
   const { EventEmitter } = require("node:events");
   const readable = new EventEmitter();

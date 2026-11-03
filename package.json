@@ -14,9 +14,11 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",
     "browser-devtools-mcp": "0.6.12",
-    "lighthouse": "^11.0.0",
     "playwright-core": "^1.58.0",
-    "ws": "^8.20.0"
+    "ws": "^8.21.3"
+  },
+  "optionalDependencies": {
+    "lighthouse": "^11.0.0"
   },
   "engines": {
     "node": ">=20"

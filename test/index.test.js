@@ -97,10 +97,12 @@ test("V0-4: shutdownAsync uses memoized promise (not boolean flag)", () => {
 // ──────────────────────────────────────────────────────────────────
 // W0-8: upstream-exit handler must NOT use process.kill(pid, signal)
 // (re-raises the signal → handler recursion on POSIX, no-op on
-// Windows). Convert signal name to numeric exit code via SIGNAL_NUMS.
+// Windows). Since W1A the upstream-exit handler doesn't exit the relay
+// at all (it respawns upstream lazily — see index-lifecycle.test.js),
+// so only the negative guard remains.
 // ──────────────────────────────────────────────────────────────────
 
-test("W0-8: upstream-exit handler uses signal-num exit codes (not process.kill self)", () => {
+test("W0-8: relay never re-raises a signal on itself via process.kill(process.pid, signal)", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   let src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
@@ -117,12 +119,6 @@ test("W0-8: upstream-exit handler uses signal-num exit codes (not process.kill s
   // no-op on Windows so the relay never exited.
   assert.ok(!/process\.kill\(\s*process\.pid\s*,\s*signal\s*\)/.test(src),
     "W0-8: must NOT call process.kill(process.pid, signal) — re-raises signal");
-  // Must declare the SIGNAL_NUMS map (POSIX convention 128 + sigNum).
-  assert.ok(/SIGNAL_NUMS\s*=\s*\{[^}]*SIGINT:\s*2[^}]*SIGTERM:\s*15/.test(src),
-    "expected SIGNAL_NUMS map with SIGINT:2 SIGTERM:15");
-  // Must compute exit code as 128 + sigNum.
-  assert.ok(/128\s*\+\s*sigNum/.test(src),
-    "expected exit code computed as 128 + sigNum (POSIX convention)");
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -147,12 +143,15 @@ test("W1-5: getUpstream wraps spawnUpstream() in Promise.resolve().then for sync
 // stranded if released last.
 // ──────────────────────────────────────────────────────────────────
 
-test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first ordering)", () => {
+// W1A revision: the lock is now released LAST. Releasing first let a
+// successor relay claim the dir while our Brave still held it; a mid-
+// shutdown process exit still releases through shutdownSync, and stale or
+// recycled-PID locks are reclaimable since W0. Behavior is covered in
+// index-lifecycle.test.js; this guards the textual order.
+test("W1-6 (revised): shutdownAsync calls releasePool() AFTER closeBrave() (lock-last ordering)", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
-  // Find the shutdownAsync function body and check the order: releasePool
-  // call site appears textually BEFORE closeBrave call site.
   const m = src.match(/function\s+shutdownAsync[\s\S]*?shutdownDone\s*=\s*true/);
   assert.ok(m, "expected to find shutdownAsync body");
   const body = m[0];
@@ -160,8 +159,7 @@ test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first or
   const closeBraveIdx = body.indexOf("closeBrave(");
   assert.ok(releaseIdx >= 0, "releasePool() must be called");
   assert.ok(closeBraveIdx >= 0, "closeBrave() must be called");
-  assert.ok(releaseIdx < closeBraveIdx,
-    "releasePool() must come BEFORE closeBrave() (W1-6 lock-first ordering for double-Ctrl-C safety)");
+  assert.ok(closeBraveIdx < releaseIdx, "releasePool() must come AFTER closeBrave()");
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -170,25 +168,49 @@ test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first or
 // orphaning any BDMCP-launched Brave subtree (renderers/GPU/utility).
 // ──────────────────────────────────────────────────────────────────
 
-test("G0-3: shutdown uses killUpstreamTree (taskkill /F /T on Windows)", () => {
+test("G0-3: upstream is killed via killProcessTree (taskkill /F /T on Windows)", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
-  // Must define a killUpstreamTree helper.
-  assert.ok(/function\s+killUpstreamTree\s*\(/.test(src),
-    "expected killUpstreamTree helper");
-  // Helper must use taskkill /F /T on win32.
-  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID\s+\$\{upstreamChild\.pid\}/.test(src),
-    "killUpstreamTree must call `taskkill /F /T /PID ${upstreamChild.pid}` on win32");
-  // Both shutdown paths must call it (not bare upstreamChild.kill()).
+  // Must define a killProcessTree helper.
+  assert.ok(/function\s+killProcessTree\s*\(\s*child\s*\)/.test(src),
+    "expected killProcessTree(child) helper");
+  // Async helper (recovery + shutdownAsync) must run taskkill /F /T via
+  // execFile — a sync taskkill would freeze the event loop mid-session.
+  assert.ok(/execFile\(\s*"taskkill",\s*\[\s*"\/F",\s*"\/T",\s*"\/PID",\s*String\(child\.pid\)\s*\]/.test(src),
+    "killProcessTree must call execFile(\"taskkill\", [\"/F\", \"/T\", \"/PID\", ...]) on win32");
+  // Sync helper (process 'exit' only) uses execSync taskkill /F /T.
+  assert.ok(/function\s+killProcessTreeSync\s*\(\s*child\s*\)[\s\S]*?execSync\(`taskkill\s+\/F\s+\/T\s+\/PID\s+\$\{child\.pid\}`/.test(src),
+    "killProcessTreeSync must call `taskkill /F /T /PID ${child.pid}` via execSync on win32");
+  // They are the lifecycle's defaults (behavior covered in index-lifecycle.test.js).
+  assert.ok(/killTree\s*=\s*killProcessTree,/.test(src),
+    "expected killProcessTree as createLifecycle's default killTree");
+  assert.ok(/killTreeSync\s*=\s*killProcessTreeSync/.test(src),
+    "expected killProcessTreeSync as createLifecycle's default killTreeSync");
   // Strip comments first since the change-rationale comment mentions the bug.
   const code = src
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/^[ \t]*\/\/.*$/gm, "");
-  assert.ok(/killUpstreamTree\(\)/.test(code),
-    "expected killUpstreamTree() call site in shutdown paths");
   assert.ok(!/upstreamChild\.kill\(\)/.test(code),
     "must not have bare upstreamChild.kill() — orphans Brave subtree on Windows");
+});
+
+// ──────────────────────────────────────────────────────────────────
+// W1A item 7: main() starts the in-process inspector through the retry
+// loop with startInspector's own "port in use" hint silenced (the loop
+// logs one line itself; the option is implemented in inspector-server.js
+// by W1E and ignored until then). Bind comes from inspector-server's
+// defaultBind so the two never disagree.
+// ──────────────────────────────────────────────────────────────────
+
+test("W1A: main() starts the inspector via startInspectorWithRetry with quietPortInUse + defaultBind", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
+  const main = src.slice(src.indexOf("async function main"));
+  assert.ok(/startInspectorWithRetry\(\{\s*start:\s*\(\)\s*=>\s*startInspector\(\{[\s\S]*?quietPortInUse:\s*true[\s\S]*?\}\)/.test(main),
+    "startInspector({...}) inside startInspectorWithRetry must pass quietPortInUse: true");
+  assert.ok(/defaultBind\(RELAY_ENV\)/.test(main), "inspector bind must come from defaultBind(RELAY_ENV)");
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -217,21 +239,27 @@ test("G0-4: registers uncaughtException + unhandledRejection handlers", () => {
 // of waits. Parallel + per-step timeout = max of waits, capped.
 // ──────────────────────────────────────────────────────────────────
 
-test("G0-7 + G1-2: shutdownAsync uses withTimeout + Promise.all (parallel + capped)", () => {
+test("G0-7 + G1-2: shutdown runs lifecycle + inspector close in parallel, each capped by withTimeout", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
   // Must define withTimeout helper.
   assert.ok(/function\s+withTimeout\s*\(/.test(src),
     "expected withTimeout helper for shutdown timeout safety");
-  // shutdownAsync must use Promise.all on the close tasks.
-  const m = src.match(/function\s+shutdownAsync[\s\S]*?shutdownDone\s*=\s*true/);
-  assert.ok(m, "expected shutdownAsync body");
-  assert.ok(/Promise\.all\(\s*tasks\s*\)/.test(m[0]),
-    "shutdownAsync must run close tasks in parallel via Promise.all");
-  assert.ok(/withTimeout\(closeBrave/.test(m[0]),
+  // Lifecycle shutdown (first shutdownAsync) caps closeBrave.
+  const lifecycleBody = src.match(/function\s+shutdownAsync[\s\S]*?shutdownDone\s*=\s*true/);
+  assert.ok(lifecycleBody, "expected the lifecycle's shutdownAsync body");
+  assert.ok(/withTimeout\(closeBrave/.test(lifecycleBody[0]),
     "closeBrave must be wrapped in withTimeout");
-  assert.ok(/withTimeout\(inspectorHandle\.close/.test(m[0]),
+  // main()'s shutdownAsync runs the lifecycle and the capped inspector close
+  // in parallel.
+  const mainBody = src.match(/async\s+function\s+main[\s\S]*?function\s+shutdownAsync[\s\S]*?return\s+shutdownPromise;\s*\}/);
+  assert.ok(mainBody, "expected main()'s shutdownAsync body");
+  const body = mainBody[0].slice(mainBody[0].lastIndexOf("function shutdownAsync"));
+  assert.ok(/Promise\.all\(\s*tasks\s*\)/.test(body),
+    "shutdownAsync must run close tasks in parallel via Promise.all");
+  assert.ok(/lifecycle\.shutdownAsync\(\)/.test(body), "main shutdown must include the lifecycle");
+  assert.ok(/withTimeout\(inspectorHandle\.close/.test(body),
     "inspectorHandle.close must be wrapped in withTimeout");
 });
 
