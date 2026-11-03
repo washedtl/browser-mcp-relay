@@ -50,7 +50,6 @@ startBroker({
     windowPages: () => fakes.fakeWindowPages(),
     ownTools: () => [fakes.probeOwnTool, fakes.tabsNewTool, fakes.toolsetsTool, ...fixtureTools],
     toolContext: fakes.fakeToolContextModule,
-    connectOverCDP: fakes.fakeConnectOverCDP().connect,
     loadCatalog: async () => fakes.FAKE_CATALOG,
   },
 }).then((handle) => {

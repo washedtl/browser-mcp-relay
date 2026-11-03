@@ -238,6 +238,22 @@ test("broker lost during initialize: initialize is re-sent under the client's id
   assert.deepStrictEqual(fb.received.map((x) => [x.conn, x.msg.id]), [[0, 1], [1, 1]]);
 });
 
+test("broker lost during initialize and none comes back: the client gets an error, not silence", async (t) => {
+  const pipe = testPipe("initdead");
+  let fb;
+  fb = await fakeBroker(t, pipe, {
+    reply: (msg, conn, sock) => {
+      if (msg.method === "initialize") { sock.destroy(); fb.server.close(); return null; } // broker gone for good
+      return defaultReply(msg);
+    },
+  });
+  const h = shimHarness(t, pipe, { connectTimeoutMs: 300 });
+  h.send(INIT);
+  const r = await h.response(1);
+  assert.strictEqual(r.error.code, -32603);
+  assert.match(r.error.message, /broker unavailable/);
+});
+
 test("server→client requests and the client's answers pass through and are not 'in flight'", async (t) => {
   const pipe = testPipe("elicit");
   const fb = await fakeBroker(t, pipe);

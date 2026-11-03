@@ -72,7 +72,8 @@ function fakeCtx(sessionKey) {
     sessionKey,
     closed: 0,
     page: { url: () => `about:blank#${sessionKey}`, sessionKey },
-    browserContext: { browser: () => browser, sessionKey },
+    // like W2B's page-scoped proxy: cookies() etc. reach the shared context
+    browserContext: { browser: () => browser, sessionKey, async cookies() { return [{ name: "smoke", via: sessionKey }]; } },
     opens: 0,
     async ensureSessionPageOpen() { this.opens++; },
     async close() { this.closed++; },
@@ -251,14 +252,25 @@ const tabsNewTool = {
   },
 };
 
-/** Like W2D's cookies_*: needsPage:false, uses the shared context. */
+/** Like W2D's cookies_*: needsPage:false, calls an async method on ctx.context. */
 const cookiesTool = {
   name: "own_cookies",
   description: "Shared cookie jar",
   inputSchema: { type: "object", properties: {} },
   needsPage: false,
   async handler(args, ctx) {
-    return text({ context: ctx.context && ctx.context.id, hasPage: "page" in ctx, cdpUrl: ctx.cdpUrl });
+    return text({ cookies: await ctx.context.cookies(), hasPage: "page" in ctx, cdpUrl: ctx.cdpUrl });
+  },
+};
+
+/** Like W2D's lighthouse_audit: needsPage:false, uses only cdpUrl (never ctx.context). */
+const cdpOnlyTool = {
+  name: "own_cdp",
+  description: "Uses the CDP endpoint only",
+  inputSchema: { type: "object", properties: {} },
+  needsPage: false,
+  async handler(args, ctx) {
+    return text({ cdpUrl: ctx.cdpUrl });
   },
 };
 
@@ -273,23 +285,15 @@ const tabsListTool = {
   },
 };
 
-/** This branch's (pre-W2D) toolsets tool, called the W2D way: handler(args, { relay }). */
+/**
+ * The real toolsets tool, called the W2D way. Before W2D merges, its handler
+ * still takes the RelayServer itself; W2D's takes (args, { relay }).
+ */
 const toolsetsTool = (() => {
   const t = require("../../src/own-tools/toolsets.js").tool;
-  return { ...t, handler: (args, ctx) => t.handler(args, ctx.relay) };
+  const w2dMerged = require("node:fs").existsSync(require("node:path").join(__dirname, "../../src/own-tools/_tool-context.js"));
+  return w2dMerged ? t : { ...t, handler: (args, ctx) => t.handler(args, ctx.relay) };
 })();
-
-/** chromium.connectOverCDP stand-in for the shared-context connection. */
-function fakeConnectOverCDP() {
-  const state = { connects: [], closes: 0 };
-  const connect = async (cdpUrl) => {
-    state.connects.push(cdpUrl);
-    const browser = { connected: true, isConnected: () => browser.connected, contexts: () => [{ id: `shared#${state.connects.length}` }], async close() { state.closes++; browser.connected = false; } };
-    state.last = browser;
-    return browser;
-  };
-  return { state, connect };
-}
 
 module.exports = {
   z,
@@ -299,11 +303,11 @@ module.exports = {
   fakeWindowPages,
   fakeCtx,
   fakeToolContextModule,
-  fakeConnectOverCDP,
   SocketClientTransport,
   probeOwnTool,
   tabsNewTool,
   cookiesTool,
+  cdpOnlyTool,
   tabsListTool,
   toolsetsTool,
 };

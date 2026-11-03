@@ -108,6 +108,7 @@ class Shim {
     this.replays = 0;
     this.ending = false; // the client went away
     this.closed = false;
+    this.exited = false;
   }
 
   start() {
@@ -252,14 +253,14 @@ class Shim {
   _unavailable(e) {
     if (this.closed) return;
     this.log(`browser broker unavailable: ${e.message}`);
+    const fail = (id) => this._toClient({ jsonrpc: "2.0", id, error: { code: -32603, message: `browser broker unavailable (${e.message}); retry the call` } });
+    // an initialize lost with the old broker can't be re-sent now: answer it
+    if (this.resendInit) fail(this.initMsg.id);
+    this.resendInit = false;
     for (const line of this.queue.splice(0)) {
       const msg = tryParse(line);
-      if (msg && msg.id !== undefined && msg.method) {
-        this._toClient({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: `browser broker unavailable (${e.message}); retry the call` } });
-      }
+      if (msg && msg.id !== undefined && msg.method) fail(msg.id);
     }
-    // a lost initialize can't be re-sent now; the next connection replays it normally
-    this.resendInit = false;
   }
 
   _clientGone() {

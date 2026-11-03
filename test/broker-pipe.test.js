@@ -50,9 +50,18 @@ test("pipeNameFor: user names with odd characters stay pipe-safe and distinct", 
   assert.notStrictEqual(a, b, "sanitizing must not merge two users");
 });
 
-test("pipeNameFor: a unix socket under the temp dir elsewhere", () => {
-  const s = pipeNameFor({ profileDir: "/home/fakeuser/prof", user: "fakeuser", platform: "linux", tmpdir: "/tmp" });
-  assert.match(s, /^\/tmp\/browser-mcp-relay-fakeuser-[0-9a-f]{12}\.sock$/);
+test("pipeNameFor: elsewhere, a unix socket in a per-user dir (not loose in a shared /tmp)", () => {
+  const s = pipeNameFor({ profileDir: "/home/fakeuser/prof", user: "fakeuser", uid: 1000, platform: "linux", tmpdir: "/tmp" });
+  assert.match(s, /^\/tmp\/browser-mcp-relay-1000\/[0-9a-f]{12}\.sock$/);
+  const other = pipeNameFor({ profileDir: "/home/fakeuser/prof", user: "fakeuser", uid: 1001, platform: "linux", tmpdir: "/tmp" });
+  assert.notStrictEqual(path.posix.dirname(s), path.posix.dirname(other));
+});
+
+test("claimPipe: refuses a socket dir other users could write", { skip: process.platform === "win32" && "unix sockets only" }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-sockdir-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.chmodSync(dir, 0o777);
+  await assert.rejects(claimPipe(path.join(dir, "x.sock")), /not private/);
 });
 
 test("resolveEndpoint: defaults to a per-user profile; env overrides pipe and profile", () => {
@@ -124,11 +133,11 @@ const {
   fakeUpstreamModule,
   fakeWindowPages,
   fakeToolContextModule,
-  fakeConnectOverCDP,
   SocketClientTransport,
   probeOwnTool,
   tabsNewTool,
   cookiesTool,
+  cdpOnlyTool,
   tabsListTool,
   toolsetsTool,
 } = require("./fixtures/broker-fakes.js");
@@ -143,14 +152,13 @@ async function until(cond, ms = 3000, what = "condition") {
   }
 }
 
-const DEFAULT_OWN_TOOLS = [probeOwnTool, tabsNewTool, cookiesTool, tabsListTool, toolsetsTool];
+const DEFAULT_OWN_TOOLS = [probeOwnTool, tabsNewTool, cookiesTool, cdpOnlyTool, tabsListTool, toolsetsTool];
 
 async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}, loadCatalog, supervisor } = {}) {
   const pipe = testPipe("broker");
   const made = [];
   const upstreamModule = fakeUpstreamModule();
   const windowPages = fakeWindowPages();
-  const cdp = fakeConnectOverCDP();
   const exits = [];
   const logs = [];
   const handle = await startBroker({
@@ -166,12 +174,11 @@ async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}
       windowPages: () => windowPages,
       ownTools: () => ownTools,
       toolContext: fakeToolContextModule,
-      connectOverCDP: cdp.connect,
       loadCatalog: loadCatalog || (async () => FAKE_CATALOG),
     },
   });
   t.after(() => handle.close("test done"));
-  return { pipe, handle, sup: made[0], upstreamModule, windowPages, exits, logs, up: upstreamModule.state, cdp: cdp.state };
+  return { pipe, handle, sup: made[0], upstreamModule, windowPages, exits, logs, up: upstreamModule.state };
 }
 
 /** Open a tab the W2D way (tabs_new); only then may calls name it. */
@@ -360,20 +367,27 @@ test("own tools (routed): an unknown tabId is an error and opens nothing", async
   assert.strictEqual(b.up.contexts.length, 0);
 });
 
-test("own tools (needsPage:false): the shared context over the broker's own CDP connection; no tab opened", async (t) => {
+test("own tools (needsPage:false): context is upstream's shared one, from an open session; no second browser client", async (t) => {
+  const b = await startTestBroker(t);
+  const a = await connectClient(t, b.pipe, { name: "A" });
+  const other = await connectClient(t, b.pipe, { name: "B" });
+  await a.callTool({ name: "content_get-as-text", arguments: {} }); // A's main tab is open
+  const got = JSON.parse(textOf(await other.callTool({ name: "own_cookies", arguments: {} })));
+  assert.match(got.cookies[0].via, /:main$/, "B reads the shared jar through A's open session");
+  assert.strictEqual(got.hasPage, false);
+  assert.strictEqual(b.up.contexts.length, 1, "B opened no tab");
+});
+
+test("own tools (needsPage:false): with no tab open anywhere, the context comes from the caller's main tab, only when used", async (t) => {
   const b = await startTestBroker(t);
   const c = await connectClient(t, b.pipe);
+  const cdp = JSON.parse(textOf(await c.callTool({ name: "own_cdp", arguments: {} })));
+  assert.strictEqual(cdp.cdpUrl, `http://127.0.0.1:${b.sup.opts.port}`);
+  assert.strictEqual(b.sup.launches, 1, "Brave is up for a page-less tool (lighthouse needs it)");
+  assert.strictEqual(b.up.contexts.length, 0, "a tool that never touches ctx.context opens no tab");
   const got = JSON.parse(textOf(await c.callTool({ name: "own_cookies", arguments: {} })));
-  assert.deepStrictEqual(got, { context: "shared#1", hasPage: false, cdpUrl: `http://127.0.0.1:${b.sup.opts.port}` });
-  assert.strictEqual(b.sup.ensures, 1, "Brave is launched");
-  assert.strictEqual(b.up.contexts.length, 0, "but no session tab/window");
-  assert.deepStrictEqual(b.cdp.connects, [`http://127.0.0.1:${b.sup.opts.port}`]);
-  await c.callTool({ name: "own_cookies", arguments: {} });
-  assert.strictEqual(b.cdp.connects.length, 1, "the connection is reused");
-  b.sup.crash();
-  await until(() => b.cdp.closes === 1, 3000, "the connection to be dropped when Brave goes down");
-  const again = JSON.parse(textOf(await c.callTool({ name: "own_cookies", arguments: {} })));
-  assert.strictEqual(again.context, "shared#2", "reconnected to the relaunched Brave");
+  assert.match(got.cookies[0].via, /:main$/);
+  assert.strictEqual(b.up.contexts.length, 1, "the caller's main tab, opened on use");
 });
 
 test("own tools (needsBrave:false): never launch Brave; just { relay } while it is down, the registry & co. while it runs", async (t) => {
@@ -393,14 +407,14 @@ test("own tools (needsBrave:false): never launch Brave; just { relay } while it 
 
 test("proxy credentials: not supported yet in broker mode, warned once", async (t) => {
   const b = await startTestBroker(t, {
-    supervisor: (opts) => Object.assign(fakeSupervisor(opts), { proxyCredentials: { username: "u", password: "p" } }),
+    supervisor: (opts) => Object.assign(fakeSupervisor(opts), { proxyCredentials: { username: "proxy-user-x", password: "s3cr3t-pw-xyz" } }),
   });
   const c = await connectClient(t, b.pipe);
   await c.callTool({ name: "content_get-as-text", arguments: {} });
   await c.callTool({ name: "own_cookies", arguments: {} });
   const warnings = b.logs.filter((l) => /authenticated proxies are not yet supported in broker mode/.test(l));
   assert.strictEqual(warnings.length, 1);
-  assert.ok(!b.logs.some((l) => l.includes("p\"") || /password/.test(l)), "the password is never logged");
+  assert.ok(!b.logs.some((l) => l.includes("s3cr3t-pw-xyz") || l.includes("proxy-user-x")), "credentials are never logged");
 });
 
 test("own tools: a handler throw keeps RelayServer's error shape and still carries the reset notice", async (t) => {
@@ -511,6 +525,15 @@ test("toCallToolResult: a non-object result is wrapped instead of crashing", () 
   assert.deepStrictEqual(JSON.parse(toCallToolResult(undefined).content[0].text), {});
 });
 
+test("brokerEnv: local-config.json values reach process.env (in-process upstream reads only that); real env wins", () => {
+  const { brokerEnv } = require("../src/broker/main.js");
+  const processEnv = { KEEP: "env", TOOL_NAME_PREFIX: "fromEnv" };
+  const env = brokerEnv(processEnv, (e) => ({ ...e, BROWSER_RELAY_UPSTREAM_PATH: "C:\\x\\dist\\index.js", TOOL_NAME_PREFIX: "fromEnv" }));
+  assert.strictEqual(processEnv.BROWSER_RELAY_UPSTREAM_PATH, "C:\\x\\dist\\index.js");
+  assert.strictEqual(processEnv.TOOL_NAME_PREFIX, "fromEnv");
+  assert.strictEqual(env.KEEP, "env");
+});
+
 test("prepareWorkDir: a broker-owned dir becomes WORKING_DIR and the cwd", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-workdir-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -596,14 +619,49 @@ test("idle: overlapping calls — the wait starts when the last one ends", (t) =
   assert.deepStrictEqual(fired, ["browser"]);
 });
 
-test("idle: stop() cancels everything", (t) => {
+test("idle: stop() cancels everything, and nothing re-arms after it", (t) => {
   const { policy, fired, tick } = idleHarness(t);
   policy.start();
+  policy.connectionOpened();
   policy.callStarted();
   policy.callEnded();
   policy.stop();
+  policy.connectionClosed(); // sockets destroyed by the shutdown itself
+  policy.callStarted();
+  policy.callEnded();
   tick(100_000);
   assert.deepStrictEqual(fired, []);
+});
+
+test("close(): an explicit shutdown never fires the idle exit afterwards", async (t) => {
+  const b = await startTestBroker(t, { idle: { exitMs: 40, browserMs: 60_000 } });
+  await connectClient(t, b.pipe);
+  assert.strictEqual(await b.handle.close("explicit"), true);
+  await sleep(150);
+  assert.deepStrictEqual(b.exits, [], "no onExit for a shutdown the caller asked for");
+});
+
+test("close(): joining an idle exit that gets called off still shuts down", async (t) => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let closing = false;
+  const b = await startTestBroker(t, {
+    idle: { exitMs: 40, browserMs: 60_000 },
+    supervisor: (opts) => {
+      const s = fakeSupervisor(opts);
+      const close = s.closeGracefully;
+      s.closeGracefully = async () => { closing = true; await gate; return close(); };
+      return s;
+    },
+  });
+  await until(() => closing, 3000, "the idle exit to start");
+  await connectClient(t, b.pipe); // calls the idle exit off...
+  const explicit = b.handle.close("explicit"); // ...while an explicit close joins it
+  release();
+  assert.strictEqual(await explicit, true);
+  const again = await claimPipe(b.pipe);
+  assert.ok(again, "the pipe was released");
+  await closeServer(again);
 });
 
 test("idle exit: Brave is closed gracefully while the pipe is still ours, then the pipe is released", async (t) => {

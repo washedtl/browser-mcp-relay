@@ -1,9 +1,10 @@
 // pipe-server.js — where the broker listens, and the single-instance claim.
 //
 // One broker per user and per Brave profile, reached over a Windows named
-// pipe (a unix socket elsewhere):
+// pipe (elsewhere a unix socket in a private per-user dir):
 //
 //   \\.\pipe\browser-mcp-relay-<user>-<sha256(user, profileDir)[:12]>
+//   <tmpdir>/browser-mcp-relay-<uid>/<sha256(user, profileDir)[:12]>.sock
 //
 // The pipe IS the lock: a second broker's listen() fails with EADDRINUSE and
 // that broker exits. Only EADDRINUSE means "another broker owns it"; any
@@ -31,6 +32,8 @@ function currentUser() {
   }
 }
 
+const currentUid = () => (typeof process.getuid === "function" ? process.getuid() : -1);
+
 /** Per-user root for broker state (profile, logs). */
 function brokerHome(env = process.env, platform = process.platform) {
   const p = platform === "win32" ? path.win32 : path.posix;
@@ -42,14 +45,18 @@ function brokerHome(env = process.env, platform = process.platform) {
 }
 
 /** The pipe (or socket path) for this user's broker on this profile. */
-function pipeNameFor({ profileDir, user = currentUser(), platform = process.platform, tmpdir = os.tmpdir() }) {
+function pipeNameFor({ profileDir, user = currentUser(), uid = currentUid(), platform = process.platform, tmpdir = os.tmpdir() }) {
   let dir = platform === "win32" ? path.win32.resolve(profileDir) : path.posix.resolve(profileDir);
   // Windows paths are case-insensitive: C:\X and c:/x/ are one profile
   if (platform === "win32") dir = dir.toLowerCase();
   const hash = crypto.createHash("sha256").update(`${user}\n${dir}`).digest("hex").slice(0, 12);
+  if (platform !== "win32") {
+    // in a private per-user dir: loose in a shared /tmp, another user could
+    // squat the name. Short file name: sun_path is ~104 bytes on macOS.
+    return path.posix.join(tmpdir, `${PIPE_PREFIX}-${uid}`, `${hash}.sock`);
+  }
   const safeUser = String(user).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40) || "user";
-  const name = `${PIPE_PREFIX}-${safeUser}-${hash}`;
-  return platform === "win32" ? `\\\\.\\pipe\\${name}` : path.posix.join(tmpdir, `${name}.sock`);
+  return `\\\\.\\pipe\\${PIPE_PREFIX}-${safeUser}-${hash}`;
 }
 
 /**
@@ -76,6 +83,19 @@ function listen(server, pipe) {
   });
 }
 
+/** Unix only: the socket's dir must be ours alone (a real dir, our uid, no group/other access). */
+function ensurePrivateDir(dir) {
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 });
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+  }
+  const st = fs.lstatSync(dir);
+  if (!st.isDirectory() || st.uid !== currentUid() || (st.mode & 0o077) !== 0) {
+    throw Object.assign(new Error(`[broker] socket dir ${dir} is not private (want a dir owned by uid ${currentUid()}, mode 0700)`), { code: "EACCES" });
+  }
+}
+
 /** Unix only: a socket file nobody answers on is a crashed broker's leftover. */
 function isStaleSocket(pipe) {
   return new Promise((resolve) => {
@@ -90,6 +110,7 @@ function isStaleSocket(pipe) {
  * broker already owns it. Rejects on any other error.
  */
 async function claimPipe(pipe) {
+  if (process.platform !== "win32") ensurePrivateDir(path.dirname(pipe));
   const server = net.createServer();
   try {
     await listen(server, pipe);

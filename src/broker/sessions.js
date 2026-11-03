@@ -42,6 +42,10 @@ function isAlive(ctx) {
   }
 }
 
+function goneMessage(connectionGone, tabKey) {
+  return connectionGone ? `connection closed before tab "${tabKey}" was ready` : `tab "${tabKey}" was closed before it was ready`;
+}
+
 async function closeQuietly(ctx, log) {
   try {
     await ctx.close();
@@ -72,6 +76,7 @@ class SessionRegistry {
     this._log = log || (() => {});
     this._conns = new Map(); // connId → Map<tabKey, entry {promise, ctx}>
     this._notices = new Map(); // connId → Map<tabKey, reason>
+    this._closedConns = new Set(); // connIds that left: a late call must not open a tab for them
     this._epoch = 0; // bumped by invalidateAll; a creation from an older epoch is stale
     this._lock = Promise.resolve(); // context-creation mutex
     if (typeof supervisor.on === "function") {
@@ -92,6 +97,9 @@ class SessionRegistry {
   }
 
   _ctxFor(connId, tabKey) {
+    // the session left while this call was on its way (e.g. awaiting the
+    // first upstream import): open nothing for it
+    if (this._closedConns.has(connId)) return Promise.reject(new Error(`[broker] ${goneMessage(true, tabKey)}`));
     const tabs = this._tabs(connId, true);
     const entry = tabs.get(tabKey);
     if (entry) {
@@ -101,8 +109,8 @@ class SessionRegistry {
       this._setNotice(connId, tabKey, "the browser disconnected");
     }
     const fresh = { ctx: null, promise: null };
-    fresh.promise = this._create(connId, tabKey, fresh);
     tabs.set(tabKey, fresh);
+    fresh.promise = this._create(connId, tabKey, fresh);
     // never cache a rejected creation
     fresh.promise.catch(() => {
       const current = this._conns.get(connId);
@@ -111,26 +119,41 @@ class SessionRegistry {
     return fresh.promise;
   }
 
+  /** Why this creation is no longer wanted (connection or tab gone), or null. */
+  _gone(connId, tabKey, entry) {
+    const current = this._conns.get(connId);
+    if (current && current.get(tabKey) === entry) return null;
+    return goneMessage(!current || this._closedConns.has(connId), tabKey);
+  }
+
   async _create(connId, tabKey, entry) {
     // A reset while we create means the context belongs to the dead browser
     // (or died with it, e.g. ensure() joined a launch just before an idle
     // close): discard it and create again (bounded, in case Brave flaps).
     for (let attempt = 1; ; attempt++) {
-      const epoch = this._epoch;
+      let gone = this._gone(connId, tabKey, entry);
+      if (gone) throw new Error(`[broker] ${gone}`);
+      let epoch;
       let ctx;
       try {
         ctx = await this._serialized(async () => {
           await this.supervisor.ensure();
+          // read after ensure(): it may have waited out an idle close whose
+          // 'down' already reset everything; this Brave is the new one
+          epoch = this._epoch;
           return this.upstream.createContext(sessionKeyOf(connId, tabKey));
         });
       } catch (e) {
-        if (epoch === this._epoch || attempt >= 3) throw e;
+        gone = this._gone(connId, tabKey, entry);
+        if (gone) throw new Error(`[broker] ${gone}`);
+        // retry only a creation a reset cut short (not an ensure() failure)
+        if (epoch === undefined || epoch === this._epoch || attempt >= 3) throw e;
         continue;
       }
-      const current = this._conns.get(connId);
-      if (!current || current.get(tabKey) !== entry) {
+      gone = this._gone(connId, tabKey, entry);
+      if (gone) {
         await closeQuietly(ctx, this._log);
-        throw new Error(`[broker] connection closed before tab "${tabKey}" was ready`);
+        throw new Error(`[broker] ${gone}`);
       }
       if (epoch === this._epoch) {
         entry.ctx = ctx;
@@ -204,6 +227,7 @@ class SessionRegistry {
 
   /** The connection went away: close all its tabs and forget it. */
   async closeConn(connId) {
+    this._closedConns.add(connId); // ids are random per connection and never reused
     const tabs = this._conns.get(connId);
     this._conns.delete(connId);
     this._notices.delete(connId);
@@ -229,6 +253,14 @@ class SessionRegistry {
     }
     if (n) this._log(`reset ${n} tab(s): ${reason}`);
     return n;
+  }
+
+  /** An open context of any connection (none is created), or null. */
+  anyOpenCtx() {
+    for (const tabs of this._conns.values()) {
+      for (const entry of tabs.values()) if (entry.ctx && isAlive(entry.ctx)) return entry.ctx;
+    }
+    return null;
   }
 
   /** The one-shot notice for a tab reset since the agent last used it, or null. */

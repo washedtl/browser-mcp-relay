@@ -327,6 +327,65 @@ test("closeConn drops pending reset notices", async () => {
   assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null);
 });
 
+test("a getCtx for a connection that already closed creates nothing (session left mid-call)", async () => {
+  // e.g. the socket closed while the call awaited the first upstream import
+  const { supervisor, upstream, registry } = setup();
+  await registry.closeConn("c1");
+  await assert.rejects(registry.getCtx("c1"), /connection closed/);
+  assert.strictEqual(upstream.calls.length, 0);
+  assert.strictEqual(supervisor.ensures, 0, "no Brave launched for nobody");
+  assert.deepStrictEqual(registry.listTabs("c1"), []);
+});
+
+test("a creation that failed across a reset is not retried once its connection has closed", async () => {
+  const { supervisor, upstream, registry } = setup();
+  const gate = deferred();
+  upstream.next = async () => { await gate.promise; throw new Error("Target closed"); };
+  const pending = registry.getCtx("c1");
+  await tick();
+  supervisor.emit("down", "closed");
+  await registry.closeConn("c1");
+  gate.resolve();
+  await assert.rejects(pending, /connection closed/);
+  assert.strictEqual(upstream.calls.length, 1, "no retry for a gone connection");
+});
+
+test("an ensure() that waits out an idle close ('down' fires inside it) creates the context once", async () => {
+  // W2C: ensure() waits for a closeGracefully in progress, which emits 'down',
+  // then relaunches; the context made on the new Brave is good.
+  const { supervisor, upstream, registry } = setup();
+  let first = true;
+  supervisor.ensure = async () => {
+    supervisor.ensures++;
+    if (first) { first = false; supervisor.emit("down", "closed"); }
+  };
+  await registry.getCtx("c1");
+  assert.strictEqual(upstream.calls.length, 1);
+  assert.strictEqual(upstream.created[0].closed, 0);
+});
+
+test("closeTab while the tab is still opening: the call rejects saying the tab was closed", async () => {
+  const { upstream, registry } = setup();
+  const gate = deferred();
+  upstream.next = async (key) => { await gate.promise; return fakeCtx(key); };
+  const pending = registry.getCtx("c1", "sub1");
+  await tick();
+  await registry.closeTab("c1", "sub1");
+  gate.resolve();
+  await assert.rejects(pending, /tab "sub1" was closed/);
+  assert.strictEqual(upstream.created[0].closed, 1);
+});
+
+test("anyOpenCtx: an open context of any connection, else null; creates nothing", async () => {
+  const { upstream, registry } = setup();
+  assert.strictEqual(registry.anyOpenCtx(), null);
+  const ctx = await registry.getCtx("c2", "sub");
+  assert.strictEqual(registry.anyOpenCtx(), ctx);
+  registry.invalidateAll("x");
+  assert.strictEqual(registry.anyOpenCtx(), null);
+  assert.strictEqual(upstream.calls.length, 1);
+});
+
 test("constructor: needs upstream.createContext and supervisor.ensure", () => {
   assert.throws(() => new SessionRegistry({ supervisor: fakeSupervisor() }), /upstream/);
   assert.throws(() => new SessionRegistry({ upstream: fakeUpstream() }), /supervisor/);

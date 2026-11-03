@@ -18,9 +18,10 @@
 // tools), so a session that never calls a tool costs no upstream import and
 // no Brave. Upstream tools run in-process with their args parsed by
 // upstream's own zod shapes; own-tools (W2D) run with the ctx W2D's
-// toolContext builds; only tabs_new opens tabs. Idle policy (design §3): Brave closes after 20 min without a
-// tool call; the broker exits after 10 min without connections. Both close
-// Brave gracefully (Browser.close flushes cookies; a kill loses ~30 s).
+// toolContext builds; only tabs_new opens tabs. Idle policy (design §3):
+// Brave closes after 20 min without a tool call; the broker exits after 10
+// min without connections. Both close Brave gracefully (Browser.close
+// flushes cookies; a kill loses ~30 s).
 //
 // CLI: node src/broker/main.js [--pipe <name>] [--profile-dir <dir>] [--log <file>]
 // (the shim passes --pipe and --profile-dir so both sides agree).
@@ -52,7 +53,7 @@ const SERVER_INSTRUCTIONS =
 // Tools that need a rendering window: a minimized one stalls rAF and
 // screenshots for 3-5 s, so it is restored first.
 const NEEDS_RENDERING_RE =
-  /^(?:content_take-screenshot|content_start-recording|content_save-as-pdf|a11y_take-|interaction_|navigation_|execute$|scenario-run$|o11y_get-web-vitals$|form_fill$|file_upload$)/;
+  /^(?:content_take-screenshot|content_start-recording|content_save-as-pdf|a11y_take-|interaction_|navigation_|execute$|scenario-run$|o11y_get-web-vitals$|form_fill$|file_upload$|download_capture$)/;
 
 const DEFAULT_DEPS = {
   createSupervisor: ({ profileDir, port, env, log }) => {
@@ -71,9 +72,6 @@ const DEFAULT_DEPS = {
   ownTools: () => require("../own-tools/index.js").tools,
   // W2D: the one place an own-tool call is routed to a tab
   toolContext: () => require("../own-tools/_tool-context.js"),
-  // page-less own-tools (cookies_*, lighthouse) get the shared BrowserContext
-  // through a connection of our own, so no tab is opened for them
-  connectOverCDP: (cdpUrl) => require("playwright-core").chromium.connectOverCDP(cdpUrl),
   loadCatalog: ({ env }) => require("../tool-catalog.js").loadUpstreamCatalog({ env }),
 };
 
@@ -94,6 +92,7 @@ class IdlePolicy {
     this.calls = 0;
     this._exit = null;
     this._browser = null;
+    this._stopped = false;
   }
 
   start() { this._armExit(); }
@@ -115,17 +114,20 @@ class IdlePolicy {
 
   callEnded() {
     this.calls = Math.max(0, this.calls - 1);
-    if (this.calls > 0) return;
+    if (this.calls > 0 || this._stopped) return;
     this._clear("_browser");
     this._browser = setTimeout(() => { this._browser = null; this.onBrowserIdle(); }, this.browserIdleMs);
   }
 
+  /** Final: the shutdown destroying sockets must not re-arm anything. */
   stop() {
+    this._stopped = true;
     this._clear("_exit");
     this._clear("_browser");
   }
 
   _armExit() {
+    if (this._stopped) return;
     this._clear("_exit");
     this._exit = setTimeout(() => { this._exit = null; this.onExitIdle(); }, this.exitIdleMs);
   }
@@ -212,20 +214,24 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, loadCatalog
  */
 async function startBroker({ pipe, profileDir, env = process.env, log = () => {}, idle = {}, onExit = () => {}, deps = {} }) {
+  // Picked before the claim: from the claim to server.on("connection")
+  // nothing may await, or an early connection can be accepted unheard.
+  const port = await pickFreePort();
   const server = await claimPipe(pipe);
   if (!server) {
     log(`${pipe} is owned by another broker; exiting`);
     return null;
   }
   try {
-    return await serve({ server, pipe, profileDir, env, log, idle, onExit, d: { ...DEFAULT_DEPS, ...deps } });
+    return serve({ server, port, pipe, profileDir, env, log, idle, onExit, d: { ...DEFAULT_DEPS, ...deps } });
   } catch (e) {
     server.close();
     throw e;
   }
 }
 
-async function serve({ server, pipe, profileDir, env, log, idle, onExit, d }) {
+/** Synchronous on purpose (see startBroker). */
+function serve({ server, port, pipe, profileDir, env, log, idle, onExit, d }) {
   // Heavy requires only once we own the pipe: a losing broker exits fast.
   const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
   const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -235,7 +241,6 @@ async function serve({ server, pipe, profileDir, env, log, idle, onExit, d }) {
   const { SessionRegistry, MAIN_TAB } = require("./sessions.js");
   const PKG = require("../../package.json");
 
-  const port = await pickFreePort();
   const cdpUrl = `http://127.0.0.1:${port}`;
   const supervisor = d.createSupervisor({ profileDir, port, env, log });
   const upstreamModule = d.upstreamModule();
@@ -300,28 +305,32 @@ async function serve({ server, pipe, profileDir, env, log, idle, onExit, d }) {
   /** Is this tab one the connection has (main always is)? Creates nothing. */
   const knownTab = (connId, tabKey) => tabKey === MAIN_TAB || registry.listTabs(connId).some((t) => t.tabKey === tabKey);
 
-  // The shared BrowserContext for page-less own-tools, over our own CDP
-  // connection: upstream only exposes contexts bound to a session page.
-  let ownBrowser = null;
-  function dropOwnBrowser() {
-    const b = ownBrowser;
-    ownBrowser = null;
-    if (b) b.then((br) => br.close()).catch(() => {});
+  /**
+   * ctx.context for page-less own-tools (cookies_*): upstream's shared
+   * BrowserContext, taken from an open session (any connection's), else from
+   * the caller's main tab — opened only when the tool actually uses it, so
+   * tabs_new / lighthouse_audit open nothing. Never a second Playwright
+   * client: its own server side would auto-dismiss every dialog it sees and
+   * repoint the context's downloads into its own temp dir.
+   * Page-less tools use only async BrowserContext methods (cookies,
+   * addCookies, ...), which is all this handle forwards.
+   */
+  function lazySharedContext(connId) {
+    let resolved = null;
+    const resolve = () => (resolved ||= Promise.resolve().then(async () => {
+      const open = registry.anyOpenCtx();
+      return (open || (await registry.getCtx(connId, MAIN_TAB))).browserContext;
+    }));
+    return new Proxy({}, {
+      get(_, prop) {
+        if (prop === "then" || typeof prop === "symbol") return undefined; // not a thenable
+        return async (...args) => {
+          const context = await resolve();
+          return context[prop](...args);
+        };
+      },
+    });
   }
-  async function sharedContext() {
-    await supervisor.ensure();
-    checkProxyCredentials();
-    if (ownBrowser) {
-      const br = await ownBrowser.catch(() => null);
-      if (br && br.isConnected()) return br.contexts()[0];
-      dropOwnBrowser();
-    }
-    const p = Promise.resolve().then(() => d.connectOverCDP(cdpUrl));
-    ownBrowser = p;
-    p.catch(() => { if (ownBrowser === p) ownBrowser = null; });
-    return (await p).contexts()[0];
-  }
-  if (typeof supervisor.on === "function") supervisor.on("down", dropOwnBrowser);
 
   async function restoreWindow(page) {
     try {
@@ -391,9 +400,12 @@ async function serve({ server, pipe, profileDir, env, log, idle, onExit, d }) {
           if (!supervisor.isUp()) return tool.handler(args, { relay });
           return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay }));
         }
-        const context = routed ? null : await sharedContext();
-        const ctx = await toolContext(registry, connId, tool, args, { context, cdpUrl, relay });
-        if (!routed) return tool.handler(args, ctx);
+        if (!routed) {
+          await supervisor.ensure(); // e.g. lighthouse_audit drives Brave over cdpUrl
+          checkProxyCredentials();
+          return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay }));
+        }
+        const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay });
         checkProxyCredentials();
         const tabKey = tabKeyOf(args.tabId); // toolContext validated it
         const notice = registry.takeResetNotice(connId, tabKey);
@@ -481,7 +493,8 @@ async function serve({ server, pipe, profileDir, env, log, idle, onExit, d }) {
    * meanwhile calls the shutdown off. Resolves true when shut down.
    */
   function close(reason, { ifIdle = false } = {}) {
-    if (closing) return closing;
+    // joining an idle attempt that gets called off (false) must still shut down
+    if (closing) return ifIdle ? closing : closing.then((done) => done || close(reason));
     const attempt = (async () => {
       log(`shutting down: ${reason}`);
       if (!ifIdle) accepting = false;
@@ -594,9 +607,20 @@ function positiveInt(raw, fallback) {
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
+/**
+ * The broker's env: process.env + local-config.json. Keys only in
+ * local-config are also copied into processEnv, because the in-process
+ * upstream (W2B) reads process.env only: the catalog (built from this env)
+ * and the in-process tools must come from the same build and names.
+ */
+function brokerEnv(processEnv = process.env, applyLocalConfig = require("../local-config.js").applyLocalConfigToEnv) {
+  const env = applyLocalConfig(processEnv);
+  for (const [k, v] of Object.entries(env)) if (processEnv[k] === undefined && v !== undefined) processEnv[k] = v;
+  return env;
+}
+
 async function main(argv = process.argv.slice(2)) {
-  const { applyLocalConfigToEnv } = require("../local-config.js");
-  const env = applyLocalConfigToEnv(process.env);
+  const env = brokerEnv();
   const args = parseArgs(argv);
   const endpoint = resolveEndpoint(env);
   const pipe = args.pipe || endpoint.pipe;
@@ -642,6 +666,7 @@ module.exports = {
   IdlePolicy,
   main,
   parseArgs,
+  brokerEnv,
   prepareWorkDir,
   toCallToolResult,
   tabKeyOf,
