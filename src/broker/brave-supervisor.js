@@ -51,6 +51,7 @@ class BraveSupervisor extends EventEmitter {
    *   launch fails; it never switches ports.
    * @param {string} [opts.executablePath] — default: detectBravePath() at first launch
    * @param {string|null} [opts.extensionPath] — unpacked extension for --load-extension
+   * @param {boolean} [opts.headless=false] — --headless=new (BROWSER_HEADLESS_ENABLE, as in legacy mode)
    * @param {string|null} [opts.proxyUrl] — --proxy-server (scheme://host:port only);
    *   policy in resolveProxy(); credentials go to `proxyCredentials`
    * @param {(msg: string) => void} [opts.log] — default: stderr
@@ -72,6 +73,7 @@ class BraveSupervisor extends EventEmitter {
     this._portUsed = false; // true once a launch on it came up (cdpUrl handed out)
     this._executablePath = opts.executablePath || null;
     this._extensionPath = opts.extensionPath || null;
+    this._headless = Boolean(opts.headless);
     this._proxyUrl = opts.proxyUrl || null;
     this._log = opts.log || ((m) => process.stderr.write(`${PREFIX} ${m}\n`));
     this._t = {
@@ -181,7 +183,7 @@ class BraveSupervisor extends EventEmitter {
     // Last step before the spawn: the proxy probe can take 1.5 s, and a port
     // taken in that window must fail loudly here, not as a 20 s CDP timeout.
     const port = await this._choosePort();
-    const args = buildBraveArgs({ port, profileDir: this.profileDir, extensionPath: this._extensionPath, proxyServer });
+    const args = buildBraveArgs({ port, profileDir: this.profileDir, extensionPath: this._extensionPath, proxyServer, headless: this._headless });
     const t0 = Date.now();
     const proc = this._spawnBrave(exe, args, port);
     this._proc = proc;
@@ -441,9 +443,10 @@ function pickFreePort() {
  * @param {string} opts.profileDir — persistent --user-data-dir
  * @param {string|null} [opts.extensionPath] — unpacked extension dir
  * @param {string|null} [opts.proxyServer] — already-probed proxy server string
+ * @param {boolean} [opts.headless]
  * @returns {string[]}
  */
-function buildBraveArgs({ port, profileDir, extensionPath = null, proxyServer = null }) {
+function buildBraveArgs({ port, profileDir, extensionPath = null, proxyServer = null, headless = false }) {
   const args = [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
@@ -466,6 +469,7 @@ function buildBraveArgs({ port, profileDir, extensionPath = null, proxyServer = 
   // tells) and --use-mock-keychain (breaks DPAPI cookie decryption).
   if (extensionPath) args.push(`--load-extension=${extensionPath}`);
   if (proxyServer) args.push(`--proxy-server=${proxyServer}`);
+  if (headless) args.push("--headless=new");
   return args;
 }
 

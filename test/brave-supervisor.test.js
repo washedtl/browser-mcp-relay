@@ -103,6 +103,20 @@ test("buildBraveArgs: --load-extension and --proxy-server only when given", () =
   assert.ok(extra.includes("--proxy-server=http://127.0.0.1:8888"));
 });
 
+test("W2E buildBraveArgs: --headless=new only when asked (BROWSER_HEADLESS_ENABLE, as in legacy mode)", () => {
+  assert.ok(!buildBraveArgs({ port: 1, profileDir: "/p" }).some((a) => a.startsWith("--headless")));
+  const args = buildBraveArgs({ port: 1, profileDir: "/p", headless: true });
+  assert.deepStrictEqual(args.filter((a) => a.startsWith("--headless")), ["--headless=new"]);
+});
+
+test("W2E ensure(): the headless option reaches the launch", async () => {
+  const dir = tmpProfile("fake-headless");
+  const { sup } = fakeSupervisor(dir, { headless: true });
+  const info = await sup.ensure();
+  const port = Number(new URL(info.cdpUrl).port);
+  assert.deepStrictEqual(launchesOf(dir)[0].args, buildBraveArgs({ port, profileDir: path.resolve(dir), headless: true }));
+});
+
 test("disableMemorySaver: fresh profile → Local State created with Memory Saver off", () => {
   const dir = tmpProfile("ms-fresh");
   assert.strictEqual(disableMemorySaver(dir), true);

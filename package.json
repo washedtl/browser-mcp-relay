@@ -9,7 +9,10 @@
     "setup": "node scripts/setup.js",
     "smoke": "node scripts/smoke.js",
     "inspector": "node scripts/inspector.js",
-    "capture-screenshots": "node scripts/capture-screenshots.js"
+    "capture-screenshots": "node scripts/capture-screenshots.js",
+    "broker:status": "node scripts/broker-ctl.js status",
+    "broker:stop": "node scripts/broker-ctl.js stop",
+    "migrate-profile": "node scripts/migrate-profile.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",

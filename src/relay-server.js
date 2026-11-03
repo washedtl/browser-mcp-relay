@@ -135,11 +135,13 @@ class RelayServer {
    *        — MCP elicitation (user prompt); resolves null when the client can't prompt
    * @param {number} [opts.elicitTimeoutMs]
    * @param {boolean} [opts.recordTraffic=true] — false: no traffic ring buffer / events (no Inspector)
+   * @param {string} [opts.trafficConn] — tags this server's request events (`conn`): the broker's
+   *   sessions share one emitter
    * @param {object} [opts.env] — reads BROWSER_RELAY_TOOLSETS (default: process.env + local-config.json)
    */
   constructor({
     getUpstream, ensureBrave, peekBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
-    elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, env,
+    elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, trafficConn, env,
   } = {}) {
     if (typeof getUpstream !== "function") {
       throw new Error("RelayServer: constructor expects { getUpstream } async function");
@@ -168,6 +170,7 @@ class RelayServer {
     // recordTraffic decides whether handleToolsCall feeds it at all.
     this.trafficEmitter = trafficEmitter || new TrafficEmitter();
     this.recordTraffic = Boolean(recordTraffic);
+    this.trafficConn = trafficConn;
   }
 
   // needsBrave / needsPage: see own-tools/index.js.
@@ -272,19 +275,20 @@ class RelayServer {
     }
   }
 
-  async handleToolsCall({ name, arguments: args }) {
-    const callArgs = args || {};
-    const own = this.ownTools.get(name);
-    const isOwn = !!own;
-    const hiddenSet = this.hiddenToolsetFor(name);
+  /**
+   * Run one tools/call (`run` returns its result), recorded as a request and
+   * a response traffic event when recordTraffic is on. `source` is "own" or
+   * "upstream". The broker records its in-process upstream calls through
+   * this too.
+   */
+  async recordCall(name, args, source, run) {
     // recordTraffic=false (no Inspector): no ids, events or per-call serialization.
-    const record = this.recordTraffic;
+    if (!this.recordTraffic) return run();
     const sensitive = SENSITIVE_TOOL_RE.test(name);
     const forEmit = (v) => truncateForEmit(sensitive ? redactStrings(v) : redactSecretHeaders(v));
-    const id = record ? this.trafficEmitter.nextId() : 0;
+    const id = this.trafficEmitter.nextId();
     const startHr = process.hrtime.bigint();
     const recordResponse = (status, body) => {
-      if (!record) return;
       this._emitTraffic("response", {
         id,
         time: new Date().toISOString(),
@@ -296,58 +300,19 @@ class RelayServer {
 
     // Emit `request` BEFORE forwarding/handling. Inspector buffers this so
     // the activity feed can show "in-flight" until the response lands.
-    if (record) {
-      this._emitTraffic("request", {
-        id,
-        time: new Date().toISOString(),
-        method: "tools/call",
-        name,
-        args: forEmit(callArgs),
-        source: isOwn ? "own" : "upstream",
-      });
-    }
+    this._emitTraffic("request", {
+      id,
+      time: new Date().toISOString(),
+      method: "tools/call",
+      name,
+      args: forEmit(args),
+      source,
+      ...(this.trafficConn ? { conn: this.trafficConn } : {}),
+    });
 
     let response;
     try {
-      if (hiddenSet) {
-        // Owner rule: the agent asks the user before enabling a toolset.
-        response = { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
-      } else if (isOwn) {
-        // Legacy mode: tabs are pages of this relay's own Brave (LegacyTabs).
-        // needsBrave:false tools never launch it: without a running Brave
-        // they get just the relay.
-        const bridge = own.needsBrave ? (this.ensureBrave && await this.ensureBrave()) : this.peekBrave();
-        try {
-          const ctx = bridge
-            ? await toolContext(legacyRegistry(bridge.context), LEGACY_CONN, own, callArgs,
-              { context: bridge.context, cdpUrl: bridge.cdpConnectUrl, relay: this })
-            : { relay: this };
-          response = await own.handler(callArgs, ctx);
-        } catch (e) {
-          response = {
-            content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
-            isError: true,
-          };
-        }
-      } else if (callArgs.tabId != null && callArgs.tabId !== "main") {
-        // Upstream runs in its own process here and its schemas drop tabId,
-        // so the call would silently act on the main tab.
-        response = {
-          content: [{ type: "text", text: `${name}: tabId is only supported for relay tools in this mode (upstream tools act on your main tab); omit tabId` }],
-          isError: true,
-        };
-      } else {
-        // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
-        if (this.ensureBrave) await this.ensureBrave();
-        const upstream = await this.getUpstream();
-        // tabId "main" is where upstream acts anyway; don't pass it on.
-        let forwardArgs = args;
-        if (callArgs.tabId != null) {
-          forwardArgs = { ...callArgs };
-          delete forwardArgs.tabId;
-        }
-        response = await upstream.request("tools/call", { name, arguments: forwardArgs });
-      }
+      response = await run();
     } catch (e) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.
       recordResponse("error", { error: e.message });
@@ -355,6 +320,56 @@ class RelayServer {
     }
     recordResponse(response && response.isError ? "error" : "ok", response);
     return response;
+  }
+
+  async handleToolsCall({ name, arguments: args }) {
+    const callArgs = args || {};
+    const own = this.ownTools.get(name);
+    return this.recordCall(name, callArgs, own ? "own" : "upstream", () => this._dispatch(name, args, callArgs, own));
+  }
+
+  async _dispatch(name, args, callArgs, own) {
+    const hiddenSet = this.hiddenToolsetFor(name);
+    if (hiddenSet) {
+      // Owner rule: the agent asks the user before enabling a toolset.
+      return { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
+    }
+    if (own) {
+      // Legacy mode: tabs are pages of this relay's own Brave (LegacyTabs).
+      // needsBrave:false tools never launch it: without a running Brave
+      // they get just the relay.
+      const bridge = own.needsBrave ? (this.ensureBrave && await this.ensureBrave()) : this.peekBrave();
+      try {
+        const ctx = bridge
+          ? await toolContext(legacyRegistry(bridge.context), LEGACY_CONN, own, callArgs,
+            { context: bridge.context, cdpUrl: bridge.cdpConnectUrl, relay: this })
+          : { relay: this };
+        return await own.handler(callArgs, ctx);
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+    if (callArgs.tabId != null && callArgs.tabId !== "main") {
+      // Upstream runs in its own process here and its schemas drop tabId,
+      // so the call would silently act on the main tab.
+      return {
+        content: [{ type: "text", text: `${name}: tabId is only supported for relay tools in this mode (upstream tools act on your main tab); omit tabId` }],
+        isError: true,
+      };
+    }
+    // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
+    if (this.ensureBrave) await this.ensureBrave();
+    const upstream = await this.getUpstream();
+    // tabId "main" is where upstream acts anyway; don't pass it on.
+    let forwardArgs = args;
+    if (callArgs.tabId != null) {
+      forwardArgs = { ...callArgs };
+      delete forwardArgs.tabId;
+    }
+    return upstream.request("tools/call", { name, arguments: forwardArgs });
   }
 }
 

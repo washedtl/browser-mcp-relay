@@ -7,6 +7,9 @@
 //   2. In-process — booted from src/index.js when
 //      BROWSER_RELAY_INSPECTOR_PORT is set on the relay process. The relay
 //      passes its trafficEmitter, so /ws/traffic streams real MCP traffic.
+//      In broker mode (W2E) the broker hosts the one Inspector: every
+//      session's traffic, plus /api/broker (sessions, tabs, Brave) from the
+//      brokerStatus option.
 //
 // Hard rules (carried over from W7-W9 inspector.js):
 //   - Bind 127.0.0.1 by default; LAN exposure requires explicit bind override.
@@ -714,7 +717,7 @@ function makeStatusCache(seams, ttlMs) {
 }
 
 /** Build the request handler. */
-function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs } = {}) {
+function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs, brokerStatus } = {}) {
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
   const _mutators = mutators || {};
   const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs);
@@ -964,6 +967,8 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
       "/api/tools": buildToolsCatalog,
       "/api/activity": buildActivity,
     };
+    // W2E: the broker hosts the Inspector; /api/broker is its sessions view
+    if (brokerStatus) apiBuilders["/api/broker"] = () => brokerStatus();
     const apiBuilder = apiBuilders[pathname];
     if (apiBuilder) {
       try {
@@ -1197,6 +1202,7 @@ function startInspector(opts = {}) {
     allowedOrigins: opts.allowedOrigins,
     mutators: opts.mutators,
     statusCacheMs: opts.statusCacheMs,
+    brokerStatus: opts.brokerStatus,
   });
   const server = http.createServer(handler);
 

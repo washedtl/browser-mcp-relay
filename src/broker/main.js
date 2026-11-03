@@ -118,6 +118,7 @@ const DEFAULT_DEPS = {
       executablePath: env.BROWSER_RELAY_BRAVE_PATH || undefined,
       extensionPath: env.BROWSER_LOAD_EXTENSIONS || null,
       proxyUrl: env.BROWSER_RELAY_PROXY_URL || null,
+      headless: env.BROWSER_HEADLESS_ENABLE === "true",
       log: (m) => log(`supervisor: ${m}`),
     });
   },
@@ -274,9 +275,12 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {string} [opts.keyFile] — this user's broker key (default: keyFileFor(env)); the shim passes its own
  * @param {{timeoutMs: number, logFile?: string}|null} [opts.watchdog] — kill the process if the event loop blocks this long
  * @param {{rssBytes: number, checkMs: number}|null} [opts.recycle] — exit while idle when RSS exceeds rssBytes
+ * @param {((opts: {profileDir: string, log: Function}) => Promise<unknown>)|null} [opts.seedProfile] — the
+ *   profile's one-time seed (profile-seed.js), done before Brave first opens the profile
+ * @param {{port: number}|null} [opts.relayInspector] — host the relay Inspector web UI on this port
  * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, toolContext, loadCatalog, rss
  */
-async function startBroker({ pipe, profileDir, env = process.env, log = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null }) {
+async function startBroker({ pipe, profileDir, env = process.env, log = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
   const key = loadOrCreateKey(keyFile || keyFileFor(env));
   // Picked before the claim: from the claim to server.on("connection")
   // nothing may await, or an early connection can be accepted unheard.
@@ -289,7 +293,7 @@ async function startBroker({ pipe, profileDir, env = process.env, log = () => {}
     return null;
   }
   try {
-    return serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, d: { ...DEFAULT_DEPS, ...deps } });
+    return serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d: { ...DEFAULT_DEPS, ...deps } });
   } catch (e) {
     server.close();
     throw e;
@@ -297,7 +301,7 @@ async function startBroker({ pipe, profileDir, env = process.env, log = () => {}
 }
 
 /** Synchronous on purpose (see startBroker). */
-function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, d }) {
+function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, watchdog, recycle, seedProfile, relayInspector, d }) {
   // Heavy requires only once we own the pipe: a losing broker exits fast.
   const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
   const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -308,6 +312,10 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
   const PKG = require("../../package.json");
 
   const cdpUrl = `http://127.0.0.1:${port}`;
+  const startedAt = Date.now();
+  // W2E: the relay Inspector's traffic feed (every session's calls), or null
+  const traffic = relayInspector ? new (require("../relay-server.js").TrafficEmitter)() : null;
+  let relayInspectorCtl = null;
   const supervisor = d.createSupervisor({ profileDir, port, env, log });
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
@@ -333,12 +341,22 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
     return upstreamPromise;
   }
 
+  // W2E: the profile's one-time seed starts now and finishes before Brave
+  // first opens the profile; a failed seed means a fresh profile.
+  const seeded = seedProfile
+    ? Promise.resolve().then(() => seedProfile({ profileDir, log })).catch((e) => log(`profile seed failed (${e.message}); starting with a fresh profile`))
+    : null;
+  let bravePid = null; // for status
+
   // Our fixed CDP port can be taken before Brave's first launch (W2C then
   // fails every launch). Exit cleanly: the shims start a broker on a new port.
   let portLost = false;
   async function ensureBrave() {
+    if (seeded) await seeded;
     try {
-      return await supervisor.ensure();
+      const info = await supervisor.ensure();
+      bravePid = info.pid;
+      return info;
     } catch (e) {
       if (!PORT_IN_USE_RE.test(e.message || "")) throw e;
       if (!portLost) {
@@ -509,6 +527,7 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
 
   // ── connections ──
   const sockets = new Set();
+  const sessions = new Map(); // connId → opened at (MCP sessions; not control connections)
   let connSeq = 0; // connIds: never reused within a broker (the registry remembers closed ones)
   let closing = null;
   let accepting = true; // false once a shutdown is committed
@@ -529,6 +548,7 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
       if (done) return;
       done = true;
       sockets.delete(sock);
+      sessions.delete(connId);
       policy.connectionClosed();
       log(`conn ${connId} closed (${sockets.size} left)`);
       if (mcp) mcp.close().catch(() => {});
@@ -541,6 +561,12 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
     // nobody else), learn whether it lost an earlier broker and its settings.
     serverHello(sock, key).then(({ hello, rest }) => {
       if (done) return undefined;
+      if (hello && hello.ctl) {
+        // npm run broker:status / broker:stop (control.js): not a session
+        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)") });
+        return undefined;
+      }
+      sessions.set(connId, Date.now());
       if (hello) {
         if (hello.reconnect) registry.noteReset(connId, MAIN_TAB, "the browser broker restarted");
         if (hello.settings && hello.settings !== ownSettings && !warnedSettings) {
@@ -574,7 +600,10 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
         if (!caps || !caps.elicitation || !caps.elicitation.form) return null;
         return mcp.elicitInput(params, { signal: opts.signal });
       },
-      recordTraffic: false,
+      // the relay Inspector's feed, shared by every session (none without it)
+      recordTraffic: Boolean(traffic),
+      trafficEmitter: traffic || undefined,
+      trafficConn: connId,
       env,
     });
     for (const tool of ownTools) relay.registerOwnTool(brokerOwnTool(tool, connId, relay));
@@ -588,7 +617,9 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
         const { name } = req.params;
         // Upstream tools go straight to the in-process path (tabId routing is
         // ours); RelayServer keeps own-tools and the hidden-toolset gate.
-        if (!relay.ownTools.has(name) && !relay.hiddenToolsetFor(name)) return await callUpstream(connId, name, req.params.arguments);
+        if (!relay.ownTools.has(name) && !relay.hiddenToolsetFor(name)) {
+          return await relay.recordCall(name, req.params.arguments || {}, "upstream", () => callUpstream(connId, name, req.params.arguments));
+        }
         return await relay.handleToolsCall(req.params);
       } finally {
         policy.callEnded();
@@ -627,6 +658,7 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
       clearInterval(rssTimer);
       for (const s of sockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
+      if (relayInspectorCtl) await relayInspectorCtl.close().catch((e) => log(`closing the relay Inspector failed: ${e.message}`));
       if (uninstallWindows) uninstallWindows();
       log("bye");
       return true;
@@ -682,16 +714,61 @@ function serve({ server, port, key, pipe, profileDir, env, log, idle, onExit, wa
     rssTimer.unref();
   }
 
+  /** What broker:status and the relay Inspector's /api/broker show. */
+  function status() {
+    const { safeUrl } = require("../own-tools/_tabs.js");
+    const up = supervisor.isUp();
+    const inspector = relayInspectorCtl && relayInspectorCtl.handle;
+    return {
+      pid: process.pid,
+      version: PKG.version,
+      uptimeS: Math.round((Date.now() - startedAt) / 1000),
+      pipe,
+      profileDir,
+      cdpUrl,
+      brave: { up, pid: up ? bravePid : null },
+      connections: [...sessions].map(([id, openedAt]) => ({
+        id,
+        openedAt: new Date(openedAt).toISOString(),
+        tabs: registry.listTabs(id).map((t) => ({ tabId: t.tabKey, state: t.state, url: safeUrl(t.page) })),
+      })),
+      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      relayInspector: inspector ? `http://${inspector.bind}:${inspector.port}` : null,
+    };
+  }
+
   server.on("connection", serveConnection);
   server.on("error", (e) => log(`pipe server error: ${e.message}`));
   policy.start();
   log(`broker pid=${process.pid} serving ${pipe} (profile ${profileDir}, CDP ${cdpUrl})`);
+
+  if (relayInspector) {
+    // One Inspector for every session (in legacy mode each relay raced for
+    // the port); W1E's Host/Origin gates and RelayServer's redaction apply.
+    const { startInspector, defaultBind } = require("../inspector-server.js");
+    const bind = defaultBind(env);
+    if (bind !== "127.0.0.1" && bind !== "localhost") log(`WARNING: relay Inspector binding to ${bind} (not 127.0.0.1). No auth: anyone reaching it reads every session's traffic.`);
+    relayInspectorCtl = require("../index.js").startInspectorWithRetry({
+      start: () => startInspector({
+        port: relayInspector.port,
+        bind,
+        uiRoot: path.join(__dirname, "..", "..", "scripts", "inspector-ui"),
+        trafficEmitter: traffic,
+        brokerStatus: status,
+        quietPortInUse: true,
+      }),
+      port: relayInspector.port,
+      bind,
+      log,
+    });
+  }
 
   return {
     server,
     registry,
     supervisor,
     cdpUrl,
+    status,
     connections: () => sockets.size,
     close: (reason = "closed") => close(reason),
   };
@@ -793,9 +870,17 @@ async function main(argv = process.argv.slice(2)) {
   process.on("uncaughtException", (e) => log(`uncaughtException (still serving): ${e.stack || e.message}`));
   process.on("unhandledRejection", (e) => log(`unhandledRejection (still serving): ${(e && e.stack) || e}`));
 
+  // the relay Inspector web UI (not Node's debugger), hosted by the broker
+  const inspectorPortRaw = env.BROWSER_RELAY_INSPECTOR_PORT;
+  const inspectorPort = Number(inspectorPortRaw);
+  const relayInspector = inspectorPortRaw && Number.isInteger(inspectorPort) && inspectorPort >= 0 && inspectorPort <= 65535 ? { port: inspectorPort } : null;
+  if (inspectorPortRaw && !relayInspector) log(`WARNING: BROWSER_RELAY_INSPECTOR_PORT="${inspectorPortRaw}" is not a valid port; no relay Inspector`);
+
   let handle;
   try {
     handle = await startBroker({
+      seedProfile: (opts) => require("./profile-seed.js").seedOnFirstStart(opts),
+      relayInspector,
       pipe,
       profileDir,
       env,
