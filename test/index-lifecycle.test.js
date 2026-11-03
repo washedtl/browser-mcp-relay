@@ -197,6 +197,13 @@ test("lazy: getUpstream claims the slot for the CDP port but does not launch Bra
   assert.strictEqual(h.children.length, 1);
 });
 
+test("W2P: the legacy upstream child runs with telemetry forced off, whatever the relay's env says", async () => {
+  const h = makeHarness();
+  const lc = createLifecycle({ ...h.deps, env: { TELEMETRY_ENABLE: "true" } });
+  await lc.getUpstream();
+  assert.strictEqual(h.children[0].spawnArgs.opts.env.TELEMETRY_ENABLE, "false");
+});
+
 test("lazy: a failed claim (pool exhausted) surfaces on the call and is retried next time", async () => {
   const h = makeHarness();
   const realClaim = h.pool.claimSlot;

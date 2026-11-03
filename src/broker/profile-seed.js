@@ -3,8 +3,8 @@
 // The broker keeps ONE persistent Brave profile. On its first start (the
 // profile dir doesn't exist yet) it is seeded once from the legacy pool slot
 // whose cookies were written most recently, so existing logins carry over;
-// from then on Brave itself keeps that profile current. Standalone installs
-// (no pool) start with a fresh profile.
+// from then on Brave itself keeps that profile current. A legacy standalone
+// install (v0.3's default) has one slot: its `<repo>/.browser-data`.
 //
 // Copied: `Default/` minus caches and the last session's tabs, plus `Local
 // State` (it holds the cookie key, DPAPI-wrapped for this same user). Nothing
@@ -43,9 +43,13 @@ const RENAME_TRIES = 5; // the final rename can hit EPERM while AV / indexing sc
 const toPath = (root, rel) => path.join(root, ...rel.split("/"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** The legacy pool slots (pool-shared's config); none in standalone mode. */
+/**
+ * The legacy profiles to seed from: pool-shared's slots, or in standalone
+ * mode its one dir (`<repo>/.browser-data`, or the per-user cache dir), which
+ * a legacy relay claims and locks exactly like a pool slot.
+ */
 function poolCandidates(pool = require("../pool-shared.js")) {
-  return pool.CONFIG.standalone ? [] : pool.CONFIG.poolDirs.slice();
+  return pool.CONFIG.poolDirs.slice();
 }
 
 /** The process probes findSeedSource needs, off the event loop (they shell out). */

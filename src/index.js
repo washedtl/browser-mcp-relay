@@ -328,6 +328,9 @@ function createLifecycle({
     // to the relay's launched Brave). Don't set ENDPOINT_EXPLICIT — BDMCP
     // derives it internally from `!!_BROWSER_CDP_ENDPOINT`.
     upstreamEnv.BROWSER_CDP_ENDPOINT_URL = `http://127.0.0.1:${port}`;
+    // Upstream reports usage to PostHog unless told not to. Forced off, as
+    // in broker mode (upstream-inproc.js) and the catalog spawn.
+    upstreamEnv.TELEMETRY_ENABLE = "false";
 
     const child = spawnChild(process.execPath, [bdmcpEntry, "--cursor-mcp-server"], {
       stdio: ["pipe", "pipe", "inherit"],

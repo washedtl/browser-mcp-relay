@@ -354,7 +354,7 @@ async function buildStatus(seams = {}, { brokerMode = false } = {}) {
   };
 }
 
-function buildSettings(seams = {}) {
+function buildSettings(seams = {}, { brokerMode = false } = {}) {
   const _loadConfig = seams._loadConfig || pool.loadConfig;
   const _detectBraveProfileDir = seams._detectBraveProfileDir || detectBraveProfileDir;
   const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
@@ -403,7 +403,7 @@ function buildSettings(seams = {}) {
         ? redactPath(cfg.cookieSourceProfile)
         : null,
       cookieFreshnessWarnDays: cfg.cookieFreshnessWarnDays,
-      mode: cfg.standalone ? "standalone" : "pool",
+      mode: brokerMode ? "broker" : cfg.standalone ? "standalone" : "pool",
     },
     env: envBooleans,
     localConfigExists,
@@ -687,10 +687,12 @@ function makeStatusCache(seams, ttlMs, opts) {
 }
 
 /** Build the request handler. */
-function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs, brokerStatus } = {}) {
+// brokerMode: the relay runs in broker mode, so there is no legacy pool to
+// probe (default: hosted by the broker, i.e. brokerStatus given).
+function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs, brokerStatus, brokerMode = Boolean(brokerStatus) } = {}) {
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
   const _mutators = mutators || {};
-  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs, { brokerMode: Boolean(brokerStatus) });
+  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs, { brokerMode });
   const slotDetail = async (n, opts) => (getSlotDetail
     ? getSlotDetail(n, seams)
     : buildSlotDetail(n, seams, await statusCache.get(opts)));
@@ -933,7 +935,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
 
     const apiBuilders = {
       "/api/status": () => statusCache.get(),
-      "/api/settings": buildSettings,
+      "/api/settings": (s) => buildSettings(s, { brokerMode }),
       "/api/tools": buildToolsCatalog,
       "/api/activity": buildActivity,
     };
@@ -1173,6 +1175,7 @@ function startInspector(opts = {}) {
     mutators: opts.mutators,
     statusCacheMs: opts.statusCacheMs,
     brokerStatus: opts.brokerStatus,
+    brokerMode: opts.brokerMode,
   });
   const server = http.createServer(handler);
 
@@ -1284,6 +1287,7 @@ function createInspector(seamsOrOpts = {}) {
     allowedOrigins: opts.allowedOrigins,
     mutators: opts.mutators,
     statusCacheMs: opts.statusCacheMs,
+    brokerMode: opts.brokerMode,
   });
   const server = http.createServer(handler);
   const wss = attachWebsocket(server, {

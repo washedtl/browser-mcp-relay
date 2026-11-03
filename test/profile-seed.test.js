@@ -119,9 +119,9 @@ test("findSeedSource: pool-shared's lock rules — a dead or recycled PID's lock
   assert.deepStrictEqual(dirsOf(r2), [recycled]);
 });
 
-test("poolCandidates: pool-shared's slots; none in standalone mode", () => {
+test("poolCandidates: pool-shared's slots; in standalone mode its one dir (a v0.3 default install)", () => {
   assert.deepStrictEqual(seed.poolCandidates(fakePool(["/a", "/b"])), ["/a", "/b"]);
-  assert.deepStrictEqual(seed.poolCandidates(fakePool(["/repo/.browser-data"], { standalone: true })), []);
+  assert.deepStrictEqual(seed.poolCandidates(fakePool(["/repo/.browser-data"], { standalone: true })), ["/repo/.browser-data"]);
 });
 
 // ───────────────────────────── planning + copying ─────────────────────────────
@@ -288,17 +288,29 @@ test("seedOnFirstStart: an unfinished seed by a dead process is removed; a live 
   assert.ok(logs.some((l) => /profile\.seeding-999999999/.test(l)), logs.join("\n"));
 });
 
-test("seedOnFirstStart: standalone (no pool) → a fresh profile, said once in the log", async () => {
+test("seedOnFirstStart: standalone whose .browser-data has no cookies (never used) → a fresh profile, and the log says why", async () => {
   const logs = [];
+  const standaloneDir = tmp("repo-browser-data");
   const r = await seed.seedOnFirstStart({
     profileDir: path.join(tmp("p"), "profile"),
     log: (m) => logs.push(m),
-    pool: fakePool([tmp("repo-browser-data")], { standalone: true }),
+    pool: fakePool([standaloneDir], { standalone: true }),
     probes: noProbes,
   });
   assert.strictEqual(r, null);
-  assert.strictEqual(logs.length, 1);
-  assert.match(logs[0], /fresh profile/i);
+  assert.strictEqual(logs.length, 2, logs.join("\n"));
+  assert.strictEqual(logs[0], `broker profile seed: not using ${standaloneDir} (no Default/Network/Cookies)`);
+  assert.match(logs[1], /fresh profile/i);
+});
+
+test("W2P seedOnFirstStart: a v0.3 standalone install (.browser-data with cookies) seeds the broker profile, so its logins carry over", async () => {
+  const standaloneDir = fakeSlot("repo-browser-data-used", { ageMs: 5e3 });
+  const profileDir = path.join(tmp("p"), "profile");
+  const logs = [];
+  const r = await seed.seedOnFirstStart({ profileDir, log: (m) => logs.push(m), pool: fakePool([standaloneDir], { standalone: true }), probes: probes([]) });
+  assert.strictEqual(r && r.from, standaloneDir, logs.join("\n"));
+  assert.strictEqual(fs.readFileSync(path.join(profileDir, "Default", "Network", "Cookies"), "utf8"), "cookies-repo-browser-data-used");
+  assert.ok(logs.some((l) => l.includes(`seeding ${profileDir} once from ${standaloneDir}`)), logs.join("\n"));
 });
 
 test("seedOnFirstStart: a pool → seeded once from the freshest idle slot, source logged", async () => {

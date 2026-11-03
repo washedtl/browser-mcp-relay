@@ -58,11 +58,21 @@ if (require.main === module) {
   }
 
   const uiRoot = path.join(__dirname, "inspector-ui");
+  // The relay's mode as a session would resolve it (env, local-config.json,
+  // platform default). In broker mode there is no legacy pool to show.
+  const brokerMode = require("../src/index.js").relayMode(require("../src/local-config.js").applyLocalConfigToEnv(process.env)) === "broker";
+  if (brokerMode) {
+    process.stdout.write(
+      "Broker mode: this standalone Inspector shows no sessions or live traffic. For those, set BROWSER_RELAY_INSPECTOR_PORT " +
+      "in the MCP server's env so the broker hosts the Inspector, or run `npm run broker:status`.\n",
+    );
+  }
 
   startInspector({
     port,
     bind,
     uiRoot,
+    brokerMode,
     // No trafficEmitter — Activity feed will show the standalone message.
   })
     .then((handle) => {

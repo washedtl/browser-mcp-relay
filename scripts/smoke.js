@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 // scripts/smoke.js — non-interactive smoke test.
 //
-// Spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
-// waits for the response, verifies ≥60 tools (51 forwarded + 21 own = 72),
-// kills the relay, exits 0 on success / non-zero on failure. Checks broker
-// mode (the Windows default) and legacy mode; see smokeModes.
+// Resolves Brave the way the relay does and fails clearly without it, then
+// spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
+// waits for the response, verifies ≥60 tools (51 forwarded + 21 own = 72 with
+// every toolset on), kills the relay, exits 0 on success / non-zero on
+// failure. Checks broker mode (the Windows default) and legacy mode; see
+// smokeModes. `--without-brave` (CI: no Brave on the runner) checks the
+// catalog alone.
 //
 // For CI / sanity checks. <60 seconds. No prompts. Reads local-config.json
 // (via the relay itself) and falls through to env vars + auto-detect
@@ -19,7 +22,7 @@ const { spawn, execSync } = require("node:child_process");
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_ENTRY = path.join(REPO_ROOT, "src", "index.js");
 // W0-9 (2026-05-09): bumped from 50 → 60. Expectation today is 51 forwarded
-// + 20 own = 71 (smoke enables every toolset). The previous 50 threshold allowed ~34/51 forwarded missing
+// + 21 own = 72 (smoke enables every toolset). The previous 50 threshold allowed ~34/51 forwarded missing
 // (2/3 of the catalog) and still reported "healthy" — false positive. 60
 // catches catastrophic upstream-tool registration failures while still
 // tolerating minor upstream churn (one new tool added, one renamed).
@@ -205,16 +208,41 @@ function report(results, write = (s) => process.stdout.write(s)) {
   return results.every((r) => r.ok && r.count >= MIN_TOOLS);
 }
 
-async function main() {
-  const results = await smokeModes({ log: (m) => process.stderr.write(m) });
-  process.exit(report(results) ? 0 : 1);
+/**
+ * Brave as the relay resolves it: BROWSER_RELAY_BRAVE_PATH (env or
+ * local-config.json), the pool wrapper's, then auto-detect.
+ * @returns {{path: string} | {error: string}}
+ */
+function resolveBrave(loadConfig = () => require("../src/pool-shared.js").loadConfig()) {
+  const cfg = loadConfig();
+  if (cfg.bravePath) return { path: cfg.bravePath };
+  return { error: cfg.braveDetectError ? cfg.braveDetectError.message : "Brave was not found" };
+}
+
+/** @returns {Promise<number>} exit code */
+async function run({ argv = process.argv.slice(2), resolve = resolveBrave, modes = smokeModes, write = (s) => process.stdout.write(s) } = {}) {
+  const withoutBrave = argv.includes("--without-brave");
+  const brave = resolve();
+  if (brave.path) {
+    write(`[smoke] Brave: ${brave.path}\n`);
+  } else if (withoutBrave) {
+    write(`[smoke] Brave not found (--without-brave): checking the tool catalog only; tool calls would fail. ${brave.error}\n`);
+  } else {
+    write(
+      `✗ Smoke test FAILED: Brave not found. ${brave.error}\n` +
+      "  Install Brave (https://brave.com/), or set BROWSER_RELAY_BRAVE_PATH (env or local-config.json; `npm run setup` writes it), then re-run.\n",
+    );
+    return 1;
+  }
+  const results = await modes({ log: (m) => process.stderr.write(m) });
+  return report(results, write) ? 0 : 1;
 }
 
 if (require.main === module) {
-  main().catch((e) => {
+  run().then((code) => process.exit(code), (e) => {
     process.stderr.write(`[smoke] fatal: ${e.stack || e.message}\n`);
     process.exit(1);
   });
 }
 
-module.exports = { smokeTest, smokeModes, modeEnv, report, killTree, MIN_TOOLS };
+module.exports = { smokeTest, smokeModes, modeEnv, report, killTree, resolveBrave, run, MIN_TOOLS };

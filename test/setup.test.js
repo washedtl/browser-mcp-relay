@@ -106,6 +106,92 @@ test("smoke.js exits with non-zero reason within timeout when given a fake fast 
   assert.ok(typeof result.reason === "string" && result.reason.length > 0);
 }, { timeout: 10000 });
 
+// ─────────────────── W2P: the wizard's mode step ───────────────────
+
+async function chooseMode(answers, platform) {
+  const { step6_chooseMode } = require("../scripts/setup.js");
+  const asked = [];
+  const prompter = { question: async (q) => { asked.push(q); return answers.shift() ?? ""; } };
+  const realWrite = process.stdout.write;
+  let printed = "";
+  process.stdout.write = (s) => { printed += s; return true; };
+  try {
+    return { choice: await step6_chooseMode(prompter, platform), asked, printed };
+  } finally {
+    process.stdout.write = realWrite;
+  }
+}
+
+test("W2P setup mode: describes broker and legacy's two setups; Enter takes broker on Windows", async () => {
+  const r = await chooseMode([""], "win32");
+  assert.match(r.printed, /broker {5}— every session shares one background Brave/);
+  assert.match(r.printed, /standalone — legacy: one Brave per session/);
+  assert.match(r.printed, /pool {7}— legacy:/);
+  assert.deepStrictEqual(r.asked, ["Choose mode (broker/standalone/pool): [broker] "]);
+  assert.deepStrictEqual(r.choice, { mode: "broker", relayMode: "broker", poolDir: "" });
+});
+
+test("W2P setup mode: Enter takes legacy standalone on macOS/Linux; broker there is allowed with a note", async () => {
+  assert.deepStrictEqual((await chooseMode([""], "linux")).choice, { mode: "standalone", relayMode: "legacy", poolDir: "" });
+  const b = await chooseMode(["broker"], "darwin");
+  assert.deepStrictEqual(b.choice, { mode: "broker", relayMode: "broker", poolDir: "" });
+  assert.match(b.printed, /never been run on this OS/);
+});
+
+test("W2P setup mode: standalone and pool are legacy mode; an unknown answer falls back to the default", async () => {
+  assert.deepStrictEqual((await chooseMode(["standalone"], "win32")).choice, { mode: "standalone", relayMode: "legacy", poolDir: "" });
+  assert.deepStrictEqual((await chooseMode(["pool", "D:\\slot"], "win32")).choice, { mode: "pool", relayMode: "legacy", poolDir: "D:\\slot" });
+  const u = await chooseMode(["brokr"], "win32");
+  assert.deepStrictEqual(u.choice, { mode: "broker", relayMode: "broker", poolDir: "" });
+  assert.match(u.printed, /Unknown mode "brokr"; using broker/);
+});
+
+// ─────────────────── W2P: smoke needs Brave ───────────────────
+
+function smokeRun(argv, brave) {
+  const { run } = require("../scripts/smoke.js");
+  const out = [];
+  let modesRan = 0;
+  const code = run({
+    argv,
+    resolve: () => brave,
+    modes: async () => { modesRan++; return [{ mode: "legacy", ok: true, count: 72, reason: "", seconds: 1 }]; },
+    write: (s) => out.push(s),
+  });
+  return code.then((c) => ({ code: c, out: out.join(""), modesRan }));
+}
+
+test("W2P smoke: no Brave → fails at once with what to do, and spawns no relay", async () => {
+  const r = await smokeRun([], { error: "Brave was not found at any standard location" });
+  assert.strictEqual(r.code, 1);
+  assert.strictEqual(r.modesRan, 0);
+  assert.match(r.out, /✗ Smoke test FAILED: Brave not found\. Brave was not found at any standard location/);
+  assert.match(r.out, /set BROWSER_RELAY_BRAVE_PATH/);
+  assert.doesNotMatch(r.out, /✓/);
+});
+
+test("W2P smoke: Brave found → names it, then runs the checks", async () => {
+  const r = await smokeRun([], { path: "C:\\fake\\brave.exe" });
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.modesRan, 1);
+  assert.match(r.out, /^\[smoke\] Brave: C:\\fake\\brave\.exe\n/);
+  assert.match(r.out, /✓ Relay healthy\. 72 tools/);
+});
+
+test("W2P smoke --without-brave (CI): catalog-only check, said so", async () => {
+  const r = await smokeRun(["--without-brave"], { error: "not found" });
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.modesRan, 1);
+  assert.match(r.out, /Brave not found \(--without-brave\): checking the tool catalog only/);
+});
+
+test("W2P smoke resolveBrave: the relay's resolved path, else its detection error", () => {
+  const { resolveBrave } = require("../scripts/smoke.js");
+  assert.deepStrictEqual(resolveBrave(() => ({ bravePath: "/opt/brave", braveDetectError: null })), { path: "/opt/brave" });
+  assert.deepStrictEqual(resolveBrave(() => ({ bravePath: null, braveDetectError: new Error("no brave here") })), { error: "no brave here" });
+  assert.deepStrictEqual(resolveBrave(() => ({ bravePath: null, braveDetectError: null })), { error: "Brave was not found" });
+});
+
 // ─────────────────── package.json scripts wiring ───────────────────
 
 test("package.json: setup + smoke scripts are wired", () => {
@@ -205,6 +291,7 @@ test("local-config.example.json contains all keys the setup wizard writes", () =
   );
   // The wizard writes these top-level keys (per step7_writeLocalConfig in setup.js).
   const expectedKeys = [
+    "BROWSER_RELAY_MODE",
     "BROWSER_RELAY_BRAVE_PATH",
     "BROWSER_RELAY_BRAVE_PROFILE_DIR",
     "BROWSER_RELAY_UPSTREAM_PATH",

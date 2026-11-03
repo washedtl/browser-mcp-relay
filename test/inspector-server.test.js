@@ -777,6 +777,32 @@ test("startInspector: standalone mode → /api/slot/:n has empty recentTraffic",
   }
 });
 
+test("W2P startInspector({ brokerMode }): the standalone Inspector of a broker-mode relay says 'broker' and probes no legacy pool", async () => {
+  const seams = makeSeams({ extra: {
+    _listBraveProcessesRaw: () => { throw new Error("must not list Brave processes"); },
+    _getProcessStartTimes: () => { throw new Error("must not probe start times"); },
+  } });
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams, brokerMode: true });
+  try {
+    const status = JSON.parse((await fetch(handle.port, "/api/status")).body);
+    assert.strictEqual(status.config.mode, "broker");
+    assert.deepStrictEqual(status.slots, []);
+    assert.strictEqual(JSON.parse((await fetch(handle.port, "/api/settings")).body).config.mode, "broker");
+    assert.strictEqual((await fetch(handle.port, "/api/broker")).status, 404, "no broker sessions view without the broker");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("W2P startInspector without brokerMode (legacy relay): mode from the pool config, as before", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    assert.strictEqual(JSON.parse((await fetch(handle.port, "/api/settings")).body).config.mode, "pool");
+  } finally {
+    await handle.close();
+  }
+});
+
 test("startInspector: in-process mode → /api/slot/:n surfaces buffered traffic", async () => {
   const ee = makeTestEmitter();
   ee.push({ id: 1, time: new Date().toISOString(), method: "tools/call", name: "capture_xhr", args: { foo: 1 }, source: "own" });
