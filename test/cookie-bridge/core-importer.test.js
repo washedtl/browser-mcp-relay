@@ -632,3 +632,43 @@ test("importer (V2-1): a partitioned cookie with an empty top-level site is refu
   assert.strictEqual(r.rejected[0].count, 2);
   assert.deepStrictEqual(cdp.live(), []);
 });
+
+// ── V2-3: npm run bridge:uninstall -- --purge ──
+
+test("importer purge: expires every cookie the bridge put into Brave (managed, refused updates, pending, not yet on disk), deletes the state file and writes none after", async (t) => {
+  const file = path.join(stateDir(t), "cookie-bridge-x.json");
+  let now = 1_800_000_000_000;
+  let refuse = false;
+  const cdp = fakeCdp({ refuse: (p) => refuse && p.name === "upd" });
+  const { imp, supervisor } = make({ up: true, cdp, stateFile: file, now: () => now });
+  await imp.braveReady({ pid: 1 });
+  const h = imp.handlers("b1");
+  await h["cookies.full"]({ cookies: [ck({ name: "a" }), ck({ name: "upd" }), ck({ name: "gone" }), ck({ name: "host", domain: "www.example.com", hostOnly: true })], last: true });
+  refuse = true;
+  await h["cookies.delta"]({ changes: [{ removed: false, cookie: ck({ name: "upd", value: "newer" }) }] }); // refused: Brave keeps the earlier value
+  await h["cookies.delta"]({ changes: [{ removed: true, cookie: ck({ name: "gone" }) }] }); // applied, not yet on disk
+  // a bridge is connected: refused (it would sync them straight back)
+  await assert.rejects(imp.purge(), (e) => e.code === "EBUSY" && /chrome:\/\/extensions/.test(e.message));
+  h.close();
+  refuse = false;
+  const before = cdp.expired().length;
+  const r = await imp.purge();
+  assert.strictEqual(r.expired, 4);
+  assert.deepStrictEqual(cdp.expired().slice(before).map((p) => p.name).sort(), ["a", "gone", "host", "upd"]);
+  assert.ok(cdp.expired().slice(before).every((p) => p.expires === 1 && p.value === ""));
+  assert.ok(!fs.existsSync(file), "state file deleted");
+  assert.deepStrictEqual([imp.status().cookies, imp.status().managed, imp.status().pendingDeletes], [0, 0, 0]);
+  // Brave restarting later never recreates the file
+  now += 120_000;
+  supervisor.emit("down", "closed");
+  assert.ok(!fs.existsSync(file));
+  // until a bridge connects again and syncs
+  const h2 = imp.handlers("b2");
+  await h2["cookies.full"]({ cookies: [ck({ name: "new" })], last: true });
+  assert.ok(fs.existsSync(file));
+});
+
+test("importer purge: refused while Brave is down (main.js launches it first)", async () => {
+  const { imp } = make({ up: false });
+  await assert.rejects(imp.purge(), (e) => e.code === "EDOWN");
+});

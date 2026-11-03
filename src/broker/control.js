@@ -1,7 +1,7 @@
 // control.js — the broker's control channel: `npm run broker:status` and
 // `npm run broker:stop` (scripts/broker-ctl.js) over the broker's own pipe.
 //
-//   client → the shim's hello (pipe-server.js) plus  ctl: "status" | "stop"
+//   client → the shim's hello (pipe-server.js) plus  ctl: "status" | "stop" | "bridge-purge"
 //   broker → its usual hello reply (proves the broker), then
 //            {"bmr":"ctl","challenge":<fresh nonce>}
 //   client → {"bmr":"ctl","mac":HMAC-SHA256(key, "ctl:<ctl>:<challenge>")}
@@ -34,9 +34,10 @@ const parse = (line) => { try { return JSON.parse(line); } catch { return null; 
 /**
  * Broker side: challenge the control request in `hello`, answer it, close.
  * @param {Buffer} rest — bytes that followed the hello
- * @param {{status: () => object, stop: () => void}} handlers — stop runs once the reply is sent
+ * @param {{status: () => object, stop: () => void, bridgePurge?: () => Promise<object>}} handlers — stop
+ *   runs once the reply is sent; bridgePurge (npm run bridge:uninstall -- --purge) is awaited
  */
-async function serveControl(sock, hello, key, { status, stop }, rest = Buffer.alloc(0)) {
+async function serveControl(sock, hello, key, { status, stop, bridgePurge }, rest = Buffer.alloc(0)) {
   const reply = (obj, then) => sock.end(`${JSON.stringify({ bmr: "ctl", ...obj })}\n`, then);
   const cmd = String(hello.ctl);
   const challenge = crypto.randomBytes(16).toString("hex");
@@ -59,6 +60,13 @@ async function serveControl(sock, hello, key, { status, stop }, rest = Buffer.al
     }
   } else if (cmd === "stop") {
     reply({ ok: true, stopping: true, pid: process.pid }, () => stop());
+  } else if (cmd === "bridge-purge" && typeof bridgePurge === "function") {
+    const { redact } = require("./cdp-proxy.js");
+    try {
+      reply({ ok: true, ...(await bridgePurge()) });
+    } catch (e) {
+      reply({ ok: false, error: redact(e.message), code: e.code });
+    }
   } else {
     reply({ ok: false, error: `unknown control command ${JSON.stringify(cmd)}` });
   }

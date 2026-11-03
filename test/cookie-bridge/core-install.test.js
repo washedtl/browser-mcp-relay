@@ -241,3 +241,69 @@ test("install: the real extension manifest's key gives the pinned extension ID (
   // goes stale (re-run npm run bridge:install) — change this deliberately
   assert.strictEqual(extensionIdFromKey(manifest.key), "dfcccancdkogdddemhecnffcjllbjmba");
 });
+
+// ── V2-3: npm run bridge:uninstall -- --purge ──
+
+/** A broker home with a key, a bridge state file for its profile, and the host's logs. */
+function purgeHome(t, { key = true } = {}) {
+  const home = tmp(t, "purge");
+  const env = { LOCALAPPDATA: home, BROWSER_RELAY_BROKER_PIPE: String.raw`\\.\pipe\bmr-test-never-opened` };
+  const pipeServer = require("../../src/broker/pipe-server.js");
+  const { stateFileFor } = require("../../src/cookie-bridge/importer.js");
+  const brokerHome = pipeServer.brokerHome(env, "win32");
+  fs.mkdirSync(brokerHome, { recursive: true });
+  if (key) pipeServer.loadOrCreateKey(pipeServer.keyFileFor(env));
+  const { profileDir } = pipeServer.resolveEndpoint(env, { platform: "win32" });
+  const files = {
+    state: stateFileFor(brokerHome, profileDir),
+    log: path.join(brokerHome, "cookie-bridge.log"),
+    log1: path.join(brokerHome, "cookie-bridge.log.1"),
+    other: path.join(brokerHome, "broker.log"),
+  };
+  for (const f of Object.values(files)) fs.writeFileSync(f, "x");
+  return { env, files };
+}
+
+test("purge: the broker expires the cookies (authenticated bridge-purge), then the state file and the host's logs go, nothing else", async (t) => {
+  const { env, files } = purgeHome(t);
+  const asked = [];
+  const lines = [];
+  const r = await installer.purge({ env, platform: "win32", out: (l) => lines.push(l), request: async (o) => { asked.push(o); return { bmr: "ctl", ok: true, expired: 3, braveClosed: true }; } });
+  assert.deepStrictEqual(asked.map((o) => [o.cmd, o.pipe, Buffer.isBuffer(o.key)]), [["bridge-purge", env.BROWSER_RELAY_BROKER_PIPE, true]]);
+  assert.strictEqual(r.expired, 3);
+  assert.deepStrictEqual(r.removed.sort(), [files.log, files.log1, files.state].sort());
+  for (const f of [files.state, files.log, files.log1]) assert.ok(!fs.existsSync(f), f);
+  assert.ok(fs.existsSync(files.other), "the broker's own log stays");
+  assert.ok(lines.some((l) => /expired 3 bridge cookie/.test(l)));
+});
+
+test("purge: no broker running, the extension still connected, or an elevated broker → a clear error and NOTHING deleted", async (t) => {
+  const cases = [
+    [async () => { throw Object.assign(new Error("connect ENOENT"), { code: "ENOENT" }); }, /no broker is running.*Make any browser tool call/],
+    [async () => { throw Object.assign(new Error("connect EPERM"), { code: "EPERM" }); }, /running elevated.*elevated terminal/],
+    [async () => ({ bmr: "ctl", ok: false, code: "EBUSY", error: "the cookie bridge extension is still connected" }), /still connected/],
+  ];
+  for (const [request, re] of cases) {
+    const { env, files } = purgeHome(t);
+    await assert.rejects(installer.purge({ env, platform: "win32", out: () => {}, request }), (e) => {
+      assert.match(e.message, re);
+      assert.match(e.message, /Nothing was deleted/);
+      return true;
+    });
+    for (const f of Object.values(files)) assert.ok(fs.existsSync(f), `${f} kept`);
+  }
+});
+
+test("purge: no broker key and no state file → nothing to expire; leftover host logs go", async (t) => {
+  const { env, files } = purgeHome(t, { key: false });
+  fs.rmSync(files.state);
+  const r = await installer.purge({ env, platform: "win32", out: () => {}, request: async () => { throw new Error("must not be called"); } });
+  assert.strictEqual(r.expired, 0);
+  assert.ok(!fs.existsSync(files.log));
+});
+
+test("purge: main() runs it only with --purge, after the uninstall", () => {
+  const src = fs.readFileSync(path.join(REPO, "scripts", "bridge-install.js"), "utf8");
+  assert.match(src, /argv\.includes\("--purge"\)/);
+  assert.ok(src.indexOf("uninstall();") < src.indexOf("await purge("), "registry + host files go first");
+});

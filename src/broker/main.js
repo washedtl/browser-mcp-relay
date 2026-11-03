@@ -601,6 +601,27 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     };
   }
 
+  /**
+   * W2F: npm run bridge:uninstall -- --purge. Expires every bridge cookie in
+   * Brave (launching it if needed) and deletes the bridge state. A Brave
+   * launched only for this is closed gracefully again, which writes the
+   * deletions to disk; a running one writes them within ~30 s.
+   */
+  async function bridgePurge() {
+    if (typeof cookieBridge.purge !== "function") throw new Error("this broker has no cookie bridge");
+    const st = cookieBridge.status();
+    if (st.bridges) throw Object.assign(new Error("the cookie bridge extension is still connected, and would sync the cookies straight back: remove it in chrome://extensions (or turn on Pause sync on its review page), then purge again"), { code: "EBUSY" });
+    const wasUp = supervisor.isUp();
+    await ensureBrave();
+    try {
+      const r = await cookieBridge.purge();
+      log(`cookie bridge purge: ${r.expired} cookie(s) expired${wasUp ? "" : "; closing the Brave started for it"}`);
+      return { ...r, braveClosed: !wasUp };
+    } finally {
+      if (!wasUp) await supervisor.closeGracefully().catch((e) => log(`closing Brave after the purge failed: ${e.message}`));
+    }
+  }
+
   // ── connections ──
   const sockets = new Set();
   const bridgeSockets = new Set(); // W2F cookie-bridge connections: never sessions
@@ -665,7 +686,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
       }
       if (hello && hello.ctl) {
         // npm run broker:status / broker:stop (control.js): not a session
-        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)") }, rest);
+        require("./control.js").serveControl(sock, hello, key, { status, stop: () => closeAndExit("stop requested (npm run broker:stop)"), bridgePurge }, rest);
         return undefined;
       }
       sessions.set(connId, Date.now());

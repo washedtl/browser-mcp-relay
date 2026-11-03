@@ -254,6 +254,21 @@ test("e2e real Brave: approved allowed cookies reach the pipe-backed Brave throu
   assert.deepStrictEqual(await braveNames(), ["sess@app.bmr-e2e.example"]);
   assert.deepStrictEqual(await status(), { ...(await status()), bridges: 1, cookies: 1, managed: 1 });
 
+  // 4. V2-3: bridge:uninstall --purge. Refused while the extension is connected;
+  //    once it's gone, every bridge cookie leaves Brave and the state file goes.
+  const { stateFileFor } = require("../../src/cookie-bridge/importer.js");
+  const stateFile = stateFileFor(path.dirname(keyFile), path.join(home, "profile"));
+  assert.ok(fs.existsSync(stateFile), "the bridge state exists before the purge");
+  const busy = await requestControl({ pipe, key, cmd: "bridge-purge", timeoutMs: 30_000 });
+  assert.deepStrictEqual([busy.ok, busy.code], [false, "EBUSY"]);
+  bridge.stop(); // the extension disconnects: Chrome ends the host
+  await until(async () => (await status()).bridges === 0, 20_000, "the host to disconnect");
+  const purged = await requestControl({ pipe, key, cmd: "bridge-purge", timeoutMs: 60_000 });
+  assert.strictEqual(purged.ok, true, JSON.stringify(purged));
+  assert.ok(purged.expired >= 1 && purged.braveClosed === false, JSON.stringify(purged));
+  assert.deepStrictEqual(await braveNames(), [], "no bridge cookie left in Brave");
+  assert.ok(!fs.existsSync(stateFile), "the state file is deleted");
+
   // never a value or the CDP secret in the broker log, the host log, chrome.storage or status
   const hostLog = path.join(path.dirname(keyFile), "cookie-bridge.log");
   const everything = [logs.join("\n"), fs.readFileSync(hostLog, "utf8"), JSON.stringify(chrome.storage.data), JSON.stringify(await status())].join("\n");

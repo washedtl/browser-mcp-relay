@@ -527,3 +527,22 @@ test("v0.4.1: a bridge reply never carries the CDP secret, even when an apply er
   assert.ok(!JSON.stringify(r).includes(secret), JSON.stringify(r));
   assert.match(r.error, /<redacted>/);
 });
+
+test("V2-3: ctl bridge-purge (authenticated) launches Brave if needed, expires the bridge's cookies, closes the Brave it started; refused while a bridge is connected", async (t) => {
+  const b = await startTestBroker(t);
+  const br = await bridge(t, b.pipe);
+  await br.request({ ctl: "cookies.full", cookies: [ck(), ck({ name: "two" })], last: true }); // Brave down: snapshot only
+  const busy = await requestControl({ pipe: b.pipe, key: KEY, cmd: "bridge-purge", timeoutMs: 10_000 });
+  assert.deepStrictEqual([busy.ok, busy.code], [false, "EBUSY"]);
+  assert.strictEqual(b.sup().launches, 0, "no Brave launched for a refused purge");
+  br.close();
+  await until(async () => (await requestControl({ pipe: b.pipe, key: KEY, cmd: "status" })).status.cookieBridge.bridges === 0, 3000, "the bridge to go");
+  const r = await requestControl({ pipe: b.pipe, key: KEY, cmd: "bridge-purge", timeoutMs: 10_000 });
+  assert.deepStrictEqual([r.ok, r.expired, r.braveClosed], [true, 2, true], JSON.stringify(r));
+  assert.deepStrictEqual(b.cdp.set.filter((c) => c.expires === 1).map((c) => c.name).sort(), ["sid", "two"]);
+  assert.strictEqual(b.sup().closes, 1, "the Brave started for the purge is closed again (writes the deletions to disk)");
+  assert.ok(!b.logs.join("\n").includes(SECRET));
+  // a wrong key gets nothing
+  const bad = await requestControl({ pipe: b.pipe, key: Buffer.alloc(32, 7), cmd: "bridge-purge" }).catch((e) => ({ code: e.code }));
+  assert.ok(bad.code === "EAUTH" || bad.ok === false, JSON.stringify(bad));
+});

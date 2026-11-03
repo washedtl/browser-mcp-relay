@@ -145,7 +145,8 @@ class CookieImporter {
     this._managed = new Map(); // key → identity: every cookie the bridge put into Brave (persisted)
     this._pendingDeletes = new Map(); // key → expired CookieParam, not yet applied to Brave (persisted)
     this._unflushed = new Map(); // key → {param, at, epoch}: applied, maybe not on disk yet (persisted as pending)
-    this._seen = new Set(); // every key the bridge has put into Brave in this broker's life (cookies_export masks them)
+    this._seen = new Map(); // key → identity: every cookie the bridge has put into Brave in this broker's life (masked, purged)
+    this._purged = false; // bridge:uninstall --purge ran: no state file until a bridge connects again
     this._epoch = 0; // bumped whenever Brave goes down: the running Brave's tombstones carry it
     this._staging = new Map(); // bridge id → {keys, fresh} of the full sync in progress
     this._bridge = null; // the one connected bridge
@@ -175,6 +176,7 @@ class CookieImporter {
       throw Object.assign(new Error("another cookie bridge is already connected (one Chrome profile syncs at a time)"), { code: "EBUSY" });
     }
     this._bridge = bridgeId;
+    this._purged = false;
     return {
       "cookies.full": async (msg) => {
         if (!Array.isArray(msg.cookies)) throw new Error("cookies must be an array");
@@ -354,6 +356,48 @@ class CookieImporter {
     this.braveReady({ pid });
   }
 
+  /**
+   * npm run bridge:uninstall -- --purge (control.js "bridge-purge"): expire in
+   * Brave every cookie the bridge has put there (managed, pending, not yet on
+   * disk, or seen in this broker's life), forget them all, and delete the
+   * state file; none is written again until a bridge connects. Refused
+   * (EBUSY) while a bridge is connected: it would sync them straight back.
+   * Brave must be up (main.js launches it first). Never logs a value.
+   * @returns {Promise<{expired: number}>}
+   */
+  async purge() {
+    if (this._bridge !== null) {
+      throw Object.assign(new Error("the cookie bridge extension is still connected, and would sync the cookies straight back: remove it in chrome://extensions (or turn on Pause sync on its review page), then purge again"), { code: "EBUSY" });
+    }
+    if (!this._isUp()) throw Object.assign(new Error("Brave is not running"), { code: "EDOWN" });
+    const all = new Map();
+    for (const [key, id] of this._seen) all.set(key, expireParam(id));
+    for (const [key, id] of this._managed) all.set(key, expireParam(id));
+    for (const [key, u] of this._unflushed) all.set(key, u.param);
+    for (const [key, p] of this._pendingDeletes) all.set(key, p);
+    this._snapshot.clear();
+    this._managed.clear();
+    this._seen.clear();
+    this._staging.clear();
+    this._unflushed.clear();
+    this._pendingDeletes = all;
+    this._dirty = true;
+    const expired = all.size; // _apply moves each applied one out of _pendingDeletes
+    await this._enqueue(() => this._apply([], [...all]));
+    // applied; kept as tombstones in memory only (re-applied if this Brave crashes before its next disk write)
+    this._purged = true;
+    this._dirty = false;
+    if (this._stateFile) {
+      try {
+        fs.rmSync(this._stateFile, { force: true });
+      } catch (e) {
+        this._log(`could not delete the bridge state ${this._stateFile}: ${e.code || e.message}`);
+      }
+    }
+    this._log(`purged: ${expired} bridge cookie(s) expired in Brave, state file deleted`);
+    return { expired };
+  }
+
   /** Brave went down: the next launch gets the snapshot (and the unflushed deletions) again. */
   braveDown() {
     this._settle(); // deletions this Brave held long enough are on disk
@@ -378,7 +422,7 @@ class CookieImporter {
     const index = new Set();
     // managed now, or put there earlier and not certainly gone (a deletion
     // pending or not on disk yet, a refused update over an earlier value)
-    for (const key of new Set([...this._seen, ...this._managed.keys(), ...this._pendingDeletes.keys(), ...this._unflushed.keys()])) {
+    for (const key of new Set([...this._seen.keys(), ...this._managed.keys(), ...this._pendingDeletes.keys(), ...this._unflushed.keys()])) {
       const [name, where, path] = key.split("\u0000");
       index.add(`${name}\u0000${where.toLowerCase()}\u0000${path}`);
     }
@@ -453,7 +497,7 @@ class CookieImporter {
   /** Snapshot it; the bridge manages it from now on. */
   _setSynced(key, param) {
     this._snapshot.set(key, param);
-    this._seen.add(key);
+    this._seen.set(key, identityOf(param));
     const id = identityOf(param);
     const was = this._managed.get(key);
     if (!was || JSON.stringify(was) !== JSON.stringify(id)) {
@@ -589,10 +633,10 @@ class CookieImporter {
       return;
     }
     for (const id of Array.isArray(data.managed) ? data.managed : []) {
-      if (validIdentity(id)) { this._managed.set(cookieKey(id), identityOf(id)); this._seen.add(cookieKey(id)); }
+      if (validIdentity(id)) { this._managed.set(cookieKey(id), identityOf(id)); this._seen.set(cookieKey(id), identityOf(id)); }
     }
     for (const id of Array.isArray(data.pendingDeletes) ? data.pendingDeletes : []) {
-      if (validIdentity(id)) { this._pendingDeletes.set(cookieKey(id), expireParam(identityOf(id))); this._seen.add(cookieKey(id)); }
+      if (validIdentity(id)) { this._pendingDeletes.set(cookieKey(id), expireParam(identityOf(id))); this._seen.set(cookieKey(id), identityOf(id)); }
     }
     if (this._managed.size || this._pendingDeletes.size) {
       this._log(`state: ${this._managed.size} bridge-managed cookie(s), ${this._pendingDeletes.size} pending deletion(s) from an earlier broker`);
@@ -616,7 +660,7 @@ class CookieImporter {
    */
   _saveState() {
     if (this._unflushed.size && this._isUp()) this._settle();
-    if (!this._stateFile || !this._dirty) return;
+    if (!this._stateFile || !this._dirty || this._purged) return;
     this._dirty = false;
     const pending = new Map(this._pendingDeletes);
     for (const [key, u] of this._unflushed) if (!pending.has(key)) pending.set(key, u.param);

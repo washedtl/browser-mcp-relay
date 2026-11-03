@@ -11,6 +11,13 @@
 // start the host. Then it prints the "load unpacked" steps. Uninstall
 // removes the registry key and exactly those two files.
 //
+// `npm run bridge:uninstall -- --purge` also asks the running broker
+// (authenticated control request "bridge-purge") to expire in Brave every
+// cookie the bridge put there, then deletes the bridge's state file and the
+// host's log. Without a running broker (or with the extension still
+// connected) it changes nothing and says what to do: the state file is what
+// a later purge needs.
+//
 // Re-run it after moving the repo or switching Node installs: the launcher
 // holds both absolute paths.
 
@@ -142,13 +149,70 @@ function uninstall({ env = process.env, platform = process.platform, runReg = de
   out('Also remove the extension in chrome://extensions ("Remove" on the cookie bridge).');
 }
 
-function main(argv = process.argv.slice(2)) {
+const defaultRequest = (opts) => require("../src/broker/control.js").requestControl(opts);
+
+/**
+ * The --purge half of uninstall: the broker expires every bridge cookie in
+ * Brave and deletes its state file; then the state file (if still there) and
+ * the host's log go. Throws, deleting nothing, when no broker answers or it
+ * refuses (the extension still connected).
+ * @param {object} [opts] — test seams: env (local-config merged), platform, out(line), request(opts)
+ * @returns {Promise<{expired: number, removed: string[]}>}
+ */
+async function purge({ env = process.env, platform = process.platform, out = console.log, request = defaultRequest } = {}) {
+  requireWindows(platform);
+  const pipeServer = require("../src/broker/pipe-server.js");
+  const { stateFileFor } = require("../src/cookie-bridge/importer.js");
+  const { pipe, profileDir } = pipeServer.resolveEndpoint(env, { platform });
+  const home = pipeServer.brokerHome(env, platform);
+  const stateFile = stateFileFor(home, profileDir);
+  const logFile = path.join(home, "cookie-bridge.log");
+  const files = [stateFile, logFile, `${logFile}.1`];
+  const removeFiles = () => files.filter((file) => {
+    if (!fs.existsSync(file)) return false;
+    fs.rmSync(file, { force: true });
+    out(`removed ${file}`);
+    return true;
+  });
+  const key = pipeServer.readKey(pipeServer.keyFileFor(env));
+  if (!key) {
+    if (fs.existsSync(stateFile)) throw new Error(`${stateFile} exists but there is no broker key: start the broker once (any browser tool call), then purge again`);
+    out("no broker has run here, so the bridge never put a cookie into Brave");
+    return { expired: 0, removed: removeFiles() };
+  }
+  let answer;
+  try {
+    answer = await request({ pipe, key, cmd: "bridge-purge", timeoutMs: 90_000 });
+  } catch (e) {
+    if (e.code === "ENOENT" || e.code === "ECONNREFUSED") {
+      throw new Error("no broker is running, so the bridge's cookies are still in Brave's profile. Make any browser tool call from an agent session (that starts the broker), then run npm run bridge:uninstall -- --purge again. Nothing was deleted.");
+    }
+    if (e.code === "EPERM" || e.code === "EACCES") {
+      throw new Error("the broker is running elevated (as administrator): run npm run bridge:uninstall -- --purge from an elevated terminal. Nothing was deleted.");
+    }
+    throw new Error(`could not reach the broker (${e.code || e.message}). Nothing was deleted.`);
+  }
+  if (!answer || answer.ok !== true) {
+    throw new Error(`the broker didn't purge: ${(answer && answer.error) || "no answer"}. Nothing was deleted.`);
+  }
+  out(`expired ${answer.expired} bridge cookie(s) in Brave${answer.braveClosed ? " (Brave was started for it and closed again, which writes them to disk)" : " (Brave writes them to disk within ~30 s)"}`);
+  return { expired: answer.expired, removed: removeFiles() };
+}
+
+async function main(argv = process.argv.slice(2)) {
   const cmd = argv[0];
   try {
     if (cmd === "install") install();
-    else if (cmd === "uninstall") uninstall();
-    else {
-      console.error("usage: node scripts/bridge-install.js install|uninstall");
+    else if (cmd === "uninstall") {
+      uninstall();
+      if (argv.includes("--purge")) {
+        const { applyLocalConfigToEnv } = require("../src/local-config.js");
+        await purge({ env: applyLocalConfigToEnv(process.env) });
+      } else {
+        console.log("The cookies the bridge copied are still in the broker's Brave: npm run bridge:uninstall -- --purge removes them.");
+      }
+    } else {
+      console.error("usage: node scripts/bridge-install.js install | uninstall [--purge]");
       process.exitCode = 2;
     }
   } catch (e) {
@@ -159,4 +223,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) main();
 
-module.exports = { install, uninstall, extensionIdFromKey, readExtensionId, HOST_NAME, REGISTRY_KEY, main };
+module.exports = { install, uninstall, purge, extensionIdFromKey, readExtensionId, HOST_NAME, REGISTRY_KEY, main };
