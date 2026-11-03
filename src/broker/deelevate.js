@@ -10,15 +10,14 @@
 // survives a tree-kill of the shim. `runas /trustlevel:0x20000` does NOT do
 // this: its token stays high-integrity and elevated, and it opens a console.
 //
-// A process started that way gets the user's default environment, not ours,
-// so the broker's settings travel in a user-private file it reads and deletes
-// (--env-file). Windows only; built-ins only (the launcher must start fast).
+// The broker gets exactly the env block we pass (the launcher's allowlist),
+// never the user's full profile env: it is handed to the elevated PowerShell
+// step in an env var, which medium-integrity processes cannot read.
+// Windows only; built-ins only (the launcher must start fast).
 
 "use strict";
 
-const fs = require("node:fs");
 const path = require("node:path");
-const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 
 const HIGH_INTEGRITY_SID = "S-1-16-12288";
@@ -50,12 +49,19 @@ function quoteArg(arg) {
 
 const commandLine = (args) => args.map(quoteArg).join(" ");
 
-/** Write the broker's env to a user-private file in `dir`; returns its path. */
-function writeEnvFile(dir, env) {
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `launch-${process.pid}-${crypto.randomBytes(4).toString("hex")}.json`);
-  fs.writeFileSync(file, JSON.stringify({ env }), { mode: 0o600, flag: "wx" });
-  return file;
+// an env var holds at most 32767 characters
+const MAX_ENV_BLOCK_B64 = 32_000;
+
+/**
+ * A CreateProcess environment block for `env` (UTF-16 "k=v\0...\0\0",
+ * sorted case-insensitively), base64.
+ */
+function envBlock(env) {
+  const entries = Object.entries(env)
+    .filter(([k, v]) => k && !k.includes("=") && !k.includes("\0") && typeof v === "string" && !v.includes("\0"))
+    .sort(([a], [b]) => (a.toUpperCase() < b.toUpperCase() ? -1 : a.toUpperCase() > b.toUpperCase() ? 1 : 0));
+  const text = entries.length ? entries.map(([k, v]) => `${k}=${v}\0`).join("") + "\0" : "\0\0";
+  return Buffer.from(text, "utf16le").toString("base64");
 }
 
 // C# via PowerShell: duplicate the shell's token, check it is ours and not
@@ -80,7 +86,7 @@ public static class BmrDeelevate {
   [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
   static extern bool CreateProcessWithTokenW(IntPtr t, int lf, string app, string cmd, uint flags, IntPtr env, string cwd, ref SI si, out PIn pi);
   static string Fail(string why) { return "{\"ok\":false,\"why\":\"" + why.Replace("\\", "\\\\").Replace("\"", "'") + "\"}"; }
-  public static string Run(string cmd, string cwd) {
+  public static string Run(string cmd, string cwd, string envB64) {
     int shellPid; GetWindowThreadProcessId(GetShellWindow(), out shellPid);
     if (shellPid == 0) return Fail("no desktop shell (explorer.exe) to take a token from");
     IntPtr hp = OpenProcess(0x1000, false, shellPid);
@@ -94,36 +100,44 @@ public static class BmrDeelevate {
         if (shellId.User != WindowsIdentity.GetCurrent().User) return Fail("the desktop shell runs as another user (" + shellId.Name + ")");
       }
       int elevated, len;
-      if (GetTokenInformation(tok, 20, out elevated, 4, out len) && elevated != 0) return Fail("the desktop shell itself runs elevated (UAC off?)");
+      if (!GetTokenInformation(tok, 20, out elevated, 4, out len)) return Fail("GetTokenInformation(shell, TokenElevation) failed: " + Marshal.GetLastWin32Error());
+      if (elevated != 0) return Fail("the desktop shell itself runs elevated (UAC off?)");
       if (!DuplicateTokenEx(tok, 0x02000000, IntPtr.Zero, 2, 1, out dup)) return Fail("DuplicateTokenEx failed: " + Marshal.GetLastWin32Error());
     } finally { CloseHandle(tok); }
+    byte[] blk = Convert.FromBase64String(envB64);
+    IntPtr envp = Marshal.AllocHGlobal(blk.Length);
     try {
+      Marshal.Copy(blk, 0, envp, blk.Length);
       SI si = new SI(); si.cb = Marshal.SizeOf(si);
       PIn pi;
-      if (!CreateProcessWithTokenW(dup, 0, null, cmd, 0x08000000 | 0x00000400, IntPtr.Zero, cwd, ref si, out pi)) {
+      // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, with OUR env block
+      if (!CreateProcessWithTokenW(dup, 0, null, cmd, 0x08000000 | 0x00000400, envp, cwd, ref si, out pi)) {
         return Fail("CreateProcessWithTokenW failed: " + Marshal.GetLastWin32Error());
       }
       CloseHandle(pi.hp); CloseHandle(pi.ht);
       return "{\"ok\":true,\"pid\":" + pi.pid + "}";
-    } finally { CloseHandle(dup); }
+    } finally { Marshal.FreeHGlobal(envp); CloseHandle(dup); }
   }
 }
 "@
-[Console]::Out.WriteLine([BmrDeelevate]::Run($env:BMR_DEELEVATE_CMDLINE, $env:BMR_DEELEVATE_CWD))
+[Console]::Out.WriteLine([BmrDeelevate]::Run($env:BMR_DEELEVATE_CMDLINE, $env:BMR_DEELEVATE_CWD, $env:BMR_DEELEVATE_ENVBLOCK))
 `;
 
 /**
- * Start `node <args>` de-elevated (shell token, no window). Throws with the
- * reason when that is impossible; the caller falls back to a normal launch.
+ * Start `node <args>` de-elevated (shell token, no window) with exactly
+ * `childEnv` as its environment. Throws with the reason when that is
+ * impossible; the caller falls back to a normal launch.
  * @returns {{pid: number}}
  */
-function launchDeelevated({ args, cwd, env = process.env, run = spawnSync }) {
+function launchDeelevated({ args, cwd, childEnv, env = process.env, run = spawnSync }) {
+  const block = envBlock(childEnv);
+  if (block.length > MAX_ENV_BLOCK_B64) throw new Error(`the broker's env is too large to hand over (${block.length} base64 chars)`);
   const r = run(path.join(system32(env), "WindowsPowerShell", "v1.0", "powershell.exe"),
     ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(PS_SCRIPT, "utf16le").toString("base64")], {
       encoding: "utf8",
       windowsHide: true,
       timeout: 30_000,
-      env: { ...env, BMR_DEELEVATE_CMDLINE: commandLine([process.execPath, ...args]), BMR_DEELEVATE_CWD: cwd },
+      env: { ...env, BMR_DEELEVATE_CMDLINE: commandLine([process.execPath, ...args]), BMR_DEELEVATE_CWD: cwd, BMR_DEELEVATE_ENVBLOCK: block },
     });
   const last = String(r.stdout || "").trim().split(/\r?\n/).pop() || "";
   let res = null;
@@ -136,4 +150,4 @@ function launchDeelevated({ args, cwd, env = process.env, run = spawnSync }) {
   return { pid: res.pid };
 }
 
-module.exports = { isElevated, launchDeelevated, writeEnvFile, quoteArg, commandLine, HIGH_INTEGRITY_SID };
+module.exports = { isElevated, launchDeelevated, envBlock, quoteArg, commandLine, HIGH_INTEGRITY_SID };

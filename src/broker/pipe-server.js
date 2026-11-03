@@ -206,17 +206,45 @@ async function claimPipe(pipe) {
 // every tool argument (passwords, cookies) and could feed results to agents.
 // So the shim talks only to a broker that proves it knows this user's key:
 //
-//   shim   → {"bmr":"hello","v":1,"nonce":<hex>,"settings":<hash>,"reconnect":bool}
-//   broker → {"bmr":"hello","v":1,"mac":HMAC-SHA256(key, "broker:" + nonce)}
+//   shim   → {"bmr":"hello","v":1,"nonce":<hex>,"settings":<HMAC of settings>,"reconnect":bool}
+//   broker → {"bmr":"hello","v":1,"mac":HMAC-SHA256(key, "broker:" + nonce)[,"warning":<text>]}
 //
 // before anything else is sent. The key lives in a user-private file under
 // brokerHome (the shim passes its path to the broker it starts).
 
 const HELLO_TIMEOUT_MS = 5000;
+const HELLO_MAX_BYTES = 4096; // a handshake line is ~200 bytes: don't buffer a flood
+const MAX_WARNING_CHARS = 500;
 
 /** The key file next to the broker's other state. */
 function keyFileFor(env = process.env) {
   return path.join(brokerHome(env), "broker.key");
+}
+
+/** Publish `hex` as the key file unless one exists (tmp + link: atomic). True if we wrote it. */
+function publishKey(file, hex) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, hex, { mode: 0o600 });
+  try {
+    fs.linkSync(tmp, file);
+    return true;
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+    return false;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+/**
+ * The broker's side: if its key file vanished while it runs (a cleanup, a
+ * reset profile), write it back, so new sessions keep matching this broker.
+ * True if it was restored.
+ */
+function restoreKeyFile(file, key) {
+  if (fs.existsSync(file)) return false;
+  return publishKey(file, key.toString("hex"));
 }
 
 /**
@@ -233,16 +261,7 @@ function loadOrCreateKey(file) {
     } catch (e) {
       if (e.code !== "ENOENT") throw e;
     }
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-    fs.writeFileSync(tmp, crypto.randomBytes(32).toString("hex"), { mode: 0o600 });
-    try {
-      fs.linkSync(tmp, file); // fails if another process published first: read theirs
-    } catch (e) {
-      if (e.code !== "EEXIST") throw e;
-    } finally {
-      fs.rmSync(tmp, { force: true });
-    }
+    publishKey(file, crypto.randomBytes(32).toString("hex")); // if another process published first, read theirs
   }
   throw new Error(`[broker] could not read or create the key file ${file}`);
 }
@@ -256,6 +275,7 @@ const helloMac = (key, nonce) => crypto.createHmac("sha256", key).update(`broker
 function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const chunks = [];
+    let size = 0;
     const done = (err, value) => {
       clearTimeout(timer);
       sock.removeListener("data", onData);
@@ -267,7 +287,16 @@ function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
     const onData = (chunk) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       const i = buf.indexOf(10);
-      if (i < 0) { chunks.push(buf); return; }
+      if (i < 0) {
+        chunks.push(buf);
+        size += buf.length;
+        if (size > HELLO_MAX_BYTES) done(Object.assign(new Error(`handshake line over ${HELLO_MAX_BYTES} bytes`), { code: "EPROTO" }));
+        return;
+      }
+      if (size + i > HELLO_MAX_BYTES) {
+        done(Object.assign(new Error(`handshake line over ${HELLO_MAX_BYTES} bytes`), { code: "EPROTO" }));
+        return;
+      }
       sock.pause();
       chunks.push(buf.subarray(0, i));
       done(null, { line: Buffer.concat(chunks).toString("utf8").replace(/\r$/, ""), rest: buf.subarray(i + 1) });
@@ -282,8 +311,10 @@ function readLine(sock, timeoutMs = HELLO_TIMEOUT_MS) {
 }
 
 /**
- * Client side: prove the pipe's owner knows `key`. Resolves the bytes that
- * followed the reply (normally none); rejects with code EAUTH otherwise.
+ * Client side: prove the pipe's owner knows `key`. Resolves { rest, warning }:
+ * the bytes that followed the reply (normally none) and the broker's warning,
+ * if any (trusted only once the mac checked out). Rejects with code EAUTH on
+ * a wrong answer; ECONNRESET / ETIMEDOUT / EPROTO when there was none.
  */
 async function clientHello(sock, key, { settings = null, reconnect = false, timeoutMs = HELLO_TIMEOUT_MS } = {}) {
   const nonce = crypto.randomBytes(16).toString("hex");
@@ -296,7 +327,8 @@ async function clientHello(sock, key, { settings = null, reconnect = false, time
   if (!got || !crypto.timingSafeEqual(got, want)) {
     throw Object.assign(new Error("the pipe's owner failed authentication (not this user's broker)"), { code: "EAUTH" });
   }
-  return rest;
+  const warning = typeof reply.warning === "string" && reply.warning ? reply.warning.slice(0, MAX_WARNING_CHARS) : null;
+  return { rest, warning };
 }
 
 /**
@@ -317,36 +349,41 @@ async function verifyPipeOwner(pipe, key, timeoutMs = HELLO_TIMEOUT_MS) {
 }
 
 /**
- * Server side: answer a hello if the connection opens with one. Resolves
- * { hello, rest } — hello null when the first line was something else (it is
- * then part of rest, untouched). The socket is left paused.
+ * Server side: answer a hello if the connection opens with one (with the
+ * broker's warning, if any). Resolves { hello, rest } — hello null when the
+ * first line was something else (it is then part of rest, untouched). The
+ * socket is left paused.
  */
-async function serverHello(sock, key, timeoutMs = HELLO_TIMEOUT_MS) {
+async function serverHello(sock, key, { warning = null, timeoutMs = HELLO_TIMEOUT_MS } = {}) {
   const { line, rest } = await readLine(sock, timeoutMs);
   let msg = null;
   try { msg = JSON.parse(line); } catch { /* not a hello */ }
   if (!msg || msg.bmr !== "hello" || typeof msg.nonce !== "string") {
     return { hello: null, rest: Buffer.concat([Buffer.from(line + "\n"), rest]) };
   }
-  sock.write(JSON.stringify({ bmr: "hello", v: 1, mac: helloMac(key, msg.nonce) }) + "\n");
+  const reply = { bmr: "hello", v: 1, mac: helloMac(key, msg.nonce) };
+  if (warning) reply.warning = String(warning).slice(0, MAX_WARNING_CHARS);
+  sock.write(JSON.stringify(reply) + "\n");
   return { hello: msg, rest };
 }
 
 /**
- * Hash of the settings a broker is started with (BROWSER_*, telemetry and
- * upstream's catalog-shaping vars), so a session can tell whether the broker
- * it reached was started with different ones.
+ * HMAC (with this user's broker key) of the settings a broker is started
+ * with (BROWSER_*, telemetry and upstream's catalog-shaping vars), so a
+ * session can tell whether the broker it reached was started with different
+ * ones. Keyed: it travels before the handshake completes and covers values
+ * such as a proxy URL with credentials.
  */
 const SETTINGS_KEY_RE = /^(?:BROWSER_.*|TELEMETRY_ENABLE|TOOL_NAME_PREFIX|AVAILABLE_TOOL_DOMAINS|TOOL_INPUT_METADATA_ENABLE|TOOL_OUTPUT_SCHEMA_DISABLE|PLATFORM|FIGMA_ACCESS_TOKEN)$/i;
-function settingsHash(env) {
+function settingsHash(env, key) {
   const pairs = Object.entries(env)
-    .filter(([k, v]) => SETTINGS_KEY_RE.test(k) && v !== undefined && v !== "" && !/^BROWSER_RELAY_BROKER_(?:PIPE|LOG)$/i.test(k))
+    .filter(([k, v]) => SETTINGS_KEY_RE.test(k) && v !== undefined && v !== "" && !/^BROWSER_RELAY_BROKER_(?:PIPE|LOG|LAUNCH_WARNING)$/i.test(k))
     .map(([k, v]) => [k.toUpperCase(), String(v)])
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return crypto.createHash("sha256").update(JSON.stringify(pairs)).digest("hex").slice(0, 16);
+  return crypto.createHmac("sha256", key).update(JSON.stringify(pairs)).digest("hex").slice(0, 32);
 }
 
 module.exports = {
   pipeNameFor, resolveEndpoint, brokerHome, claimPipe, privateDirProblem, PIPE_PREFIX,
-  keyFileFor, loadOrCreateKey, helloMac, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS,
+  keyFileFor, loadOrCreateKey, restoreKeyFile, helloMac, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS, HELLO_MAX_BYTES,
 };

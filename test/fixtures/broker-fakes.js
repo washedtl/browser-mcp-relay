@@ -194,7 +194,8 @@ class SocketClientTransport {
     });
     if (this.hello) {
       const { clientHello } = require("../../src/broker/pipe-server.js");
-      const rest = await clientHello(sock, this.hello.key, this.hello);
+      const { rest, warning } = await clientHello(sock, this.hello.key, this.hello);
+      this.warning = warning;
       if (rest.length) sock.unshift(rest);
     }
     sock.on("data", (chunk) => {

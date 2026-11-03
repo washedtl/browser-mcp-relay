@@ -57,7 +57,7 @@ function defaultReply(msg) {
  * A scripted broker. It answers the shim's hello with KEY (or, as a
  * squatter, with garbage), records hellos apart from the JSON-RPC traffic.
  */
-async function fakeBroker(t, pipe, { reply = defaultReply, squat = false } = {}) {
+async function fakeBroker(t, pipe, { reply = defaultReply, squat = false, key = KEY, warning = null } = {}) {
   const conns = [];
   const received = [];
   const hellos = [];
@@ -75,8 +75,8 @@ async function fakeBroker(t, pipe, { reply = defaultReply, squat = false } = {})
         try { msg = JSON.parse(line); } catch { received.push({ conn, raw: line }); continue; }
         if (msg.bmr === "hello") {
           hellos.push({ conn, msg });
-          const mac = squat ? crypto.randomBytes(32).toString("hex") : helloMac(KEY, msg.nonce);
-          sock.write(JSON.stringify({ bmr: "hello", v: 1, mac }) + "\n");
+          const mac = squat ? crypto.randomBytes(32).toString("hex") : helloMac(key, msg.nonce);
+          sock.write(JSON.stringify({ bmr: "hello", v: 1, mac, ...(warning ? { warning } : {}) }) + "\n");
           continue;
         }
         received.push({ conn, msg });
@@ -118,8 +118,8 @@ function shimHarness(t, pipe, opts = {}) {
   const launches = [];
   const shim = new Shim({
     pipe,
-    keyFile: KEY_FILE,
-    settings: opts.settings || null,
+    keyFile: opts.keyFile || KEY_FILE,
+    settingsEnv: opts.settingsEnv || null,
     brokerEntry: "fake-broker-entry.js",
     brokerArgs: ["--pipe", pipe],
     input,
@@ -131,6 +131,7 @@ function shimHarness(t, pipe, opts = {}) {
     respawnAfterMs: opts.respawnAfterMs || 5000,
     ...(opts.pipeDirProblem ? { pipeDirProblem: opts.pipeDirProblem } : {}),
   });
+  if (opts.staleKey) shim.key = opts.staleKey; // as if read before the key file was recreated
   shim.start();
   t.after(() => shim.close());
   const send = (obj) => input.write(JSON.stringify(obj) + "\n");
@@ -323,24 +324,57 @@ test("hello: the shim sends nothing of the session's to a pipe owner without thi
   const r = await h.response(1);
   assert.match(r.error.message, /failed authentication/);
   assert.match(r.error.message, /squatting/);
-  assert.strictEqual(fb.hellos.length, 1, "it saw only the hello");
+  assert.strictEqual(fb.hellos.length, 2, "it saw only hellos (a second try after re-reading the key file)");
   assert.deepStrictEqual(fb.received, [], "no JSON-RPC message reached the squatter");
   assert.strictEqual(h.launches.length, 0);
 });
 
-test("hello: carries the session's settings hash, and reconnect=true only after a broker was lost", async (t) => {
+test("hello: carries the session's KEYED settings hash, and reconnect=true only after a broker was lost", async (t) => {
   const pipe = testPipe("hello");
   const fb = await fakeBroker(t, pipe);
-  const h = shimHarness(t, pipe, { settings: "abcd1234abcd1234" });
+  const settingsEnv = { BROWSER_RELAY_PROXY_URL: "http://user:pw@p:1" };
+  const h = shimHarness(t, pipe, { settingsEnv });
   h.send(INIT);
   await h.response(1);
-  assert.strictEqual(fb.hellos[0].msg.settings, "abcd1234abcd1234");
+  assert.strictEqual(fb.hellos[0].msg.settings, settingsHash(settingsEnv, KEY));
+  assert.notStrictEqual(fb.hellos[0].msg.settings, settingsHash(settingsEnv, Buffer.alloc(32, 1)), "keyed: useless without the key");
   assert.strictEqual(fb.hellos[0].msg.reconnect, false);
   assert.match(fb.hellos[0].msg.nonce, /^[0-9a-f]{32}$/);
   fb.dropAll();
   await until(() => fb.hellos.length === 2, 5000, "the reconnect hello");
   assert.strictEqual(fb.hellos[1].msg.reconnect, true, "the new broker marks this session's main tab reset");
   assert.notStrictEqual(fb.hellos[1].msg.nonce, fb.hellos[0].msg.nonce);
+});
+
+test("hello: a stale cached key is re-read from the key file once before the owner is called a squatter", async (t) => {
+  const pipe = testPipe("stalekey");
+  const fb = await fakeBroker(t, pipe); // answers with the key in KEY_FILE
+  const h = shimHarness(t, pipe, { staleKey: Buffer.alloc(32, 9) });
+  h.send(INIT);
+  const r = await h.response(1);
+  assert.ok(r.result, JSON.stringify(r));
+  assert.strictEqual(fb.hellos.length, 2, "one failed try with the stale key, one with the re-read key");
+});
+
+test("broker warning (e.g. it runs elevated): on the shim's stderr and once in the session's first tool result", async (t) => {
+  const pipe = testPipe("warn");
+  const warning = "the browser broker runs elevated (as administrator), and so does its Brave: starting it de-elevated failed (x)";
+  await fakeBroker(t, pipe, {
+    warning,
+    reply: (msg) => (msg.method === "tools/call" ? { jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "ok" }] } } : defaultReply(msg)),
+  });
+  const h = shimHarness(t, pipe);
+  h.send(INIT);
+  const init = await h.response(1);
+  assert.ok(!JSON.stringify(init).includes("WARNING"), "not in the initialize result");
+  assert.ok(h.logs.some((l) => l === `WARNING: ${warning}`), h.logs.join("\n"));
+  h.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "x", arguments: {} } });
+  const first = await h.response(2);
+  assert.deepStrictEqual(first.result.content[0], { type: "text", text: `[browser-mcp-relay] WARNING: ${warning}` });
+  assert.deepStrictEqual(first.result.content[1], { type: "text", text: "ok" });
+  h.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "x", arguments: {} } });
+  const second = await h.response(3);
+  assert.strictEqual(second.result.content.length, 1, "once per session");
 });
 
 test("reconnect backoff: a broker that drops every connection at once is not hammered", async (t) => {
@@ -414,7 +448,6 @@ function launcherHarness({ elevated = false, deelevate = () => ({ pid: 1 }), env
     spawnFn: (cmd, args, opts) => { r.spawns.push({ cmd, args, opts }); return { unref() {} }; },
     exit: (c) => r.exits.push(c),
     isElevated: () => elevated,
-    writeEnvFile: (dir, e) => { r.files.push({ dir, env: e }); return path.join(dir, "launch-x.json"); },
     launchDeelevated: (opts) => { r.deelevated.push(opts); return deelevate(opts); },
     log: (m) => r.logs.push(m),
   });
@@ -434,25 +467,30 @@ test("launcher: a non-elevated launch spawns the broker with the allowlisted env
   assert.deepStrictEqual(r.exits, [0]);
 });
 
-test("launcher: elevated → the broker starts de-elevated with --env-file (its env goes in the file), no spawn", () => {
-  const r = launcherHarness({ elevated: true, env: { BROWSER_RELAY_TEST_MARK: "m", SECRET_TOKEN: "x" } });
+test("launcher: elevated → the broker starts de-elevated with exactly the allowlisted env as its env block; no file, no spawn", (t) => {
+  const lad = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-launch-lad-"));
+  t.after(() => fs.rmSync(lad, { recursive: true, force: true }));
+  const r = launcherHarness({ elevated: true, env: { LOCALAPPDATA: lad, BROWSER_RELAY_TEST_MARK: "m", SECRET_TOKEN: "x" } });
   assert.strictEqual(r.spawns.length, 0);
   assert.strictEqual(r.deelevated.length, 1);
-  const { args, cwd } = r.deelevated[0];
-  assert.deepStrictEqual(args.slice(0, 3), ["C:\\x\\broker.js", "--pipe", "P"]);
-  assert.deepStrictEqual(args.slice(3), ["--env-file", path.join(r.files[0].dir, "launch-x.json")]);
-  assert.strictEqual(cwd, r.files[0].dir);
-  assert.strictEqual(r.files[0].env.BROWSER_RELAY_TEST_MARK, "m");
-  assert.strictEqual(r.files[0].env.SECRET_TOKEN, undefined);
+  const { args, cwd, childEnv } = r.deelevated[0];
+  assert.deepStrictEqual(args, ["C:\\x\\broker.js", "--pipe", "P"], "no --env-file");
+  assert.ok(fs.statSync(cwd).isDirectory(), "its working dir exists");
+  assert.strictEqual(childEnv.BROWSER_RELAY_TEST_MARK, "m");
+  assert.strictEqual(childEnv.SECRET_TOKEN, undefined);
+  assert.deepStrictEqual(fs.readdirSync(cwd).filter((n) => n.startsWith("launch-")), [], "no launch file");
   assert.deepStrictEqual(r.logs, []);
   assert.deepStrictEqual(r.exits, [0]);
 });
 
-test("launcher: when de-elevation fails it starts the broker elevated, with one clear warning", () => {
-  const r = launcherHarness({ elevated: true, deelevate: () => { throw new Error("the desktop shell runs as another user"); } });
+test("launcher: when de-elevation fails it starts the broker elevated, warns in the log and hands the warning to the broker", (t) => {
+  const lad = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-launch-lad-"));
+  t.after(() => fs.rmSync(lad, { recursive: true, force: true }));
+  const r = launcherHarness({ elevated: true, env: { LOCALAPPDATA: lad }, deelevate: () => { throw new Error("the desktop shell runs as another user"); } });
   assert.strictEqual(r.spawns.length, 1);
   assert.strictEqual(r.logs.length, 1);
-  assert.match(r.logs[0], /WARNING: could not start the broker de-elevated \(the desktop shell runs as another user\); starting it elevated/);
+  assert.match(r.logs[0], /^WARNING: the browser broker runs elevated \(as administrator\), and so does its Brave: starting it de-elevated failed \(the desktop shell runs as another user\)/);
+  assert.strictEqual(r.spawns[0].opts.env.BROWSER_RELAY_BROKER_LAUNCH_WARNING, r.logs[0].replace(/^WARNING: /, ""), "every session will hear it");
   assert.deepStrictEqual(r.exits, [0]);
 });
 
@@ -497,7 +535,7 @@ test("runLauncher: starts the broker detached, hidden, stdio ignored, then exits
   assert.deepStrictEqual(exits, [0]);
 });
 
-test("resolveShimOptions: the real broker entry, the same pipe + profile the broker derives, the key file and settings hash", () => {
+test("resolveShimOptions: the real broker entry, the same pipe + profile the broker derives, the key file and settings env", () => {
   const env = { LOCALAPPDATA: "C:\\Users\\fakeuser\\AppData\\Local", BROWSER_RELAY_BROKER_PROFILE_DIR: "D:\\prof" };
   const o = resolveShimOptions(env);
   const ep = resolveEndpoint(env);
@@ -505,8 +543,8 @@ test("resolveShimOptions: the real broker entry, the same pipe + profile the bro
   assert.ok(fs.existsSync(o.brokerEntry));
   assert.strictEqual(o.pipe, ep.pipe);
   assert.strictEqual(o.keyFile, keyFileFor(env));
-  assert.strictEqual(o.settings, settingsHash(env));
   assert.deepStrictEqual(o.brokerArgs, ["--pipe", ep.pipe, "--profile-dir", ep.profileDir, "--key-file", keyFileFor(env)]);
+  assert.strictEqual(o.settingsEnv, env, "hashed with the key once the shim has it");
 });
 
 // ──────────────── processes: real shims, real fixture broker ────────────────
@@ -533,12 +571,15 @@ function processRun(t, tag) {
   const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), `bmr-shim-${tag}-`));
   const pipe = testPipe(tag);
   const brokerPids = (kind = "started") => fs.readdirSync(markerDir).filter((f) => f.startsWith(`${kind}-`)).map((f) => Number(f.split("-")[1]));
+  const clients = [];
   t.after(async () => {
+    // sessions first, as Claude Code would close them, then any broker left
+    for (const c of clients) await c.close().catch(() => {});
     for (const pid of brokerPids()) killTree(pid);
     await until(() => brokerPids().every((p) => !pidAlive(p)), 5000, "test brokers to be gone");
     fs.rmSync(markerDir, { recursive: true, force: true });
   });
-  return { markerDir, pipe, brokerPids };
+  return { markerDir, pipe, brokerPids, clients };
 }
 
 async function shimClient(t, run, { exitMs = 60_000, watchdogMs = 0, name = "c", env = {} } = {}) {
@@ -552,6 +593,7 @@ async function shimClient(t, run, { exitMs = 60_000, watchdogMs = 0, name = "c",
   });
   const client = new Client({ name, version: "0" });
   await client.connect(transport);
+  run.clients.push(client);
   const connectMs = Date.now() - t0;
   t.after(() => client.close().catch(() => {}));
   return { client, transport, connectMs, shimPid: transport.pid };
@@ -629,19 +671,21 @@ test("processes: the launched broker gets only the allowlisted env", async (t) =
 });
 
 const elevatedHere = process.platform === "win32" && isElevated();
-test("processes: from an elevated session the broker runs de-elevated (medium integrity), env via the launch file", { skip: !elevatedHere && "needs an elevated Windows session" }, async (t) => {
+test("processes: from an elevated session the broker runs de-elevated (medium integrity) with only the allowlisted env", { skip: !elevatedHere && "needs an elevated Windows session" }, async (t) => {
   const run = processRun(t, "deelevate");
   const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-lad-"));
-  t.after(() => fs.rmSync(localAppData, { recursive: true, force: true }));
+  // the broker's working dir is in here; a just-killed broker may hold it a moment
+  t.after(() => fs.rmSync(localAppData, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const c = await shimClient(t, run, {
     env: { BROWSER_RELAY_BROKER_DEELEVATE: "auto", LOCALAPPDATA: localAppData, BROWSER_RELAY_TEST_MARK: "m-2", NOT_ALLOWLISTED_SECRET: "s3cr3t" },
   });
   const who = await callJson(c, "fixture_whoami");
   assert.strictEqual(who.integrity, "Medium", "the broker is not elevated");
-  assert.strictEqual(who.mark, "m-2", "settings arrive through the launch file");
-  assert.strictEqual(who.secret, null);
+  assert.strictEqual(who.mark, "m-2", "allowlisted settings arrive in its env block");
+  assert.strictEqual(who.secret, null, "a session-only var outside the allowlist is absent");
+  assert.deepStrictEqual(who.profileOnly, [], "vars that only the user-profile env sets (ALLUSERSPROFILE, PUBLIC) are absent too");
   const leftover = fs.readdirSync(path.join(localAppData, "browser-mcp-relay", "broker")).filter((n) => n.startsWith("launch-"));
-  assert.deepStrictEqual(leftover, [], "the broker deleted the launch file");
+  assert.deepStrictEqual(leftover, [], "no launch file");
   t.diagnostic(`broker pid ${who.pid}: ${who.integrity} integrity; connected in ${c.connectMs} ms`);
 });
 

@@ -21,6 +21,7 @@ const {
   claimPipe,
   keyFileFor,
   loadOrCreateKey,
+  restoreKeyFile,
   helloMac,
   clientHello,
   serverHello,
@@ -219,7 +220,8 @@ test("hello: a broker holding the key passes; the bytes after the reply are kept
   });
   const c = await connectTo(pipe);
   t.after(() => c.destroy());
-  const rest = await clientHello(c, KEY, { settings: "s1", reconnect: true });
+  const { rest, warning } = await clientHello(c, KEY, { settings: "s1", reconnect: true });
+  assert.strictEqual(warning, null);
   assert.strictEqual(seen.hello.settings, "s1");
   assert.strictEqual(seen.hello.reconnect, true);
   assert.strictEqual(seen.rest, "");
@@ -243,6 +245,47 @@ test("hello: a wrong key or a garbage answer is EAUTH; silence or a hang-up is t
   }
 });
 
+test("hello: a handshake line over 4 KB is refused on either side (EPROTO), not buffered", async (t) => {
+  let serverErr = null;
+  const pipe = await onePipe(t, (sock) => { serverHello(sock, KEY).catch((e) => { serverErr = e; }); });
+  const c = await connectTo(pipe);
+  t.after(() => c.destroy());
+  c.write("x".repeat(5000)); // no newline
+  await until(() => serverErr, 3000, "the server to refuse");
+  assert.strictEqual(serverErr.code, "EPROTO");
+
+  const flood = await onePipe(t, (sock) => { sock.once("data", () => sock.write("y".repeat(5000))); sock.on("error", () => {}); });
+  const c2 = await connectTo(flood);
+  t.after(() => c2.destroy());
+  await assert.rejects(clientHello(c2, KEY, { timeoutMs: 2000 }), (e) => e.code === "EPROTO");
+});
+
+test("hello: the broker's warning reaches a client only with a valid mac", async (t) => {
+  const pipe = await onePipe(t, (sock) => serverHello(sock, KEY, { warning: "runs elevated" }).catch(() => {}));
+  const c = await connectTo(pipe);
+  t.after(() => c.destroy());
+  assert.strictEqual((await clientHello(c, KEY)).warning, "runs elevated");
+  const forged = await onePipe(t, (sock) => serverHello(sock, Buffer.alloc(32, 4), { warning: "forged" }).catch(() => {}));
+  const c2 = await connectTo(forged);
+  t.after(() => c2.destroy());
+  await assert.rejects(clientHello(c2, KEY), (e) => e.code === "EAUTH");
+});
+
+test("restoreKeyFile: a running broker puts its key back when the file vanished, never over another", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-restore-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "broker.key");
+  const key = loadOrCreateKey(file);
+  assert.strictEqual(restoreKeyFile(file, key), false, "present: nothing to do");
+  fs.rmSync(file);
+  assert.strictEqual(restoreKeyFile(file, key), true);
+  assert.ok(loadOrCreateKey(file).equals(key));
+  fs.rmSync(file);
+  const other = loadOrCreateKey(file); // a new session created a new one first
+  assert.strictEqual(restoreKeyFile(file, key), false);
+  assert.ok(loadOrCreateKey(file).equals(other));
+});
+
 test("serverHello: a first line that is not a hello is handed back untouched", async (t) => {
   let seen = null;
   const pipe = await onePipe(t, async (sock) => { seen = await serverHello(sock, KEY); });
@@ -261,13 +304,17 @@ test("verifyPipeOwner: ok for a broker with the key, bad for a squatter", async 
   assert.strictEqual(await verifyPipeOwner(squat, KEY), "bad");
 });
 
-test("settingsHash: the broker-relevant settings only, order- and case-insensitive", () => {
-  const base = { BROWSER_RELAY_PROXY_URL: "http://p:1", TELEMETRY_ENABLE: "false", TOOL_NAME_PREFIX: "x" };
-  const h = settingsHash(base);
-  assert.match(h, /^[0-9a-f]{16}$/);
-  assert.strictEqual(settingsHash({ tool_name_prefix: "x", TELEMETRY_ENABLE: "false", BROWSER_RELAY_PROXY_URL: "http://p:1" }), h);
-  assert.strictEqual(settingsHash({ ...base, PATH: "a", GITHUB_TOKEN: "t", BROWSER_RELAY_BROKER_PIPE: "\\\\.\\pipe\\x", BROWSER_RELAY_BROKER_LOG: "l", BROWSER_RELAY_EMPTY: "" }), h);
-  assert.notStrictEqual(settingsHash({ ...base, BROWSER_RELAY_PROXY_URL: "http://p:2" }), h);
+test("settingsHash: keyed (HMAC), broker-relevant settings only, order- and case-insensitive", () => {
+  const base = { BROWSER_RELAY_PROXY_URL: "http://u:pw@p:1", TELEMETRY_ENABLE: "false", TOOL_NAME_PREFIX: "x" };
+  const h = settingsHash(base, KEY);
+  assert.match(h, /^[0-9a-f]{32}$/);
+  assert.strictEqual(settingsHash({ tool_name_prefix: "x", TELEMETRY_ENABLE: "false", BROWSER_RELAY_PROXY_URL: "http://u:pw@p:1" }, KEY), h);
+  assert.strictEqual(settingsHash({
+    ...base, PATH: "a", GITHUB_TOKEN: "t", BROWSER_RELAY_BROKER_PIPE: "\\\\.\\pipe\\x", BROWSER_RELAY_BROKER_LOG: "l",
+    BROWSER_RELAY_BROKER_LAUNCH_WARNING: "w", BROWSER_RELAY_EMPTY: "",
+  }, KEY), h);
+  assert.notStrictEqual(settingsHash({ ...base, BROWSER_RELAY_PROXY_URL: "http://u:pw@p:2" }, KEY), h);
+  assert.notStrictEqual(settingsHash(base, Buffer.alloc(32, 2)), h, "another key, another hash: not guessable offline");
 });
 
 // ───────────────────── broker: per-connection MCP servers ─────────────────────
@@ -357,6 +404,26 @@ test("startBroker: resolves null when another broker owns the pipe (verified wit
   assert.ok(!logs.some((l) => /WARNING/.test(l)));
 });
 
+test("startBroker: a key file recreated after the broker read it is re-read once before 'squatted'", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-rekey-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "broker.key");
+  const oldKey = loadOrCreateKey(file);
+  const newKey = Buffer.alloc(32, 5);
+  const pipe = await onePipe(t, (sock) => serverHello(sock, newKey).catch(() => {})); // the running broker has the new key
+  const logs = [];
+  const pending = startBroker({
+    pipe, profileDir: "unused", keyFile: file, log: (m) => logs.push(m),
+    deps: { createSupervisor: () => { throw new Error("must not build"); } },
+  });
+  // startBroker read oldKey synchronously; the file now holds the new one
+  assert.ok(!oldKey.equals(newKey));
+  fs.writeFileSync(file, newKey.toString("hex"));
+  assert.strictEqual(await pending, null);
+  assert.ok(!logs.some((l) => /squatted/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /is owned by another broker; exiting/.test(l)), logs.join("\n"));
+});
+
 test("startBroker: a pipe held by something without the key is reported as squatted", async (t) => {
   const pipe = await onePipe(t, (sock) => serverHello(sock, Buffer.alloc(32, 3)).catch(() => {}));
   const logs = [];
@@ -370,7 +437,7 @@ test("startBroker: a pipe held by something without the key is reported as squat
 
 test("hello: the broker proves the key, then serves MCP on the same connection", async (t) => {
   const b = await startTestBroker(t);
-  const c = await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({}) } });
+  const c = await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({}, KEY) } });
   assert.ok((await c.listTools()).tools.length > 0);
   assert.ok(!b.logs.some((l) => /WARNING/.test(l)));
 });
@@ -386,10 +453,23 @@ test("hello reconnect: a session that lost its previous broker gets a reset noti
 
 test("hello settings: a session whose settings differ from the broker's gets one warning in the log", async (t) => {
   const b = await startTestBroker(t, { env: { BROWSER_RELAY_PROXY_URL: "http://p:1" } });
-  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:1" }) } });
-  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:2" }) } });
-  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:3" }) } });
+  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:1" }, KEY) } });
+  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:2" }, KEY) } });
+  await connectClient(t, b.pipe, { hello: { key: KEY, settings: settingsHash({ BROWSER_RELAY_PROXY_URL: "http://p:3" }, KEY) } });
   assert.strictEqual(b.logs.filter((l) => /WARNING: session c\d+ has browser settings .* differ/.test(l)).length, 1);
+});
+
+test("launch warning (elevated fallback): logged once, in every session's hello reply, not counted as a settings difference", async (t) => {
+  const warning = "the browser broker runs elevated (as administrator), and so does its Brave: starting it de-elevated failed (x)";
+  const b = await startTestBroker(t, { env: { BROWSER_RELAY_BROKER_LAUNCH_WARNING: warning } });
+  const { SocketClientTransport: T } = require("./fixtures/broker-fakes.js");
+  const transport = new T(b.pipe, { hello: { key: KEY, settings: settingsHash({}, KEY) } });
+  const c = new Client({ name: "w", version: "0" });
+  await c.connect(transport);
+  t.after(() => c.close().catch(() => {}));
+  assert.strictEqual(transport.warning, warning);
+  assert.strictEqual(b.logs.filter((l) => l === `WARNING: ${warning}`).length, 1);
+  assert.ok(!b.logs.some((l) => /settings .* differ/.test(l)));
 });
 
 test("V1-2: a CDP port taken before Brave's first launch exits the broker so the shims start one on a new port", async (t) => {
@@ -426,6 +506,16 @@ test("recycle: over the RSS limit while idle, the broker exits (gracefully) so a
   assert.match(b.exits[0], /2048 MB RSS is over the 100 MB limit while idle/);
 });
 
+test("recycle: not while a session is connected and its browser is up; once Brave idles out, yes", async (t) => {
+  const b = await startTestBroker(t, { recycle: { rssBytes: 1, checkMs: 40 }, rss: () => 10 * 1024 * 1024 * 1024 });
+  const c = await connectClient(t, b.pipe);
+  await c.callTool({ name: "content_get-as-text", arguments: {} }); // Brave up, a tab open
+  await sleep(250);
+  assert.deepStrictEqual(b.exits, [], "the session would lose its tabs");
+  await b.sup.closeGracefully(); // the browser-idle close
+  await until(() => b.exits.length === 1, 3000, "the recycle");
+});
+
 test("recycle: never while a tool call is running", async (t) => {
   let release;
   const gate = new Promise((r) => { release = r; });
@@ -440,16 +530,39 @@ test("recycle: never while a tool call is running", async (t) => {
   await until(() => b.exits.length === 1, 3000, "the recycle once idle");
 });
 
-test("applyEnvFile: applies the launch settings and deletes the file", (t) => {
-  const { applyEnvFile } = require("../src/broker/main.js");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-envfile-"));
+test("watchdog: kills a blocked process, but stands down while an inspector is attached", () => {
+  const { spawnSync } = require("node:child_process");
+  const main = path.resolve(__dirname, "../src/broker/main.js");
+  // block the event loop for 1.5 s with a 300 ms watchdog
+  const script = `require(${JSON.stringify(main)}).startWatchdog({ timeoutMs: 300 }, () => {});
+    setTimeout(() => { const t = Date.now(); while (Date.now() - t < 1500) {} process.stdout.write("survived"); process.exit(0); }, 100);`;
+  const plain = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+  assert.notStrictEqual(plain.stdout, "survived", "killed by the watchdog");
+  assert.notStrictEqual(plain.status, 0);
+  const inspected = spawnSync(process.execPath, ["--inspect=127.0.0.1:0", "-e", script], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+  assert.strictEqual(inspected.stdout, "survived", `a debugging session is left alone (status ${inspected.status})`);
+});
+
+test("watchdogSetting: default 60 s, 0 turns it off, anything else at least 10 s", () => {
+  const { watchdogSetting } = require("../src/broker/main.js");
+  assert.strictEqual(watchdogSetting(undefined), 60_000);
+  assert.strictEqual(watchdogSetting("0"), 0);
+  assert.strictEqual(watchdogSetting("500"), 10_000);
+  assert.strictEqual(watchdogSetting("90000"), 90_000);
+  assert.strictEqual(watchdogSetting("junk"), 60_000);
+});
+
+test("sweepLaunchFiles: removes launch-*.json older than 5 min, keeps fresh ones and other files", (t) => {
+  const { sweepLaunchFiles } = require("../src/broker/main.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-sweep-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const file = path.join(dir, "launch-1.json");
-  fs.writeFileSync(file, JSON.stringify({ env: { BROWSER_RELAY_X: "1", NOT_A_STRING: 5 } }));
-  const env = {};
-  applyEnvFile(file, env);
-  assert.deepStrictEqual(env, { BROWSER_RELAY_X: "1" });
-  assert.ok(!fs.existsSync(file));
+  for (const n of ["launch-1-a.json", "launch-2-b.json", "broker.key", "broker.log"]) fs.writeFileSync(path.join(dir, n), "x");
+  const old = new Date(Date.now() - 10 * 60_000);
+  fs.utimesSync(path.join(dir, "launch-1-a.json"), old, old);
+  fs.utimesSync(path.join(dir, "broker.log"), old, old);
+  assert.strictEqual(sweepLaunchFiles(dir), 1);
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(), ["broker.key", "broker.log", "launch-2-b.json"]);
+  assert.strictEqual(sweepLaunchFiles(path.join(dir, "missing")), 0);
 });
 
 test("startBroker: the supervisor gets a fixed CDP port chosen up front", async (t) => {
