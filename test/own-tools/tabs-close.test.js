@@ -119,3 +119,47 @@ test("T0-8: tabs_close on a non-active page leaves activePage untouched", async 
     clearActivePage();
   }
 });
+
+// W1C2: page.close() can reject (e.g. connection lost). That must come back as
+// a structured isError result, and a failed close must not drop the active-page
+// reference for a page that is still open.
+test("W1C2: tabs_close returns isError when close() rejects and keeps the active page", async () => {
+  const prev = globalThis.__relayBridge;
+  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
+  const bridge = makeFakeBridge(["about:blank", "https://target.example.com/"]);
+  const target = bridge._pages[1];
+  target.close = async () => { throw new Error("Protocol error: Connection closed"); };
+  target.isClosed = () => false;
+  globalThis.__relayBridge = bridge;
+  setActivePage(target);
+  try {
+    const result = await tool.handler({ index: 1 });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.content[0].text, /Connection closed/);
+    assert.strictEqual(getActivePageRaw(), target, "still-open page must stay active after a failed close");
+  } finally {
+    globalThis.__relayBridge = prev;
+    clearActivePage();
+  }
+});
+
+// W1C2: the active reference is cleared after close() resolves, so a tab
+// selected while close() was in flight must not be clobbered.
+test("W1C2: tabs_close keeps a tab selected while close() was in flight", async () => {
+  const prev = globalThis.__relayBridge;
+  const { setActivePage, getActivePageRaw, clearActivePage } = require("../../src/own-tools/_active-page.js");
+  const bridge = makeFakeBridge(["about:blank", "https://a.example.com/", "https://b.example.com/"]);
+  const [, target, other] = bridge._pages;
+  target.close = async () => { setActivePage(other); }; // concurrent tabs_select during close
+  globalThis.__relayBridge = bridge;
+  setActivePage(target);
+  try {
+    const result = await tool.handler({ index: 1 });
+    assert.notStrictEqual(result.isError, true);
+    assert.strictEqual(JSON.parse(result.content[0].text).wasActive, true);
+    assert.strictEqual(getActivePageRaw(), other, "selection made during close() must survive");
+  } finally {
+    globalThis.__relayBridge = prev;
+    clearActivePage();
+  }
+});

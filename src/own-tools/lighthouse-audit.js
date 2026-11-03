@@ -14,8 +14,8 @@
 let _lhPromise = null;
 function getLighthouse() {
   if (!_lhPromise) {
+    // Resolves the whole module: the handler needs `default` + `desktopConfig`.
     _lhPromise = import("lighthouse")
-      .then((m) => m.default)
       .catch((e) => {
         // Reset so a future call can retry (e.g. after `npm install` fixes
         // a missing dep). Without reset, every retry would resolve to the
@@ -33,7 +33,11 @@ module.exports = {
     "Run a Lighthouse audit against a URL using the relay's Brave instance. " +
     "Returns category scores (performance, accessibility, best-practices, seo). " +
     "The audit runs against a fresh page in the relay's browser; cookies and " +
-    "extensions are inherited from the slot's profile.",
+    "extensions are inherited from the slot's profile. desktop uses Lighthouse's " +
+    "desktop config (desktop throttling + UA); mobile its default mobile emulation. " +
+    "Side effects on that shared profile: clears the audited origin's service " +
+    "workers, Cache Storage, file systems and shader cache, and wipes the whole " +
+    "HTTP cache (cookies, localStorage and IndexedDB are kept).",
   inputSchema: {
     type: "object",
     properties: {
@@ -90,9 +94,9 @@ module.exports = {
       };
     }
 
-    let lighthouse;
+    let lighthouse, desktopConfig;
     try {
-      lighthouse = await getLighthouse();
+      ({ default: lighthouse, desktopConfig } = await getLighthouse());
     } catch (e) {
       return {
         content: [{ type: "text", text: `lighthouse_audit: failed to load lighthouse module: ${e.message || e}` }],
@@ -135,6 +139,10 @@ module.exports = {
     // lighthouse so a dead Brave fails fast (~ms) instead of after lighthouse's
     // ~30s connection timeout. Lighthouse on a dead port hangs without
     // surfacing a useful error until Lighthouse itself gives up.
+    // W1C2: ensureBrave() already ran for this call (relay-server does it
+    // before every own-tool), so a failed probe means Brave died or hung.
+    const PROBE_ADVICE = "Brave may have crashed or hung. Retry: the relay relaunches Brave " +
+      "after it sees the browser disconnect; if it keeps failing, restart the MCP server.";
     try {
       const probeResp = await fetch(`http://127.0.0.1:${bridge.port}/json/version`, {
         // 1.5s is enough to detect a healthy CDP endpoint without making the
@@ -143,29 +151,30 @@ module.exports = {
       });
       if (!probeResp.ok) {
         return {
-          content: [{ type: "text", text: `lighthouse_audit: relay's Brave CDP endpoint http://127.0.0.1:${bridge.port}/json/version returned status ${probeResp.status}. Brave may have crashed; restart Cursor or call any other tool to relaunch.` }],
+          content: [{ type: "text", text: `lighthouse_audit: relay's Brave CDP endpoint http://127.0.0.1:${bridge.port}/json/version returned status ${probeResp.status}. ${PROBE_ADVICE}` }],
           isError: true,
         };
       }
     } catch (e) {
       return {
-        content: [{ type: "text", text: `lighthouse_audit: cannot reach relay's Brave CDP at http://127.0.0.1:${bridge.port}: ${e.message || e}. Likely Brave isn't launched yet — call any browser tool first to trigger ensureBrave().` }],
+        content: [{ type: "text", text: `lighthouse_audit: cannot reach relay's Brave CDP at http://127.0.0.1:${bridge.port}: ${e.message || e}. ${PROBE_ADVICE}` }],
         isError: true,
       };
     }
 
     let result;
     try {
+      // W1C2: formFactor/screenEmulation flags alone kept the default
+      // config's mobile throttling + mobile UA on desktop runs. Desktop uses
+      // Lighthouse's own desktopConfig; mobile uses the default config. Flags
+      // override config settings, so none of those are passed as flags.
       result = await lighthouse(url, {
         port: bridge.port,
         output: "json",
         logLevel: "error",
         onlyCategories: cats,
         formFactor,
-        screenEmulation: formFactor === "mobile"
-          ? { mobile: true, width: 412, height: 823, deviceScaleFactor: 1.75, disabled: false }
-          : { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false },
-      });
+      }, formFactor === "desktop" ? desktopConfig : undefined);
     } catch (e) {
       return {
         content: [{ type: "text", text: `lighthouse_audit: ${e.message || String(e)}` }],
@@ -175,7 +184,7 @@ module.exports = {
 
     if (!result || !result.lhr) {
       return {
-        content: [{ type: "text", text: "lighthouse returned no result" }],
+        content: [{ type: "text", text: "lighthouse_audit: lighthouse returned no result" }],
         isError: true,
       };
     }
@@ -189,5 +198,9 @@ module.exports = {
     return {
       content: [{ type: "text", text: JSON.stringify({ url, formFactor, categories: summary, finalUrl: result.lhr.finalUrl, fetchTime: result.lhr.fetchTime }, null, 2) }],
     };
+  },
+  // Test seam: substitute the lighthouse module (null restores lazy import).
+  _setLighthouseForTest(mod) {
+    _lhPromise = mod ? Promise.resolve(mod) : null;
   },
 };

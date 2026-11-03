@@ -141,3 +141,77 @@ test("V1-3: dialog_handle settles exactly once when timeout + dialog race", asyn
     globalThis.__relayBridge = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C2: promptText null-as-missing, dismiss fallback, blocking description.
+// ──────────────────────────────────────────────────────────────────
+
+// Models playwright-core 1.59 client Dialog: accept(promptText) sends
+// { promptText } through the protocol validator, where promptText is
+// tOptional(tString) — undefined passes, null throws "expected string, got
+// object". dismiss() records the call.
+function makeDialog({ acceptImpl } = {}) {
+  const calls = { accept: [], dismiss: 0 };
+  const dialog = {
+    type: () => "prompt",
+    message: () => "Name?",
+    defaultValue: () => "",
+    accept: async (promptText) => {
+      calls.accept.push(promptText);
+      if (acceptImpl) return acceptImpl(promptText);
+      if (promptText !== undefined && typeof promptText !== "string") {
+        throw new Error(`promptText: expected string, got ${typeof promptText}`);
+      }
+    },
+    dismiss: async () => { calls.dismiss++; },
+  };
+  return { dialog, calls };
+}
+
+async function runWithDialog(args, dialog) {
+  const prev = globalThis.__relayBridge;
+  let onDialog = null;
+  const fakePage = {
+    once: (event, fn) => { if (event === "dialog") onDialog = fn; },
+    off: () => {},
+  };
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    const promise = tool.handler(args);
+    await new Promise((r) => setImmediate(r));
+    await onDialog(dialog);
+    return await promise;
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+}
+
+test("W1C2: dialog_handle treats promptText:null as missing (accept(undefined), not accept(null))", async () => {
+  const { dialog, calls } = makeDialog();
+  const result = await runWithDialog({ action: "accept", promptText: null, timeoutMs: 1000 }, dialog);
+  assert.notStrictEqual(result.isError, true, `expected success, got: ${result.content[0].text}`);
+  assert.deepStrictEqual(calls.accept, [undefined]);
+});
+
+test("W1C2: dialog_handle dismisses the dialog when accept throws (page not left blocked)", async () => {
+  const { dialog, calls } = makeDialog({ acceptImpl: async () => { throw new Error("boom"); } });
+  const result = await runWithDialog({ action: "accept", promptText: "x", timeoutMs: 1000 }, dialog);
+  assert.strictEqual(result.isError, true);
+  assert.strictEqual(calls.dismiss, 1, "fallback dismiss must run after accept throws");
+  assert.match(result.content[0].text, /boom/);
+  assert.match(result.content[0].text, /dismissed/i);
+});
+
+test("W1C2: dialog_handle reports when the fallback dismiss also fails", async () => {
+  const { dialog, calls } = makeDialog({ acceptImpl: async () => { throw new Error("boom"); } });
+  dialog.dismiss = async () => { calls.dismiss++; throw new Error("gone"); };
+  const result = await runWithDialog({ action: "accept", timeoutMs: 1000 }, dialog);
+  assert.strictEqual(result.isError, true);
+  assert.strictEqual(calls.dismiss, 1);
+  assert.match(result.content[0].text, /gone/);
+});
+
+test("W1C2: dialog_handle description says the call blocks until a dialog or timeout", () => {
+  assert.match(tool.description, /blocks/i);
+  assert.match(tool.description, /timeout/i);
+});

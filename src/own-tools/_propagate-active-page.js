@@ -65,10 +65,15 @@ async function propagateActivePageToUpstream(url) {
     // snapshot/screenshot — we only care about the side effect of
     // upstream's `_page` being navigated. includeSnapshot/Screenshot
     // default true on upstream, which would double our latency.
-    await upstream.request("tools/call", {
+    const result = await upstream.request("tools/call", {
       name: "navigation_go-to",
       arguments: { url, includeSnapshot: false, includeScreenshot: false },
     });
+    // W1C2: tool failures arrive as a resolved result with isError:true.
+    if (result && result.isError) {
+      const text = (result.content || []).map((c) => c && c.text).filter(Boolean).join(" ");
+      throw new Error(text || "navigation_go-to returned isError");
+    }
     return { propagated: true };
   } catch (e) {
     process.stderr.write(

@@ -10,6 +10,10 @@
 // the upstream-MCP side.
 
 let activePage = null;
+// W1C2: pages that already carry our close listener. One listener per page
+// is enough (it checks `activePage === page`); registering on every
+// setActivePage stacked a listener per tabs_select call.
+const pagesWithCloseListener = new WeakSet();
 
 function setActivePage(page) {
   activePage = page;
@@ -20,7 +24,8 @@ function setActivePage(page) {
   // getActivePage's fallback chain — `activePage.isClosed()` returns true
   // after close, but the explicit null means `getActivePageRaw()` and
   // anything else reading the variable directly sees the right answer.
-  if (page && typeof page.once === "function") {
+  if (page && typeof page.once === "function" && !pagesWithCloseListener.has(page)) {
+    pagesWithCloseListener.add(page);
     page.once("close", () => {
       if (activePage === page) activePage = null;
     });
@@ -49,16 +54,13 @@ function getActivePageRaw() {
  * Get the page own-tools should target. Order:
  *   1. The explicit active page if set + still open
  *   2. The last page in the context (tabs_new appends, so this is usually right)
- *   3. The first page (last resort — works for the common single-page case)
  *
  * @param {import('playwright-core').BrowserContext} context
  * @returns {import('playwright-core').Page | null}
  */
 function getActivePage(context) {
   if (activePage && !activePage.isClosed()) return activePage;
-  const pages = context.pages();
-  if (pages.length === 0) return null;
-  return pages[pages.length - 1] || pages[0];
+  return context.pages().at(-1) ?? null;
 }
 
 /**

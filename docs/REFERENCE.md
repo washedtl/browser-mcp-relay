@@ -37,7 +37,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `lighthouse_audit` | Lighthouse audit against a URL | `formFactor: "desktop"\|"mobile"` | Performance regression check on a deploy |
-| `memory_take-heap-snapshot` | V8 heap snapshot via CDP | `outputPath` | Memory-leak hunt on a long-running SPA |
+| `memory_take-heap-snapshot` | V8 heap snapshot via CDP | `outputPath`, `timeoutMs` | Memory-leak hunt on a long-running SPA |
 
 #### 📱 Device emulation
 
@@ -58,7 +58,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `dialog_handle` | Auto-handle the next JS dialog | `action: "accept"\|"dismiss"` | Click a button that triggers `confirm()` |
+| `dialog_handle` | Handle the next JS dialog; blocks until one appears (trigger it with a parallel call) | `action: "accept"\|"dismiss"` | Click a button that triggers `confirm()` |
 | `file_upload` | Set files on a file input | `files: [absPath]` | Upload a file without an OS picker |
 | `form_fill` | Fill many fields in one round-trip | `fields: [{selector, value}]` | Bulk-fill a long signup form |
 
@@ -237,7 +237,7 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
   "result": {
     "content": [{
       "type": "text",
-      "text": "{\n  \"url\": \"https://example.com\",\n  \"formFactor\": \"desktop\",\n  \"scores\": {\n    \"performance\": 0.99,\n    \"accessibility\": 0.92,\n    \"best-practices\": 1.0,\n    \"seo\": 0.91\n  }\n}"
+      "text": "{\n  \"url\": \"https://example.com\",\n  \"formFactor\": \"desktop\",\n  \"categories\": {\n    \"performance\": { \"score\": 99, \"title\": \"Performance\" },\n    \"accessibility\": { \"score\": 92, \"title\": \"Accessibility\" },\n    \"best-practices\": { \"score\": 100, \"title\": \"Best Practices\" },\n    \"seo\": { \"score\": 91, \"title\": \"SEO\" }\n  },\n  \"finalUrl\": \"https://example.com/\",\n  \"fetchTime\": \"2026-01-01T00:00:00.000Z\"\n}"
     }]
   }
 }

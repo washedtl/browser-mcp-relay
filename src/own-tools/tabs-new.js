@@ -18,6 +18,8 @@
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
 const { setActivePage } = require("./_active-page.js");
 
+const WAIT_UNTIL = ["load", "domcontentloaded", "networkidle", "commit"];
+
 module.exports = {
   name: "tabs_new",
   description: "Open a new tab/page in the relay's browser context, optionally navigating to a URL. Tracks the new tab as the active page for subsequent own-tool calls.",
@@ -27,7 +29,7 @@ module.exports = {
       url: { type: "string", description: "Optional URL to navigate the new tab to" },
       waitUntil: {
         type: "string",
-        enum: ["load", "domcontentloaded", "networkidle", "commit"],
+        enum: WAIT_UNTIL,
         default: "load",
         description: "Playwright navigation lifecycle to wait for. Default 'load'. Use 'networkidle' for SPA-heavy sites.",
       },
@@ -42,11 +44,23 @@ module.exports = {
   },
   handler: async (_args = {}) => {
     // F0-9 (2026-05-10): treat null as missing.
+    // W1C2: reject invalid values like the sibling tools do — silently
+    // defaulting turned waitUntil "networkIdle" into a plain "load" wait.
     const url = _args.url ?? undefined;
-    let waitUntil = _args.waitUntil;
-    if (!["load", "domcontentloaded", "networkidle", "commit"].includes(waitUntil)) waitUntil = "load";
-    let timeoutMs = _args.timeoutMs;
-    if (timeoutMs == null || !Number.isFinite(timeoutMs) || timeoutMs < 100) timeoutMs = 30000;
+    const waitUntil = _args.waitUntil ?? "load";
+    if (!WAIT_UNTIL.includes(waitUntil)) {
+      return {
+        content: [{ type: "text", text: `tabs_new: waitUntil must be one of ${WAIT_UNTIL.join(", ")} (got ${JSON.stringify(_args.waitUntil)})` }],
+        isError: true,
+      };
+    }
+    const timeoutMs = _args.timeoutMs ?? 30000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > 300000) {
+      return {
+        content: [{ type: "text", text: `tabs_new: timeoutMs must be a number in [100, 300000] (got ${JSON.stringify(_args.timeoutMs)})` }],
+        isError: true,
+      };
+    }
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const page = await bridge.context.newPage();
@@ -73,7 +87,9 @@ module.exports = {
       content: [{
         type: "text",
         text: JSON.stringify({
-          index: bridge.context.pages().length - 1,
+          // W1C2: real position — pages() can also gain popups during goto.
+          // null when the tab closed or crashed during goto.
+          index: bridge.context.pages().includes(page) ? bridge.context.pages().indexOf(page) : null,
           url: page.url(),
           waitUntil,
           navError,

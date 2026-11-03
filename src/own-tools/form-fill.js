@@ -4,6 +4,29 @@
 
 const { withActivePage } = require("./_active-page.js");
 
+// W1C2: Playwright appends a call log to fill errors (ANSI-dimmed line by
+// line, even with piped stdio). It holds the raw `fill("<value>")` (a
+// multi-line value spans lines) and element previews like `<input value="…">`
+// (newlines rewritten, truncated, so exact matching misses them). After the
+// first line, keep only structured log entries ("- …" / "N × …") that carry
+// no preview and no fill( call, so the plain diagnostics ("element is not
+// visible") survive. Then blank any exact occurrence left when 4+ chars;
+// shorter isn't a secret and blanking garbles the text.
+const ANSI = /\x1b\[[0-9;]*m/g;
+const LOG_ENTRY = /^\s*(?:- |\d+ × )/;
+
+function redactValue(message, value) {
+  // Strip ANSI from the value too: the message is stripped, so a value that
+  // itself contains an SGR sequence would otherwise never match.
+  const plain = String(value).replace(ANSI, "");
+  const [first, ...rest] = String(message).replace(ANSI, "")
+    .split(`fill("${plain}")`).join("fill()").split("\n");
+  const kept = rest.filter((line) =>
+    (line === "Call log:" || LOG_ENTRY.test(line)) && !line.includes("<") && !line.includes("fill("));
+  const text = [first, ...kept].join("\n");
+  return plain.length >= 4 ? text.replaceAll(plain, "<redacted>") : text;
+}
+
 // T1-11: page.fill default timeout is 30s. With N fields, a flaky page that
 // blocks element-resolution can hang the tool for 30s × N. Shorter per-field
 // default + tunable knob + opt-in continueOnError makes form_fill resilient
@@ -95,7 +118,7 @@ module.exports = {
         await page.fill(f.selector, f.value, { timeout: timeoutMs });
         filled.push({ selector: f.selector, ok: true });
       } catch (e) {
-        filled.push({ selector: f.selector, ok: false, error: e.message });
+        filled.push({ selector: f.selector, ok: false, error: redactValue(e.message, f.value) });
         if (!continueOnError) {
           return {
             content: [{
@@ -103,7 +126,7 @@ module.exports = {
               text: JSON.stringify({
                 filledCount: filled.filter((x) => x.ok).length,
                 total: fields.length,
-                failed: f,
+                failed: { selector: f.selector },
                 partial: filled,
               }, null, 2),
             }],

@@ -1,6 +1,6 @@
 // dialog_handle — registers a one-shot listener for the next dialog
-// (alert/confirm/prompt) on the active page. Use this BEFORE triggering an
-// action that opens a dialog.
+// (alert/confirm/prompt) on the active page. The call blocks until a dialog,
+// page close, or timeout, so the triggering action must run concurrently.
 //
 // T0-9 / T0-10 / T1-12 fixes (2026-05-09):
 //   • short-circuit on page close — without it, waiting for a dialog on a page
@@ -15,12 +15,12 @@ const { withActivePage } = require("./_active-page.js");
 module.exports = {
   name: "dialog_handle",
   description:
-    "Register a one-shot handler for the NEXT JavaScript dialog (alert/confirm/prompt) " +
-    "on the active page. Call this BEFORE the action that triggers the dialog. " +
-    "The handler resolves when the dialog appears and is auto-handled per the " +
-    "`action` parameter (accept by default, or dismiss). For prompts, set " +
-    "`promptText` to inject a value. If the page closes during the wait, the " +
-    "handler resolves immediately with isError + a `pageClosed: true` flag.",
+    "Handle the NEXT JavaScript dialog (alert/confirm/prompt) on the active page " +
+    "per `action` (accept by default, or dismiss). This call BLOCKS until a dialog " +
+    "appears, the page closes (isError + `pageClosed: true`), or timeoutMs elapses " +
+    "(isError), so the action that opens the dialog must run concurrently (e.g. a " +
+    "parallel tool call), not after this returns. For prompts, set `promptText`. " +
+    "If accept throws, a dismiss is attempted (the result says whether it worked).",
   inputSchema: {
     type: "object",
     properties: {
@@ -36,6 +36,8 @@ module.exports = {
     // against the enum — pre-fix, `"ACCEPT"` (caps) silently dismissed.
     if (action == null) action = "accept";
     if (timeoutMs == null) timeoutMs = 30000;
+    // W1C2: Playwright's validator rejects promptText:null ("expected string").
+    if (promptText === null) promptText = undefined;
     if (action !== "accept" && action !== "dismiss") {
       return {
         content: [{ type: "text", text: `dialog_handle: action must be "accept" or "dismiss" (got ${JSON.stringify(action)})` }],
@@ -54,7 +56,7 @@ module.exports = {
     }
     // promptText, if provided, must be a string (Playwright would reject
     // numbers/objects with a less actionable message).
-    if (promptText !== undefined && promptText !== null && typeof promptText !== "string") {
+    if (promptText !== undefined && typeof promptText !== "string") {
       return {
         content: [{ type: "text", text: `dialog_handle: promptText must be a string when provided (got ${typeof promptText})` }],
         isError: true,
@@ -76,7 +78,7 @@ module.exports = {
         if (settled) return;
         settled = true;
         cleanup();
-        resolve({ content: [{ type: "text", text: `timeout: no dialog appeared within ${timeoutMs}ms` }], isError: true });
+        resolve({ content: [{ type: "text", text: `dialog_handle: timeout: no dialog appeared within ${timeoutMs}ms` }], isError: true });
       }, timeoutMs);
 
       // T0-9: short-circuit if the page closes before a dialog fires.
@@ -110,7 +112,20 @@ module.exports = {
           else await dialog.dismiss();
           resolve({ content: [{ type: "text", text: JSON.stringify({ handled: action, ...info }, null, 2) }] });
         } catch (e) {
-          resolve({ content: [{ type: "text", text: `dialog handle failed: ${e.message}` }], isError: true });
+          // W1C2: our listener suppresses Playwright's auto-dismiss, so a
+          // failed accept could leave the dialog open and the page blocked.
+          // Try dismiss. (It only helps when accept failed client-side: the
+          // server marks the dialog handled first, then dismiss throws.)
+          let text = `dialog_handle: ${action} failed: ${e.message}`;
+          if (action === "accept") {
+            try {
+              await dialog.dismiss();
+              text += "; dialog dismissed instead";
+            } catch (e2) {
+              text += `; fallback dismiss also failed: ${e2.message}`;
+            }
+          }
+          resolve({ content: [{ type: "text", text }], isError: true });
         }
       };
 

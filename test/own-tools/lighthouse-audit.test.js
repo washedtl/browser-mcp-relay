@@ -86,3 +86,106 @@ test("T0-6: lighthouse_audit catches lighthouse() throws and returns isError", a
     "lighthouse() call must be wrapped in try/catch",
   );
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C2: desktop runs use Lighthouse's desktop config (desktop throttling +
+// desktop UA). Passing only formFactor/screenEmulation flags kept the default
+// config's mobileSlow4G throttling and Moto G UA.
+// ──────────────────────────────────────────────────────────────────
+
+function fakeLighthouseModule(result) {
+  const calls = [];
+  const desktopConfig = { extends: "lighthouse:default", settings: { formFactor: "desktop" } };
+  const run = async (url, flags, config) => {
+    calls.push({ url, flags, config });
+    if (result !== undefined) return result;
+    return { lhr: { categories: { performance: { score: 0.9, title: "Performance" } }, finalUrl: url, fetchTime: "t" } };
+  };
+  return { mod: { default: run, desktopConfig }, calls, desktopConfig };
+}
+
+async function withFakes({ fetchImpl, result }, fn) {
+  const prevBridge = globalThis.__relayBridge;
+  const prevFetch = globalThis.fetch;
+  const fake = fakeLighthouseModule(result);
+  globalThis.__relayBridge = { port: 9333, context: { pages: () => [] } };
+  globalThis.fetch = fetchImpl || (async () => ({ ok: true, status: 200 }));
+  tool._setLighthouseForTest(fake.mod);
+  try {
+    return await fn(fake);
+  } finally {
+    tool._setLighthouseForTest(null);
+    globalThis.__relayBridge = prevBridge;
+    globalThis.fetch = prevFetch;
+  }
+}
+
+test("W1C2: desktop audit passes Lighthouse's desktopConfig; mobile uses the default config", async () => {
+  await withFakes({}, async (fake) => {
+    const d = await tool.handler({ url: "https://example.com/" });
+    assert.notStrictEqual(d.isError, true, d.content[0].text);
+    const m = await tool.handler({ url: "https://example.com/", formFactor: "mobile" });
+    assert.notStrictEqual(m.isError, true, m.content[0].text);
+    assert.strictEqual(fake.calls.length, 2);
+    assert.strictEqual(fake.calls[0].config, fake.desktopConfig, "desktop must run with desktopConfig");
+    assert.strictEqual(fake.calls[1].config, undefined, "mobile must run with the default (mobile) config");
+    for (const c of fake.calls) {
+      // Flags override config settings in Lighthouse, so none may re-impose
+      // mobile emulation/throttling on top of desktopConfig.
+      assert.strictEqual(c.flags.throttling, undefined);
+      assert.strictEqual(c.flags.screenEmulation, undefined);
+      assert.strictEqual(c.flags.emulatedUserAgent, undefined);
+      assert.strictEqual(c.flags.port, 9333);
+    }
+  });
+});
+
+// Uses the config file directly: importing the full lighthouse entry costs
+// ~10s here, the config file ~15ms. The entry re-export is checked as text.
+test("W1C2: installed lighthouse exports a desktopConfig with desktop throttling + UA", async (t) => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  let lhDir;
+  try { lhDir = path.dirname(require.resolve("lighthouse/package.json")); } catch { t.skip("lighthouse not installed"); return; }
+  const entry = fs.readFileSync(path.join(lhDir, "core", "index.js"), "utf8");
+  assert.match(entry, /export\s*\{\s*default as desktopConfig\s*\}\s*from\s*['"]\.\/config\/desktop-config\.js['"]/,
+    "lighthouse entry must re-export desktopConfig");
+  const { pathToFileURL } = require("node:url");
+  const cfg = (await import(pathToFileURL(path.join(lhDir, "core", "config", "desktop-config.js")).href)).default;
+  const s = cfg.settings;
+  assert.strictEqual(s.formFactor, "desktop");
+  assert.strictEqual(s.throttling.cpuSlowdownMultiplier, 1, "desktop throttling has no CPU slowdown (mobile is 4x)");
+  assert.strictEqual(s.screenEmulation.mobile, false);
+  assert.doesNotMatch(s.emulatedUserAgent, /Mobile/);
+});
+
+test("W1C2: CDP probe failures give current advice (no Cursor restart / 'call another tool first')", async () => {
+  const cases = [
+    async () => ({ ok: false, status: 500 }),
+    async () => { throw new Error("connect ECONNREFUSED 127.0.0.1:9333"); },
+  ];
+  for (const fetchImpl of cases) {
+    await withFakes({ fetchImpl }, async (fake) => {
+      const r = await tool.handler({ url: "https://example.com/" });
+      assert.strictEqual(r.isError, true);
+      const text = r.content[0].text;
+      assert.doesNotMatch(text, /Cursor/);
+      assert.doesNotMatch(text, /call any (other|browser) tool/i);
+      assert.match(text, /retry/i);
+      assert.strictEqual(fake.calls.length, 0);
+    });
+  }
+});
+
+test("W1C2: lighthouse_audit description warns about clearing data in the shared profile", () => {
+  assert.match(tool.description, /cache/i);
+  assert.match(tool.description, /service worker/i);
+});
+
+test("W1C2: lighthouse_audit 'no result' error carries the tool-name prefix", async () => {
+  await withFakes({ result: {} }, async () => {
+    const r = await tool.handler({ url: "https://example.com/" });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content[0].text, /^lighthouse_audit: /);
+  });
+});

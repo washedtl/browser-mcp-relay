@@ -126,3 +126,199 @@ test("T1-11: form_fill continueOnError=false (default) stops at first failure", 
     globalThis.__relayBridge = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C2: never echo a field's value (passwords) in error output.
+// playwright-core 1.59 server/dom.js logs `  fill("${value}")` into the call
+// log, and client/connection.js appends that call log to the thrown error's
+// message — so e.message from a failed page.fill contains the raw value.
+// ──────────────────────────────────────────────────────────────────
+
+const SECRET = "hunter2-s3cret";
+
+function failLikePlaywright({ selector, value, opts }) {
+  if (selector !== "#pw") return;
+  throw new Error(
+    `page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n` +
+    `  - waiting for locator('${selector}')\n` +
+    `    - locator resolved to <input type="password" value="${value}"/>\n` +
+    `  - fill("${value}")\n`,
+  );
+}
+
+for (const continueOnError of [false, true]) {
+  test(`W1C2: form_fill error output never contains a field value (continueOnError=${continueOnError})`, async () => {
+    const prev = globalThis.__relayBridge;
+    const { fakePage } = makePageWithFillRecorder(failLikePlaywright);
+    globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+    try {
+      const r = await tool.handler({
+        fields: [{ selector: "#user", value: "alice" }, { selector: "#pw", value: SECRET }],
+        continueOnError,
+      });
+      assert.strictEqual(r.isError, true);
+      const text = r.content[0].text;
+      assert.ok(!text.includes(SECRET), `value leaked into error output:\n${text}`);
+      // The diagnostic part of the message must survive redaction.
+      assert.match(text, /Timeout 5000ms exceeded/);
+      assert.match(text, /#pw/);
+    } finally {
+      globalThis.__relayBridge = prev;
+    }
+  });
+}
+
+// W1C2 (altitude review): exact-value replacement is not enough. Playwright's
+// element previews in the call log rewrite newlines and truncate, so a
+// multi-line value (e.g. a key pasted into a textarea) leaks in pieces; and
+// blanking a 1-char value garbles the message ("Tim<redacted>out").
+test("W1C2: form_fill: element previews of a multi-line value can't leak", async () => {
+  const prev = globalThis.__relayBridge;
+  const KEY = "-----BEGIN KEY-----\nAAAAsecretline1\nBBBBsecretline2\n-----END KEY-----";
+  const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
+    throw new Error(
+      `page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n` +
+      `  - waiting for locator('#key')\n` +
+      `    - locator resolved to <textarea>${value.replace(/\s+/g, " ").slice(0, 40)}…</textarea>\n` +
+      `  - fill("${value}")\n`,
+    );
+  });
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] });
+    assert.strictEqual(r.isError, true);
+    const text = r.content[0].text;
+    for (const frag of ["AAAAsecretline1", "BBBBsecretline2"]) {
+      assert.ok(!text.includes(frag), `fragment ${frag} leaked:\n${text}`);
+    }
+    assert.match(text, /Timeout 5000ms exceeded/);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("W1C2: form_fill keeps the error readable for very short values", async () => {
+  const prev = globalThis.__relayBridge;
+  const { fakePage } = makePageWithFillRecorder(failLikePlaywright);
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    const r = await tool.handler({ fields: [{ selector: "#pw", value: "e" }] });
+    assert.match(r.content[0].text, /Timeout 5000ms exceeded/);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+// W1C2 (spec review): keep the call log's plain diagnostics (why the fill
+// failed) while dropping the lines that carry the value or element previews.
+test("W1C2: form_fill keeps call-log diagnostics but not the value-bearing lines", async () => {
+  const prev = globalThis.__relayBridge;
+  const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
+    throw new Error(
+      `page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n` +
+      `  - waiting for locator('#pw')\n` +
+      `    - locator resolved to <input type="password" value="${value}"/>\n` +
+      `    - fill("${value}")\n` +
+      `  - attempting fill action\n` +
+      `    - waiting for element to be visible, enabled and editable\n` +
+      `    - element is not visible\n`,
+    );
+  });
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    const r = await tool.handler({ fields: [{ selector: "#pw", value: SECRET }] });
+    const text = r.content[0].text;
+    assert.ok(!text.includes(SECRET), `value leaked:\n${text}`);
+    assert.match(text, /element is not visible/);
+    assert.match(text, /waiting for locator/);
+    assert.doesNotMatch(text, /locator resolved to/);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("W1C2: form_fill drops the fill line even if Playwright escapes the value", async () => {
+  const prev = globalThis.__relayBridge;
+  const VALUE = 's3cr"et-word';
+  const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
+    throw new Error(
+      `page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n` +
+      `  - waiting for locator('#pw')\n` +
+      `    - fill(${JSON.stringify(value)})\n`,
+    );
+  });
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    const r = await tool.handler({ fields: [{ selector: "#pw", value: VALUE }] });
+    assert.ok(!r.content[0].text.includes("et-word"), `value leaked:\n${r.content[0].text}`);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+// W1C2 (re-review V0): build the error exactly like playwright-core 1.59 does —
+// server/callLog.js compressCallLog + client/connection.js formatCallLog, whose
+// colors.dim (enabled even with piped stdio) re-wraps ANSI codes at every
+// newline, so a multi-line value no longer matches `fill("<value>")` verbatim.
+test("W1C2: form_fill redacts a multi-line value in a real (ANSI-coloured) Playwright call log", async () => {
+  const path = require("node:path");
+  const { colors } = require("playwright-core/lib/utilsBundle");
+  // callLog is not in the package "exports"; load it by file path (read-only).
+  const { compressCallLog } = require(path.join(path.dirname(require.resolve("playwright-core")), "lib", "server", "callLog.js"));
+  const prev = globalThis.__relayBridge;
+  const KEY = "-----BEGIN KEY-----\nAAAAsecretline1\r\nBBBBsecretline2\n-----END KEY-----";
+  const { fakePage } = makePageWithFillRecorder(({ value, opts }) => {
+    const log = compressCallLog([
+      "waiting for locator('#key')",
+      `  locator resolved to <textarea>${value.replace(/\n/g, "↵").slice(0, 50)}</textarea>`,
+      `  fill("${value}")`,
+      "  attempting fill action",
+      "    waiting for element to be visible, enabled and editable",
+      "    element is not visible",
+      "  retrying fill action",
+      "  attempting fill action",
+      "    waiting for element to be visible, enabled and editable",
+      "    element is not visible",
+      "  retrying fill action",
+    ]);
+    throw new Error(`page.fill: Timeout ${opts.timeout}ms exceeded.\nCall log:\n${colors.dim(log.join("\n"))}\n`);
+  });
+  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
+  try {
+    const r = await tool.handler({ fields: [{ selector: "#key", value: KEY }] });
+    const text = r.content[0].text;
+    for (const frag of ["AAAAsecretline1", "BBBBsecretline2", "END KEY"]) {
+      assert.ok(!text.includes(frag), `fragment ${frag} leaked:\n${text}`);
+    }
+    assert.match(text, /element is not visible/);
+    // compressCallLog writes a repeated block's first line as "2 × …" (no "- ").
+    assert.match(text, /2 × attempting fill action/, `repeat-block header dropped:\n${text}`);
+  } finally {
+    globalThis.__relayBridge = prev;
+  }
+});
+
+test("W1C2 review: a value that itself contains ANSI codes + a '- ' line can't leak", async () => {
+  const secret = "x\x1b[0m\n- s3cretTail";
+  const page = {
+    url: () => "https://example.com/login",
+    fill: async () => {
+      throw new Error(
+        "page.fill: Timeout 5000ms exceeded.\nCall log:\n" +
+        "  - waiting for locator('#pw')\n" +
+        `  - fill("${secret}")\n` +
+        "  - element is not visible\n",
+      );
+    },
+  };
+  const context = { pages: () => [page] };
+  globalThis.__relayBridge = { context };
+  try {
+    const res = await tool.handler({ fields: [{ selector: "#pw", value: secret }] });
+    const text = res.content.map((c) => c.text).join("\n");
+    assert.ok(!text.includes("s3cretTail"), "secret tail must not appear: " + text);
+    assert.ok(text.includes("element is not visible"), "diagnostic line survives");
+  } finally {
+    delete globalThis.__relayBridge;
+  }
+});

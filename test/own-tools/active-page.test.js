@@ -293,3 +293,36 @@ test("V1-9: withActivePage propagates handler return value as-is", async () => {
     globalThis.__relayBridge = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// W1C2: setActivePage must not stack a new `close` listener per call.
+// Playwright pages are EventEmitters; selecting the same tab repeatedly
+// used to add one listener each time (leak + MaxListenersExceededWarning).
+// ──────────────────────────────────────────────────────────────────
+
+const { EventEmitter } = require("node:events");
+
+function emitterPage() {
+  const p = new EventEmitter();
+  p._closed = false;
+  p.isClosed = () => p._closed;
+  p.close = () => { p._closed = true; p.emit("close", p); };
+  return p;
+}
+
+test("W1C2: setActivePage registers at most one close listener per page", () => {
+  const { getActivePageRaw } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const a = emitterPage();
+  const b = emitterPage();
+  for (let i = 0; i < 20; i++) { setActivePage(a); setActivePage(b); }
+  assert.strictEqual(a.listenerCount("close"), 1);
+  assert.strictEqual(b.listenerCount("close"), 1);
+  // The single listener still clears the reference when the ACTIVE page closes…
+  setActivePage(a);
+  b.close();
+  assert.strictEqual(getActivePageRaw(), a, "closing a non-active page must not clear the active one");
+  a.close();
+  assert.strictEqual(getActivePageRaw(), null, "closing the active page must clear the reference");
+  clearActivePage();
+});

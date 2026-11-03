@@ -66,3 +66,23 @@ test("propagateActivePageToUpstream: upstream error returned as failure, not thr
     globalThis.__relayUpstream = prev;
   }
 });
+
+// W1C2: upstream reports tool failures as a RESOLVED CallToolResult with
+// isError:true (upstream-client.js only rejects on JSON-RPC errors), so a
+// failed navigation_go-to must not count as propagated.
+test("W1C2: upstream isError:true result is reported as not propagated", async () => {
+  const prev = globalThis.__relayUpstream;
+  globalThis.__relayUpstream = async () => ({
+    request: async () => ({
+      content: [{ type: "text", text: "page.goto: net::ERR_NAME_NOT_RESOLVED" }],
+      isError: true,
+    }),
+  });
+  try {
+    const r = await propagateActivePageToUpstream("https://nope.invalid/");
+    assert.strictEqual(r.propagated, false);
+    assert.match(r.reason, /ERR_NAME_NOT_RESOLVED/);
+  } finally {
+    globalThis.__relayUpstream = prev;
+  }
+});

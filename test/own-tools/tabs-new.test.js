@@ -219,3 +219,60 @@ test("T1-10: tabs_new accepts waitUntil parameter and passes it to goto", async 
     globalThis.__relayBridge = prevBridge;
   }
 });
+
+// W1C2: the reported index must be the new page's real position. context.pages()
+// also gains popups the page opens during goto (window.open), so
+// `pages().length - 1` pointed at the popup, not the new tab.
+test("W1C2: tabs_new reports the new page's index, not pages().length - 1", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const pages = [{ url: () => "about:blank" }];
+  let created = null;
+  globalThis.__relayBridge = {
+    context: {
+      pages: () => pages,
+      newPage: async () => {
+        created = {
+          _url: "about:blank",
+          url() { return this._url; },
+          async goto(u) {
+            this._url = u;
+            pages.push({ url: () => "https://popup.example.com/" }); // popup opened by the page
+          },
+        };
+        pages.push(created);
+        return created;
+      },
+    },
+  };
+  try {
+    const result = await tool.handler({ url: "https://example.com/" });
+    const payload = JSON.parse(result.content[0].text);
+    assert.strictEqual(payload.index, pages.indexOf(created));
+    assert.strictEqual(payload.index, 1);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+  }
+});
+
+test("W1C2 review: tabs_new reports index null when the new tab closed during goto", async () => {
+  const pages = [];
+  const page = {
+    url: () => "about:blank",
+    goto: async () => { pages.splice(pages.indexOf(page), 1); }, // tab closes itself mid-goto
+    on: () => {},
+    once: () => {},
+    isClosed: () => !pages.includes(page),
+  };
+  const context = { pages: () => pages.slice(), newPage: async () => { pages.push(page); return page; } };
+  globalThis.__relayBridge = { context };
+  const prevUp = globalThis.__relayUpstream;
+  globalThis.__relayUpstream = async () => ({ request: async () => ({ content: [] }) });
+  try {
+    const res = await tool.handler({ url: "https://example.com" });
+    const body = JSON.parse(res.content[0].text);
+    assert.strictEqual(body.index, null);
+  } finally {
+    delete globalThis.__relayBridge;
+    globalThis.__relayUpstream = prevUp;
+  }
+});

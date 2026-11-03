@@ -25,12 +25,12 @@ module.exports = {
     // crash with an unhelpful undefined-property TypeError otherwise.
     if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
       return {
-        content: [{ type: "text", text: `index out of range: ${index} (have ${pages.length} pages)` }],
+        content: [{ type: "text", text: `tabs_close: index out of range: ${index} (have ${pages.length} pages)` }],
         isError: true,
       };
     }
     if (pages.length === 1) {
-      return { content: [{ type: "text", text: "refusing to close the last remaining page" }], isError: true };
+      return { content: [{ type: "text", text: "tabs_close: refusing to close the last remaining page" }], isError: true };
     }
     const target = pages[index];
     const url = target.url();
@@ -38,10 +38,20 @@ module.exports = {
     // the next own-tool call's `getActivePage` falls through cleanly to
     // pages[length-1] (excluding the now-closed one).
     const wasActive = getActivePageRaw() === target;
-    if (wasActive) {
+    // W1C2: close() can reject (e.g. connection lost) — return a structured
+    // error, and only drop the active reference once the page really closed.
+    try {
+      await target.close();
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `tabs_close: failed to close tab ${index} (${url}): ${e.message}` }],
+        isError: true,
+      };
+    }
+    // Identity check: a tabs_select that landed during close() must survive.
+    if (getActivePageRaw() === target) {
       clearActivePage();
     }
-    await target.close();
     return {
       content: [{
         type: "text",

@@ -29,7 +29,7 @@ module.exports = {
     // produce an actionable error instead of an undefined-property crash.
     if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
       return {
-        content: [{ type: "text", text: `index out of range: ${index} (have ${pages.length} pages)` }],
+        content: [{ type: "text", text: `tabs_select: index out of range: ${index} (have ${pages.length} pages)` }],
         isError: true,
       };
     }
