@@ -1848,6 +1848,17 @@ test("W1E-2: buildStatus awaits async process probes", async () => {
   assert.deepStrictEqual(status.slots[0].bravePids, [1111]);
 });
 
+test("W2E: buildStatus in broker mode runs no legacy pool probes (no slots, mode 'broker')", async () => {
+  const seams = makeSeams({ extra: {
+    _listBraveProcessesRaw: () => { throw new Error("must not list Brave processes"); },
+    _getProcessStartTimes: () => { throw new Error("must not probe start times"); },
+  } });
+  const status = await buildStatus(seams, { brokerMode: true });
+  assert.deepStrictEqual(status.slots, []);
+  assert.strictEqual(status.config.mode, "broker");
+  assert.deepStrictEqual(status.config.poolDirs, []);
+});
+
 test("W1E-2: Brave PIDs from the live process listing aren't re-probed for liveness", async () => {
   const probed = [];
   const seams = makeSeams({ extra: {

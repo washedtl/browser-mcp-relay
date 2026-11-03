@@ -224,6 +224,11 @@ test("relay Inspector: one per broker; /api/broker shows sessions + tabs; every 
   assert.strictEqual(new Set(requests.map((e) => e.conn)).size, 2, "events say which session made them");
   assert.ok(events.some((e) => e.status === "ok"), "responses recorded too");
 
+  // hosted by the broker: no legacy pool to probe on /api/status
+  const st = JSON.parse((await get(port, "/api/status")).body);
+  assert.strictEqual(st.config.mode, "broker");
+  assert.deepStrictEqual(st.slots, []);
+
   // W1E's DNS-rebinding gate still applies
   assert.strictEqual((await get(port, "/api/broker", { Host: "evil.example" })).status, 403);
 });

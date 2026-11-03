@@ -58,10 +58,6 @@ function relayMode(env, { platform = process.platform, log = logStderr } = {}) {
   return fallback;
 }
 
-// How often a relay whose inspector port is taken (another relay owns it)
-// retries the bind, so a surviving relay takes over when the owner exits.
-const INSPECTOR_RETRY_MS = 30_000;
-
 const SERVER_INSTRUCTIONS =
   "Debug / React / scenario / trace tools are hidden to save context. " +
   "If a task clearly needs one, ask the user, then call the `toolsets` tool.";
@@ -608,50 +604,6 @@ function buildServer({ lifecycle, recordTraffic, createRelay = (opts) => new (re
   return { server, relay };
 }
 
-/**
- * Start the in-process Inspector. Several relays share one configured port,
- * so a busy port is normal: log one line and retry every `retryMs` so this
- * relay takes over when the owner exits. Returns { handle, close() }.
- */
-function startInspectorWithRetry({ start, port, bind, retryMs = INSPECTOR_RETRY_MS, log }) {
-  let handle = null;
-  let timer = null;
-  let closed = false;
-  let warned = false;
-
-  async function attempt() {
-    timer = null;
-    try {
-      const h = await start();
-      if (closed) { await h.close(); return; } // closed while binding
-      handle = h;
-      log(`[mcp-relay] inspector running at http://${bind}:${h.port}`);
-    } catch (e) {
-      if (closed) return;
-      if (e && e.code === "EADDRINUSE") {
-        if (!warned) {
-          warned = true;
-          log(`[mcp-relay] inspector port ${port} is in use (another relay's inspector?); retrying every ${retryMs / 1000}s`);
-        }
-        timer = setTimeout(attempt, retryMs);
-        timer.unref();
-        return;
-      }
-      log(`[mcp-relay] inspector failed to start: ${e.stack || e.message}`);
-    }
-  }
-  attempt();
-
-  return {
-    get handle() { return handle; },
-    async close() {
-      closed = true;
-      if (timer) clearTimeout(timer);
-      if (handle) await handle.close();
-    },
-  };
-}
-
 async function main() {
   const lifecycle = createLifecycle();
 
@@ -660,16 +612,8 @@ async function main() {
   // and wire its WebSocket to the relay's trafficEmitter — so the /slot/N
   // Inspector page sees real MCP traffic as it happens. Standalone
   // `npm run inspector` runs separately and never gets here.
-  let inspectorPort = null;
-  const inspectorPortRaw = RELAY_ENV.BROWSER_RELAY_INSPECTOR_PORT;
-  if (inspectorPortRaw) {
-    const parsed = parseInt(inspectorPortRaw, 10);
-    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 65535) {
-      logStderr(`[mcp-relay] WARNING: BROWSER_RELAY_INSPECTOR_PORT="${inspectorPortRaw}" is not a valid port; skipping in-process inspector`);
-    } else {
-      inspectorPort = parsed;
-    }
-  }
+  const { inspectorPortFromEnv, launchInspector } = require("./inspector-launch.js");
+  const inspectorPort = inspectorPortFromEnv(RELAY_ENV, logStderr);
 
   // MCP server first (NO slot, NO Brave, NO upstream yet — all lazy).
   const { server, relay } = buildServer({ lifecycle, recordTraffic: inspectorPort !== null });
@@ -680,31 +624,9 @@ async function main() {
   const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
   await server.connect(new StdioServerTransport());
 
-  let inspectorHandle = null;
-  if (inspectorPort !== null) {
-    const { startInspector, defaultBind } = require("./inspector-server.js");
-    const inspectorBind = defaultBind(RELAY_ENV);
-    if (inspectorBind !== "127.0.0.1" && inspectorBind !== "localhost") {
-      logStderr(
-        `[mcp-relay] WARNING: inspector binding to ${inspectorBind} (not 127.0.0.1). ` +
-        `No auth — anyone reaching this address can read pool state.`,
-      );
-    }
-    inspectorHandle = startInspectorWithRetry({
-      start: () => startInspector({
-        port: inspectorPort,
-        bind: inspectorBind,
-        uiRoot: path.resolve(__dirname, "..", "scripts", "inspector-ui"),
-        trafficEmitter: relay.trafficEmitter,
-        // startInspector's own "port in use" hint would repeat on every
-        // retry; the retry loop logs once instead (W1E implements the option).
-        quietPortInUse: true,
-      }),
-      port: inspectorPort,
-      bind: inspectorBind,
-      log: logStderr,
-    });
-  }
+  const inspectorHandle = inspectorPort === null
+    ? null
+    : launchInspector({ port: inspectorPort, env: RELAY_ENV, log: logStderr, trafficEmitter: relay.trafficEmitter });
 
   // Lifecycle shutdown + inspector close, in PARALLEL with per-step
   // timeouts (G0-7 / G1-2). Memoized (V0-4) so every trigger awaits one chain.
@@ -770,6 +692,8 @@ if (require.main === module) {
     });
   }
 }
+
+const { startInspectorWithRetry, INSPECTOR_RETRY_MS } = require("./inspector-launch.js");
 
 module.exports = {
   main,

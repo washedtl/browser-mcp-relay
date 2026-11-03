@@ -94,3 +94,16 @@ test("broker mode: `node src/index.js` is the shim — its stdio reaches the bro
   const heavy = loaded.filter((p) => /node_modules\/@modelcontextprotocol|node_modules\/zod|\/src\/(?:pool-shared|relay-server|tool-catalog|vault|own-tools\/)/.test(p));
   assert.deepStrictEqual(heavy, [], "the shim must stay light (it runs once per Claude session)");
 });
+
+test("inspectorPortFromEnv: the one port parse the legacy relay and the broker share", () => {
+  const { inspectorPortFromEnv } = require("../src/inspector-launch.js");
+  const logs = [];
+  const log = (m) => logs.push(m);
+  assert.strictEqual(inspectorPortFromEnv({}, log), null);
+  assert.strictEqual(inspectorPortFromEnv({ BROWSER_RELAY_INSPECTOR_PORT: "9091" }, log), 9091);
+  assert.strictEqual(inspectorPortFromEnv({ BROWSER_RELAY_INSPECTOR_PORT: "0" }, log), 0);
+  assert.deepStrictEqual(logs, []);
+  for (const bad of ["70000", "-1", "91a", "abc"]) assert.strictEqual(inspectorPortFromEnv({ BROWSER_RELAY_INSPECTOR_PORT: bad }, log), null);
+  assert.strictEqual(logs.length, 4);
+  assert.match(logs[0], /BROWSER_RELAY_INSPECTOR_PORT="70000" is not a valid port/);
+});

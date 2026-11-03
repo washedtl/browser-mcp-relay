@@ -203,14 +203,18 @@ test("G0-3: upstream is killed via killProcessTree (taskkill /F /T on Windows)",
 // defaultBind so the two never disagree.
 // ──────────────────────────────────────────────────────────────────
 
-test("W1A: main() starts the inspector via startInspectorWithRetry with quietPortInUse + defaultBind", () => {
+test("W1A: the inspector starts via startInspectorWithRetry with quietPortInUse + defaultBind (inspector-launch.js, shared by the relay and the broker)", () => {
   const fs = require("node:fs");
   const path = require("node:path");
-  const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
-  const main = src.slice(src.indexOf("async function main"));
-  assert.ok(/startInspectorWithRetry\(\{\s*start:\s*\(\)\s*=>\s*startInspector\(\{[\s\S]*?quietPortInUse:\s*true[\s\S]*?\}\)/.test(main),
+  const read = (...p) => fs.readFileSync(path.resolve(__dirname, "..", "src", ...p), "utf8");
+  const launch = read("inspector-launch.js");
+  assert.ok(/startInspectorWithRetry\(\{[\s\S]*?start:\s*\(\)\s*=>\s*startInspector\(\{[\s\S]*?quietPortInUse:\s*true[\s\S]*?\}\)/.test(launch),
     "startInspector({...}) inside startInspectorWithRetry must pass quietPortInUse: true");
-  assert.ok(/defaultBind\(RELAY_ENV\)/.test(main), "inspector bind must come from defaultBind(RELAY_ENV)");
+  assert.ok(/defaultBind\(env\)/.test(launch), "inspector bind must come from defaultBind(env)");
+  const index = read("index.js");
+  const main = index.slice(index.indexOf("async function main"));
+  assert.ok(/inspectorPortFromEnv\(RELAY_ENV/.test(main) && /launchInspector\(\{[^}]*env: RELAY_ENV/.test(main), "index.js main uses the shared launcher with RELAY_ENV");
+  assert.ok(!/require\("\.\.\/index\.js"\)/.test(read("broker", "main.js")), "the broker must not require the CLI entrypoint");
 });
 
 // ──────────────────────────────────────────────────────────────────

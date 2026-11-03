@@ -770,21 +770,10 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   if (relayInspector) {
     // One Inspector for every session (in legacy mode each relay raced for
     // the port); W1E's Host/Origin gates and RelayServer's redaction apply.
-    const { startInspector, defaultBind } = require("../inspector-server.js");
-    const bind = defaultBind(env);
-    if (bind !== "127.0.0.1" && bind !== "localhost") log(`WARNING: relay Inspector binding to ${bind} (not 127.0.0.1). No auth: anyone reaching it reads every session's traffic.`);
-    relayInspectorCtl = require("../index.js").startInspectorWithRetry({
-      start: () => startInspector({
-        port: relayInspector.port,
-        bind,
-        uiRoot: path.join(__dirname, "..", "..", "scripts", "inspector-ui"),
-        trafficEmitter: traffic,
-        brokerStatus: status,
-        quietPortInUse: true,
-      }),
-      port: relayInspector.port,
-      bind,
-      log,
+    // After this tick, so the first sessions' initialize comes first.
+    setImmediate(() => {
+      if (closing) return;
+      relayInspectorCtl = require("../inspector-launch.js").launchInspector({ port: relayInspector.port, env, log, trafficEmitter: traffic, brokerStatus: status });
     });
   }
 
@@ -905,10 +894,8 @@ async function main(argv = process.argv.slice(2)) {
   process.on("unhandledRejection", (e) => log(`unhandledRejection (still serving): ${(e && e.stack) || e}`));
 
   // the relay Inspector web UI (not Node's debugger), hosted by the broker
-  const inspectorPortRaw = env.BROWSER_RELAY_INSPECTOR_PORT;
-  const inspectorPort = Number(inspectorPortRaw);
-  const relayInspector = inspectorPortRaw && Number.isInteger(inspectorPort) && inspectorPort >= 0 && inspectorPort <= 65535 ? { port: inspectorPort } : null;
-  if (inspectorPortRaw && !relayInspector) log(`WARNING: BROWSER_RELAY_INSPECTOR_PORT="${inspectorPortRaw}" is not a valid port; no relay Inspector`);
+  const inspectorPort = require("../inspector-launch.js").inspectorPortFromEnv(env, log);
+  const relayInspector = inspectorPort === null ? null : { port: inspectorPort };
 
   let handle;
   try {

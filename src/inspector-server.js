@@ -135,7 +135,7 @@ const getProcessStartTimesAsync = (pids) =>
 /** Build the /api/status payload. Pure-ish (everything stateful is injected
  *  via the seams object). Async (W1E-2): the process probes run off the
  *  event loop; process seams may return values or promises. */
-async function buildStatus(seams = {}) {
+async function buildStatus(seams = {}, { brokerMode = false } = {}) {
   const _loadConfig = seams._loadConfig || pool.loadConfig;
   const _findBraveProcessesForDir =
     seams._findBraveProcessesForDir || pool.findBraveProcessesForDir;
@@ -156,6 +156,8 @@ async function buildStatus(seams = {}) {
   const _ownTools = seams._ownTools || ownTools;
 
   const cfg = _loadConfig();
+  // W2E: hosted by the broker there is no legacy pool to probe
+  const poolDirs = brokerMode ? [] : (cfg.poolDirs || []);
 
   // W0-2 (2026-11-03): read every lock up front so the recycled-PID check is
   // ONE batched start-time probe per poll, not one per slot.
@@ -166,17 +168,17 @@ async function buildStatus(seams = {}) {
     try { return { exists: true, meta: JSON.parse(_readFile(lockPath)) }; }
     catch { return { exists: true, meta: null, malformed: true }; }
   };
-  const locks = (cfg.poolDirs || []).map((dir) => readLock(path.join(dir, pool.WRAPPER_LOCK)));
+  const locks = poolDirs.map((dir) => readLock(path.join(dir, pool.WRAPPER_LOCK)));
   const livePids = locks
     .map((l) => l.meta && l.meta.pid)
     .filter((p) => Number.isFinite(p) && _isPidAlive(p));
   // The two probes are independent — run them concurrently.
   const [braveProcessText, startTimes] = await Promise.all([
-    _listBraveProcessesRaw(),
+    poolDirs.length > 0 ? _listBraveProcessesRaw() : "",
     livePids.length > 0 ? _getProcessStartTimes(livePids) : new Map(),
   ]);
 
-  const slots = (cfg.poolDirs || []).map((dir, idx) => {
+  const slots = poolDirs.map((dir, idx) => {
     const lockPath = path.join(dir, pool.WRAPPER_LOCK);
     let pid = null;
     let pidAlive = null;
@@ -304,12 +306,12 @@ async function buildStatus(seams = {}) {
   const ownCount = _ownTools.length;
   const forwardedCount = 51;
   const uptimeSeconds = Math.floor((_now() - _startedAt) / 1000);
-  let mode = cfg.standalone ? "standalone" : "pool";
+  const mode = brokerMode ? "broker" : cfg.standalone ? "standalone" : "pool";
 
   return {
     config: {
       mode,
-      poolDirs: (cfg.poolDirs || []).map(redactPath),
+      poolDirs: poolDirs.map(redactPath),
       slotRoles: Object.fromEntries(
         Object.entries(cfg.slotRoles || {}).map(([k, v]) => [redactPath(k), v]),
       ),
@@ -653,7 +655,7 @@ function readJsonBody(req, maxBytes = 65536) {
 // take ~1-2s on Windows). Concurrent requests share the in-flight build.
 const STATUS_CACHE_MS = 5000;
 
-function makeStatusCache(seams, ttlMs) {
+function makeStatusCache(seams, ttlMs, opts) {
   let entry = null; // { at, promise }
   return {
     get({ fresh = false } = {}) {
@@ -661,7 +663,7 @@ function makeStatusCache(seams, ttlMs) {
         return entry.promise;
       }
       const e = { at: null, promise: null };
-      e.promise = buildStatus(seams).then(
+      e.promise = buildStatus(seams, opts).then(
         (status) => { e.at = Date.now(); return status; },
         (err) => { if (entry === e) entry = null; throw err; },
       );
@@ -676,7 +678,7 @@ function makeStatusCache(seams, ttlMs) {
 function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs, brokerStatus } = {}) {
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
   const _mutators = mutators || {};
-  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs);
+  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs, { brokerMode: Boolean(brokerStatus) });
   const slotDetail = async (n, opts) => (getSlotDetail
     ? getSlotDetail(n, seams)
     : buildSlotDetail(n, seams, await statusCache.get(opts)));
