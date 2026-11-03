@@ -1,7 +1,8 @@
 // core-policy.test.js — W2F: the cookie bridge's domain policy
 // (extensions/cookie-bridge/policy.js), shared by the extension and the
 // broker. Denylist mode: deny = built-in categories, hold = keyword guard,
-// allow = everything else (business tools explicitly).
+// allow = everything else. v0.4.1: no owner-specific domains ship; the
+// owner's always-allow list (classify(d, { allow })) lifts the keyword guard.
 
 "use strict";
 
@@ -13,22 +14,56 @@ const vm = require("node:vm");
 
 const POLICY_FILE = path.join(__dirname, "..", "..", "extensions", "cookie-bridge", "policy.js");
 const policy = require(POLICY_FILE);
-const { classify, normalizeDomain, DENYLIST, KEYWORDS, BUSINESS_ALLOW, CATEGORY_LABELS } = policy;
+const { classify, normalizeDomain, parseAllowList, DENYLIST, KEYWORDS, CATEGORY_LABELS } = policy;
 
 const decision = (d) => classify(d).decision;
 
-test("policy: business tools are allowed, category business (owner list)", () => {
+test("policy: ordinary sites are allowed by default (no built-in allow list; category default)", () => {
   for (const d of [
-    "amazon.com", ".amazon.com", "www.amazon.com", "sellercentral.amazon.com", "keepa.com", "washed.boxedup.cc",
-    "boxeduplabs.com", "discord.com", "ebay.com", "www.ebay.com", "walmart.com", "seller.walmart.com", "whop.com", "github.com",
+    "amazon.com", ".amazon.com", "www.amazon.com", "sellercentral.amazon.com", "discord.com", "ebay.com", "www.ebay.com",
+    "walmart.com", "seller.walmart.com", "github.com",
   ]) {
-    assert.deepStrictEqual([d, classify(d).decision, classify(d).category], [d, "allow", "business"]);
+    assert.deepStrictEqual([d, classify(d).decision, classify(d).category], [d, "allow", "default"]);
   }
+  assert.ok(!("business" in CATEGORY_LABELS), "no owner business category ships");
+  assert.strictEqual(policy.BUSINESS_ALLOW, undefined, "no owner business list ships");
 });
 
-test("policy: a business domain's sensitive-looking subdomain is still allowed (no keyword hold)", () => {
-  assert.strictEqual(decision("payments.ebay.com"), "allow");
-  assert.strictEqual(decision("wallet.walmart.com"), "allow");
+test("policy: no owner-specific domain ships in policy.js", () => {
+  const src = fs.readFileSync(POLICY_FILE, "utf8").toLowerCase();
+  for (const owner of ["boxedup", "boxeduplabs", "washed", "keepa", "whop"]) assert.ok(!src.includes(owner), owner);
+});
+
+test("policy: a sensitive-looking subdomain is held unless it is on the owner's always-allow list", () => {
+  assert.strictEqual(decision("payments.ebay.com"), "hold");
+  assert.strictEqual(decision("wallet.walmart.com"), "hold");
+  const { allow } = parseAllowList("ebay.com, wallet.walmart.com");
+  const r = classify("payments.ebay.com", { allow });
+  assert.deepStrictEqual([r.decision, r.category], ["allow", "user-allow"]);
+  assert.strictEqual(r.reason, "On your always-allow list (ebay.com)");
+  assert.strictEqual(classify("wallet.walmart.com", { allow }).decision, "allow");
+  assert.strictEqual(classify("x.wallet.walmart.com", { allow }).decision, "allow", "subdomains of an entry too");
+  assert.strictEqual(classify("pay.walmart.com", { allow }).decision, "hold", "a sibling is not covered");
+  assert.strictEqual(classify("notebay.com", { allow }).category, "default", "whole labels only");
+});
+
+test("policy: the always-allow list never lifts a deny category (only the review page re-allows one)", () => {
+  const { allow } = parseAllowList("chase.com amazon.com example.gov 10.0.0.7");
+  for (const d of ["chase.com", "secure.chase.com", "pay.amazon.com", "aws.amazon.com", "www.example.gov"]) {
+    assert.strictEqual(classify(d, { allow }).decision, "deny", d);
+  }
+  assert.strictEqual(classify("10.0.0.7", { allow }).decision, "allow", "an IP entry: that address");
+  assert.strictEqual(classify("10.0.0.8", { allow }).decision, "hold");
+});
+
+test("policy: parseAllowList normalizes, dedupes, and reports what it can't use", () => {
+  assert.deepStrictEqual(parseAllowList(" Pay.Example.com, .pay.example.com;intranet.example  10.0.0.7 nas com 1.1 bad_one!! "), {
+    allow: ["pay.example.com", "intranet.example", "10.0.0.7"],
+    invalid: ["nas", "com", "1.1", "bad_one!!"],
+  });
+  assert.deepStrictEqual(parseAllowList(undefined), { allow: [], invalid: [] });
+  assert.deepStrictEqual(parseAllowList(""), { allow: [], invalid: [] });
+  assert.strictEqual(classify("pay.example.com", { allow: [] }).decision, "hold", "an empty list changes nothing");
 });
 
 test("policy: an unknown, harmless domain is allowed by default", () => {
@@ -86,7 +121,7 @@ test("policy: cloud / infra / registrar consoles are denied", () => {
   }
 });
 
-test("policy: deny wins over business allow (aws.amazon.com is denied, amazon.com allowed)", () => {
+test("policy: deny wins over a default allow (aws.amazon.com is denied, amazon.com allowed)", () => {
   assert.strictEqual(decision("console.aws.amazon.com"), "deny");
   assert.strictEqual(decision("amazon.com"), "allow");
   assert.strictEqual(decision("smile.amazon.com"), "allow");
@@ -155,7 +190,7 @@ test("policy: every result has decision, category and a human reason", () => {
 });
 
 test("policy: exported lists are frozen, labelled, and free of duplicates / malformed entries", () => {
-  assert.ok(Object.isFrozen(DENYLIST) && Object.isFrozen(KEYWORDS) && Object.isFrozen(BUSINESS_ALLOW));
+  assert.ok(Object.isFrozen(DENYLIST) && Object.isFrozen(KEYWORDS));
   const seen = new Map();
   for (const [category, domains] of Object.entries(DENYLIST)) {
     assert.ok(CATEGORY_LABELS[category], `no label for ${category}`);
@@ -168,7 +203,6 @@ test("policy: exported lists are frozen, labelled, and free of duplicates / malf
       assert.strictEqual(classify(d).category, category, d);
     }
   }
-  for (const d of BUSINESS_ALLOW) assert.strictEqual(classify(d).decision, "allow", d);
   assert.ok(KEYWORDS.length >= 8);
 });
 
@@ -194,7 +228,7 @@ test("policy: Google's country domains are identity too (google.<cc>, google.co.
   assert.strictEqual(decision("google.example.com"), "allow", "a google label under someone else's domain");
 });
 
-test("policy: .youtube.com and .amazon.com session cookies stay allowed (business use)", () => {
+test("policy: .youtube.com and .amazon.com session cookies stay allowed (default allow)", () => {
   assert.strictEqual(decision(".youtube.com"), "allow");
   assert.strictEqual(decision("www.youtube.com"), "allow");
   assert.strictEqual(decision(".amazon.com"), "allow");

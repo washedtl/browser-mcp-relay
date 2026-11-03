@@ -14,17 +14,22 @@
 //           the review page (the cookie then carries userOverride:true);
 //   hold  — the keyword guard: an unknown domain that looks sensitive waits
 //           for the owner's approval on the review page;
-//   allow — everything else. The owner's business tools are listed so a
-//           sensitive-looking subdomain of theirs is not held.
-// Deny is checked first, so a denied subdomain of a business tool
-// (aws.amazon.com) stays denied.
+//   allow — everything else.
+// Only generic categories ship here. A domain of yours that the keyword
+// guard holds (pay.example.com) is let through by your own always-allow
+// list: classify(domain, { allow }) — the broker passes it from
+// BROWSER_RELAY_BRIDGE_ALLOW (parseAllowList) — or, in the extension, by
+// re-allowing it on the review page. The list never lifts a deny category:
+// deny is checked first, so a denied subdomain of an allowed domain
+// (aws.amazon.com under amazon.com) stays denied; only the review page can
+// re-allow one.
 //
 // Matching is per cookie domain. Denying a subdomain (aws.amazon.com,
 // pharmacy.amazon.com) stops cookies set on that host, NOT cookies set on a
 // parent domain (.amazon.com session cookies still sync, and they are what
 // signs those subdomains in). Only denying the parent would stop those.
 //
-// classify(domain) -> { decision: "allow"|"deny"|"hold", category, reason }
+// classify(domain, { allow }?) -> { decision: "allow"|"deny"|"hold", category, reason }
 
 (function (root) {
   "use strict";
@@ -37,7 +42,7 @@
     "cloud-infra": "Cloud, infrastructure and domain-registrar consoles",
     invalid: "Not a valid cookie domain",
     keyword: "Sensitive keyword in the domain",
-    business: "Business tool",
+    "user-allow": "On your always-allow list (BROWSER_RELAY_BRIDGE_ALLOW)",
     default: "Not on the denylist",
   });
 
@@ -108,12 +113,6 @@
     `),
   });
 
-  // The owner's business tools: allowed even where a keyword would hold a subdomain.
-  const BUSINESS_ALLOW = list(`
-    amazon.com keepa.com washed.boxedup.cc boxeduplabs.com discord.com discordapp.com ebay.com walmart.com
-    whop.com github.com
-  `);
-
   // Substrings of the domain that hold an unknown domain back for review.
   const KEYWORDS = list(`
     bank credit financ invest wallet pay tax health medic clinic patient hospital pharm insur loan mortgage
@@ -131,7 +130,6 @@
 
   const DENY_INDEX = new Map();
   for (const category of Object.keys(DENYLIST)) for (const d of DENYLIST[category]) DENY_INDEX.set(d, category);
-  const BUSINESS_INDEX = new Set(BUSINESS_ALLOW);
 
   const HOSTNAME_RE = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*$/;
   const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
@@ -151,13 +149,52 @@
 
   const result = (decision, category, reason) => ({ decision, category, reason });
 
+  const isIp = (host) => IPV4_RE.test(host) || (host.includes(":") && IPV6_RE.test(host));
+
+  /**
+   * An always-allow list as the owner writes it (comma- or space-separated
+   * domains, e.g. BROWSER_RELAY_BRIDGE_ALLOW). Each entry is normalized; it
+   * must be a host of two or more labels (it then covers its subdomains) or
+   * an IP address (that address only). Anything else is reported in invalid.
+   * @returns {{allow: string[], invalid: string[]}}
+   */
+  function parseAllowList(text) {
+    const allow = [];
+    const invalid = [];
+    for (const raw of String(text == null ? "" : text).split(/[\s,;]+/)) {
+      if (!raw) continue;
+      const d = normalizeDomain(raw);
+      const ok = isIp(d) || (d.length <= 253 && HOSTNAME_RE.test(d) && d.includes(".") && !/^[\d.]+$/.test(d));
+      if (!ok) invalid.push(raw);
+      else if (!allow.includes(d)) allow.push(d);
+    }
+    return { allow, invalid };
+  }
+
+  // classify() is called per cookie: one Set per allow array
+  const allowSets = new WeakMap();
+  function allowSet(allow) {
+    if (!Array.isArray(allow) || !allow.length) return null;
+    let set = allowSets.get(allow);
+    if (!set) {
+      set = new Set(allow.map(normalizeDomain).filter(Boolean));
+      allowSets.set(allow, set);
+    }
+    return set;
+  }
+  const userAllowed = (s) => result("allow", "user-allow", `On your always-allow list (${s})`);
+
   /**
    * @param {string} domain — a cookie domain (".example.com" or "example.com")
+   * @param {{allow?: string[]}} [opts] — allow: the owner's always-allow list
+   *   (parseAllowList): lifts the keyword guard, never a deny category
    * @returns {{decision: "allow"|"deny"|"hold", category: string, reason: string}}
    */
-  function classify(domain) {
+  function classify(domain, opts) {
     const host = normalizeDomain(domain);
-    if (IPV4_RE.test(host) || (host.includes(":") && IPV6_RE.test(host))) {
+    const allow = allowSet(opts && opts.allow);
+    if (isIp(host)) {
+      if (allow && allow.has(host)) return userAllowed(host);
       return result("hold", "keyword", "An IP address (router / NAS consoles live there): held for review");
     }
     if (!host || host.length > 253 || !HOSTNAME_RE.test(host)) {
@@ -177,8 +214,8 @@
       const suffix = labels.slice(-2).join(".");
       return result("deny", "gov-tax-health", `Built-in denylist: ${CATEGORY_LABELS["gov-tax-health"]} (.${suffix})`);
     }
-    for (const s of suffixes(host)) {
-      if (BUSINESS_INDEX.has(s)) return result("allow", "business", `Business tool (${s})`);
+    if (allow) {
+      for (const s of suffixes(host)) if (allow.has(s)) return userAllowed(s);
     }
     if (host === "localhost") return result("allow", "default", "localhost (local development)");
     if (labels.length === 1) return result("hold", "keyword", "A single-label host (a router, NAS or intranet name): held for review");
@@ -193,7 +230,7 @@
     return result("allow", "default", "Not on the denylist and no sensitive keyword");
   }
 
-  const api = Object.freeze({ classify, normalizeDomain, DENYLIST, KEYWORDS, BUSINESS_ALLOW, CATEGORY_LABELS });
+  const api = Object.freeze({ classify, normalizeDomain, parseAllowList, DENYLIST, KEYWORDS, CATEGORY_LABELS });
   root.CookieBridgePolicy = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

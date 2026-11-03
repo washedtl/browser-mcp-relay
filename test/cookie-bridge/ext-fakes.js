@@ -157,8 +157,6 @@ function fakeClassify(domain) {
   if (under("chase.com") || under("paypal.com")) return { decision: "deny", category: "banking", reason: "built-in denylist" };
   if (under("accounts.google.com") || under("mail.google.com")) return { decision: "deny", category: "email-identity", reason: "built-in denylist" };
   if (/bank|wallet|tax|health/.test(d)) return { decision: "hold", category: "keyword", reason: "keyword guard" };
-  // same shape as the real policy.js: allow carries "business" or "default"
-  if (under("amazon.com") || under("github.com") || under("keepa.com")) return { decision: "allow", category: "business", reason: "business tool" };
   return { decision: "allow", category: "default", reason: "not on a denylist" };
 }
 

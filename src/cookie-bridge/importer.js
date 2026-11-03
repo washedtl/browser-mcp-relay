@@ -8,8 +8,12 @@
 // decided. Accepted cookies go into an in-memory snapshot that is
 //   - applied to Brave at once when Brave is up (CDP Storage.setCookies on a
 //     browser-level session: the default context every session shares), and
-//   - applied again after every Brave (re)launch (main.js ensureBrave →
-//     braveReady): session cookies don't survive a restart.
+//   - applied again after every Brave (re)launch: the supervisor's 'pipe'
+//     event (W2G: once per launch, as the CdpProxy starts serving it) starts
+//     the apply, and main.js ensureBrave → braveReady waits for it before
+//     any tool uses that Brave. Session cookies don't survive a restart.
+// The CDP connection is the broker's own: its CdpProxy's secret ws URL
+// (openCdp, injected by main.js in-process); Brave has no debugging port.
 // Brave is never launched for the bridge. An add replaces the cookie with
 // the same name/domain/path/partition. A removal in Chrome expires that
 // cookie in Brave (now, or once at the next launch); for a deny/hold domain
@@ -22,6 +26,17 @@
 // atomically, user-private), so a broker restart forgets nothing: a full
 // resync (last:true) expires every managed cookie Chrome no longer has, and
 // deletions queued while Brave was down apply at the next launch.
+//
+// Chromium writes cookie changes to disk only every ~30 s (and at a
+// graceful close), so a Brave killed right after a deletion comes back with
+// the cookie. An applied deletion therefore stays as an "unflushed"
+// tombstone, tagged with the launch (epoch) it went to, until that Brave
+// has stayed up for FLUSH_MS after it; a launch re-applies the tombstones
+// an earlier Brave may have lost. Re-syncing the cookie drops its tombstone.
+//
+// The owner's always-allow list (BROWSER_RELAY_BRIDGE_ALLOW, opts.allow)
+// lifts the keyword guard for those domains on this side; deny categories
+// still need the review page's re-allow (userOverride), as before.
 //
 // One bridge at a time (one Chrome profile is the single source of truth).
 // Cookie values live only in the in-memory snapshot and the CDP calls:
@@ -38,6 +53,8 @@ const { toCdpCookie, cookieKey, expireParam, isExpired } = require("./cdp-cookie
 const DEFAULT_BATCH = 200;
 const DEFAULT_APPLY_TIMEOUT_MS = 15_000;
 const STATE_VERSION = 1;
+// Chromium's cookie store commits every 30 s: twice that, and a deletion is on disk
+const DEFAULT_FLUSH_MS = 60_000;
 const IDENTITY_FIELDS = ["name", "url", "domain", "path", "secure", "httpOnly", "sameSite", "partitionKey"];
 
 const domainOf = (c) => (c && typeof c === "object" && typeof c.domain === "string" ? policy.normalizeDomain(c.domain) : "");
@@ -107,32 +124,45 @@ class CookieImporter {
    *   CDP connection to the broker's Brave (the broker decides how: cdp-client.js openBrowserCdp today)
    * @param {string|null} [opts.stateFile] — where the bridge-managed keys persist (null: memory only)
    * @param {(msg: string) => void} [opts.log]
+   * @param {string[]} [opts.allow] — the owner's always-allow domains (policy.parseAllowList)
    * @param {() => number} [opts.now] — ms clock (test seam)
    * @param {number} [opts.batchSize] — cookies per Storage.setCookies call
    * @param {number} [opts.applyTimeoutMs] — the longest a tool call or a sync reply waits on Brave
+   * @param {number} [opts.flushMs] — how long an applied deletion is kept for re-applying after a crash (test seam)
    */
-  constructor({ supervisor, openCdp, stateFile = null, log = () => {}, now = Date.now, batchSize = DEFAULT_BATCH, applyTimeoutMs = DEFAULT_APPLY_TIMEOUT_MS }) {
+  constructor({ supervisor, openCdp, stateFile = null, log = () => {}, allow = [], now = Date.now, batchSize = DEFAULT_BATCH, applyTimeoutMs = DEFAULT_APPLY_TIMEOUT_MS, flushMs = DEFAULT_FLUSH_MS }) {
     if (typeof openCdp !== "function") throw new Error("CookieImporter: openCdp is required");
     this._supervisor = supervisor;
     this._openCdp = openCdp;
+    this._allow = Object.freeze([...allow]);
     this._stateFile = stateFile;
     this._log = (m) => log(`cookie bridge: ${m}`);
     this._now = now;
     this._batch = batchSize;
     this._applyTimeoutMs = applyTimeoutMs;
+    this._flushMs = flushMs;
     this._snapshot = new Map(); // key → CDP CookieParam (with its value; memory only)
     this._managed = new Map(); // key → identity: every cookie the bridge put into Brave (persisted)
     this._pendingDeletes = new Map(); // key → expired CookieParam, not yet applied to Brave (persisted)
+    this._unflushed = new Map(); // key → {param, at, epoch}: applied, maybe not on disk yet (persisted as pending)
+    this._epoch = 0; // bumped whenever Brave goes down: the running Brave's tombstones carry it
     this._staging = new Map(); // bridge id → {keys, fresh} of the full sync in progress
     this._bridge = null; // the one connected bridge
     this._queue = Promise.resolve(); // CDP work, strictly in order
     this._cdp = null;
     this._ready = null; // the apply for the running Brave
     this._readyPid = null;
+    this._launch = 0; // bumped on every 'pipe' (one per launch that came up)
+    this._readyLaunch = 0;
     this._lastSyncAt = null;
     this._dirty = false;
     this._loadState();
-    if (supervisor && typeof supervisor.on === "function") supervisor.on("down", () => this.braveDown());
+    if (supervisor && typeof supervisor.on === "function") {
+      supervisor.on("down", () => this.braveDown());
+      // W2G: emitted once per launch, after the CdpProxy took the new pipe
+      // and before ensure() resolves: the new Brave gets the snapshot now.
+      supervisor.on("pipe", () => this.braveLaunched());
+    }
   }
 
   /**
@@ -273,8 +303,9 @@ class CookieImporter {
    */
   braveReady(info) {
     const pid = info && info.pid;
-    if (this._ready && this._readyPid === pid) return this._ready;
+    if (this._ready && this._readyPid === pid && this._readyLaunch === this._launch) return this._ready;
     this._readyPid = pid;
+    this._readyLaunch = this._launch;
     const run = this._enqueue(async () => {
       if (!this._snapshot.size && !this._pendingDeletes.size) return;
       const t0 = this._now();
@@ -288,7 +319,9 @@ class CookieImporter {
         this._snapshot.delete(key); // Brave expires it too
         if (this._managed.delete(key)) this._dirty = true;
       }
+      // and the deletions an earlier Brave may not have written to disk
       const deletes = [...this._pendingDeletes];
+      for (const [key, u] of this._unflushed) if (u.epoch !== this._epoch) deletes.push([key, u.param]);
       try {
         const refused = await this._apply(sets, deletes);
         this._dropRefused(refused);
@@ -304,8 +337,24 @@ class CookieImporter {
     return ready;
   }
 
-  /** Brave went down: the next launch gets the snapshot again. */
+  /**
+   * W2G 'pipe': a Brave launch came up. Whatever was applied belongs to an
+   * earlier Brave (even one with the same PID): start this one's apply.
+   * Never throws (it runs inside the supervisor's emit).
+   */
+  braveLaunched() {
+    this.braveDown();
+    this._launch++;
+    let pid = null;
+    try { pid = this._supervisor.pid; } catch { /* a fake without it */ }
+    this.braveReady({ pid });
+  }
+
+  /** Brave went down: the next launch gets the snapshot (and the unflushed deletions) again. */
   braveDown() {
+    this._settle(); // deletions this Brave held long enough are on disk
+    this._epoch++;
+    this._saveState();
     this._ready = null;
     this._readyPid = null;
     const cdp = this._cdp;
@@ -313,7 +362,30 @@ class CookieImporter {
     if (cdp) Promise.resolve(cdp).then((c) => c.close(), () => {});
   }
 
-  /** What broker:status shows: counts only. */
+  /**
+   * A matcher for cookies as cookies_export reads them from Brave
+   * ({name, domain, path}): true for one the bridge manages, whose value
+   * cookies_export then hides. Built from the managed set as it is now (one
+   * per export). Matched on name, domain (host-only or not) and path,
+   * ignoring the partition: a doubt hides a value rather than shows it.
+   * @returns {(cookie: {name: string, domain: string, path?: string}) => boolean}
+   */
+  managedMatcher() {
+    const index = new Set();
+    for (const key of this._managed.keys()) {
+      const [name, where, path] = key.split("\u0000");
+      index.add(`${name}\u0000${where.toLowerCase()}\u0000${path}`);
+    }
+    return (cookie) => {
+      if (!index.size || !cookie || typeof cookie.name !== "string" || typeof cookie.domain !== "string") return false;
+      const d = cookie.domain.trim().toLowerCase();
+      const where = d.startsWith(".") ? d : `host:${d}/`;
+      const path = typeof cookie.path === "string" ? cookie.path : "/";
+      return index.has(`${cookie.name}\u0000${where}\u0000${path}`);
+    };
+  }
+
+  /** What broker:status shows: counts only (and the owner's own allow list). */
   status() {
     const domains = new Set();
     for (const p of this._snapshot.values()) domains.add(p.domain ? p.domain.replace(/^\./, "") : p.url.replace(/^https?:\/\/|\/$/g, ""));
@@ -324,6 +396,7 @@ class CookieImporter {
       managed: this._managed.size,
       pendingDeletes: this._pendingDeletes.size,
       lastSyncAt: this._lastSyncAt,
+      allow: [...this._allow],
     };
   }
 
@@ -349,12 +422,13 @@ class CookieImporter {
 
   /** The policy refusal for a cookie's domain or partition site, or null when both are allowed. */
   _verdict(mapped, cookie) {
-    const own = policy.classify(mapped.host);
+    const opts = { allow: this._allow };
+    const own = policy.classify(mapped.host, opts);
     if (own.decision !== "allow") return { domain: domainOf(cookie), reason: `${own.decision}:${own.category}` };
     const pk = mapped.param.partitionKey;
     if (pk) {
       const top = siteHost(pk.topLevelSite);
-      const v = policy.classify(top);
+      const v = policy.classify(top, opts);
       if (v.decision !== "allow") return { domain: policy.normalizeDomain(top), reason: `${v.decision}:${v.category}` };
     }
     return null;
@@ -381,6 +455,7 @@ class CookieImporter {
       this._dirty = true;
     }
     if (this._pendingDeletes.delete(key)) this._dirty = true;
+    if (this._unflushed.delete(key)) this._dirty = true; // a tombstone must never undo it at a relaunch
   }
 
   /** Delete it from Brave (now or at the next launch) and stop managing it. */
@@ -389,6 +464,7 @@ class CookieImporter {
     this._snapshot.delete(key);
     this._managed.delete(key);
     this._pendingDeletes.set(key, expireParam(id));
+    this._unflushed.delete(key); // the new deletion supersedes it
     this._dirty = true;
   }
 
@@ -445,6 +521,7 @@ class CookieImporter {
    * deletions leave pendingDeletes.
    */
   async _apply(sets, deletes) {
+    const epoch = this._epoch; // the Brave these go to (a 'down' mid-apply bumps it)
     const cdp = await this._connection();
     const refused = [];
     const setAll = async (pairs, onRefused) => {
@@ -467,11 +544,14 @@ class CookieImporter {
     };
     await setAll(sets, (pair) => refused.push(pair));
     await setAll(deletes, ([key]) => this._log(`Brave refused a deletion (${key.split("\u0000")[1]})`));
+    const at = this._now();
     for (const [key, param] of deletes) {
-      if (this._pendingDeletes.get(key) === param) {
-        this._pendingDeletes.delete(key);
-        this._dirty = true;
-      }
+      const pending = this._pendingDeletes.get(key) === param;
+      const u = this._unflushed.get(key);
+      if (!pending && !(u && u.param === param)) continue; // re-synced or deleted again meanwhile
+      if (pending) this._pendingDeletes.delete(key);
+      this._unflushed.set(key, { param, at, epoch });
+      this._dirty = true;
     }
     return refused;
   }
@@ -513,14 +593,31 @@ class CookieImporter {
     }
   }
 
-  /** Atomic (temp file + rename), user-private; identities only, never values. */
+  /** Drop the tombstones the running Brave has held for flushMs: they are on disk. */
+  _settle() {
+    const now = this._now();
+    for (const [key, u] of this._unflushed) {
+      if (u.epoch === this._epoch && now - u.at >= this._flushMs) {
+        this._unflushed.delete(key);
+        this._dirty = true;
+      }
+    }
+  }
+
+  /**
+   * Atomic (temp file + rename), user-private; identities only, never values.
+   * Unflushed tombstones are saved as pending: a new broker re-applies them.
+   */
   _saveState() {
+    if (this._unflushed.size && this._isUp()) this._settle();
     if (!this._stateFile || !this._dirty) return;
     this._dirty = false;
+    const pending = new Map(this._pendingDeletes);
+    for (const [key, u] of this._unflushed) if (!pending.has(key)) pending.set(key, u.param);
     const data = JSON.stringify({
       v: STATE_VERSION,
       managed: [...this._managed.values()],
-      pendingDeletes: [...this._pendingDeletes.values()].map(identityOf),
+      pendingDeletes: [...pending.values()].map(identityOf),
     });
     const tmp = `${this._stateFile}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
     try {

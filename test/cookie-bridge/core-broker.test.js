@@ -432,3 +432,98 @@ test("bridge: a line over the size limit closes the bridge connection (no unboun
   await until(() => c.destroyed || c.readableEnded, 2000, "the socket to close");
   c.destroy();
 });
+
+// ── v0.4.1 integration ──
+
+const baseDeps = () => ({
+  createSupervisor: (opts) => fakes.fakeSupervisor(opts),
+  upstreamModule: () => fakes.fakeUpstreamModule(),
+  windowPages: () => fakes.fakeWindowPages(),
+  ownTools: () => [],
+  toolContext: fakes.fakeToolContextModule,
+  loadCatalog: async () => fakes.FAKE_CATALOG,
+});
+
+test("v0.4.1: BROWSER_RELAY_BRIDGE_ALLOW reaches the default importer: a keyword-held domain on it is accepted, a denied one never; broker:status lists it; bad entries are logged", async (t) => {
+  const pipe = fakes.testPipe("w2f-allow");
+  const logs = [];
+  const handle = await startBroker({
+    pipe, profileDir: path.join(HOME, "profile-allow"), keyFile: KEY_FILE, log: (m) => logs.push(m),
+    env: { BROWSER_RELAY_BRIDGE_ALLOW: "pay.example.com, chase.com, nope" },
+    idle: { exitMs: 60_000, browserMs: 60_000 }, onExit: () => {},
+    deps: baseDeps(), // the DEFAULT cookieBridge dep (Brave down: nothing to apply)
+  });
+  t.after(() => handle.close("test done"));
+  const br = await bridge(t, pipe);
+  const r = await br.request({ ctl: "cookies.full", cookies: [ck({ domain: ".pay.example.com" }), ck({ domain: ".chase.com", name: "bank" }), ck({ domain: ".mybank.example", name: "held" })], last: true });
+  assert.strictEqual(r.applied, 1, JSON.stringify(r));
+  assert.deepStrictEqual(r.rejected.map((x) => [x.domain, x.reason]), [["chase.com", "deny:finance"], ["mybank.example", "hold:keyword"]]);
+  const s = (await requestControl({ pipe, key: KEY, cmd: "status" })).status;
+  assert.deepStrictEqual(s.cookieBridge.allow, ["pay.example.com", "chase.com"]);
+  assert.ok(logs.some((l) => l.includes('ignoring BROWSER_RELAY_BRIDGE_ALLOW entries') && l.includes('"nope"')), logs.join("\n"));
+  assert.ok(logs.some((l) => l.includes("never lifts the built-in denylist (chase.com)")), logs.join("\n"));
+});
+
+test("v0.4.1: own-tools get the bridge-managed matcher in-process (main.js → the real _tool-context.js); it tracks the bridge's set", async (t) => {
+  const pipe = fakes.testPipe("w2f-matcher");
+  const order = [];
+  const cdp = recordingCdp(order);
+  const probe = {
+    name: "own_bridge_probe",
+    description: "Reports what the bridge matcher says",
+    inputSchema: { type: "object", properties: {} },
+    needsPage: false,
+    async handler(_args, ctx) {
+      const m = typeof ctx.bridgeManagedMatcher === "function" ? ctx.bridgeManagedMatcher() : null;
+      const ask = (c) => (m ? m(c) : null);
+      return { content: [{ type: "text", text: JSON.stringify({ type: typeof ctx.bridgeManagedMatcher, sid: ask({ name: "sid", domain: ".example.com", path: "/" }), other: ask({ name: "other", domain: ".example.com", path: "/" }) }) }] };
+    },
+  };
+  const handle = await startBroker({
+    pipe, profileDir: path.join(HOME, "profile-matcher"), keyFile: KEY_FILE, log: () => {}, env: {},
+    idle: { exitMs: 60_000, browserMs: 60_000 }, onExit: () => {},
+    deps: {
+      ...baseDeps(),
+      ownTools: () => [probe],
+      toolContext: () => require("../../src/own-tools/_tool-context.js"),
+      cookieBridge: ({ supervisor, log }) => new CookieImporter({ supervisor, log, openCdp: cdp.openCdp }),
+    },
+  });
+  t.after(() => handle.close("test done"));
+  const c = await connectClient(t, pipe);
+  const ask = async () => JSON.parse((await c.callTool({ name: "own_bridge_probe", arguments: {} })).content[0].text);
+  assert.deepStrictEqual(await ask(), { type: "function", sid: false, other: false });
+  const br = await bridge(t, pipe);
+  await br.request({ ctl: "cookies.full", cookies: [ck()], last: true });
+  assert.deepStrictEqual(await ask(), { type: "function", sid: true, other: false });
+  await br.request({ ctl: "cookies.delta", changes: [{ removed: true, cause: "explicit", cookie: ck() }] });
+  assert.deepStrictEqual(await ask(), { type: "function", sid: false, other: false });
+});
+
+test("v0.4.1: a bridge reply never carries the CDP secret, even when an apply error quotes the proxy URL", async (t) => {
+  const pipe = fakes.testPipe("w2f-redact");
+  let cdpUrlSeen = null;
+  let sup = null;
+  const handle = await startBroker({
+    pipe, profileDir: path.join(HOME, "profile-redact"), keyFile: KEY_FILE, log: () => {}, env: {},
+    idle: { exitMs: 60_000, browserMs: 60_000 }, onExit: () => {},
+    deps: {
+      ...baseDeps(),
+      createSupervisor: (opts) => (sup = Object.assign(fakes.fakeSupervisor(opts), { up: true })),
+      cookieBridge: ({ supervisor, cdpUrl, log }) => {
+        cdpUrlSeen = cdpUrl;
+        return new CookieImporter({ supervisor, log, openCdp: async () => { throw new Error(`could not reach ${cdpUrl}`); } });
+      },
+    },
+  });
+  t.after(() => handle.close("test done"));
+  assert.ok(sup && sup.up);
+  const secret = cdpUrlSeen.split("/")[3];
+  assert.match(secret, /^[0-9a-f]{64}$/, "the importer gets the proxy's secret URL in-process");
+  const br = await bridge(t, pipe);
+  const r = await br.request({ ctl: "cookies.full", cookies: [ck()], last: true });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /not applied to Brave/);
+  assert.ok(!JSON.stringify(r).includes(secret), JSON.stringify(r));
+  assert.match(r.error, /<redacted>/);
+});

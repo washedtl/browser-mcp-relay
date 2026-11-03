@@ -33,6 +33,8 @@ const SERIAL_FILES = [
   "brave-supervisor.test.js",
   "cdp-bridge.test.js",
   "cdp-lockdown.test.js",
+  "cookie-bridge/core-e2e.test.js",
+  "cookie-bridge/core-real-brave.test.js",
   "e2e-broker.test.js",
   "shim.test.js",
   "upstream-contract.test.js",

@@ -141,11 +141,13 @@ const DEFAULT_DEPS = {
   toolContext: () => require("../own-tools/_tool-context.js"),
   loadCatalog: ({ env }) => require("../tool-catalog.js").loadUpstreamCatalog({ env }),
   // W2F: cookies from the owner's Chrome (the cookie bridge), applied to Brave
-  // over a CDP connection the broker hands it; managed keys persist next to the key
-  cookieBridge: ({ supervisor, cdpUrl, log, stateDir, profileDir }) => {
+  // over a CDP connection the broker hands it: W2G's CdpProxy URL (with its
+  // secret, in-process only; Brave has no debugging port). Managed keys
+  // persist next to the key.
+  cookieBridge: ({ supervisor, cdpUrl, log, stateDir, profileDir, allow }) => {
     const { CookieImporter, stateFileFor } = require("../cookie-bridge/importer.js");
     const openCdp = () => require("../cookie-bridge/cdp-client.js").openBrowserCdp(cdpUrl);
-    return new CookieImporter({ supervisor, log, openCdp, stateFile: stateFileFor(stateDir, profileDir) });
+    return new CookieImporter({ supervisor, log, openCdp, allow, stateFile: stateFileFor(stateDir, profileDir) });
   },
 };
 
@@ -376,7 +378,9 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   const supervisor = d.createSupervisor({ profileDir, env, log, poolConfig: d.poolConfig });
   // each launch's verified pipe is what the proxy serves (503 while Brave is down)
   if (typeof supervisor.on === "function") supervisor.on("pipe", (p) => cdpProxy.setPipe(p));
-  const cookieBridge = d.cookieBridge({ supervisor, cdpUrl, log, stateDir: path.dirname(keyFile), profileDir }); // W2F
+  const cookieBridge = d.cookieBridge({ supervisor, cdpUrl, log, stateDir: path.dirname(keyFile), profileDir, allow: bridgeAllowList(env, log) }); // W2F
+  // W2F: cookies_export hides the values of the cookies the bridge manages (in-process: no new endpoint)
+  const bridgeManagedMatcher = typeof cookieBridge.managedMatcher === "function" ? () => cookieBridge.managedMatcher() : null;
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
   const placement = env.BROWSER_RELAY_BROKER_WINDOWS === "offscreen" ? "offscreen" : "cascade";
@@ -564,14 +568,14 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     async function run(args) {
       if (tool.needsBrave === false) {
         if (!supervisor.isUp()) return tool.handler(args, { relay });
-        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay }));
+        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay, bridgeManagedMatcher }));
       }
       if (!routed) {
         await ensureBrave(); // e.g. lighthouse_audit drives Brave over cdpUrl
         checkProxyCredentials();
-        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay }));
+        return tool.handler(args, await toolContext(registry, connId, tool, args, { context: lazySharedContext(connId), cdpUrl, relay, bridgeManagedMatcher }));
       }
-      const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay });
+      const ctx = await toolContext(registry, connId, tool, args, { context: null, cdpUrl, relay, bridgeManagedMatcher });
       checkProxyCredentials();
       const tabKey = tabKeyOf(args.tabId); // toolContext validated it
       const notice = registry.takeResetNotice(connId, tabKey);
@@ -923,6 +927,21 @@ function watchdogSetting(raw) {
  * upstream (W2B) reads process.env only: the catalog (built from this env)
  * and the in-process tools must come from the same build and names.
  */
+/**
+ * W2F: the owner's always-allow list for the cookie bridge
+ * (BROWSER_RELAY_BRIDGE_ALLOW, env or local-config.json; comma-separated).
+ * It lifts the keyword guard for those domains; it never lifts a built-in
+ * deny category (those need the extension's review page).
+ */
+function bridgeAllowList(env, log = () => {}) {
+  const policy = require("../../extensions/cookie-bridge/policy.js");
+  const { allow, invalid } = policy.parseAllowList(env.BROWSER_RELAY_BRIDGE_ALLOW);
+  if (invalid.length) log(`cookie bridge: ignoring BROWSER_RELAY_BRIDGE_ALLOW entries that are not a domain of two or more labels or an IP: ${invalid.map((x) => JSON.stringify(x)).join(", ")}`);
+  const denied = allow.filter((d) => policy.classify(d).decision === "deny");
+  if (denied.length) log(`cookie bridge: BROWSER_RELAY_BRIDGE_ALLOW never lifts the built-in denylist (${denied.join(", ")}); re-allow those on the extension's review page`);
+  return allow;
+}
+
 function brokerEnv(processEnv = process.env, applyLocalConfig = require("../local-config.js").applyLocalConfigToEnv) {
   const env = applyLocalConfig(processEnv);
   // "" counts as unset, as local-config.js treats it
@@ -989,6 +1008,7 @@ module.exports = {
   main,
   parseArgs,
   brokerEnv,
+  bridgeAllowList,
   watchdogSetting,
   startWatchdog,
   prepareWorkDir,

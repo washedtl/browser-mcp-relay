@@ -7,6 +7,7 @@
 
 const fsp = require("node:fs/promises");
 const { errorResult, absolutePathArg } = require("./_tool-args.js");
+const { BRIDGE_MANAGED_VALUE } = require("./cookies-export.js");
 
 // Read a cookies_export file: { cookies: [...] } or a bare array.
 // Returns { cookies } or { error }.
@@ -118,14 +119,20 @@ module.exports = {
         return errorResult(`cookies_import: cookies[${i}].sameSite must be 'Strict' | 'Lax' | 'None' (got ${JSON.stringify(c.sameSite)})`);
       }
     }
+    // W2F: a cookies_export of a bridge-managed cookie holds a placeholder,
+    // not its value; importing it would overwrite the real cookie with it.
+    const importable = cookies.filter((c) => c.value !== BRIDGE_MANAGED_VALUE);
+    const skipped = cookies.length - importable.length;
     try {
-      await context.addCookies(cookies);
+      if (importable.length) await context.addCookies(importable);
     } catch (e) {
       // Playwright throws on malformed cookies (missing domain+path or url,
       // invalid sameSite, etc.). Return structured error instead of letting
       // it propagate as an uncaught exception.
       return errorResult(`addCookies failed: ${e.message}`);
     }
-    return { content: [{ type: "text", text: JSON.stringify({ imported: cookies.length }) }] };
+    const result = { imported: importable.length };
+    if (skipped) result.skippedBridgeManaged = skipped; // their real values stay as they are
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
   },
 };

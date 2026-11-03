@@ -293,7 +293,8 @@ test("BROWSER_HEADLESS_ENABLE / BROWSER_RELAY_IGNORE_HTTPS_ERRORS (broker env) r
       deps: { upstreamModule: () => fakes.fakeUpstreamModule(), loadCatalog: async () => fakes.FAKE_CATALOG, ownTools: () => [], toolContext: fakes.fakeToolContextModule },
     });
     real[label] = [handle.supervisor._headless, handle.supervisor._ignoreHttpsErrors];
-    assert.strictEqual(handle.supervisor.listenerCount("pipe"), 1, "each verified launch's pipe goes to the CDP proxy");
+    // each verified launch's pipe goes to the CDP proxy; the cookie bridge (W2F) re-applies its snapshot on it
+    assert.strictEqual(handle.supervisor.listenerCount("pipe"), 2, "the CDP proxy's and the cookie bridge's listeners");
     await handle.close("test done");
   }
   assert.deepStrictEqual(real, { on: [true, true], off: [false, false] });

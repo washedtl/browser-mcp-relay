@@ -326,16 +326,21 @@ test("importer state: a broker restart forgets nothing — a full resync expires
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).managed.map((m) => m.name), ["a"]);
 });
 
-test("importer state: deletions queued while Brave is down survive a restart and apply at the next launch", async (t) => {
+test("importer state: deletions queued while Brave is down survive a restart and apply at the next launch; kept until that Brave wrote them to disk", async (t) => {
   const file = path.join(stateDir(t), "cookie-bridge-x.json");
-  const first = make({ stateFile: file }); // Brave down
+  let now = 1_800_000_000_000;
+  const first = make({ stateFile: file, now: () => now }); // Brave down
   await first.imp.full("b1", [ck({ name: "a" }), ck({ name: "b" })], true);
   await first.imp.delta([{ removed: true, cause: "explicit", cookie: ck({ name: "a" }) }]);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).pendingDeletes.map((m) => m.name), ["a"]);
-  const second = make({ stateFile: file });
+  const second = make({ stateFile: file, now: () => now });
   second.supervisor.up = true;
   await second.imp.braveReady({ pid: 1 });
   assert.deepStrictEqual(second.cdp.expired().map((p) => p.name), ["a"]);
+  // applied, but Chromium may not have written it yet: a broker killed now re-applies it
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).pendingDeletes.map((m) => m.name), ["a"]);
+  now += 60_000; // that Brave held it for the flush interval
+  second.supervisor.emit("down", "closed");
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")).pendingDeletes, []);
 });
 
@@ -388,8 +393,9 @@ test("importer: a delta re-adding an expired-in-the-past cookie is a removal", a
   assert.strictEqual(imp.status().cookies, 0);
 });
 
-test("importer: deletions while Brave is down are applied once at the next launch, then forgotten", async () => {
-  const { imp, cdp, supervisor } = make();
+test("importer: deletions while Brave is down are applied at the next launch, then forgotten once that Brave wrote them to disk", async () => {
+  let now = 1_800_000_000_000;
+  const { imp, cdp, supervisor } = make({ now: () => now });
   await imp.full("b1", [ck({ name: "a" }), ck({ name: "b" })], true);
   await imp.delta([{ removed: true, cause: "explicit", cookie: ck({ name: "a" }) }]);
   assert.strictEqual(cdp.opened.length, 0);
@@ -397,9 +403,36 @@ test("importer: deletions while Brave is down are applied once at the next launc
   await imp.braveReady({ pid: 1 });
   assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["a"]);
   assert.deepStrictEqual(cdp.live().map((p) => p.name), ["b"]);
+  now += 60_000; // Chromium commits cookies every 30 s: this Brave has it on disk
   supervisor.emit("down", "closed");
   await imp.braveReady({ pid: 2 });
   assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["a"], "a later launch must not delete it again (it may be the agent's own cookie by then)");
+});
+
+test("importer: a deletion Brave may not have written to disk (it died within the flush interval) is applied again at the relaunch", async () => {
+  let now = 1_800_000_000_000;
+  const { imp, cdp, supervisor } = make({ up: true, now: () => now });
+  await imp.braveReady({ pid: 1 });
+  await imp.full("b1", [ck({ name: "a" }), ck({ name: "b" })], true);
+  await imp.delta([{ removed: true, cause: "explicit", cookie: ck({ name: "a" }) }]); // applied at once
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["a"]);
+  now += 5_000;
+  supervisor.emit("down", "exited (pid gone)"); // killed 5 s later: the deletion may be lost
+  now += 600_000; // however long until the next tool call
+  await imp.braveReady({ pid: 2 });
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["a", "a"], "re-applied to the relaunched Brave");
+  // this one stays up long enough: no third time
+  now += 60_000;
+  supervisor.emit("down", "closed");
+  await imp.braveReady({ pid: 3 });
+  assert.deepStrictEqual(cdp.expired().map((p) => p.name), ["a", "a"]);
+  // and Chrome re-adding the cookie drops its tombstone at once
+  await imp.delta([{ removed: true, cause: "explicit", cookie: ck({ name: "b" }) }]);
+  await imp.delta([{ removed: false, cause: "explicit", cookie: ck({ name: "b" }) }]);
+  supervisor.emit("down", "exited (pid gone)");
+  await imp.braveReady({ pid: 4 });
+  const last = cdp.calls.filter((c) => c.method === "Storage.setCookies" && c.ok).slice(-2).flatMap((c) => c.params.cookies);
+  assert.ok(!last.some((p) => p.name === "b" && p.expires === 1), "the re-synced b is never deleted by its old tombstone");
 });
 
 test("importer: expired cookies are dropped, not applied at a later launch", async () => {
@@ -467,4 +500,76 @@ test("importer: handlers validate the request shape", async () => {
   const r = await h["cookies.delta"]({ changes: [{ removed: false }, 7] });
   assert.strictEqual(r.applied, 0);
   assert.strictEqual(r.rejected[0].reason, "malformed cookie (not an object)");
+});
+
+// ── v0.4.1 integration: W2G's 'pipe' signal, cookies_export's matcher, the always-allow list ──
+
+test("importer (W2G): every 'pipe' (a launch came up) applies the snapshot with no tool call, and the ensureBrave that follows shares it", async () => {
+  const { imp, cdp, supervisor } = make();
+  await imp.full("b1", [ck(), ck({ name: "sess", session: true, expirationDate: undefined })], true);
+  assert.strictEqual(cdp.opened.length, 0, "Brave down: nothing applied yet");
+  supervisor.up = true;
+  supervisor.pid = 300;
+  supervisor.emit("pipe", {});
+  const t0 = Date.now();
+  while (cdp.live().length < 2 && Date.now() - t0 < 2000) await new Promise((r) => setTimeout(r, 5));
+  assert.deepStrictEqual(cdp.live().map((p) => p.name).sort(), ["sess", "sid"]);
+  await imp.braveReady({ pid: 300 }); // ensureBrave right after: the same launch, nothing new
+  assert.strictEqual(cdp.live().length, 2);
+  // Brave crashes and comes back with the SAME pid (Windows reuses them): still a new launch
+  supervisor.emit("down", "exited (code=1)");
+  supervisor.emit("pipe", {});
+  await imp.braveReady({ pid: 300 });
+  assert.strictEqual(cdp.live().length, 4, "re-applied to the relaunched Brave");
+});
+
+test("importer (W2G): a 'pipe' listener never throws into the supervisor's emit, even when the apply fails", async () => {
+  const cdp = fakeCdp();
+  cdp.openCdp = async () => { throw new Error("the broker's CDP endpoint: HTTP 503 (Brave is not running)"); };
+  const { imp, supervisor, logs } = make({ cdp, applyTimeoutMs: 200 });
+  await imp.full("b1", [ck()], true);
+  supervisor.up = true;
+  assert.doesNotThrow(() => supervisor.emit("pipe", {}));
+  await imp.braveReady({ pid: 1 }); // waits for (and swallows) that failure
+  const t0 = Date.now();
+  while (!logs.some((l) => /HTTP 503/.test(l)) && Date.now() - t0 < 2000) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(logs.some((l) => /HTTP 503/.test(l)), logs.join("\n"));
+});
+
+test("importer: managedMatcher() — the cookies_export check: bridge-managed name/domain/path, host-only and domain cookies, case-insensitive, any partition", async () => {
+  const { imp } = make();
+  assert.strictEqual(imp.managedMatcher()({ name: "sid", domain: ".example.com", path: "/" }), false, "nothing managed yet");
+  await imp.full("b1", [
+    ck(),
+    ck({ name: "host", domain: "www.example.com", hostOnly: true, path: "/app" }),
+    ck({ name: "part", sameSite: "no_restriction", partitionKey: { topLevelSite: "https://top.example" } }),
+  ], true);
+  const m = imp.managedMatcher();
+  // as Playwright's context.cookies() reports them
+  assert.strictEqual(m({ name: "sid", domain: ".example.com", path: "/", value: "x" }), true);
+  assert.strictEqual(m({ name: "sid", domain: ".EXAMPLE.com", path: "/" }), true);
+  assert.strictEqual(m({ name: "host", domain: "www.example.com", path: "/app" }), true, "host-only: no leading dot");
+  assert.strictEqual(m({ name: "part", domain: ".example.com", path: "/", partitionKey: "https://other.example" }), true, "the partition is ignored (a doubt hides)");
+  assert.strictEqual(m({ name: "sid", domain: "example.com", path: "/" }), false, "a host-only twin is a different cookie");
+  assert.strictEqual(m({ name: "host", domain: "www.example.com", path: "/" }), false, "another path");
+  assert.strictEqual(m({ name: "brave-own", domain: ".example.com", path: "/" }), false, "Brave's own cookie");
+  assert.strictEqual(m(null), false);
+  // Chrome deletes one: no longer managed
+  await imp.delta([{ removed: true, cause: "explicit", cookie: ck() }]);
+  assert.strictEqual(imp.managedMatcher()({ name: "sid", domain: ".example.com", path: "/" }), false);
+});
+
+test("importer: the owner's always-allow list lets a keyword-held domain in broker-side, never a denied one", async () => {
+  const policy = require("../../extensions/cookie-bridge/policy.js");
+  const { allow } = policy.parseAllowList("pay.example.com, chase.com");
+  const { imp } = make({ allow });
+  const r = await imp.full("b1", [
+    ck({ domain: ".pay.example.com" }),
+    ck({ domain: "checkout.pay.example.com", hostOnly: true, name: "h" }),
+    ck({ domain: ".chase.com", name: "bank" }),
+    ck({ domain: ".mybank.example", name: "held" }),
+  ], true);
+  assert.strictEqual(r.applied, 2);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.domain, x.reason]), [["chase.com", "deny:finance"], ["mybank.example", "hold:keyword"]]);
+  assert.deepStrictEqual(imp.status().allow, ["pay.example.com", "chase.com"], "broker:status shows the list it read");
 });

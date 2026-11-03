@@ -105,7 +105,8 @@ module.exports = { serveControl, requestControl, ctlMac };
 //   {id, ctl:"cookies.full", cookies, last} | {id, ctl:"cookies.delta", changes}
 //   → {"bmr":"ctl", id, ok:true, applied, rejected:[{domain, reason, count}]} | {…, ok:false, error}
 // A bridge connection is never an MCP session (main.js), and only one is
-// served at a time. Cookie values are never echoed back.
+// served at a time. Cookie values are never echoed back, and error text
+// passes through W2G's redact() (the CDP secret never leaves the broker).
 
 const BRIDGE_COMMANDS = Object.freeze(["cookies.full", "cookies.delta"]);
 
@@ -119,6 +120,7 @@ const bridgeMac = (key, nonce, challenge) => crypto.createHmac("sha256", key).up
  */
 async function serveBridge(sock, hello, rest, key, open) {
   const { readLines } = require("../cookie-bridge/line-channel.js");
+  const { redact } = require("./cdp-proxy.js");
   const refuse = (obj) => sock.end(`${JSON.stringify({ bmr: "ctl", ok: false, ...obj })}\n`, () => sock.destroy());
   const challenge = crypto.randomBytes(16).toString("hex");
   if (rest.length) sock.unshift(rest);
@@ -138,7 +140,7 @@ async function serveBridge(sock, hello, rest, key, open) {
   try {
     handlers = open();
   } catch (e) {
-    refuse({ error: e.message, code: e.code });
+    refuse({ error: redact(e.message), code: e.code });
     return;
   }
   const reply = (obj) => { if (!sock.destroyed) sock.write(`${JSON.stringify({ bmr: "ctl", ...obj })}\n`); };
@@ -153,7 +155,7 @@ async function serveBridge(sock, hello, rest, key, open) {
     try {
       reply({ id, ok: true, ...(await handlers[cmd](msg)) });
     } catch (e) {
-      reply({ id, ok: false, error: e.message });
+      reply({ id, ok: false, error: redact(e && e.message !== undefined ? e.message : e) });
     }
   };
   // one request at a time: the socket stays paused while one is handled

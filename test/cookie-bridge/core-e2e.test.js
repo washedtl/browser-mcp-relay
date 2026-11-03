@@ -143,3 +143,121 @@ test("e2e: approved extension → real host process → real broker pipe: allowe
   assert.ok(fs.existsSync(hostLog) && !fs.readFileSync(hostLog, "utf8").includes(SECRET));
   assert.ok(!JSON.stringify(chrome.storage.data).includes(SECRET), "a cookie value reached chrome.storage");
 });
+
+// ── v0.4.1: the same chain into a REAL Brave, as the broker runs it since W2G ──
+// extension bridge-core → real host process → test broker (in-process
+// startBroker with the DEFAULT cookie-bridge importer: real cdp-client over
+// the CdpProxy's secret ws URL) → real BraveSupervisor on
+// --remote-debugging-pipe (temp profile, headless unless BMR_TEST_HEADFUL=1).
+// Temp LOCALAPPDATA (key, state, host log), a private pipe; no real profile,
+// registry or Chrome is touched. Only the Brave this test's supervisor
+// started is closed.
+
+const BRAVE = require("../fixtures/temp-brave.js");
+const REAL_SKIP = SKIP || (!BRAVE.braveAvailable() && "needs Windows + Brave");
+
+test("e2e real Brave: approved allowed cookies reach the pipe-backed Brave through the secret URL, deny/hold never do, a deletion is mirrored, and a relaunch re-applies", { skip: REAL_SKIP, timeout: 180_000 }, async (t) => {
+  const core = require(path.join(EXT_DIR, "bridge-core.js"));
+  const { classify } = require(path.join(EXT_DIR, "policy.js"));
+  const { startBroker } = require("../../src/broker/main.js");
+  const { keyFileFor, loadOrCreateKey } = require("../../src/broker/pipe-server.js");
+  const { requestControl } = require("../../src/broker/control.js");
+  const { BraveSupervisor } = require("../../src/broker/brave-supervisor.js");
+  const { openBrowserCdp } = require("../../src/cookie-bridge/cdp-client.js");
+  const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
+  const fakes = require("../fixtures/broker-fakes.js");
+  const { until } = fakes;
+
+  // One cleanup, in order (t.after hooks run first-registered first): the
+  // bridge and its host, the session, the broker, OUR Brave, then the files.
+  const cleanup = [];
+  t.after(async () => {
+    for (const step of cleanup.reverse()) {
+      try { await step(); } catch (e) { process.stderr.write(`[e2e real Brave] cleanup: ${e.message}\n`); }
+    }
+  });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-w2f-e2e-real-"));
+  cleanup.push(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 300 }));
+  const env = { LOCALAPPDATA: home, XDG_STATE_HOME: home };
+  const keyFile = keyFileFor(env);
+  const key = loadOrCreateKey(keyFile);
+  const pipe = fakes.testPipe("w2f-e2e-real");
+  const logs = [];
+  let sup = null;
+  const handle = await startBroker({
+    pipe, profileDir: path.join(home, "profile"), env: {}, keyFile, log: (m) => logs.push(m),
+    idle: { exitMs: 120_000, browserMs: 120_000 }, onExit: () => {},
+    deps: {
+      createSupervisor: ({ profileDir, log }) => (sup = new BraveSupervisor({ profileDir, headless: !BRAVE.headfulRequested(), log: (m) => log(`supervisor: ${m}`) })),
+      upstreamModule: () => fakes.fakeUpstreamModule(),
+      windowPages: () => fakes.fakeWindowPages(),
+      ownTools: () => [],
+      toolContext: fakes.fakeToolContextModule,
+      loadCatalog: async () => fakes.FAKE_CATALOG,
+      // cookieBridge: the default (real importer + cdp-client on handle.cdpUrl)
+    },
+  });
+  cleanup.push(async () => { if (sup) await sup.closeGracefully(); });
+  cleanup.push(() => handle.close("test done"));
+  const proxySecret = handle.cdpUrl.split("/")[3];
+  assert.match(proxySecret, /^[0-9a-f]{64}$/);
+  assert.strictEqual(new URL(handle.cdpUrl).protocol, "ws:", "W2G: the only CDP endpoint is the proxy's ws URL");
+
+  /** Brave's cookies, read through the proxy as any CDP client would. */
+  const braveNames = async () => {
+    const cdp = await openBrowserCdp(handle.cdpUrl);
+    try {
+      return (await cdp.send("Storage.getCookies", {})).cookies.map((c) => `${c.name}@${c.domain}`).sort();
+    } finally {
+      cdp.close();
+    }
+  };
+  // a tool call: ensureBrave → the real supervisor (launch / relaunch) → braveReady
+  const client = new Client({ name: "w2f-e2e-real", version: "0" });
+  await client.connect(new fakes.SocketClientTransport(pipe, { hello: { key } }));
+  cleanup.push(() => client.close());
+  const toolCall = async () => assert.ok(!(await client.callTool({ name: "content_get-as-text", arguments: {} })).isError);
+
+  const sid = chromeCookie(".bmr-e2e.example", "sid");
+  const sess = chromeCookie("app.bmr-e2e.example", "sess", { session: true, expirationDate: undefined, sameSite: "no_restriction" });
+  const chrome = fakeChrome([sid, sess, chromeCookie(".chase.com", "bank"), chromeCookie(".mybank.example", "held")],
+    { approved: true, approvedAt: 1, paused: false, overrides: {}, reviewed: {} });
+  const hosts = [];
+  cleanup.push(() => { for (const h of hosts) try { h.kill(); } catch { /* gone */ } });
+  const bridge = core.createBridge({
+    cookies: chrome.cookies, storage: chrome.storage, action: chrome.action, alarms: chrome.alarms, classify,
+    connectNative: nativeConnector({ ...env, BROWSER_RELAY_BROKER_PIPE: pipe }, hosts),
+    timers: { setTimeout, clearTimeout }, now: Date.now, log: () => {},
+  });
+  cleanup.push(() => bridge.stop());
+  await bridge.ready;
+
+  // 1. Brave down: the full sync is held by the broker; the first tool call
+  //    launches Brave and the cookies are in before the tool runs
+  const status = async () => (await requestControl({ pipe, key, cmd: "status" })).status.cookieBridge;
+  await until(async () => (await status()).cookies === 2, 30_000, `the full sync to reach the broker (log: ${logs.slice(-5).join(" | ")})`);
+  assert.strictEqual(sup.isUp(), false, "the bridge never launches Brave");
+  await toolCall();
+  assert.deepStrictEqual(await braveNames(), ["sess@app.bmr-e2e.example", "sid@.bmr-e2e.example"], "deny (chase.com) and hold (mybank.example) never reach Brave");
+
+  // 2. Chrome deletes sid (Brave up): mirrored at once
+  chrome.jar.splice(chrome.jar.indexOf(sid), 1);
+  chrome.cookies.change({ removed: true, cause: "explicit", cookie: sid });
+  await until(async () => !(await braveNames()).includes("sid@.bmr-e2e.example"), 20_000, "the deletion to be mirrored into Brave");
+
+  // 3. Brave relaunches (graceful close, next tool call): the session cookie,
+  //    which no restart keeps, is re-applied; the deleted one stays gone
+  const firstPid = sup.pid;
+  await sup.closeGracefully();
+  await toolCall();
+  assert.notStrictEqual(sup.pid, firstPid, "a new Brave");
+  assert.deepStrictEqual(await braveNames(), ["sess@app.bmr-e2e.example"]);
+  assert.deepStrictEqual(await status(), { ...(await status()), bridges: 1, cookies: 1, managed: 1 });
+
+  // never a value or the CDP secret in the broker log, the host log, chrome.storage or status
+  const hostLog = path.join(path.dirname(keyFile), "cookie-bridge.log");
+  const everything = [logs.join("\n"), fs.readFileSync(hostLog, "utf8"), JSON.stringify(chrome.storage.data), JSON.stringify(await status())].join("\n");
+  assert.ok(!everything.includes(SECRET), "a cookie value leaked");
+  assert.ok(!everything.includes(proxySecret), "the CDP secret leaked");
+  assert.ok(logs.some((l) => /cookie bridge: applied 2 synced cookie/.test(l)), logs.join("\n"));
+});

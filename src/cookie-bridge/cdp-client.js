@@ -1,12 +1,17 @@
-// cdp-client.js — a minimal CDP client on Brave's browser-level endpoint,
-// for the cookie bridge's Storage.setCookies calls (no Playwright: one
-// websocket, request/response by id). Errors carry the CDP message only,
+// cdp-client.js — a minimal CDP client on the broker's browser-level
+// endpoint, for the cookie bridge's Storage.setCookies calls (no Playwright:
+// one websocket, request/response by id). Errors carry the CDP message only,
 // never the params (they hold cookie values).
 //
-// The websocket always goes to the cdpUrl's own host:port (only the path
-// comes from /json/version), and a call that times out closes the
-// connection: a hung Brave fails the rest of the work at once instead of
-// costing a timeout per call.
+// W2G: the broker's Brave has no TCP debugging port. The only endpoint is
+// the broker's CdpProxy at ws://127.0.0.1:<port>/<secret>/devtools/browser,
+// which the broker hands the importer in-process. That URL is connected to
+// as it is (no /json discovery: the proxy serves none), only on loopback,
+// and it never appears in an error: the secret in its path is a bearer
+// token (the broker's log redacts it too, see cdp-proxy.js redact()).
+//
+// A call that times out closes the connection: a hung Brave fails the rest
+// of the work at once instead of costing a timeout per call.
 
 "use strict";
 
@@ -14,39 +19,52 @@ const WebSocket = require("ws");
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_CALL_TIMEOUT_MS = 10_000;
+// What errors call the endpoint: never the URL (it carries the secret).
+const LABEL = "the broker's CDP endpoint";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
 /**
- * @param {string} cdpUrl — http://127.0.0.1:<port>
+ * @param {string} wsUrl — the broker's CDP URL (CdpProxy.wsUrl): ws://127.0.0.1:<port>/<secret>/devtools/browser
  * @returns {Promise<{send: (method: string, params?: object) => Promise<object>, close: () => void, closed: boolean}>}
  */
-async function openBrowserCdp(cdpUrl, { connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS } = {}) {
-  let version;
+async function openBrowserCdp(wsUrl, { connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS } = {}) {
+  let url;
   try {
-    const res = await fetch(`${cdpUrl}/json/version`, { signal: AbortSignal.timeout(connectTimeoutMs) });
-    version = res.ok ? await res.json() : null;
-  } catch (e) {
-    throw new Error(`no CDP endpoint at ${cdpUrl} (${e.name === "TimeoutError" ? "timed out" : "fetch failed"})`);
-  }
-  if (!version || typeof version.webSocketDebuggerUrl !== "string") throw new Error(`no CDP browser endpoint at ${cdpUrl}`);
-  let wsPath;
-  try {
-    wsPath = new URL(version.webSocketDebuggerUrl).pathname;
+    url = new URL(String(wsUrl));
   } catch {
-    throw new Error(`no CDP browser endpoint at ${cdpUrl}`);
+    throw new Error(`${LABEL} is not a valid URL`);
   }
-  const ws = new WebSocket(`ws://${new URL(cdpUrl).host}${wsPath}`, { perMessageDeflate: false });
-  return wrapWebSocket(ws, { label: cdpUrl, connectTimeoutMs, callTimeoutMs });
+  // the proxy listens on 127.0.0.1 only; anything else is a wiring mistake
+  if (url.protocol !== "ws:" || !LOOPBACK_HOSTS.has(url.hostname) || !url.port) {
+    throw new Error(`${LABEL} must be a ws:// URL on 127.0.0.1 with a port`);
+  }
+  // No Origin header (the proxy refuses any upgrade that has one) and no compression.
+  const ws = new WebSocket(url.href, { perMessageDeflate: false });
+  return wrapWebSocket(ws, { connectTimeoutMs, callTimeoutMs });
 }
 
 /**
- * A CDP connection over an already-created browser-level websocket (also the
- * seam for a broker that reaches Brave some other way than a TCP port).
+ * A CDP connection over an already-created browser-level websocket.
+ * `label` names the endpoint in errors: never pass a URL that carries a secret.
  */
-async function wrapWebSocket(ws, { label = "CDP", connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS } = {}) {
+async function wrapWebSocket(ws, { label = LABEL, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS } = {}) {
+  // terminate() during the handshake emits 'error' too: never leave one unheard
+  ws.on("error", () => {});
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { ws.terminate(); reject(new Error(`CDP websocket at ${label} did not open within ${connectTimeoutMs} ms`)); }, connectTimeoutMs);
-    ws.once("open", () => { clearTimeout(timer); resolve(); });
-    ws.once("error", (e) => { clearTimeout(timer); reject(new Error(`CDP websocket at ${label}: ${e.code || "connect failed"}`)); });
+    let settled = false;
+    const fail = (why) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.terminate(); } catch { /* not open */ }
+      reject(new Error(`${label}: ${why}`));
+    };
+    const timer = setTimeout(() => fail(`the websocket did not open within ${connectTimeoutMs} ms`), connectTimeoutMs);
+    ws.once("open", () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); });
+    // The status only: 503 = Brave is down, 403 = refused (wrong secret, Origin, Host).
+    ws.once("unexpected-response", (_req, res) => fail(`HTTP ${res.statusCode}${res.statusCode === 503 ? " (Brave is not running)" : ""}`));
+    // e.code only: ws error messages can quote the URL
+    ws.once("error", (e) => fail(e.code || "connect failed"));
   });
 
   let nextId = 1;
@@ -90,8 +108,7 @@ async function wrapWebSocket(ws, { label = "CDP", connectTimeoutMs = DEFAULT_CON
     if (msg.error) p.reject(new Error(`${p.method}: ${msg.error.message || "CDP error"}`));
     else p.resolve(msg.result || {});
   });
-  ws.on("close", shut);
-  ws.on("error", () => { /* 'close' follows */ });
+  ws.on("close", shut); // after an 'error' too
   return conn;
 }
 
