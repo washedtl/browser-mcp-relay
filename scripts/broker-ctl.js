@@ -4,8 +4,9 @@
 //   npm run broker:status   what it serves: sessions and their tabs, Brave
 //                           (up, pid), pipe, profile, memory
 //   npm run broker:stop     close Brave gracefully (cookies flushed) and exit;
-//                           open Claude sessions start a fresh broker on
-//                           their next call: this is how to restart it
+//                           it stays stopped until a session's next tool
+//                           call starts a fresh one (with that session's
+//                           settings): this is how to restart it
 //
 // Same pipe and key as the shim (env and local-config.json); the request
 // carries an HMAC of this user's broker key and the broker proves it back
@@ -70,7 +71,7 @@ async function run({
     }
     await new Promise((r) => setTimeout(r, 200));
   }
-  out(`stopped in ${Date.now() - t0} ms. Open sessions start a new broker on their next call.`);
+  out(`stopped in ${Date.now() - t0} ms. It stays stopped until a session's next tool call starts a new one, with that session's settings.`);
   return 0;
 }
 

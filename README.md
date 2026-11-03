@@ -103,15 +103,15 @@ For inspector details (in-process vs standalone modes, security defenses, screen
 2. The first shim starts a shared **broker** in the background, de-elevated when the session is elevated. The others join it over a per-user named pipe.
 3. The broker runs one Brave on one persistent profile. Logins persist, and every session shares them live.
 4. Each session gets its own window. Parallel subagents call `tabs_new` and pass the returned `tabId` so they don't share a tab.
-5. If Brave crashes, the next call relaunches it. If the broker dies, the shims start a new one. Both happen without restarting the client. Brave closes after 20 idle minutes, and the broker exits 10 minutes after its last session.
+5. If Brave crashes, the next call relaunches it. If the broker dies, the next call starts a new one. Both happen without restarting the client. Brave closes after 20 idle minutes, and the broker exits 10 minutes after its last session.
 
 On first start, the broker profile is seeded once from your freshest legacy pool profile, when you have one.
 
 **Recovery:**
 - `npm run broker:status` shows sessions, tabs and Brave.
-- `npm run broker:stop` closes Brave cleanly and stops the broker. Open sessions start a fresh one on their next call.
+- `npm run broker:stop` closes Brave cleanly and stops the broker. It stays stopped until a session's next tool call starts a fresh one, with that session's settings.
 - The log is `%LOCALAPPDATA%\browser-mcp-relay\broker\broker.log`.
-- **Fallback:** set `BROWSER_RELAY_MODE=legacy` (in the MCP server's `env`, or in `local-config.json`) to get the old one-relay-and-one-Brave-per-session model back. On macOS and Linux, legacy stays the default until the broker's unix-socket paths are verified.
+- **Fallback:** set `BROWSER_RELAY_MODE=legacy` (in the MCP server's `env`, or in `local-config.json`) to get the old one-relay-and-one-Brave-per-session model back. On macOS and Linux, legacy stays the default: the broker's unix-socket code ships but is untested.
 
 The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **21 of its own** into a single 72-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
 

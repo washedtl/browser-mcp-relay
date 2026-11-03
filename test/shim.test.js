@@ -130,7 +130,6 @@ function shimHarness(t, pipe, opts = {}) {
     connectTimeoutMs: opts.connectTimeoutMs || 5000,
     respawnAfterMs: opts.respawnAfterMs || 5000,
     ...(opts.pipeDirProblem ? { pipeDirProblem: opts.pipeDirProblem } : {}),
-    ...(opts.keyRestoreWaitMs ? { keyRestoreWaitMs: opts.keyRestoreWaitMs } : {}),
   });
   if (opts.staleKey) shim.key = opts.staleKey; // as if read before the key file was recreated
   shim.start();
@@ -223,7 +222,7 @@ test("broker unreachable past the deadline: queued requests get errors; the shim
 
 // ─────────────────────── unit: broker restart recovery ───────────────────────
 
-test("broker lost: in-flight requests fail with -32603, initialize is replayed, its reply swallowed", async (t) => {
+test("broker lost: in-flight requests fail with -32603; the next client message reconnects, initialize is replayed, its reply swallowed", async (t) => {
   const pipe = testPipe("lost");
   const fb = await fakeBroker(t, pipe);
   const h = shimHarness(t, pipe);
@@ -232,10 +231,13 @@ test("broker lost: in-flight requests fail with -32603, initialize is replayed, 
   h.send(INITIALIZED);
   h.send({ jsonrpc: "2.0", id: 2, method: "slow", params: {} });
   await until(() => fb.received.some((r) => r.msg.method === "slow"), 3000, "slow to reach the broker");
-  fb.dropAll(); // broker died; the pipe still exists, so the shim reconnects at once
+  fb.dropAll(); // broker died; the pipe still exists
 
   const failed = await h.response(2);
   assert.deepStrictEqual(failed.error, { code: -32603, message: "browser broker restarted; please retry the call" });
+  await sleep(300);
+  assert.strictEqual(fb.conns.length, 1, "no reconnect until the client sends something (a stopped broker stays stopped)");
+  h.send({ jsonrpc: "2.0", id: 3, method: "echo", params: { after: true } });
   await until(() => fb.received.filter((r) => r.conn === 1).length >= 2, 3000, "the replay");
   const replay = fb.received.filter((r) => r.conn === 1).map((r) => r.msg);
   assert.strictEqual(replay[0].method, "initialize");
@@ -243,7 +245,6 @@ test("broker lost: in-flight requests fail with -32603, initialize is replayed, 
   assert.deepStrictEqual(replay[0].params, INIT.params, "same client capabilities");
   assert.deepStrictEqual(replay[1], INITIALIZED);
   await until(() => h.lines.find((l) => l.method === "notifications/tools/list_changed"), 3000, "list_changed");
-  h.send({ jsonrpc: "2.0", id: 3, method: "echo", params: { after: true } });
   assert.deepStrictEqual((await h.response(3)).result, { echo: { after: true } });
   assert.strictEqual(h.lines.filter((l) => l.result && l.result.serverInfo).length, 1, "the client saw one initialize result");
 });
@@ -290,8 +291,10 @@ test("server→client requests and the client's answers pass through and are not
   h.send({ jsonrpc: "2.0", id: 99, result: { action: "accept" } });
   await until(() => fb.received.find((r) => r.msg.id === 99 && r.msg.result), 3000, "the answer at the broker");
   fb.dropAll();
+  await until(() => !h.shim.sock, 3000, "the shim to notice the drop");
+  h.send({ jsonrpc: "2.0", id: 100, method: "echo", params: {} }); // reconnects
   await until(() => fb.conns.length === 2, 3000, "reconnect");
-  await sleep(50);
+  await h.response(100);
   assert.ok(!h.lines.some((l) => l.id === 99 && l.error), "no synthesized error for a server request");
 });
 
@@ -324,7 +327,7 @@ test("hello: the shim sends nothing of the session's to a pipe owner without thi
   h.send(INIT);
   const r = await h.response(1);
   assert.match(r.error.message, /failed authentication/);
-  assert.match(r.error.message, /squatting/);
+  assert.match(r.error.message, /another program holds the pipe name/);
   assert.strictEqual(fb.hellos.length, 2, "it saw only hellos (a second try after re-reading the key file)");
   assert.deepStrictEqual(fb.received, [], "no JSON-RPC message reached the squatter");
   assert.strictEqual(h.launches.length, 0);
@@ -342,6 +345,8 @@ test("hello: carries the session's KEYED settings hash, and reconnect=true only 
   assert.strictEqual(fb.hellos[0].msg.reconnect, false);
   assert.match(fb.hellos[0].msg.nonce, /^[0-9a-f]{32}$/);
   fb.dropAll();
+  await until(() => !h.shim.sock, 3000, "the shim to notice the drop");
+  h.send({ jsonrpc: "2.0", id: 2, method: "echo", params: {} }); // the next message reconnects
   await until(() => fb.hellos.length === 2, 5000, "the reconnect hello");
   assert.strictEqual(fb.hellos[1].msg.reconnect, true, "the new broker marks this session's main tab reset");
   assert.notStrictEqual(fb.hellos[1].msg.nonce, fb.hellos[0].msg.nonce);
@@ -378,7 +383,7 @@ test("broker warning (e.g. it runs elevated): on the shim's stderr and once in t
   assert.strictEqual(second.result.content.length, 1, "once per session");
 });
 
-test("reconnect backoff: a broker that drops every connection at once is not hammered", async (t) => {
+test("lazy reconnect (V1-2): a broker that drops every connection is reached once per client message, never in a loop", async (t) => {
   const pipe = testPipe("spin");
   let accepted = 0;
   const fb = await fakeBroker(t, pipe);
@@ -399,9 +404,28 @@ test("reconnect backoff: a broker that drops every connection at once is not ham
   });
   fb.dropAll();
   const before = accepted;
-  await sleep(1500);
-  const cycles = accepted - before;
-  assert.ok(cycles >= 2 && cycles <= 8, `expected a backed-off handful of reconnects in 1.5 s, got ${cycles}`);
+  await sleep(800);
+  assert.strictEqual(accepted - before, 0, "no reconnect on its own");
+  h.send({ jsonrpc: "2.0", id: 2, method: "echo", params: {} });
+  const r = await h.response(2);
+  assert.match(r.error.message, /restarted/, "the dropped request fails; the session stays usable");
+  await sleep(500);
+  assert.strictEqual(accepted - before, 1, "one connection for one message");
+});
+
+test("V2: a cancelled request is no longer in flight (no bogus 'restarted' error for it after a restart)", async (t) => {
+  const pipe = testPipe("cancel");
+  const fb = await fakeBroker(t, pipe);
+  const h = shimHarness(t, pipe);
+  h.send(INIT);
+  await h.response(1);
+  h.send({ jsonrpc: "2.0", id: 7, method: "slow", params: {} });
+  h.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7, reason: "user" } });
+  await until(() => fb.received.some((r) => r.msg.method === "notifications/cancelled"), 3000, "the cancel");
+  fb.dropAll();
+  await sleep(300);
+  assert.ok(!h.lines.some((l) => l.id === 7), "nothing synthesized for the cancelled request");
+  assert.strictEqual(h.shim.inflight.size, 0);
 });
 
 test("line splitter: a 15 MB line in 8 KB chunks is split in linear time", () => {
@@ -609,6 +633,8 @@ test("processes: 3 shims racing a cold start leave exactly one broker, and all t
   await until(() => run.brokerPids("started").every((p) => run.brokerPids("winner").includes(p) || run.brokerPids("loser").includes(p)), 5000, "every started broker to settle");
   assert.strictEqual(run.brokerPids("winner").length, 1);
   assert.deepStrictEqual(run.brokerPids("winner"), [pids[0].pid]);
+  // a loser writes its marker, then exits: wait for the exit itself
+  await until(() => run.brokerPids("loser").every((p) => !pidAlive(p)), 5000, "the losing brokers to exit");
   const alive = run.brokerPids("started").filter(pidAlive);
   assert.deepStrictEqual(alive, [pids[0].pid], "the losers exited");
   t.diagnostic(`cold connect ms (initialize answered): ${cs.map((c) => c.connectMs).join(", ")}; brokers started: ${run.brokerPids("started").length}`);
@@ -722,31 +748,31 @@ function missingKeyFile(t) {
   return path.join(dir, "broker.key");
 }
 
-test("W2: a broker answers but the key file is missing: no key is created; the shim waits for the broker to restore it, then talks", async (t) => {
-  const pipe = testPipe("w2-restore");
+test("W2: a broker answers but the key file is missing: no key is made; the session gets the one clear error at once, and talks once the broker restored the key", async (t) => {
+  const pipe = testPipe("w2-missing");
   const fb = await fakeBroker(t, pipe);
   const keyFile = missingKeyFile(t);
-  const h = shimHarness(t, pipe, { keyFile, keyRestoreWaitMs: 5000 });
+  const h = shimHarness(t, pipe, { keyFile });
   h.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
-  await sleep(400);
+  const r = await h.response(1);
+  assert.match(r.error.message, /key file .* is missing while a broker runs/);
+  assert.match(r.error.message, /restores a missing key file within ~30 s, so retry then; if it persists, run `npm run broker:stop` \(close sessions first\)/);
   assert.strictEqual(fs.existsSync(keyFile), false, "the shim made no key of its own");
-  assert.deepStrictEqual(fb.hellos, [], "nothing sent before the key is back");
+  assert.deepStrictEqual(fb.hellos, [], "nothing sent without the key");
   assert.deepStrictEqual(h.launches, [], "a broker answers: no launch");
-  fs.writeFileSync(keyFile, KEY.toString("hex")); // the broker restores it (restoreKeyFile)
-  await until(() => fb.received.some((r) => r.msg && r.msg.id === 1), 5000, "the request to reach the broker");
-  assert.strictEqual(fs.readFileSync(keyFile, "utf8"), KEY.toString("hex"));
-  assert.ok(h.logs.some((l) => /key file .* is missing/.test(l)), h.logs.join("\n"));
+  fs.writeFileSync(keyFile, KEY.toString("hex")); // the broker restores it (main.js restoreKeyFile)
+  h.send({ jsonrpc: "2.0", id: 2, method: "echo", params: {} }); // the retry
+  assert.ok((await h.response(2)).result, "talks with the restored key");
 });
 
-test("W2: the key never comes back: the session gets an error after the wait, and still no key is created", async (t) => {
-  const pipe = testPipe("w2-never");
-  await fakeBroker(t, pipe);
-  const keyFile = missingKeyFile(t);
-  const h = shimHarness(t, pipe, { keyFile, keyRestoreWaitMs: 600, connectTimeoutMs: 300 });
-  h.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-  const r = await h.response(2);
-  assert.match(r.error.message, /key file .* is still missing/);
-  assert.strictEqual(fs.existsSync(keyFile), false);
+test("W2: a key the pipe's owner doesn't match is re-read once, then the same clear error", async (t) => {
+  const pipe = testPipe("w2-eauth");
+  await fakeBroker(t, pipe, { key: Buffer.alloc(32, 5) }); // a broker with another key
+  const h = shimHarness(t, pipe);
+  h.send({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+  const r = await h.response(3);
+  assert.match(r.error.message, /the broker key changed or is missing/);
+  assert.match(r.error.message, /BROWSER_RELAY_BROKER_PIPE/);
 });
 
 test("W2: no broker and no key: the key is created right before the launch, not earlier", async (t) => {
@@ -776,6 +802,24 @@ test("W3: reconnecting to a broker without a warning clears the old one", async 
   assert.strictEqual(h.shim.warning, "the browser broker runs elevated");
   await first.close();
   await fakeBroker(t, pipe); // the restarted broker runs de-elevated: no warning
+  await until(() => !h.shim.sock, 3000, "the shim to notice the drop");
   h.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
   await until(() => h.shim.sock && h.shim.warning === null, 5000, "the warning to clear on reconnect");
+});
+
+test("processes (V1-2): broker:stop with a session open really stops the broker; the session's next call starts a new one", async (t) => {
+  const run = processRun(t, "stop");
+  const c = await shimClient(t, run);
+  const { pid: first } = await callJson(c, "fixture_pid");
+  const { requestControl } = require("../src/broker/control.js");
+  const key = Buffer.from(fs.readFileSync(path.join(run.markerDir, "broker.key"), "utf8").trim(), "hex");
+  const r = await requestControl({ pipe: run.pipe, key, cmd: "stop" });
+  assert.strictEqual(r.ok, true);
+  await until(() => !pidAlive(first), 10_000, "the broker to exit");
+  await sleep(4000); // the reviewer measured a relaunch 3.9 s after stop
+  assert.deepStrictEqual(run.brokerPids().filter(pidAlive), [], "nothing relaunched it while the session sat idle");
+  assert.strictEqual(run.brokerPids().length, 1, "no broker started at all");
+  const { pid: second } = await callJson(c, "fixture_pid"); // the next call
+  assert.notStrictEqual(second, first);
+  assert.ok(pidAlive(second));
 });

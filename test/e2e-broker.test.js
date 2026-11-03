@@ -222,7 +222,7 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     assert.ok(after.brave.up && after.brave.pid !== before.brave.pid);
   });
 
-  await t.test("broker killed → the shims start a new one and the next call works", async () => {
+  await t.test("broker killed → the next call starts a new one and works; the other sessions reconnect on their next message", async () => {
     const before = await status();
     killTree(before.pid); // its Brave goes with it (job object)
     await until(() => !pidAlive(before.pid), 10_000, "the broker to die");
@@ -246,7 +246,10 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     await textOfPage(B(), {}, /page after-broker-kill/);
     const after = await status();
     assert.notStrictEqual(after.pid, before.pid);
-    await until(async () => (await status()).connections.length === 3, 15_000, "all 3 shims to reconnect");
+    // lazy reconnect (V1-2): only the session that called is back
+    assert.strictEqual(after.connections.length, 1, `only B reconnected: ${JSON.stringify(after.connections)}`);
+    for (const s of [A(), C()]) await s.client.listTools();
+    await until(async () => (await status()).connections.length === 3, 15_000, "A and C to reconnect");
     assert.ok(!pidAlive(before.brave.pid), "the old broker's Brave died with it");
   });
 

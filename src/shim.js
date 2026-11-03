@@ -17,13 +17,14 @@
 //   - Before forwarding anything, the shim checks that the pipe's owner knows
 //     this user's broker key (HMAC over a nonce, broker/pipe-server.js): a
 //     squatter on the predictable pipe name gets nothing.
-//   - Broker connection lost (crash, kill): reconnect (restarting the broker
-//     if needed), replay the client's initialize + notifications/initialized
-//     under the shim's own id and swallow that reply, then tell the client
-//     tools/list_changed. Requests that were in flight get a JSON-RPC error
-//     ("browser broker restarted; please retry the call"); an initialize
-//     still in flight is re-sent instead. A connection that dies right away
-//     (broker shutting down) backs off before the next try.
+//   - Broker connection lost (crash, kill, broker:stop): requests that were
+//     in flight get a JSON-RPC error ("browser broker restarted; please
+//     retry the call"). The shim reconnects LAZILY, on the client's next
+//     message (restarting the broker if needed, with this session's env), so
+//     a stopped broker stays stopped; only an initialize still waiting for
+//     its answer reconnects at once (it is re-sent). On reconnect it replays
+//     the client's initialize + notifications/initialized under its own id,
+//     swallows that reply, and tells the client tools/list_changed.
 //   - Broker unreachable: queued requests get an error; the shim stays up and
 //     tries again on the next message, so the session's MCP server survives.
 //
@@ -42,11 +43,10 @@ const BROKER_MAIN = path.join(__dirname, "broker", "main.js");
 const CONNECT_TIMEOUT_MS = 30_000; // a cold broker under load needs a few seconds at most
 const RESPAWN_AFTER_MS = 5_000; // pipe still missing this long after a launch: launch again
 const EXIT_GRACE_MS = 2_000;
-const QUICK_CLOSE_MS = 250; // a connection that dies this fast with no data: back off
-const MAX_RECONNECT_DELAY_MS = 2_000;
-// a running broker puts back a deleted key file within 30 s (main.js KEY_CHECK_MS)
-const KEY_RESTORE_WAIT_MS = 35_000;
 const RESTARTED = "browser broker restarted; please retry the call";
+// the one answer to a key the pipe's owner doesn't match (main.js restores a deleted key file every 30 s)
+const KEY_ADVICE = "the broker key changed or is missing: the running broker restores a missing key file within ~30 s, so retry then; " +
+  "if it persists, run `npm run broker:stop` (close sessions first) and retry. (Or another program holds the pipe name: set BROWSER_RELAY_BROKER_PIPE.)";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -179,11 +179,10 @@ class Shim {
     pipeDirProblem = defaultPipeDirProblem,
     connectTimeoutMs = CONNECT_TIMEOUT_MS,
     respawnAfterMs = RESPAWN_AFTER_MS,
-    keyRestoreWaitMs = KEY_RESTORE_WAIT_MS,
   }) {
     Object.assign(this, {
       pipe, brokerEntry, brokerArgs, keyFile, settingsEnv, input, output, log, exitFn: exit, connectFn: connect,
-      spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs, keyRestoreWaitMs,
+      spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs,
     });
     this.key = null;
     this.warning = null; // from the broker's hello: shown once (stderr + first tool result)
@@ -198,10 +197,6 @@ class Shim {
     this.replayId = null;
     this.replays = 0;
     this.everAttached = false; // a later connection is to a restarted broker
-    this.attachedAt = 0;
-    this.gotData = false;
-    this.reconnectDelay = 0;
-    this.reconnectTimer = null;
     this.ending = false; // the client went away
     this.closed = false;
     this.exited = false;
@@ -220,7 +215,6 @@ class Shim {
     this.closed = true;
     this.ending = true;
     this.exited = true;
-    clearTimeout(this.reconnectTimer);
     if (this.sock) this.sock.destroy();
   }
 
@@ -244,6 +238,8 @@ class Shim {
       if (msg.method === "initialize") this.initMsg = msg;
       else if (msg.method === "notifications/initialized") this.initializedMsg = msg;
       if (msg.id !== undefined && msg.method) this.inflight.set(msg.id, msg.method);
+      // a cancelled request gets no answer: no bogus "restarted" error for it later
+      else if (msg.method === "notifications/cancelled" && msg.params) this.inflight.delete(msg.params.requestId);
     }
     this.sock.write(line + "\n");
   }
@@ -267,8 +263,6 @@ class Shim {
   }
 
   _connect() {
-    clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
     if (this.connecting || this.sock || this.closed) return;
     this.connecting = this._connectOrStart().then(
       (sock) => {
@@ -288,9 +282,7 @@ class Shim {
     let lastLaunch = 0;
     let lastErr = null;
     let keyReloaded = false;
-    let keyWaitSince = 0; // a broker answers but our key file is gone: wait for it to restore it
-    const deadline = () => (keyWaitSince ? Math.max(t0 + this.connectTimeoutMs, keyWaitSince + this.keyRestoreWaitMs) : t0 + this.connectTimeoutMs);
-    for (let attempt = 0; Date.now() < deadline(); attempt++) {
+    for (let attempt = 0; Date.now() - t0 < this.connectTimeoutMs; attempt++) {
       if (this.closed) throw new Error("shim closed");
       // waiting won't fix it, and launching a broker there would be refused too
       const problem = this.pipeDirProblem(this.pipe);
@@ -299,24 +291,13 @@ class Shim {
         return await this._connectOnce();
       } catch (e) {
         if (e.code === "EKEY") throw e;
-        if (e.code === "ENOKEY") {
-          if (!keyWaitSince) {
-            keyWaitSince = Date.now();
-            this.log(e.message);
-          }
-          lastErr = e;
-          await sleep(250);
-          continue;
-        }
         if (e.code === "EAUTH" && !keyReloaded) {
           // our cached key may be stale (the key file was recreated): read it again, once
           keyReloaded = true;
           this.key = null;
           continue;
         }
-        if (e.code === "EAUTH") {
-          throw new Error(`refusing ${this.pipe}: ${e.message}; another program may be squatting the pipe name (close it, or set BROWSER_RELAY_BROKER_PIPE)`);
-        }
+        if (e.code === "EAUTH" || e.code === "ENOKEY") throw new Error(`${e.message}; ${KEY_ADVICE}`);
         lastErr = e;
         const missing = e.code === "ENOENT" || e.code === "ECONNREFUSED";
         if (missing && Date.now() - lastLaunch >= this.respawnAfterMs) {
@@ -332,9 +313,6 @@ class Shim {
         }
         await sleep(Math.min(25 + attempt * 10, 200));
       }
-    }
-    if (lastErr && lastErr.code === "ENOKEY") {
-      throw new Error(`the broker key file ${this.keyFile} is still missing after ${Math.round(this.keyRestoreWaitMs / 1000)} s while a broker runs on ${this.pipe}; run npm run broker:stop and retry`);
     }
     throw new Error(`no broker answered on ${this.pipe} within ${this.connectTimeoutMs} ms (${lastErr ? lastErr.code || lastErr.message : "timeout"})`);
   }
@@ -365,7 +343,7 @@ class Shim {
       // a broker answers, but this user's key file is gone. The broker puts
       // it back; a key made here would not be the broker's.
       s.destroy();
-      throw Object.assign(new Error(`the broker key file ${this.keyFile} is missing; waiting for the running broker to restore it`), { code: "ENOKEY" });
+      throw Object.assign(new Error(`the broker key file ${this.keyFile} is missing while a broker runs on ${this.pipe}`), { code: "ENOKEY" });
     }
     try {
       // nothing of the session's goes out before the owner proves it is ours
@@ -388,9 +366,6 @@ class Shim {
   _attach(sock) {
     this.sock = sock;
     this.everAttached = true;
-    this.attachedAt = Date.now();
-    this.gotData = false;
-    sock.on("data", () => { this.gotData = true; });
     onLines(sock, (line) => this._fromBroker(line));
     sock.on("error", () => { /* 'close' follows */ });
     sock.on("close", () => this._brokerGone(sock));
@@ -424,16 +399,9 @@ class Shim {
       else this._toClient({ jsonrpc: "2.0", id, error: { code: -32603, message: RESTARTED } });
     }
     this.inflight.clear();
-    // dropped right away with nothing said (e.g. a broker shutting down):
-    // don't spin connect/destroy, back off 250 ms → 2 s
-    const quick = Date.now() - this.attachedAt < QUICK_CLOSE_MS && !this.gotData;
-    this.reconnectDelay = quick ? Math.min(Math.max(QUICK_CLOSE_MS, this.reconnectDelay * 2), MAX_RECONNECT_DELAY_MS) : 0;
-    if (this.reconnectDelay) {
-      this.reconnectTimer = setTimeout(() => this._connect(), this.reconnectDelay);
-      if (this.reconnectTimer.unref) this.reconnectTimer.unref();
-    } else {
-      this._connect();
-    }
+    // lazily: the client's next message reconnects (_fromClient). An
+    // initialize waiting for its answer sends nothing more: re-send it now.
+    if (this.resendInit) this._connect();
   }
 
   _unavailable(e) {
@@ -453,7 +421,6 @@ class Shim {
     if (this.ending) return;
     this.ending = true;
     this.queue.length = 0;
-    clearTimeout(this.reconnectTimer);
     if (!this.sock) {
       this.closed = true;
       this._exit(0);
