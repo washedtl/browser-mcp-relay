@@ -21,7 +21,10 @@ const { PipeConnection } = require("./cdp-proxy.js");
 const { detectBravePath } = require("../detect-browser.js");
 
 const PREFIX = "[mcp-relay] brave-supervisor:";
-const KILL_WAIT_MS = 5000;
+// After TerminateProcess, a large Brave can take several seconds to report
+// its exit on a saturated machine (seen right after a Lighthouse run, 100%
+// CPU). Too short a wait reported "survived a kill" for a dying process.
+const KILL_WAIT_MS = 15000;
 const CLOSE_TIMEOUT_MS = 10000;
 const SHUTDOWN_GRACE_MS = 20000;
 // An unexpected pipe EOF → the process exit, then a kill. EOF comes first:

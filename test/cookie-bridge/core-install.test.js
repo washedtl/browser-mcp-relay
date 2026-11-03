@@ -117,7 +117,9 @@ test("install: the launcher really starts node from a non-ASCII directory (as Ch
   const dir = path.join(tmp(t, "nonascii"), "Zoë Ünal ✓");
   fs.mkdirSync(dir);
   const nodeCopy = path.join(dir, "node.exe");
-  try { fs.linkSync(process.execPath, nodeCopy); } catch { fs.copyFileSync(process.execPath, nodeCopy); }
+  // A real copy, never a hard link: a link shares the image the test runner
+  // itself is executing, and Windows refuses to delete it (EPERM on CI).
+  fs.copyFileSync(process.execPath, nodeCopy);
   const m = fixtureManifest(t);
   const home = tmp(t, "home");
   const { result } = run(t, install, { home, args: { extensionManifest: m.file, nodePath: nodeCopy } });
@@ -127,7 +129,11 @@ test("install: the launcher really starts node from a non-ASCII directory (as Ch
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
-  t.after(() => { try { child.kill(); } catch { /* gone */ } });
+  // kill the whole tree: cmd.exe AND the node host it started (which holds node.exe open)
+  t.after(() => {
+    try { require("node:child_process").execFileSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore", windowsHide: true }); }
+    catch { /* already gone */ }
+  });
   const got = [];
   let stderr = "";
   child.stderr.on("data", (c) => { stderr += c; });
