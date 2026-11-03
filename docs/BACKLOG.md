@@ -154,11 +154,11 @@ Lower-priority items not specifically about stealth.
 
 ### `lighthouse@13` upgrade
 
-**What:** Currently pinned at `lighthouse@^11.0.0` due to dep churn. v13 fixes the 3 low-severity transitive `cookie<0.7.0` advisories.
+**What:** Currently pinned at `lighthouse@^11.0.0` (11.7.1 is the last 11.x). v13.6.0 clears the advisories left in its tree: `@puppeteer/browsers` (`extract-zip`, `basic-ftp` via `proxy-agent`), `chromium-bidi`'s `zod@3` and `@sentry/node`'s `cookie<0.7.0`. 12.x is still in the affected range.
 
-**Why deferred:** Breaking dep upgrade. Localhost-bound dev tool, so the advisories aren't exploitable in practice. Tracked but not blocking.
+**Why deferred:** lighthouse 13 needs Node ≥ 22.19; the relay supports Node ≥ 20. The API `lighthouse_audit` uses (`lighthouse(url, flags, config)`, `desktopConfig`) is unchanged, but the `pwa` category is gone (its `VALID_CATS` still lists it) and puppeteer-core jumps from 22 to 25. None of the flagged code runs here: Lighthouse attaches to the relay's Brave over CDP.
 
-**Ship gate:** When lighthouse@13's API differences are minor enough to be a 1-day adapter, OR when the cookie<0.7.0 advisories become actually exploitable.
+**Ship gate:** When the relay's Node floor reaches 22.19, OR when one of those advisories becomes reachable.
 
 ---
 

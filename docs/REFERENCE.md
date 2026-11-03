@@ -960,7 +960,11 @@ Then `Get-Content $env:USERPROFILE/.claude/scripts/browser-mcp-relay/relay-stder
 - 🦁 Requires **Brave** installed locally. Other Chromium browsers may work via `BROWSER_RELAY_BRAVE_PATH` but are untested.
 - 🍪 **Standalone mode does not snapshot cookies** from another profile — first run hits login walls. Cookie snapshot is a pool-mode feature.
 - 🧍 **Legacy mode: one Brave per relay process.** To run multiple Brave sessions in parallel there, run multiple relays (each on its own slot / profile dir).
-- 🔐 **3 low-severity transitive `cookie<0.7.0` advisories** via `lighthouse → @sentry/node`. Fix requires `lighthouse@13`, which is a breaking dep upgrade for our `^11.0.0` pin. Tracked; not exploitable in practice for a localhost-bound dev tool. Run `npm audit` to see them; `npm audit fix --force` would resolve at the cost of a major-version upgrade.
+- 🔐 **`npm audit` still lists advisories that have no compatible fix** (none critical). Don't run `npm audit fix --force`: it would downgrade `browser-devtools-mcp` to 0.1.1.
+  - `lighthouse@11`'s tree: `@puppeteer/browsers` (`extract-zip`, `basic-ftp` via `proxy-agent`), `chromium-bidi`'s `zod@3`, `@sentry/node`'s `cookie`. Not reached: `lighthouse_audit` attaches to the relay's Brave over CDP, so Lighthouse never downloads a browser, speaks WebDriver BiDi or reports to Sentry. The fix is `lighthouse@13`, which needs Node ≥ 22.19 (see BACKLOG).
+  - `browser-devtools-mcp@0.6.12`'s own `zod@3`, which validates tool arguments. Those come only from your MCP client, which already drives the browser and runs JavaScript through `execute`.
+  - `browser-devtools-mcp@0.6.12`'s `sharp@0.34`, used only by `figma_compare-page-with-design` (off unless `FIGMA_ACCESS_TOKEN` is set), on Brave screenshots and Figma renders.
+  - `@hono/node-server@1.19`'s `serveStatic` advisory (fixed only in 2.x). Nothing here serves static files through it.
 
 ### Broker mode: known risks
 
