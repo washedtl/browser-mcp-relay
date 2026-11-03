@@ -56,7 +56,10 @@ function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       // Count the whole catalog, including the hidden-by-default toolsets,
       // and refresh the cached upstream catalog so the upstream really starts.
-      env: { ...process.env, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
+      // Legacy mode: the catalog is the same in both modes, and a broker-mode
+      // check would leave a detached broker running (`npm run broker:status`
+      // checks the broker).
+      env: { ...process.env, BROWSER_RELAY_MODE: "legacy", BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
     });
 
     let resolved = false;

@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 /**
- * browser-mcp-relay entrypoint.
+ * browser-mcp-relay entrypoint. BROWSER_RELAY_MODE picks what this process is
+ * (see relayMode): `broker` (the default on Windows) runs the shim
+ * (src/shim.js), which joins this session to the shared broker; `legacy`
+ * runs the per-session relay below. Either way the MCP client config is
+ * `node …/src/index.js`. Only light modules load before the mode is known:
+ * the shim starts once per Claude session.
  *
- * Lifecycle:
+ * Legacy lifecycle:
  *   1. Connect the MCP server on stdio right away. Nothing heavy happens at
  *      startup: no pool slot, no profile snapshot, no Brave, no upstream,
  *      no playwright-core. An idle session costs one small node process.
@@ -24,34 +29,34 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, execFile, execSync } = require("node:child_process");
-// MCP SDK imports — the standard `@modelcontextprotocol/sdk/server/index.js`
-// form resolves under CJS because the package's "exports" map points at
-// dist/cjs/server/index.js for the require condition. Verified at
-// task-A.5 import check.
-const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
-const {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} = require("@modelcontextprotocol/sdk/types.js");
-
-const poolShared = require("./pool-shared.js");
-const { UpstreamClient } = require("./upstream-client.js");
-const { RelayServer } = require("./relay-server.js");
-const { resolveUpstreamEntry } = require("./tool-catalog.js");
-const { tools: ownTools } = require("./own-tools/index.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
-const { loadVaultFromEnv } = require("./vault.js");
-const autofill = require("./autofill-injector.js");
 const PKG = require("../package.json");
-// cdp-bridge.js is required lazily (it pulls in playwright-core: 1-2s and
-// ~32MB at require time) — only once Brave is actually needed.
+// Everything else is required where it's used: the MCP SDK, pool-shared,
+// RelayServer, own-tools and friends cost ~250 ms and ~25 MB, which the
+// broker-mode shim must not pay. cdp-bridge.js (playwright-core: 1-2s and
+// ~32MB) loads only once Brave is actually needed.
 
 // Layer local-config.json under env so resolveBdmcpEntry / launch flags see
 // it transparently. pool-shared.js applies the same overlay independently.
 const RELAY_ENV = applyLocalConfigToEnv(process.env);
 
 const logStderr = (msg) => process.stderr.write(`${msg}\n`);
+
+/**
+ * Which relay this process runs (BROWSER_RELAY_MODE, env or local-config.json):
+ *   broker  the shim: this session joins the shared broker (one Brave, one profile)
+ *   legacy  this process is the whole relay: its own pool slot, Brave and upstream
+ * Default: broker on Windows; legacy elsewhere, where the broker's unix-socket
+ * paths have not been run yet.
+ * @returns {"broker"|"legacy"}
+ */
+function relayMode(env, { platform = process.platform, log = logStderr } = {}) {
+  const raw = String(env.BROWSER_RELAY_MODE || "").trim().toLowerCase();
+  if (raw === "broker" || raw === "legacy") return raw;
+  const fallback = platform === "win32" ? "broker" : "legacy";
+  if (raw) log(`[mcp-relay] BROWSER_RELAY_MODE="${env.BROWSER_RELAY_MODE}" is neither broker nor legacy; using ${fallback}`);
+  return fallback;
+}
 
 // How often a relay whose inspector port is taken (another relay owns it)
 // retries the bind, so a surviving relay takes over when the owner exits.
@@ -87,7 +92,7 @@ async function attachWithCleanupOnError(launched, fn) {
 // Shared with the catalog cache (tool-catalog.js) so the cached tool list and
 // the live upstream always come from the same entry.
 function resolveBdmcpEntry() {
-  return resolveUpstreamEntry(RELAY_ENV);
+  return require("./tool-catalog.js").resolveUpstreamEntry(RELAY_ENV);
 }
 
 /** Resolve the upstream entry and patch its bundle; returns the entry path. */
@@ -185,12 +190,12 @@ const SHUTDOWN_STEP_MS = 1500;
  */
 function createLifecycle({
   env = RELAY_ENV,
-  pool = poolShared,
+  pool = require("./pool-shared.js"),
   spawnChild = spawn,
   prepareUpstreamEntry = prepareBdmcpEntry,
   loadCdpBridge = () => require("./cdp-bridge.js"),
-  loadVault = loadVaultFromEnv,
-  attachAutofill = autofill.attachAutofill,
+  loadVault = () => require("./vault.js").loadVaultFromEnv(),
+  attachAutofill = (...args) => require("./autofill-injector.js").attachAutofill(...args),
   killTree = killProcessTree,
   killTreeSync = killProcessTreeSync,
   log = logStderr,
@@ -344,6 +349,7 @@ function createLifecycle({
     child.on("error", (e) => onDead(`failed: ${e.message}`));
 
     upstreamChild = child;
+    const { UpstreamClient } = require("./upstream-client.js");
     upstreamClient = new UpstreamClient(child.stdout, child.stdin);
     return upstreamClient;
   }
@@ -562,7 +568,9 @@ function createLifecycle({
  * The MCP server + RelayServer pair. `createRelay` is the RelayServer
  * factory (overridable so tests can observe the options it receives).
  */
-function buildServer({ lifecycle, recordTraffic, createRelay = (opts) => new RelayServer(opts) }) {
+function buildServer({ lifecycle, recordTraffic, createRelay = (opts) => new (require("./relay-server.js").RelayServer)(opts) }) {
+  const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
+  const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
   const server = new Server(
     { name: "browser-mcp-relay", version: PKG.version },
     {
@@ -592,7 +600,7 @@ function buildServer({ lifecycle, recordTraffic, createRelay = (opts) => new Rel
     recordTraffic,
   });
   // Register own-tools. Each entry is { name, description, inputSchema, handler }.
-  for (const tool of ownTools) {
+  for (const tool of require("./own-tools/index.js").tools) {
     relay.registerOwnTool(tool);
   }
   server.setRequestHandler(ListToolsRequestSchema, async () => relay.handleToolsList());
@@ -665,9 +673,11 @@ async function main() {
 
   // MCP server first (NO slot, NO Brave, NO upstream yet — all lazy).
   const { server, relay } = buildServer({ lifecycle, recordTraffic: inspectorPort !== null });
-  if (ownTools.length > 0) {
-    logStderr(`[mcp-relay] registered ${ownTools.length} own-tools: ${ownTools.map(t => t.name).join(", ")}`);
+  const ownToolNames = [...relay.ownTools.keys()];
+  if (ownToolNames.length > 0) {
+    logStderr(`[mcp-relay] registered ${ownToolNames.length} own-tools: ${ownToolNames.join(", ")}`);
   }
+  const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
   await server.connect(new StdioServerTransport());
 
   let inspectorHandle = null;
@@ -751,14 +761,19 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((e) => {
-    logStderr(`[mcp-relay] fatal: ${e.stack || e.message}`);
-    process.exit(1);
-  });
+  if (relayMode(RELAY_ENV) === "broker") {
+    require("./shim.js").main([]);
+  } else {
+    main().catch((e) => {
+      logStderr(`[mcp-relay] fatal: ${e.stack || e.message}`);
+      process.exit(1);
+    });
+  }
 }
 
 module.exports = {
   main,
+  relayMode,
   attachWithCleanupOnError,
   createLifecycle,
   buildServer,

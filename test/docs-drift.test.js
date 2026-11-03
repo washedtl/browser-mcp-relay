@@ -169,6 +169,13 @@ test("W1B: README + REFERENCE state the live hidden-by-default count", () => {
   }
 });
 
+test("W2E: smoke + setup run the relay in legacy mode (a broker-mode check would leave a detached broker running)", () => {
+  for (const script of ["smoke.js", "setup.js"]) {
+    const src = fs.readFileSync(path.join(REPO, "scripts", script), "utf8");
+    assert.match(src, /BROWSER_RELAY_MODE:\s*"legacy"/, `${script} must spawn the relay with BROWSER_RELAY_MODE=legacy`);
+  }
+});
+
 test("W1B: smoke + setup count the full catalog (all toolsets) against MIN_TOOLS", () => {
   for (const script of ["smoke.js", "setup.js"]) {
     const src = fs.readFileSync(path.join(REPO, "scripts", script), "utf8");

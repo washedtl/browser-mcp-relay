@@ -314,7 +314,9 @@ function step9_smokeTest({ timeoutMs = 30000 } = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       // Count the whole catalog, including the hidden-by-default toolsets,
       // and refresh the cached upstream catalog so the upstream really starts.
-      env: { ...process.env, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
+      // Legacy mode: same catalog as the broker, without leaving a detached
+      // broker running after the check.
+      env: { ...process.env, BROWSER_RELAY_MODE: "legacy", BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
     });
 
     let resolved = false;

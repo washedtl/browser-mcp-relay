@@ -795,6 +795,8 @@ test("relay process: answers initialize without claiming a slot, exits 0 when st
   await new Promise((r) => probe.close(r));
   const env = {
     ...process.env,
+    // this test is about the legacy relay (broker mode: test/index-mode.test.js)
+    BROWSER_RELAY_MODE: "legacy",
     BROWSER_RELAY_POOL_DIR: poolDir,
     BROWSER_RELAY_INSPECTOR_PORT: String(inspectorPort),
     BROWSER_RELAY_INSPECTOR_BIND: "127.0.0.1",
