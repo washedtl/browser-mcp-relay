@@ -684,6 +684,31 @@ test("redaction: numbers/booleans and structure survive (timeoutMs, isError, fie
   assert.ok(!JSON.stringify(res).includes(SECRET), "own-tool error text is redacted too");
 });
 
+test("E3: a huge response is capped while it is walked: image data summarized, strings cut to the budget, the caller gets it all", async () => {
+  const big = "A".repeat(5_000_000);
+  const result = { content: [{ type: "image", data: "B".repeat(3_000_000), mimeType: "image/png" }, { type: "text", text: big }, { type: "text", text: "tail" }] };
+  const relay = new RelayServer({ getUpstream: async () => ({ request: async () => result }), loadUpstreamCatalog: fakeCatalog, env: {} });
+  const out = await relay.handleToolsCall({ name: "content_take-screenshot", arguments: {} });
+  assert.strictEqual(out, result, "the caller's result is untouched");
+  const [, res] = relay.trafficEmitter.getRecent();
+  const recorded = JSON.stringify(res.response);
+  assert.ok(recorded.length <= MAX_TRAFFIC_BODY_CHARS + 200, `recorded ${recorded.length} chars`);
+  assert.ok(!recorded.includes("B".repeat(100)), "image data is never copied");
+  assert.match(recorded, /\[image data: 3000000 chars\]/);
+  assert.ok(!recorded.includes("tail"), "the walk stopped once the budget was spent");
+});
+
+test("E3: a credential header cut off by the budget is still redacted (no partial secret)", async () => {
+  // the value starts 500 chars before the cut and runs well past it
+  const filler = "x".repeat(MAX_TRAFFIC_BODY_CHARS - 500);
+  const text = `${filler}{"authorization": "Bearer ${SECRET.repeat(100)}"}`;
+  const relay = new RelayServer({ getUpstream: async () => ({ request: async () => ({ content: [{ type: "text", text }] }) }), loadUpstreamCatalog: fakeCatalog, env: {} });
+  await relay.handleToolsCall({ name: "content_get-as-text", arguments: {} });
+  const recorded = JSON.stringify(relay.trafficEmitter.getRecent());
+  assert.ok(!recorded.includes("s3cr3t"), recorded.slice(-200));
+  assert.ok(!recorded.includes("Bearer s"), "not even a prefix of the secret");
+});
+
 test("redaction: non-sensitive tools are recorded verbatim", async () => {
   const relay = makeRelay();
   await relay.handleToolsCall({ name: "navigation_go-to", arguments: { url: "https://example.com/?q=1" } });

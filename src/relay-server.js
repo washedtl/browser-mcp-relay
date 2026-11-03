@@ -63,35 +63,59 @@ function truncateForEmit(value, max = MAX_TRAFFIC_BODY_CHARS) {
 const SENSITIVE_TOOL_RE = /^(?:cookies_export|cookies_import|form_fill|interaction_fill|storage_.+)$/;
 const REDACTED = "[redacted]";
 
-function redactStrings(value) {
-  if (typeof value === "string") return REDACTED;
-  if (Array.isArray(value)) return value.map(redactStrings);
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = redactStrings(v);
-    return out;
-  }
-  return value;
-}
-
 // Credential headers, redacted in EVERY recorded event: as object keys at
 // any depth (any case) and as "key": "value" pairs inside JSON text (tool
 // results usually carry their data as JSON in content[].text).
 const SECRET_HEADERS = ["authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"];
 const SECRET_HEADER_SET = new Set(SECRET_HEADERS);
-const SECRET_HEADER_IN_TEXT_RE = new RegExp(`("(?:${SECRET_HEADERS.join("|")})"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, "gi");
+// The value may end mid-string (a string cut to the event's budget): an
+// unterminated value at the end is redacted too, never left as a prefix.
+const SECRET_HEADER_IN_TEXT_RE = new RegExp(`("(?:${SECRET_HEADERS.join("|")})"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*(?:"|$)`, "gi");
 
-function redactSecretHeaders(value) {
-  if (typeof value === "string") return value.replace(SECRET_HEADER_IN_TEXT_RE, `$1"${REDACTED}"`);
-  if (Array.isArray(value)) return value.map(redactSecretHeaders);
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = SECRET_HEADER_SET.has(k.toLowerCase()) ? REDACTED : redactSecretHeaders(v);
+/**
+ * What an event records of `value`: every string "[redacted]" for a
+ * sensitive tool, credential headers redacted for the rest, image data
+ * summarized, and strings cut to `max` chars in total WHILE walking, so a
+ * multi-MB screenshot or capture is never scanned, copied or serialized
+ * whole. A string is cut before the header regex runs on it.
+ */
+function redactForEmit(value, sensitive, max = MAX_TRAFFIC_BODY_CHARS) {
+  let budget = max;
+  const str = (v) => {
+    if (budget <= 0) return TRUNCATED_MARKER;
+    if (sensitive) {
+      budget -= REDACTED.length;
+      return REDACTED;
     }
-    return out;
-  }
-  return value;
+    const cut = v.length > budget;
+    const part = cut ? v.slice(0, budget) : v;
+    budget -= part.length;
+    return part.replace(SECRET_HEADER_IN_TEXT_RE, `$1"${REDACTED}"`) + (cut ? TRUNCATED_MARKER : "");
+  };
+  const walk = (v) => {
+    if (typeof v === "string") return str(v);
+    if (Array.isArray(v)) {
+      const out = [];
+      for (const x of v) {
+        if (budget <= 0) { out.push(TRUNCATED_MARKER); break; }
+        out.push(walk(x));
+      }
+      return out;
+    }
+    if (v && typeof v === "object") {
+      const image = v.type === "image" && typeof v.data === "string";
+      const out = {};
+      for (const [k, x] of Object.entries(v)) {
+        if (budget <= 0) { out[TRUNCATED_MARKER] = true; break; }
+        if (image && k === "data") out[k] = `[image data: ${x.length} chars]`;
+        else if (!sensitive && SECRET_HEADER_SET.has(k.toLowerCase())) out[k] = REDACTED;
+        else out[k] = walk(x);
+      }
+      return out;
+    }
+    return v;
+  };
+  return walk(value);
 }
 
 // Our own deadline for an elicitation prompt — under the MCP SDK's 60s
@@ -289,7 +313,7 @@ class RelayServer {
     // recordTraffic=false (no Inspector): no ids, events or per-call serialization.
     if (!this.recordTraffic) return run();
     const sensitive = SENSITIVE_TOOL_RE.test(name);
-    const forEmit = (v) => truncateForEmit(sensitive ? redactStrings(v) : redactSecretHeaders(v));
+    const forEmit = (v) => truncateForEmit(redactForEmit(v, sensitive));
     const id = this.trafficEmitter.nextId();
     const startHr = process.hrtime.bigint();
     const recordResponse = (status, body) => {
