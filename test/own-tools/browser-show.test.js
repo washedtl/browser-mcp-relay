@@ -1,7 +1,18 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/browser-show.js");
-const { OFFSCREEN_LEFT } = require("../../src/broker/window-pages.js");
+const wp = require("../../src/broker/window-pages.js");
+const { OFFSCREEN_LEFT } = wp;
+
+/** Run fn with the broker's window placement set to "offscreen" (hooks installed meanwhile). */
+async function underOffscreenPlacement(fn) {
+  const uninstall = wp.installWindowPerPage({ placement: "offscreen" });
+  try {
+    return await fn();
+  } finally {
+    uninstall();
+  }
+}
 
 const VISIBLE = { left: 40, top: 40, width: 1280, height: 900, windowState: "normal" };
 
@@ -68,9 +79,9 @@ test("browser_show restores a minimized window, then brings it to the front", as
   assert.deepStrictEqual(b, { shown: true, url: "https://login.example/", restored: true, movedOnScreen: false });
 });
 
-test("browser_show moves a window placed off-screen to a visible cascade slot", async () => {
+test("browser_show, broker placement 'offscreen': moves the window to a visible cascade slot, once per page", async () => {
   const w = makeWindow({ bounds: { ...VISIBLE, left: OFFSCREEN_LEFT } });
-  const b = await show(w);
+  const b = await underOffscreenPlacement(() => show(w));
   const moves = setBounds(w);
   assert.strictEqual(moves.length, 1);
   assert.strictEqual(moves[0].windowId, 7);
@@ -78,10 +89,13 @@ test("browser_show moves a window placed off-screen to a visible cascade slot", 
   assert.ok(moves[0].bounds.left >= 40 && moves[0].bounds.top >= 40, JSON.stringify(moves[0]));
   assert.strictEqual(b.movedOnScreen, true);
   assert.strictEqual(w.page.fronted, 1);
+  const again = await underOffscreenPlacement(() => show(w));
+  assert.strictEqual(again.movedOnScreen, false, "already on-screen: not moved again");
+  assert.strictEqual(setBounds(w).length, 1);
 });
 
-test("a visible window (incl. one on a monitor left of the primary) is only brought to the front", async () => {
-  for (const left of [40, -1500, -3800]) {
+test("cascade placement or no broker (legacy): a window is never moved, wherever it is; only brought to the front", async () => {
+  for (const left of [40, -1500, -3800, OFFSCREEN_LEFT]) {
     const w = makeWindow({ bounds: { ...VISIBLE, left } });
     const b = await show(w);
     assert.deepStrictEqual(setBounds(w), [], `left=${left}`);

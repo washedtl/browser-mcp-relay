@@ -200,4 +200,4 @@ async function seedOnFirstStart({ profileDir, log, pool = require("../pool-share
   }
 }
 
-module.exports = { poolCandidates, findSeedSource, listSeed, planSeed, copySeed, seedOnFirstStart, EXCLUDED };
+module.exports = { poolCandidates, findSeedSource, planSeed, copySeed, seedOnFirstStart };

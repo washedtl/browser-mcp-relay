@@ -17,34 +17,15 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const crypto = require("node:crypto");
-const { spawnSync, execFileSync } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 
 const { braveAvailable, headfulRequested, makeProfileDir, removeProfile } = require("./fixtures/temp-brave.js");
+const { until, pidAlive, killTree, freePort } = require("./fixtures/broker-fakes.js");
 
 const SKIP = !braveAvailable() && "needs Windows + Brave";
 const ENTRY = path.resolve(__dirname, "..", "src", "index.js");
 const IDLE_EXIT_MS = 4000;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const textOf = (r) => (r.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
-
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === "EPERM";
-  }
-}
-
-async function until(cond, ms, what) {
-  const t0 = Date.now();
-  for (;;) {
-    const v = await cond();
-    if (v) return v;
-    if (Date.now() - t0 > ms) throw new Error(`timed out after ${ms} ms waiting for ${what}`);
-    await sleep(100);
-  }
-}
 
 /** [{pid, name, privateMB, wsMB, cmd}] for processes whose command line contains `needle` or whose pid is listed. */
 function processes({ needle = null, pids = [] }) {
@@ -58,10 +39,6 @@ function processes({ needle = null, pids = [] }) {
     const [pid, name, priv, ws, ...cmd] = line.split("|");
     return { pid: Number(pid), name, privateMB: Number(priv) / 1048576, wsMB: Number(ws) / 1048576, cmd: cmd.join("|") };
   }).filter((p) => p.pid !== process.pid && !p.cmd.includes("Get-CimInstance Win32_Process")); // not this query's own shell
-}
-
-function killTree(pid) {
-  try { execFileSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }); } catch { /* gone */ }
 }
 
 /** A local site: cookies, per-page titles, a fetch the stub tests intercept, localStorage. */
@@ -115,7 +92,6 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
   const base = `http://127.0.0.1:${site.address().port}`;
   const numbers = {};
   const sessions = [];
-  const seenPids = new Set(); // brokers + Braves this run caused
 
   async function openSession(name) {
     const transport = new StdioClientTransport({ command: process.execPath, args: [ENTRY], env, stderr: "pipe" });
@@ -174,7 +150,6 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     const st = await status();
     assert.strictEqual(st.connections.length, 3);
     assert.ok(st.brave.up && st.brave.pid);
-    seenPids.add(st.pid).add(st.brave.pid);
   });
 
   const [A, B, C] = [0, 1, 2].map((i) => () => sessions[i]);
@@ -245,7 +220,6 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     await textOfPage(A(), {}, /page after-crash/);
     const after = await status();
     assert.ok(after.brave.up && after.brave.pid !== before.brave.pid);
-    seenPids.add(after.brave.pid);
   });
 
   await t.test("broker killed → the shims start a new one and the next call works", async () => {
@@ -254,25 +228,24 @@ test("e2e broker: 3 real shims → one real broker → one real Brave", { skip: 
     await until(() => !pidAlive(before.pid), 10_000, "the broker to die");
     const t0 = Date.now();
     // a request the shim sent before it saw the connection drop is answered
-    // "browser broker restarted; please retry the call" (W2A): retry, as an agent would
+    // "browser broker restarted; please retry the call" (W2A's contract):
+    // retry it ONCE, as an agent would; anything else is a failure
+    const go = () => call(B(), "navigation_go-to", { url: `${base}/page/after-broker-kill` });
     let r;
     numbers.brokerKillRetries = 0;
-    await until(async () => {
-      try {
-        r = await call(B(), "navigation_go-to", { url: `${base}/page/after-broker-kill` });
-        return r;
-      } catch (e) {
-        if (!/restarted; please retry|unavailable/.test(e.message)) throw e;
-        numbers.brokerKillRetries++;
-        return null;
-      }
-    }, 60_000, "a call to succeed on the new broker");
+    try {
+      r = await go();
+    } catch (e) {
+      if (!/browser broker restarted; please retry the call/.test(e.message)) throw e;
+      numbers.brokerKillRetries++;
+      r = await go();
+    }
     numbers.brokerKillRecoveryMs = Date.now() - t0;
+    assert.ok(numbers.brokerKillRetries <= 1);
     assert.ok(!r.isError, `${textOf(r)}\n${brokerLog()}`);
     await textOfPage(B(), {}, /page after-broker-kill/);
     const after = await status();
     assert.notStrictEqual(after.pid, before.pid);
-    seenPids.add(after.pid).add(after.brave.pid);
     await until(async () => (await status()).connections.length === 3, 15_000, "all 3 shims to reconnect");
     assert.ok(!pidAlive(before.brave.pid), "the old broker's Brave died with it");
   });
@@ -294,15 +267,11 @@ test("legacy mode smoke: navigation, storage_get-local, tabs_new + tabId", {
 }, async (t) => {
   const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
   const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
-  const net = require("node:net");
   const site = await startSite();
   const port = site.address().port;
   const slotDir = makeProfileDir("e2e-legacy");
   // legacy derives the CDP port from the slot (9332 + slot): pick a free one
-  const probe = net.createServer();
-  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
-  const cdpPort = probe.address().port;
-  await new Promise((r) => probe.close(r));
+  const cdpPort = await freePort();
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [ENTRY],

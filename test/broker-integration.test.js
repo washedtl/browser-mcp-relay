@@ -22,6 +22,8 @@ const { keyFileFor, loadOrCreateKey } = require("../src/broker/pipe-server.js");
 const { requestControl, ctlMac } = require("../src/broker/control.js");
 const brokerCtl = require("../scripts/broker-ctl.js");
 const fakes = require("./fixtures/broker-fakes.js");
+const { sleep, until, freePort } = fakes;
+const testPipe = () => fakes.testPipe("integ");
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-integ-"));
 test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
@@ -29,27 +31,6 @@ test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
 const ENV = { LOCALAPPDATA: HOME, XDG_STATE_HOME: HOME };
 const KEY_FILE = keyFileFor(ENV);
 const KEY = loadOrCreateKey(KEY_FILE);
-
-const testPipe = () =>
-  process.platform === "win32"
-    ? `\\\\.\\pipe\\bmr-test-integ-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
-    : path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bmr-test-")), "integ.sock");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(cond, ms = 3000, what = "condition") {
-  const t0 = Date.now();
-  while (!(await cond())) {
-    if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`);
-    await sleep(10);
-  }
-}
-
-async function freePort() {
-  const srv = net.createServer();
-  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-  const { port } = srv.address();
-  await new Promise((r) => srv.close(r));
-  return port;
-}
 
 async function startTestBroker(t, { seedProfile = null, relayInspector = null, supervisor = null, env = {}, deps = {} } = {}) {
   const pipe = testPipe();

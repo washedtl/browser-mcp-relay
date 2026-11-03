@@ -782,7 +782,6 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
     registry,
     supervisor,
     cdpUrl,
-    status,
     connections: () => sockets.size,
     close: (reason = "closed") => close(reason),
   };

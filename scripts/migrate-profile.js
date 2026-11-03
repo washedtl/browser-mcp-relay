@@ -92,4 +92,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, parseArgs };
+module.exports = { run };

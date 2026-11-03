@@ -11,13 +11,12 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
-const net = require("node:net");
 const path = require("node:path");
-const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 
 const { relayMode } = require("../src/index.js");
 const { keyFileFor, loadOrCreateKey, serverHello, claimPipe } = require("../src/broker/pipe-server.js");
+const testPipe = () => require("./fixtures/broker-fakes.js").testPipe("mode");
 
 const ENTRY = path.resolve(__dirname, "..", "src", "index.js");
 
@@ -39,11 +38,6 @@ test("relayMode: an unknown value warns once and falls back to the platform defa
   assert.match(logs[0], /BROWSER_RELAY_MODE="pool"/);
   assert.match(logs[0], /broker/);
 });
-
-const testPipe = () =>
-  process.platform === "win32"
-    ? `\\\\.\\pipe\\bmr-test-mode-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
-    : path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bmr-test-")), "mode.sock");
 
 test("broker mode: `node src/index.js` is the shim — its stdio reaches the broker pipe, and it loads no relay or MCP SDK modules", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-mode-home-"));

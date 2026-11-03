@@ -4,11 +4,17 @@
 //   W2B upstream-inproc   → fakeUpstreamModule() (real upstream zod v3 shapes)
 //   W2B window-pages      → fakeWindowPages()
 //   W1B cached catalog    → FAKE_CATALOG
-// plus an MCP client transport over a pipe socket.
+// plus an MCP client transport over a pipe socket, and small helpers the
+// broker tests share (test pipes, waits, ports, test-started processes).
 
 "use strict";
 
+const fs = require("node:fs");
+const os = require("node:os");
 const net = require("node:net");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const { createRequire } = require("node:module");
 const { ReadBuffer, serializeMessage } = require("@modelcontextprotocol/sdk/shared/stdio.js");
@@ -309,7 +315,61 @@ const toolsetsTool = (() => {
   return w2dMerged ? t : { ...t, handler: (args, ctx) => t.handler(args, ctx.relay) };
 })();
 
+// ── shared helpers ──
+
+/** A pipe no real broker uses (those start with "browser-mcp-relay-"); unix: a socket in a private dir. */
+const testPipe = (tag) =>
+  process.platform === "win32"
+    ? `\\\\.\\pipe\\bmr-test-${tag}-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+    : path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bmr-test-")), `${tag}.sock`);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Resolve cond()'s first truthy value; reject after ms. */
+async function until(cond, ms = 3000, what = "condition") {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await cond();
+    if (v) return v;
+    if (Date.now() - t0 > ms) throw new Error(`timed out after ${ms} ms waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
+/** A port the OS just handed out (and released). */
+async function freePort() {
+  const srv = net.createServer();
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const { port } = srv.address();
+  await new Promise((r) => srv.close(r));
+  return port;
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+/** Kill a process this test started, with its tree. */
+function killTree(pid) {
+  if (process.platform !== "win32") {
+    try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    return;
+  }
+  try { execFileSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }); } catch { /* gone */ }
+}
+
 module.exports = {
+  testPipe,
+  sleep,
+  until,
+  freePort,
+  pidAlive,
+  killTree,
   z,
   FAKE_CATALOG,
   fakeSupervisor,

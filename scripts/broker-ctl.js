@@ -17,26 +17,18 @@ const fs = require("node:fs");
 const { applyLocalConfigToEnv } = require("../src/local-config.js");
 const { resolveEndpoint, keyFileFor, loadOrCreateKey } = require("../src/broker/pipe-server.js");
 const control = require("../src/broker/control.js");
+const processShim = require("../src/process-shim.js");
 
 const USAGE = "usage: npm run broker:status | npm run broker:stop   (node scripts/broker-ctl.js status|stop)";
 // Brave gets 10 s to close before the broker kills it; then the broker exits.
 const STOP_WAIT_MS = 30_000;
-
-function defaultIsPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === "EPERM";
-  }
-}
 
 /** @returns {Promise<number>} exit code: 0 ok (incl. "not running"), 1 failed, 2 usage */
 async function run({
   argv = process.argv.slice(2),
   env = applyLocalConfigToEnv(process.env),
   out = (line) => process.stdout.write(`${line}\n`),
-  isPidAlive = defaultIsPidAlive,
+  isPidAlive = processShim.isPidAlive,
   stopWaitMs = STOP_WAIT_MS,
 } = {}) {
   const cmd = argv[0];

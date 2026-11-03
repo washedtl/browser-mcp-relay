@@ -205,22 +205,26 @@ async function ensureNotMinimized(page) {
   return true;
 }
 
+// pages browser_show already brought on-screen (placement "offscreen")
+const shownPages = new WeakSet();
+
 /**
  * Bring the page's window into view for the user (browser_show): restore it
- * if minimized, and move one placed off-screen (right edge past
- * OFFSCREEN_LEFT / 2, beyond any left-hand monitor) to the next cascade slot.
- * Raising it is page.bringToFront()'s job. Runs no page JS, so an open
- * alert() can't block it.
+ * if minimized and, under placement "offscreen", move it to the next cascade
+ * slot (once per page: a page upstream re-creates is placed off-screen
+ * again). Raising it is page.bringToFront()'s job. Runs no page JS, so an
+ * open alert() can't block it.
  * @returns {Promise<{restored: boolean, movedOnScreen: boolean}>}
  */
 async function showWindow(page) {
   const restored = await ensureNotMinimized(page);
-  const browser = page.isClosed() ? null : page.context().browser();
+  if (currentPlacement() !== "offscreen" || shownPages.has(page) || page.isClosed()) return { restored, movedOnScreen: false };
+  const browser = page.context().browser();
   if (!browser) return { restored, movedOnScreen: false };
-  const { windowId, bounds } = await sendBrowser(browser, "Browser.getWindowForTarget", { targetId: await targetIdOf(page) });
-  if (bounds.windowState !== "normal" || bounds.left + bounds.width > OFFSCREEN_LEFT / 2) return { restored, movedOnScreen: false };
+  const { windowId } = await sendBrowser(browser, "Browser.getWindowForTarget", { targetId: await targetIdOf(page) });
   const { left, top } = windowBounds("cascade", cascadeIndex++);
   await sendBrowser(browser, "Browser.setWindowBounds", { windowId, bounds: { left, top } });
+  shownPages.add(page);
   return { restored, movedOnScreen: true };
 }
 
