@@ -254,6 +254,22 @@ test("relay Inspector: off unless asked; RelayServers then record nothing", asyn
 
 // ───────────────────────────── BROWSER_HEADLESS_ENABLE ─────────────────────────────
 
+test("V1-4a: Brave's path and the proxy come from pool-shared's config, as in legacy mode (env, then the pool wrapper's)", async () => {
+  const run = async (env, poolConfig) => {
+    const handle = await startBroker({
+      pipe: testPipe(), profileDir: path.join(HOME, "profile-parity"), env, keyFile: KEY_FILE, log: () => {},
+      deps: { poolConfig: () => poolConfig, upstreamModule: () => fakes.fakeUpstreamModule(), loadCatalog: async () => fakes.FAKE_CATALOG, ownTools: () => [], toolContext: fakes.fakeToolContextModule },
+    });
+    const r = [handle.supervisor._proxyUrl, handle.supervisor._executablePath];
+    await handle.close("test done");
+    return r;
+  };
+  const wrapper = { proxyUrl: "http://127.0.0.1:8888", bravePath: "C:\\wrapper\\brave.exe" };
+  assert.deepStrictEqual(await run({}, wrapper), ["http://127.0.0.1:8888", "C:\\wrapper\\brave.exe"], "the pool wrapper's proxy and Brave");
+  assert.strictEqual((await run({ BROWSER_RELAY_PROXY_URL: "http://127.0.0.1:9999" }, wrapper))[0], "http://127.0.0.1:9999", "the env var wins");
+  assert.deepStrictEqual(await run({}, { proxyUrl: null, bravePath: null }), [null, null], "none: direct, Brave auto-detected at launch");
+});
+
 test("BROWSER_HEADLESS_ENABLE / BROWSER_RELAY_IGNORE_HTTPS_ERRORS (broker env) reach the real supervisor, as legacy mode honours them; both off by default", async (t) => {
   const real = {};
   for (const [label, env] of [["on", { BROWSER_HEADLESS_ENABLE: "true", BROWSER_RELAY_IGNORE_HTTPS_ERRORS: "true" }], ["off", {}]]) {

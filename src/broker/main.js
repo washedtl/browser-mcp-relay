@@ -119,19 +119,22 @@ const NEEDS_RENDERING_RE =
   /^(?:content_take-screenshot|content_start-recording|content_save-as-pdf|a11y_take-|interaction_|navigation_|execute$|scenario-run$|o11y_get-web-vitals$|form_fill$|file_upload$|download_capture$)/;
 
 const DEFAULT_DEPS = {
-  createSupervisor: ({ profileDir, port, env, log }) => {
+  createSupervisor: ({ profileDir, port, env, log, poolConfig }) => {
     const { BraveSupervisor } = require("./brave-supervisor.js");
+    // as in legacy mode (index.js): env, then the pool wrapper's, then auto-detect
+    const pool = poolConfig();
     return new BraveSupervisor({
       profileDir,
       port,
-      executablePath: env.BROWSER_RELAY_BRAVE_PATH || undefined,
+      executablePath: pool.bravePath || undefined,
       extensionPath: env.BROWSER_LOAD_EXTENSIONS || null,
-      proxyUrl: env.BROWSER_RELAY_PROXY_URL || null,
+      proxyUrl: env.BROWSER_RELAY_PROXY_URL || pool.proxyUrl || null,
       headless: env.BROWSER_HEADLESS_ENABLE === "true",
       ignoreHttpsErrors: env.BROWSER_RELAY_IGNORE_HTTPS_ERRORS === "true",
       log: (m) => log(`supervisor: ${m}`),
     });
   },
+  poolConfig: () => require("../pool-shared.js").CONFIG,
   upstreamModule: () => require("./upstream-inproc.js"),
   windowPages: () => require("./window-pages.js"),
   ownTools: () => require("../own-tools/index.js").tools,
@@ -353,7 +356,7 @@ function serve({ server, port, key, keyFile, pipe, profileDir, env, log, idle, o
   // W2E: the relay Inspector's traffic feed (every session's calls), or null
   const traffic = relayInspector ? new (require("../relay-server.js").TrafficEmitter)() : null;
   let relayInspectorCtl = null;
-  const supervisor = d.createSupervisor({ profileDir, port, env, log });
+  const supervisor = d.createSupervisor({ profileDir, port, env, log, poolConfig: d.poolConfig });
   const upstreamModule = d.upstreamModule();
   const sessionless = new Set(upstreamModule.SESSIONLESS_TOOLS || []);
   const placement = env.BROWSER_RELAY_BROKER_WINDOWS === "offscreen" ? "offscreen" : "cascade";
