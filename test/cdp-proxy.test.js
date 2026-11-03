@@ -329,14 +329,14 @@ test("sessions announced by a Target.attachedToTarget event belong to the client
   assert.strictEqual((await b.send("DOM.enable", {}, child)).error.code, -32001);
 });
 
-test("Browser.close, Browser.crash, Browser.crashGpuProcess and non-flat sendMessageToTarget are refused for clients, on any session", async (t) => {
+test("Browser.close, Browser.crash and Browser.crashGpuProcess are refused for clients, on any session", async (t) => {
   const { wsUrl, fake } = await served(t);
-  assert.deepStrictEqual([...BLOCKED_CLIENT_METHODS].sort(), ["Browser.close", "Browser.crash", "Browser.crashGpuProcess", "Target.sendMessageToTarget"]);
+  assert.deepStrictEqual([...BLOCKED_CLIENT_METHODS].sort(), ["Browser.close", "Browser.crash", "Browser.crashGpuProcess"]);
   const c = await cdpClient(wsUrl);
   const { result: { sessionId: nested } } = await c.send("Target.attachToBrowserTarget");
   for (const method of BLOCKED_CLIENT_METHODS) {
     for (const sessionId of [undefined, nested]) {
-      const r = await c.send(method, method === "Target.sendMessageToTarget" ? { sessionId: nested, message: '{"id":1,"method":"Browser.close"}' } : undefined, sessionId);
+      const r = await c.send(method, undefined, sessionId);
       assert.ok(r.error && r.error.code === -32000 && r.error.message.includes(method), `${method} on ${sessionId}: ${JSON.stringify(r)}`);
     }
     assert.deepStrictEqual(fake.sent(method), [], `${method} reached the browser`);
@@ -510,4 +510,73 @@ test("redactCdpUrl(): a CDP URL without its secret path; other URLs unchanged", 
   assert.strictEqual(redactCdpUrl(`ws://127.0.0.1:5/${secret}/devtools/browser`), "ws://127.0.0.1:5/<redacted>/devtools/browser");
   assert.strictEqual(redactCdpUrl("http://127.0.0.1:9333"), "http://127.0.0.1:9333");
   assert.strictEqual(redactCdpUrl(undefined), "undefined");
+});
+
+// ── v0.4.1: non-flat Target.sendMessageToTarget (emulate_device resumes paused iframes / workers with it) ──
+
+const wrap = (sessionId, inner) => ({ sessionId, message: typeof inner === "string" ? inner : JSON.stringify(inner) });
+
+test("v0.4.1 sendMessageToTarget: allowed on the client's OWN (non-flat) session; a benign wrapped command reaches the browser", async (t) => {
+  const { wsUrl, fake } = await served(t);
+  const c = await cdpClient(wsUrl);
+  const { result: { sessionId: page } } = await c.send("Target.attachToTarget", { targetId: "T1", flatten: true });
+  const { result: { sessionId: child } } = await c.send("Fake.autoAttach", {}, page); // a child attached under the page
+  const r = await c.send("Target.sendMessageToTarget", wrap(child, { id: 1, method: "Runtime.runIfWaitingForDebugger", params: {} }), page);
+  assert.ok(!r.error, JSON.stringify(r));
+  assert.strictEqual(r.sessionId, page);
+  const sent = fake.sent("Target.sendMessageToTarget");
+  assert.strictEqual(sent.length, 1);
+  assert.strictEqual(sent[0].sessionId, page);
+  assert.strictEqual(JSON.parse(sent[0].params.message).method, "Runtime.runIfWaitingForDebugger");
+  // nested: child → grandchild, still benign
+  const nested = wrap(child, { id: 2, method: "Target.sendMessageToTarget", params: wrap("grandchild", { id: 1, method: "Runtime.evaluate", params: { expression: "1" } }) });
+  assert.ok(!(await c.send("Target.sendMessageToTarget", nested, page)).error);
+  assert.strictEqual(fake.sent("Target.sendMessageToTarget").length, 2);
+});
+
+test("v0.4.1 sendMessageToTarget: a blocked method wrapped at ANY depth is refused, nothing reaches the browser", async (t) => {
+  const { wsUrl, fake } = await served(t);
+  const c = await cdpClient(wsUrl);
+  const { result: { sessionId: page } } = await c.send("Target.attachToTarget", { targetId: "T1", flatten: true });
+  const { result: { sessionId: child } } = await c.send("Fake.autoAttach", {}, page);
+  for (const method of BLOCKED_CLIENT_METHODS) {
+    const once = wrap(child, { id: 1, method });
+    const twice = wrap(child, { id: 1, method: "Target.sendMessageToTarget", params: wrap("gc", { id: 1, method }) });
+    const thrice = wrap(child, { id: 1, method: "Target.sendMessageToTarget", params: wrap("gc", { id: 1, method: "Target.sendMessageToTarget", params: wrap("ggc", { id: 9, method }) }) });
+    for (const params of [once, twice, thrice]) {
+      for (const sessionId of [page, undefined]) {
+        const r = await c.send("Target.sendMessageToTarget", params, sessionId);
+        assert.ok(r.error && r.error.code === -32000 && r.error.message.includes(method), `${method}: ${JSON.stringify(r)}`);
+      }
+    }
+  }
+  assert.deepStrictEqual(fake.sent("Target.sendMessageToTarget"), [], "nothing wrapped reached the browser");
+  for (const method of BLOCKED_CLIENT_METHODS) assert.deepStrictEqual(fake.sent(method), []);
+});
+
+test("v0.4.1 sendMessageToTarget: refused for another client's session, a targetId, a non-JSON or method-less message, and nesting past 8", async (t) => {
+  const { wsUrl, fake } = await served(t);
+  const a = await cdpClient(wsUrl);
+  const b = await cdpClient(wsUrl);
+  const { result: { sessionId: page } } = await a.send("Target.attachToTarget", { targetId: "T1", flatten: true });
+  const { result: { sessionId: child } } = await a.send("Fake.autoAttach", {}, page);
+  const benign = { id: 1, method: "Runtime.evaluate", params: { expression: "1" } };
+  // another client can't address a's child (on its own browser session)
+  assert.strictEqual((await b.send("Target.sendMessageToTarget", wrap(child, benign))).error.code, -32001);
+  for (const params of [
+    { targetId: "T1", message: JSON.stringify(benign) },
+    { sessionId: child, targetId: "T1", message: JSON.stringify(benign) },
+    wrap(child, "not json"),
+    wrap(child, "[1,2]"),
+    wrap(child, { id: 1 }),
+    { sessionId: child },
+    undefined,
+  ]) {
+    const r = await a.send("Target.sendMessageToTarget", params, page);
+    assert.ok(r.error && r.error.code === -32000, JSON.stringify(params));
+  }
+  let deep = { id: 1, method: "Runtime.evaluate" };
+  for (let i = 0; i < 9; i++) deep = { id: 1, method: "Target.sendMessageToTarget", params: wrap("s" + i, deep) };
+  assert.match((await a.send("Target.sendMessageToTarget", wrap(child, deep), page)).error.message, /nested more than 8 deep/);
+  assert.deepStrictEqual(fake.sent("Target.sendMessageToTarget"), []);
 });

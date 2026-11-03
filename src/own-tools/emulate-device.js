@@ -38,6 +38,11 @@ const { clientHintsFromUA, navigatorPlatformFromHints } = require("./_client-hin
 // reset turns auto-attach off: Chromium then detaches those sessions and
 // their overrides go with them.
 //
+// A child that can't be resumed would stay paused for good (an iframe that
+// never loads). So a failed resume detaches it (it then runs, without the
+// override) and is reported: in this call's childTargets result for the
+// targets that exist now, in the next call's for later ones.
+//
 // Not covered (documented in the tool description + docs/REFERENCE.md):
 //   • service / shared workers: shared by every tab of an origin (other
 //     sessions' tabs included), and their navigator.userAgent ignores CDP
@@ -61,17 +66,34 @@ const AUTO_ATTACH = {
   ],
 };
 const OVERRIDDEN_TYPES = new Set(["iframe", "worker"]);
+// How long a call waits for the resumes of the child targets it attached to
+const RESUME_WAIT_MS = 2000;
 
 /** Fire-and-forget: a closed target must not surface as an unhandled rejection. */
 function fire(node, method, params) {
   try { Promise.resolve(node.send(method, params)).catch(() => {}); } catch { /* target gone */ }
 }
 
+/**
+ * Resume a paused child target. If that fails, detach it (a detached target
+ * runs) and keep the reason for the caller to report.
+ */
+function resume(state, parent, child, sessionId) {
+  let run;
+  try { run = Promise.resolve(child.send("Runtime.runIfWaitingForDebugger")); } catch (e) { run = Promise.reject(e); }
+  const done = run.then(() => {}, (e) => {
+    state.resumeError = `a child target (${child.type || "unknown type"}) could not be resumed (${(e && e.message) || e}); it was detached and runs without the user-agent override`;
+    fire(parent, "Target.detachFromTarget", { sessionId });
+  });
+  state.resumes.add(done);
+  done.then(() => state.resumes.delete(done));
+}
+
 /** Per-session child-target state; installs the CDP event listeners once. */
 function childTargetsOf(cdp) {
   let state = CHILD_TARGETS.get(cdp);
   if (state) return state;
-  state = { params: null, autoAttach: null, root: { send: (m, p) => cdp.send(m, p), children: new Map() } };
+  state = { params: null, autoAttach: null, resumes: new Set(), resumeError: null, root: { send: (m, p) => cdp.send(m, p), children: new Map() } };
   const childOf = (parent, sessionId, type) => {
     let id = 0;
     return {
@@ -94,7 +116,7 @@ function childTargetsOf(cdp) {
       }
       // Always, and last on that session: the target stays paused until
       // every client that auto-attached with waitForDebuggerOnStart resumes it.
-      fire(child, "Runtime.runIfWaitingForDebugger");
+      resume(state, parent, child, p.sessionId);
     } else if (method === "Target.receivedMessageFromTarget") {
       // A child's own events (its children attaching / detaching), wrapped.
       const child = parent.children.get(p.sessionId);
@@ -131,6 +153,22 @@ async function overrideChildTargets(cdp, params) {
     });
   }
   await state.autoAttach;
+  // Chromium reports the existing children before it answers setAutoAttach:
+  // their resumes are in flight now. A failed one fails this call.
+  if (state.resumes.size) {
+    let timer;
+    await Promise.race([Promise.all([...state.resumes]), new Promise((r) => { timer = setTimeout(r, RESUME_WAIT_MS); })]);
+    clearTimeout(timer);
+  }
+  takeResumeError(state);
+}
+
+/** Throw the last resume failure (once). */
+function takeResumeError(state) {
+  const why = state && state.resumeError;
+  if (!why) return;
+  state.resumeError = null;
+  throw new Error(why);
 }
 
 module.exports = {
@@ -295,6 +333,12 @@ module.exports = {
         failed.push({ name: sends[i].name, error: r.reason && (r.reason.message || String(r.reason)) });
       }
     });
+    // a resume that failed after an earlier call (a child target that appeared later)
+    try {
+      takeResumeError(CHILD_TARGETS.get(cdp));
+    } catch (e) {
+      failed.push({ name: "childTargets", error: e.message });
+    }
     const summary = reset ? { reset: sends.map((s) => s.name) } : { applied };
     const result = {
       content: [{

@@ -26,7 +26,8 @@
 // the URL), any upgrade whose path is not exactly /<secret>/devtools/browser
 // (timing-safe compare), any upgrade with an Origin header (a web page; Node
 // clients send none) or a Host other than 127.0.0.1/localhost:<port> (DNS
-// rebinding), and the methods in BLOCKED_CLIENT_METHODS.
+// rebinding), and the methods in BLOCKED_CLIENT_METHODS, also wrapped in a
+// non-flat Target.sendMessageToTarget (see blockedInside).
 //
 // The secret is a bearer token: it leaks through error text (Playwright's
 // call log and upstream's "[CDP connect] … endpoint:" both print the URL), so
@@ -53,11 +54,16 @@ const REDACTED = "<redacted>";
 
 // A shared Brave must not be closed or crashed by one of its clients
 // (Playwright's browser.close() on a connectOverCDP browser only disconnects;
-// puppeteer's browser.close() sends Browser.close). sendMessageToTarget is
-// the deprecated non-flat channel: it would carry Browser.close past this
-// check inside a string. A footgun guard, not a security boundary: a holder
-// of the secret already drives the whole browser.
-const BLOCKED_CLIENT_METHODS = Object.freeze(new Set(["Browser.close", "Browser.crash", "Browser.crashGpuProcess", "Target.sendMessageToTarget"]));
+// puppeteer's browser.close() sends Browser.close). A footgun guard, not a
+// security boundary: a holder of the secret already drives the whole browser.
+const BLOCKED_CLIENT_METHODS = Object.freeze(new Set(["Browser.close", "Browser.crash", "Browser.crashGpuProcess"]));
+// Target.sendMessageToTarget is the deprecated non-flat channel: its params
+// carry another CDP message as a JSON string, for a session attached with
+// flatten:false (emulate_device resumes paused child targets this way). It
+// is allowed only on a session the client owns, and only when every message
+// it wraps, however deep, is JSON and none is a blocked method.
+const SEND_TO_TARGET = "Target.sendMessageToTarget";
+const MAX_WRAPPED_DEPTH = 8;
 
 // Largest message a client may send. Big ones are legitimate: page.route's
 // fulfil of a large body (base64, Fetch.fulfillRequest), a long
@@ -84,6 +90,27 @@ function redact(text) {
 /** A CDP URL without its secret path segment (for messages that print one). */
 function redactCdpUrl(url) {
   return String(url).replace(/\/[0-9a-f]{64}(?=\/|$)/gi, `/${REDACTED}`);
+}
+
+/**
+ * Why a client message must not reach Brave, looking inside (nested)
+ * non-flat Target.sendMessageToTarget wrappers, or null. The outer
+ * message's own sessionId routing is checked by the caller.
+ */
+function blockedInside(msg, depth = 0) {
+  if (BLOCKED_CLIENT_METHODS.has(msg.method)) return `${msg.method} is not allowed through the broker's CDP proxy (the browser is shared)`;
+  if (msg.method !== SEND_TO_TARGET) return null;
+  if (depth >= MAX_WRAPPED_DEPTH) return `${SEND_TO_TARGET} nested more than ${MAX_WRAPPED_DEPTH} deep is not allowed through the broker's CDP proxy`;
+  const p = msg.params;
+  if (!p || typeof p !== "object" || p.targetId !== undefined || typeof p.sessionId !== "string" || typeof p.message !== "string") {
+    return `${SEND_TO_TARGET} needs a sessionId and a message string through the broker's CDP proxy (no targetId)`;
+  }
+  let inner;
+  try { inner = JSON.parse(p.message); } catch { inner = null; }
+  if (!inner || typeof inner !== "object" || Array.isArray(inner) || typeof inner.method !== "string") {
+    return `${SEND_TO_TARGET}: the wrapped message is not a CDP command (JSON with a method)`;
+  }
+  return blockedInside(inner, depth + 1);
 }
 
 class PipeConnection extends EventEmitter {
@@ -362,10 +389,20 @@ class CdpProxy {
       this._dropClient(client, 1007, "bad message");
       return;
     }
-    if (BLOCKED_CLIENT_METHODS.has(msg.method)) {
+    const refused = blockedInside(msg);
+    if (refused) {
       this._toClient(client, {
         id: msg.id,
-        error: { code: -32000, message: `${msg.method} is not allowed through the broker's CDP proxy (the browser is shared)` },
+        error: { code: -32000, message: refused },
+        ...(msg.sessionId !== undefined ? { sessionId: msg.sessionId } : {}),
+      });
+      return;
+    }
+    // non-flat: the session it addresses must be this client's too
+    if (msg.method === SEND_TO_TARGET && this._owner.get(msg.params.sessionId) !== client) {
+      this._toClient(client, {
+        id: msg.id,
+        error: { code: -32001, message: "Session with given id not found." },
         ...(msg.sessionId !== undefined ? { sessionId: msg.sessionId } : {}),
       });
       return;
@@ -452,4 +489,4 @@ class CdpProxy {
   }
 }
 
-module.exports = { PipeConnection, CdpProxy, redact, redactCdpUrl, BLOCKED_CLIENT_METHODS, REDACTED };
+module.exports = { PipeConnection, CdpProxy, redact, redactCdpUrl, blockedInside, BLOCKED_CLIENT_METHODS, REDACTED };

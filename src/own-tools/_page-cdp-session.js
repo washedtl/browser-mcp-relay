@@ -39,7 +39,9 @@ function getOrCreatePageCdp(page, context) {
   const promise = (async () => {
     const cdp = await context.newCDPSession(page);
     page.once("close", () => {
-      try { cdp.detach(); } catch { /* best-effort */ }
+      // detach() is async: it rejects when the page or browser is already
+      // gone (a tab or browser closing), which try/catch alone doesn't catch
+      try { Promise.resolve(cdp.detach()).catch(() => {}); } catch { /* best-effort */ }
       PAGE_CDP_SESSIONS.delete(page);
     });
     return cdp;

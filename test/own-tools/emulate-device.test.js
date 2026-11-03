@@ -575,3 +575,69 @@ test("STEALTH2-5: the description states what the override reaches and what it c
   assert.match(tool.description, /cross-origin iframes/);
   assert.match(tool.description, /service\/shared workers/);
 });
+
+// ── v0.4.1: a child target that can't be resumed is never left paused, and the failure is reported ──
+
+const refuseResume = (method, params) => method === "Target.sendMessageToTarget" && JSON.parse(params.message).method === "Runtime.runIfWaitingForDebugger";
+
+test("v0.4.1: a resume that fails for an EXISTING child (attached during this call) fails childTargets now, and the child is detached so it runs", async () => {
+  const s = fakeSession({ fail: refuseResume });
+  const send = s.send;
+  // Chromium reports the existing children before it answers setAutoAttach
+  s.send = async (method, params) => {
+    if (method === "Target.setAutoAttach" && params.autoAttach) s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    return send(method, params);
+  };
+  await withSession(s, async (ctx) => {
+    const r = await tool.handler({ userAgent: MAC_UA }, ctx);
+    assert.strictEqual(r.isError, true);
+    const failed = JSON.parse(r.content[0].text).failed;
+    assert.deepStrictEqual(failed.map((x) => x.name), ["childTargets"]);
+    assert.match(failed[0].error, /a child target \(iframe\) could not be resumed \(boom: Target.sendMessageToTarget\); it was detached/);
+    assert.deepStrictEqual(s.sent.filter((c) => c.method === "Target.detachFromTarget").map((c) => c.params), [{ sessionId: "F1" }], "detached on the page session: it runs");
+    assert.strictEqual(pageOverride(s.sent).length, 1, "the page's own override still applied");
+    // reported once
+    const again = await tool.handler({ viewport: { width: 800, height: 600 } }, ctx);
+    assert.strictEqual(again.isError, undefined);
+  });
+});
+
+test("v0.4.1: a resume that fails for a LATER child (nested too) detaches it from its parent and is reported by the next call", async () => {
+  const s = fakeSession({ fail: (method, params) => {
+    if (method !== "Target.sendMessageToTarget") return false;
+    const inner = JSON.parse(params.message);
+    // F1's own resume works; resuming F1's child F2 (wrapped twice) is refused
+    return inner.method === "Target.sendMessageToTarget" && JSON.parse(inner.params.message).method === "Runtime.runIfWaitingForDebugger";
+  } });
+  await withSession(s, async (ctx) => {
+    assert.strictEqual((await tool.handler({ userAgent: MAC_UA }, ctx)).isError, undefined);
+    s.emit("Target.attachedToTarget", attach("F1", "iframe"));
+    s.emit("Target.receivedMessageFromTarget", { sessionId: "F1", message: JSON.stringify({ method: "Target.attachedToTarget", params: attach("F2", "worker") }) });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepStrictEqual(childCommands(s.sent).filter((c) => c.method === "Target.detachFromTarget").map((c) => [c.path, c.params.sessionId]), [["F1", "F2"]], "F2 detached through its parent F1");
+    const r = await tool.handler({ viewport: { width: 800, height: 600 } }, ctx);
+    assert.strictEqual(r.isError, true);
+    const failed = JSON.parse(r.content[0].text).failed;
+    assert.deepStrictEqual(failed.map((x) => x.name), ["childTargets"]);
+    assert.match(failed[0].error, /a child target \(worker\) could not be resumed/);
+  });
+});
+
+test("v0.4.1: closing the page detaches its CDP session without an unhandled rejection (detach rejects once the page is gone)", async () => {
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(e);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    let onClose = null;
+    const page = { once(event, fn) { if (event === "close") onClose = fn; } };
+    const session = { send: async () => ({}), on() {}, detach: async () => { throw new Error("cdpSession.detach: Target page, context or browser has been closed"); } };
+    await tool.handler({ viewport: { width: 800, height: 600 } }, { page, context: { pages: () => [page], newCDPSession: async () => session } });
+    assert.ok(PAGE_CDP_SESSIONS.has(page));
+    onClose();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepStrictEqual(unhandled, []);
+    assert.ok(!PAGE_CDP_SESSIONS.has(page), "forgotten with its page");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
