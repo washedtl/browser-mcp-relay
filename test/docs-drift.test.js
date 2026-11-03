@@ -169,14 +169,78 @@ test("W1B: README + REFERENCE state the live hidden-by-default count", () => {
   }
 });
 
-test("W1B: smoke + setup count the full catalog (all toolsets) against MIN_TOOLS", () => {
-  for (const script of ["smoke.js", "setup.js"]) {
-    const src = fs.readFileSync(path.join(REPO, "scripts", script), "utf8");
-    assert.match(src, /BROWSER_RELAY_TOOLSETS:\s*"all"/,
-      `${script} must spawn the relay with BROWSER_RELAY_TOOLSETS=all — hidden toolsets would drop tools/list below MIN_TOOLS`);
-    assert.match(src, /BROWSER_RELAY_CATALOG_REFRESH:\s*"true"/,
-      `${script} must force a catalog refresh so it exercises the real upstream, not just the cache file`);
-    const min = parseInt(src.match(/const MIN_TOOLS = (\d+)/)[1], 10);
-    assert.ok(liveTotal >= min, `${script} MIN_TOOLS=${min} exceeds the live catalog (${liveTotal})`);
+test("W2E: smoke checks broker mode (Windows) on a private pipe + temp profile with a short idle exit, and legacy; setup runs the same checks", () => {
+  const smoke = require("../scripts/smoke.js");
+  const env = smoke.modeEnv("broker", "/tmp/x");
+  assert.strictEqual(env.BROWSER_RELAY_MODE, "broker");
+  assert.match(env.BROWSER_RELAY_BROKER_PIPE, /smoke/, "a private pipe, never the real broker's");
+  assert.ok(env.BROWSER_RELAY_BROKER_PROFILE_DIR.startsWith(path.normalize("/tmp/x")), "a temp profile, never the real one");
+  assert.ok(Number(env.BROWSER_RELAY_BROKER_IDLE_EXIT_MS) <= 5000, "the smoke broker exits on its own right after");
+  assert.ok(env.LOCALAPPDATA === "/tmp/x" && env.XDG_STATE_HOME === "/tmp/x", "a temp broker home: never the real key or work dir");
+  assert.strictEqual(smoke.modeEnv("legacy", "/tmp/x").BROWSER_RELAY_MODE, "legacy");
+  const setup = fs.readFileSync(path.join(REPO, "scripts", "setup.js"), "utf8");
+  assert.ok(setup.includes("smoke.smokeModes("), "setup runs smoke.js's checks");
+});
+
+test("W1B: smoke counts the full catalog (all toolsets, refreshed cache) against MIN_TOOLS, in every mode", () => {
+  const smoke = require("../scripts/smoke.js");
+  for (const mode of ["broker", "legacy"]) {
+    const env = smoke.modeEnv(mode, "/tmp/x");
+    assert.strictEqual(env.BROWSER_RELAY_TOOLSETS, "all", "hidden toolsets would drop tools/list below MIN_TOOLS");
+    assert.strictEqual(env.BROWSER_RELAY_CATALOG_REFRESH, "true", "exercise the real upstream, not just the cache file");
   }
+  assert.ok(liveTotal >= smoke.MIN_TOOLS, `smoke MIN_TOOLS=${smoke.MIN_TOOLS} exceeds the live catalog (${liveTotal})`);
+});
+
+// ── W2E: broker mode ──
+
+test("W2E: every BROWSER_RELAY_BROKER_* setting the code reads is documented in REFERENCE.md", () => {
+  // set by the launcher for the broker it starts, never by a user
+  const INTERNAL = new Set(["BROWSER_RELAY_BROKER_LAUNCH_WARNING"]);
+  const read = new Set();
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith(".js")) for (const m of fs.readFileSync(full, "utf8").matchAll(/BROWSER_RELAY_BROKER_[A-Z_]*[A-Z]/g)) read.add(m[0]);
+    }
+  };
+  walk(path.join(REPO, "src"));
+  const missing = [...read].filter((k) => !INTERNAL.has(k) && !REFERENCE.includes(`\`${k}\``));
+  assert.ok(read.size >= 8, `expected the broker settings in src/, found ${[...read].join(", ")}`);
+  assert.deepStrictEqual(missing, [], "broker settings read in src/ but missing from REFERENCE.md");
+});
+
+test("W2E: README + REFERENCE state the default mode the code uses, and the legacy fallback", () => {
+  const { relayMode } = require("../src/index.js");
+  assert.strictEqual(relayMode({}, { platform: "win32" }), "broker");
+  assert.strictEqual(relayMode({}, { platform: "linux" }), "legacy");
+  assert.match(README, /Broker mode is the default on Windows/);
+  assert.match(README, /BROWSER_RELAY_MODE=legacy/);
+  assert.match(REFERENCE, /`BROWSER_RELAY_MODE` \| `broker` on Windows, `legacy` elsewhere/);
+  const example = JSON.parse(fs.readFileSync(path.join(REPO, "local-config.example.json"), "utf8"));
+  assert.ok("BROWSER_RELAY_MODE" in example && "_BROWSER_RELAY_MODE_doc" in example);
+});
+
+test("W2E: the broker npm scripts the docs name exist", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8"));
+  for (const script of ["broker:status", "broker:stop", "migrate-profile"]) {
+    assert.ok(pkg.scripts[script], `package.json lacks "${script}"`);
+    assert.ok(fs.existsSync(path.join(REPO, pkg.scripts[script].split(" ")[1])), `${script} points at a missing file`);
+    assert.ok(REFERENCE.includes(`npm run ${script}`), `REFERENCE.md doesn't show npm run ${script}`);
+  }
+  assert.ok(README.includes("npm run broker:status") && README.includes("npm run broker:stop"));
+});
+
+test("W2E: no control characters in the docs (a mangled \\b once became a backspace in README)", () => {
+  const docs = ["README.md", "CONTRIBUTING.md", "THIRD_PARTY_NOTICES.md", "local-config.example.json",
+    ...fs.readdirSync(path.join(REPO, "docs")).filter((f) => f.endsWith(".md")).map((f) => path.join("docs", f))];
+  const bad = [];
+  for (const doc of docs) {
+    fs.readFileSync(path.join(REPO, doc), "utf8").split("\n").forEach((line, i) => {
+      // eslint-disable-next-line no-control-regex
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(line)) bad.push(`${doc}:${i + 1}`);
+    });
+  }
+  assert.deepStrictEqual(bad, [], "control characters (below 0x20, except tab/CR/LF)");
 });

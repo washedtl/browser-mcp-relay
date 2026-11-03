@@ -21,7 +21,7 @@
 // a fake to avoid hitting the real OS. `_platform` similarly defaults to
 // `process.platform` but can be overridden.
 
-const { spawnSync } = require("node:child_process");
+const { spawnSync, execFile } = require("node:child_process");
 
 /**
  * List running processes whose command line contains `needle`.
@@ -249,10 +249,55 @@ function getProcessStartTimes(pids, opts = {}) {
   return out;
 }
 
+/** spawnSync's result shape from an async execFile, so a probe written
+ *  against spawnSync can be fed a non-blocking run's output. */
+function spawnAsync(cmd, args, options = {}) {
+  const opts = { encoding: options.encoding || "utf8" };
+  for (const k of ["windowsHide", "timeout", "maxBuffer", "env"]) {
+    if (options[k] !== undefined) opts[k] = options[k];
+  }
+  return new Promise((resolve) => {
+    execFile(cmd, args, opts, (err, stdout, stderr) => {
+      if (!err) return resolve({ status: 0, stdout, stderr });
+      // Non-zero exit: err.code is the exit status (spawnSync: status=N,
+      // no error). Anything else (spawn failure, timeout, maxBuffer) is
+      // spawnSync's status=null + error.
+      if (typeof err.code === "number") return resolve({ status: err.code, stdout, stderr });
+      resolve({ status: null, stdout, stderr, error: err });
+    });
+  });
+}
+
+/**
+ * W1E-2 (2026-11-03): run a spawnSync-based probe (one of the above) without blocking the
+ * event loop. The pool/process-shim probes (PowerShell on Windows, ~1s
+ * each) are synchronous and take a `_spawnSync` seam: a dry run captures
+ * the exact command the probe would spawn, that command runs async, and the
+ * probe runs again on the real output — so command construction and
+ * parsing stay in one place (process-shim) with no duplicate.
+ *
+ * @param {(spawn?: Function) => T} probe — calls its probe with `{ _spawnSync: spawn }`
+ * @returns {Promise<T>}
+ */
+async function runProbeAsync(probe) {
+  const calls = [];
+  probe((cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { status: 0, stdout: "", stderr: "" };
+  });
+  // No spawn needed (e.g. empty pid list), or a shape we can't replay
+  // faithfully: run it as-is.
+  if (calls.length !== 1) return probe();
+  const { cmd, args, options } = calls[0];
+  const result = await spawnAsync(cmd, args, options);
+  return probe(() => result);
+}
+
 module.exports = {
   listProcessesByCommand,
   isPidAlive,
   getProcessStartTimes,
+  runProbeAsync,
   // Exposed for unit tests of the parser.
   parsePidPipeOutput,
 };

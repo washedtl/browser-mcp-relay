@@ -12,7 +12,7 @@ function parseStore(tool, store) {
 }
 
 /**
- * The active page's origin, or "" when it has none. Opaque origins
+ * The tab's origin, or "" when it has none. Opaque origins
  * (about:, chrome:, file:, data:, …) serialize as the literal string
  * "null", which reads like JSON null, so they report "".
  */

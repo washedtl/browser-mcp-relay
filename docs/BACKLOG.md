@@ -72,9 +72,7 @@ Big lifts. Different scope from JS patches.
 - New mode in `index.js` that skips `launchBrave` and just connects via CDP
 - User must launch Brave themselves with the right flags + a fresh user-data-dir (or accept profile-lock contention with their main browsing session)
 - New documentation explaining the trade-off (no auto-launch convenience, no auto-cleanup on shutdown)
-- The Walmart sidecar already does this — code patterns exist to copy
-
-**Already exists where:** `~/Documents/GitHub/Washed-Command-Center/washed-web-app-v2-test/walmart_search.py` — uses CloakBrowser to attach to a manually-launched Brave with Walmart+ session auth. Pattern is proven.
+- The attach pattern itself is proven: CloakBrowser-style tools attach to a manually launched Brave with an authed session
 
 **Ship gate:** A specific use case where Tier 1+2 stealth is provably insufficient AND attached-mode provides relief. Walmart B2C-authed scraping is the canonical example.
 
@@ -154,11 +152,11 @@ Lower-priority items not specifically about stealth.
 
 ### `lighthouse@13` upgrade
 
-**What:** Currently pinned at `lighthouse@^11.0.0` due to dep churn. v13 fixes the 3 low-severity transitive `cookie<0.7.0` advisories.
+**What:** Currently pinned at `lighthouse@^11.0.0` (11.7.1 is the last 11.x). v13.6.0 clears the advisories left in its tree: `@puppeteer/browsers` (`extract-zip`, `basic-ftp` via `proxy-agent`), `chromium-bidi`'s `zod@3` and `@sentry/node`'s `cookie<0.7.0`. 12.x is still in the affected range.
 
-**Why deferred:** Breaking dep upgrade. Localhost-bound dev tool, so the advisories aren't exploitable in practice. Tracked but not blocking.
+**Why deferred:** lighthouse 13 needs Node ≥ 22.19; the relay supports Node ≥ 20. The API `lighthouse_audit` uses (`lighthouse(url, flags, config)`, `desktopConfig`) is unchanged, but the `pwa` category is gone (its `VALID_CATS` still lists it) and puppeteer-core jumps from 22 to 25. None of the flagged code runs here: Lighthouse attaches to the relay's Brave over CDP.
 
-**Ship gate:** When lighthouse@13's API differences are minor enough to be a 1-day adapter, OR when the cookie<0.7.0 advisories become actually exploitable.
+**Ship gate:** When the relay's Node floor reaches 22.19, OR when one of those advisories becomes reachable.
 
 ---
 
@@ -210,7 +208,7 @@ The honest meta-thing: **most items in this backlog should not be shipped withou
 
 Specific signal to watch for:
 
-- **Inspector traffic logs** — which of the 70 tools are actually called? If 50 of them have zero invocations after 2 weeks, the right move is deprecation, not more polish.
+- **Inspector traffic logs** — which tools are actually called? If 50 of them have zero invocations after 2 weeks, the right move is deprecation, not more polish.
 - **Issue reports** — what breaks for friends? The `windows-only CI + clean-clone smoke` setup catches install-time regressions; only friends running real workflows surface in-flight bugs.
 - **Performance** — does relay startup feel slow? Does Brave-launch latency matter? `npm run smoke` reports timing; a week of real use generates the distribution.
 - **Stealth wins/losses** — are friends scraping sites that flag them? Concrete failure cases are 100x more useful for prioritizing Tier 2/3 stealth work than speculative planning.

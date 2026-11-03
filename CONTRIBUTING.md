@@ -6,24 +6,39 @@ Thanks for taking a look. This project stays small on purpose; PRs that keep the
 
 ```
 src/
-├── index.js              # entrypoint — runs the relay server; on the first
-│                         #   tool call claims a slot, launches Brave, spawns
-│                         #   the upstream child (and respawns both on death)
-├── relay-server.js       # tools/list merge + tools/call routing
+├── index.js              # entrypoint: BROWSER_RELAY_MODE=broker (Windows default)
+│                         #   runs shim.js; legacy runs the per-session relay
+│                         #   (claims a slot, launches Brave, spawns upstream)
+├── shim.js               # broker mode, per session: stdio <-> the broker's pipe
+├── broker/               # broker mode: ONE broker per user + profile
+│   ├── main.js           #   per-connection MCP servers, idle policy, status
+│   ├── pipe-server.js    #   pipe name, single-instance claim, HMAC handshake
+│   ├── sessions.js       #   (connection, tabId) -> upstream session context
+│   ├── upstream-inproc.js#   browser-devtools-mcp imported in-process
+│   ├── window-pages.js   #   one Brave window per session tab
+│   ├── brave-supervisor.js#  the one Brave: launch, crash relaunch, graceful close
+│   ├── deelevate.js      #   start the broker without admin rights
+│   ├── profile-seed.js   #   one-time profile seed from a legacy pool slot
+│   └── control.js        #   broker:status / broker:stop over the pipe
+├── relay-server.js       # tools/list merge + tools/call routing (+ traffic recording)
+├── inspector-launch.js   # starts the in-process Inspector (relay or broker)
 ├── upstream-client.js    # JSON-RPC over stdio to browser-devtools-mcp
 ├── cdp-bridge.js         # launchBrave / closeBrave (Playwright-over-CDP)
 ├── detect-browser.js     # cross-platform Brave + profile-dir detection
 ├── process-shim.js       # cross-platform "is process alive?" + kill
 ├── pool-shared.js        # opt-in pool / standalone slot management
 ├── local-config.js       # local-config.json loader + env merge
-└── own-tools/            # the 16 first-party tools live here
+└── own-tools/            # the first-party tools live here
     ├── index.js          # registry — add new tools here
     └── <tool>.js         # one file per tool (name + schema + handler)
 test/                     # node --test runner; mirrors src/ layout
-└── own-tools/            # tests for each own-tool (shape + bridge-missing)
+└── own-tools/            # tests for each own-tool (shape + acts on ctx.page only)
 scripts/
+├── run-tests.js          # `npm test` — unit files in parallel, then real-Brave/e2e files one at a time
 ├── setup.js              # interactive `npm run setup` wizard
-└── smoke.js              # `npm run smoke` — spawn relay + tools/list check
+├── smoke.js              # `npm run smoke` — Brave check, then tools/list: broker (Windows, private pipe) + legacy
+├── broker-ctl.js         # `npm run broker:status` / `broker:stop`
+└── migrate-profile.js    # `npm run migrate-profile` — seed the broker profile by hand
 ```
 
 ## Add an own-tool in 5 minutes
@@ -42,22 +57,17 @@ scripts/
        },
        required: ["someArg"],
      },
-     async handler(args) {
-       const bridge = globalThis.__relayBridge;
-       if (!bridge) {
-         return {
-           isError: true,
-           content: [{ type: "text", text: "Relay bridge not initialized." }],
-         };
-       }
-       // bridge.context is a Playwright BrowserContext attached to the same
-       // Brave instance the upstream uses.
-       const page = (await bridge.context.pages())[0] || await bridge.context.newPage();
+     // ctx.page is the caller's tab (args.tabId, default "main") and
+     // ctx.context its BrowserContext, which every session shares: never
+     // touch other pages. Tools that don't need a page set needsPage: false.
+     async handler(args, { page }) {
        // ... do the thing ...
-       return { content: [{ type: "text", text: JSON.stringify({ ok: true }) }] };
+       return { content: [{ type: "text", text: JSON.stringify({ ok: true, url: page.url() }) }] };
      },
    };
    ```
+
+   The full ctx contract is at the top of `src/own-tools/index.js`.
 
 2. **Register it.** Add the require to `src/own-tools/index.js`:
 
@@ -82,19 +92,14 @@ scripts/
      assert.strictEqual(typeof tool.handler, "function");
    });
 
-   test("my_tool returns isError when bridge missing", async () => {
-     const prev = globalThis.__relayBridge;
-     globalThis.__relayBridge = undefined;
-     try {
-       const result = await tool.handler({ someArg: "x" });
-       assert.strictEqual(result.isError, true);
-     } finally {
-       globalThis.__relayBridge = prev;
-     }
+   test("my_tool acts on ctx.page", async () => {
+     const page = { url: () => "https://example.com/" };
+     const result = await tool.handler({ someArg: "x" }, { page, context: { pages: () => [page] } });
+     assert.strictEqual(JSON.parse(result.content[0].text).url, "https://example.com/");
    });
    ```
 
-4. **Run the suite.** `npm test`. The count should be N+2.
+4. **Run the suite.** `npm test`. The total goes up by 2; `npm test -- --update-badge` writes the new count into the README badge (a full run fails while the badge is stale).
 
 5. **Restart your MCP client.** It will see the new tool in `tools/list` after the next relay launch.
 
@@ -111,9 +116,11 @@ scripts/
 ## Tests
 
 - `node --test` is the runner. No mocha, no jest, no babel.
+- `npm test` (`scripts/run-tests.js`) runs in two phases: every unit file in one parallel `node --test`, then the files in its `SERIAL_FILES` list one at a time. Those launch real Brave, real brokers and shims, or time process races, and in parallel they starve each other into timeouts on a loaded machine. A test file that uses `test/fixtures/temp-brave.js` or a real `detectBravePath()` must be in that list (`test/run-tests.test.js` checks). Extra arguments go to every `node --test` run (e.g. `npm test -- --test-name-pattern=broker`); one file alone: `node --test test/<file>.test.js`.
+- The README test badge is the total count with Brave installed (real-Brave suites only register their subtests when it is). A full run checks it when the real-Brave tests ran, and fails if it is stale: update it with `npm test -- --update-badge`.
 - Prefer **test seams** over real side-effects. `src/detect-browser.js` + `test/detect-browser.test.js` show the pattern: detection takes injected `platform` + `env` + `existsSync` so the tests don't need a real Brave install.
 - Don't reach for the network in tests.
-- Don't launch Brave in tests. Bridge-missing assertions cover the unhappy path; manual `npm run smoke` covers the happy path. (The one exception, `launchBrave + connectOverCDP roundtrip` in `test/cdp-bridge.test.js`, runs only when Brave is detected — set `BROWSER_RELAY_BRAVE_PATH` to a non-existent path to skip it.)
+- Real-Brave tests (the broker's upstream, window, supervisor and end-to-end tests, plus `launchBrave + connectOverCDP roundtrip` in `test/cdp-bridge.test.js`) run only when Brave is installed, and skip cleanly otherwise. They use `test/fixtures/temp-brave.js`: a throwaway profile under `.tmp-profiles/`, an OS-assigned port, headless unless `BMR_TEST_HEADFUL=1`. Never a real profile, a real broker pipe (`browser-mcp-relay-*`) or the real broker home: broker tests use `bmr-test-*` pipes and a temp `LOCALAPPDATA`. Kill only processes your test started, and check none are left.
 - Never hardcode a port a test binds or connects to — other relays, agents and real Brave instances use the 90xx/93xx ranges. Ask the OS for one (listen on `0`, read the port, close) or bind the server under test to `0`.
 
 ## Sending PRs

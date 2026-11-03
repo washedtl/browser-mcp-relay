@@ -106,6 +106,86 @@ test("smoke.js exits with non-zero reason within timeout when given a fake fast 
   assert.ok(typeof result.reason === "string" && result.reason.length > 0);
 }, { timeout: 10000 });
 
+// ─────────────────── W2P: the wizard's mode step ───────────────────
+
+async function chooseMode(answers, platform) {
+  const { step6_chooseMode } = require("../scripts/setup.js");
+  const asked = [];
+  const prompter = { question: async (q) => { asked.push(q); return answers.shift() ?? ""; } };
+  const realWrite = process.stdout.write;
+  let printed = "";
+  process.stdout.write = (s) => { printed += s; return true; };
+  try {
+    return { choice: await step6_chooseMode(prompter, platform), asked, printed };
+  } finally {
+    process.stdout.write = realWrite;
+  }
+}
+
+test("W2P setup mode: describes broker and legacy's two setups; Enter takes broker on Windows", async () => {
+  const r = await chooseMode([""], "win32");
+  assert.match(r.printed, /broker {5}— every session shares one background Brave/);
+  assert.match(r.printed, /standalone — legacy: one Brave per session/);
+  assert.match(r.printed, /pool {7}— legacy:/);
+  assert.deepStrictEqual(r.asked, ["Choose mode (broker/standalone/pool): [broker] "]);
+  assert.deepStrictEqual(r.choice, { mode: "broker", poolDir: "" });
+});
+
+test("W2P setup mode: Enter takes legacy standalone on macOS/Linux; broker there is allowed with a note", async () => {
+  assert.deepStrictEqual((await chooseMode([""], "linux")).choice, { mode: "standalone", poolDir: "" });
+  const b = await chooseMode(["broker"], "darwin");
+  assert.deepStrictEqual(b.choice, { mode: "broker", poolDir: "" });
+  assert.match(b.printed, /never been run on this OS/);
+});
+
+test("W2P setup mode: standalone and pool are legacy mode; an unknown answer falls back to the default", async () => {
+  assert.deepStrictEqual((await chooseMode(["standalone"], "win32")).choice, { mode: "standalone", poolDir: "" });
+  assert.deepStrictEqual((await chooseMode(["pool", "D:\\slot"], "win32")).choice, { mode: "pool", poolDir: "D:\\slot" });
+  const u = await chooseMode(["brokr"], "win32");
+  assert.deepStrictEqual(u.choice, { mode: "broker", poolDir: "" });
+  assert.match(u.printed, /Unknown mode "brokr"; using broker/);
+});
+
+// ─────────────────── W2P: smoke needs Brave ───────────────────
+
+function smokeRun(argv, config) {
+  const { run } = require("../scripts/smoke.js");
+  const out = [];
+  let modesRan = 0;
+  const code = run({
+    argv,
+    loadConfig: () => config,
+    modes: async () => { modesRan++; return [{ mode: "legacy", ok: true, count: 72, reason: "", seconds: 1 }]; },
+    write: (s) => out.push(s),
+  });
+  return code.then((c) => ({ code: c, out: out.join(""), modesRan }));
+}
+const noBrave = (message) => ({ bravePath: null, braveDetectError: new Error(message) });
+
+test("W2P smoke: no Brave → fails at once with the relay's detection error and what to do; spawns no relay", async () => {
+  const r = await smokeRun([], noBrave("Brave was not found at any standard location"));
+  assert.strictEqual(r.code, 1);
+  assert.strictEqual(r.modesRan, 0);
+  assert.match(r.out, /✗ Smoke test FAILED: Brave not found\. Brave was not found at any standard location/);
+  assert.match(r.out, /set BROWSER_RELAY_BRAVE_PATH/);
+  assert.doesNotMatch(r.out, /✓/);
+});
+
+test("W2P smoke: Brave found → names it, then runs the checks", async () => {
+  const r = await smokeRun([], { bravePath: "C:\\fake\\brave.exe", braveDetectError: null });
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.modesRan, 1);
+  assert.match(r.out, /^\[smoke\] Brave: C:\\fake\\brave\.exe\n/);
+  assert.match(r.out, /✓ Relay healthy\. 72 tools/);
+});
+
+test("W2P smoke --without-brave (CI): catalog-only check, said so", async () => {
+  const r = await smokeRun(["--without-brave"], noBrave("not found"));
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.modesRan, 1);
+  assert.match(r.out, /Brave not found \(--without-brave\): checking the tool catalog only/);
+});
+
 // ─────────────────── package.json scripts wiring ───────────────────
 
 test("package.json: setup + smoke scripts are wired", () => {
@@ -160,12 +240,11 @@ test("V0-5: smoke.js source uses taskkill /F /T on win32", () => {
     "smoke.js must branch on process.platform === 'win32'");
 });
 
-test("V0-5: setup.js source uses taskkill /F /T on win32", () => {
-  const src = fs.readFileSync(SETUP_PATH, "utf8");
-  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID/.test(src),
-    "setup.js must call taskkill /F /T /PID on win32");
-  assert.ok(/process\.platform\s*===\s*['"]win32['"]/.test(src),
-    "setup.js must branch on process.platform === 'win32'");
+test("V0-5: setup.js kills the relay tree the way smoke.js does (W2E: it runs smoke.js's checks)", () => {
+  assert.strictEqual(require("../scripts/setup.js").killTree, require("../scripts/smoke.js").killTree);
+  const src = fs.readFileSync(SMOKE_PATH, "utf8");
+  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID/.test(src), "smoke.js must call taskkill /F /T /PID on win32");
+  assert.ok(/process\.platform\s*===\s*['"]win32['"]/.test(src), "smoke.js must branch on process.platform === 'win32'");
 });
 
 test("V0-5: killTree on win32 invokes taskkill (mocked execSync)", () => {
@@ -206,6 +285,7 @@ test("local-config.example.json contains all keys the setup wizard writes", () =
   );
   // The wizard writes these top-level keys (per step7_writeLocalConfig in setup.js).
   const expectedKeys = [
+    "BROWSER_RELAY_MODE",
     "BROWSER_RELAY_BRAVE_PATH",
     "BROWSER_RELAY_BRAVE_PROFILE_DIR",
     "BROWSER_RELAY_UPSTREAM_PATH",

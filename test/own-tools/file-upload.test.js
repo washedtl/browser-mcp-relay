@@ -10,16 +10,13 @@ test("file_upload has required tool shape", () => {
   assert.deepStrictEqual(tool.inputSchema.required.sort(), ["files", "selector"]);
 });
 
-test("file_upload returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ selector: "input[type=file]", files: ["/tmp/x"] });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+test("W2D: file_upload sets files on ctx.page only, not on the context's other pages", async () => {
+  const used = [];
+  const page = (name) => ({ url: () => "about:blank", locator: () => ({ setInputFiles: async () => { used.push(name); } }) });
+  const mine = page("mine");
+  const result = await tool.handler({ selector: "input[type=file]", files: ["/tmp/x"] }, { page: mine, context: { pages: () => [page("other"), mine] } });
+  assert.notStrictEqual(result.isError, true, result.content[0].text);
+  assert.deepStrictEqual(used, ["mine"]);
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -28,7 +25,6 @@ test("file_upload returns isError when bridge missing", async () => {
 // ──────────────────────────────────────────────────────────────────
 
 test("V0-6: file_upload returns isError + structured error when setInputFiles throws", async () => {
-  const prev = globalThis.__relayBridge;
   // Fake bridge with a context whose pages()[0] is a page whose locator()
   // returns an object whose setInputFiles throws.
   const fakePage = {
@@ -38,25 +34,20 @@ test("V0-6: file_upload returns isError + structured error when setInputFiles th
     }),
   };
   const fakeContext = { pages: () => [fakePage] };
-  globalThis.__relayBridge = { context: fakeContext };
-  try {
-    const result = await tool.handler({
-      selector: "input[type=file]",
-      files: ["/nonexistent/file.png"],
-    });
-    assert.strictEqual(result.isError, true);
-    const parsed = JSON.parse(result.content[0].text);
-    assert.strictEqual(parsed.ok, false);
-    assert.match(parsed.error, /ENOENT|not found/i);
-    assert.deepStrictEqual(parsed.files, ["/nonexistent/file.png"]);
-    assert.strictEqual(parsed.selector, "input[type=file]");
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage, context: fakeContext };
+  const result = await tool.handler({
+    selector: "input[type=file]",
+    files: ["/nonexistent/file.png"],
+  }, ctx);
+  assert.strictEqual(result.isError, true);
+  const parsed = JSON.parse(result.content[0].text);
+  assert.strictEqual(parsed.ok, false);
+  assert.match(parsed.error, /ENOENT|not found/i);
+  assert.deepStrictEqual(parsed.files, ["/nonexistent/file.png"]);
+  assert.strictEqual(parsed.selector, "input[type=file]");
 });
 
 test("V0-6: file_upload success path returns ok:true with uploaded list", async () => {
-  const prev = globalThis.__relayBridge;
   let lastFiles = null;
   const fakePage = {
     url: () => "about:blank",
@@ -65,18 +56,14 @@ test("V0-6: file_upload success path returns ok:true with uploaded list", async 
     }),
   };
   const fakeContext = { pages: () => [fakePage] };
-  globalThis.__relayBridge = { context: fakeContext };
-  try {
-    const result = await tool.handler({
-      selector: "input#file",
-      files: ["/tmp/a.txt", "/tmp/b.txt"],
-    });
-    assert.notStrictEqual(result.isError, true);
-    const parsed = JSON.parse(result.content[0].text);
-    assert.strictEqual(parsed.ok, true);
-    assert.deepStrictEqual(parsed.uploaded, ["/tmp/a.txt", "/tmp/b.txt"]);
-    assert.deepStrictEqual(lastFiles, ["/tmp/a.txt", "/tmp/b.txt"]);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage, context: fakeContext };
+  const result = await tool.handler({
+    selector: "input#file",
+    files: ["/tmp/a.txt", "/tmp/b.txt"],
+  }, ctx);
+  assert.notStrictEqual(result.isError, true);
+  const parsed = JSON.parse(result.content[0].text);
+  assert.strictEqual(parsed.ok, true);
+  assert.deepStrictEqual(parsed.uploaded, ["/tmp/a.txt", "/tmp/b.txt"]);
+  assert.deepStrictEqual(lastFiles, ["/tmp/a.txt", "/tmp/b.txt"]);
 });

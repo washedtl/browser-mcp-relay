@@ -134,11 +134,6 @@ async function waitFor(pred, ms = 2000) {
   }
 }
 
-test.afterEach(() => {
-  // ensureBrave publishes the bridge for own-tools; don't leak it across tests.
-  globalThis.__relayBridge = null;
-});
-
 // ─────────────────────── lazy slot claim (item 2) ───────────────────────
 
 test("lazy: creating the lifecycle claims no slot, loads no cdp-bridge, spawns nothing", () => {
@@ -159,8 +154,25 @@ test("lazy: first ensureBrave claims the slot once and derives the CDP port from
   // Claimed dir is poolDirs[1] → slot 2 → port 9333 + 2 - 1.
   assert.strictEqual(h.calls.launch[0].port, 9334);
   assert.strictEqual(h.calls.launch[0].userDataDir, "/fake/pool-2");
-  assert.strictEqual(globalThis.__relayBridge.port, 9334);
+  // W2D: own-tools get { context, cdpUrl } from this bridge (relay ctx); no globals.
+  assert.strictEqual(a.cdpConnectUrl, "http://127.0.0.1:9334");
+  assert.strictEqual(a.context, h.contexts[0]);
+  assert.strictEqual(globalThis.__relayBridge, undefined);
   assert.ok(h.logs.some((l) => /slot=2\/2/.test(l)), "banner logged at claim time");
+});
+
+// W2D: tabs_list / tabs_select / tabs_close look at the running Brave only.
+test("W2D: peekBrave returns the running bridge (null before launch / after Brave dies) and never launches", async () => {
+  const h = makeHarness();
+  const lc = createLifecycle(h.deps);
+  assert.strictEqual(lc.peekBrave(), null);
+  assert.strictEqual(h.calls.claim, 0);
+  assert.strictEqual(h.calls.launch.length, 0);
+  const bridge = await lc.ensureBrave();
+  assert.strictEqual(lc.peekBrave(), bridge);
+  h.contexts[0].emit("close");
+  assert.strictEqual(lc.peekBrave(), null);
+  assert.strictEqual(h.calls.launch.length, 1);
 });
 
 test("lazy: BROWSER_RELAY_POOL_SLOT override sets the port at claim time", async () => {
@@ -183,6 +195,13 @@ test("lazy: getUpstream claims the slot for the CDP port but does not launch Bra
   await lc.getUpstream();
   assert.strictEqual(h.calls.claim, 1);
   assert.strictEqual(h.children.length, 1);
+});
+
+test("W2P: the legacy upstream child runs with telemetry forced off, whatever the relay's env says", async () => {
+  const h = makeHarness();
+  const lc = createLifecycle({ ...h.deps, env: { TELEMETRY_ENABLE: "true" } });
+  await lc.getUpstream();
+  assert.strictEqual(h.children[0].spawnArgs.opts.env.TELEMETRY_ENABLE, "false");
 });
 
 test("lazy: a failed claim (pool exhausted) surfaces on the call and is retried next time", async () => {
@@ -217,7 +236,7 @@ for (const [label, kill] of [
     t.mock.method(process, "exit", () => {});
     const h = makeHarness();
     const lc = createLifecycle(h.deps);
-    await lc.ensureBrave();
+    const bridge1 = await lc.ensureBrave();
     const client1 = await lc.getUpstream();
     const child1 = h.children[0];
 
@@ -225,11 +244,11 @@ for (const [label, kill] of [
 
     assert.deepStrictEqual(h.calls.killTree, [child1.pid], "stale upstream killed (it caches the dead CDP session)");
     assert.strictEqual(client1.closed, true, "stale client closed");
-    assert.strictEqual(globalThis.__relayBridge, null);
 
-    await lc.ensureBrave();
+    const bridge2 = await lc.ensureBrave();
     const client2 = await lc.getUpstream();
     assert.strictEqual(h.calls.launch.length, 2, "Brave relaunched");
+    assert.notStrictEqual(bridge2, bridge1, "own-tools get the relaunched Brave, not the dead one");
     assert.notStrictEqual(client2, client1, "fresh upstream client");
     assert.strictEqual(h.children.length, 2);
     assert.strictEqual(h.calls.claim, 1, "same slot reused");
@@ -500,7 +519,7 @@ async function connectClient(server) {
 }
 
 test("MCP server: version comes from package.json and tools.listChanged is declared", async () => {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   const { server } = buildServer({ lifecycle, recordTraffic: false });
   const { client, connect } = await connectClient(server);
   await connect();
@@ -515,7 +534,7 @@ test("MCP server: version comes from package.json and tools.listChanged is decla
 
 test("RelayServer receives lifecycle hooks, recordTraffic, and a notifyToolsChanged that emits tools/list_changed", async () => {
   const { ToolListChangedNotificationSchema } = require("@modelcontextprotocol/sdk/types.js");
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   for (const recordTraffic of [true, false]) {
     let opts = null;
     const { server, relay } = buildServer({
@@ -527,6 +546,7 @@ test("RelayServer receives lifecycle hooks, recordTraffic, and a notifyToolsChan
     assert.strictEqual(opts.recordTraffic, recordTraffic);
     assert.strictEqual(opts.getUpstream, lifecycle.getUpstream);
     assert.strictEqual(opts.ensureBrave, lifecycle.ensureBrave);
+    assert.strictEqual(opts.peekBrave, lifecycle.peekBrave);
     assert.ok(relay.ownTools.size > 0, "own-tools registered");
 
     const { client, connect } = await connectClient(server);
@@ -544,7 +564,7 @@ test("RelayServer receives lifecycle hooks, recordTraffic, and a notifyToolsChan
 });
 
 test("MCP server instructions tell agents hidden toolsets exist and to ask the user before `toolsets`", async () => {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   const { server } = buildServer({ lifecycle, recordTraffic: false });
   const { client, connect } = await connectClient(server);
   await connect();
@@ -561,7 +581,7 @@ test("MCP server instructions tell agents hidden toolsets exist and to ask the u
 });
 
 test("elicit: null when the client doesn't support elicitation (or before initialize)", async () => {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   let opts = null;
   const { server } = buildServer({
     lifecycle, recordTraffic: false,
@@ -591,7 +611,7 @@ async function connectWithCaps(server, capabilities, onElicit) {
 }
 
 function buildWithOpts() {
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   let opts = null;
   const { server } = buildServer({
     lifecycle, recordTraffic: false,
@@ -639,7 +659,7 @@ test("elicit: forwards to the client as elicitation/create when supported", asyn
   const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
   const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
   const { ElicitRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
-  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {} };
+  const lifecycle = { getUpstream: async () => {}, ensureBrave: async () => {}, peekBrave: () => null };
   let opts = null;
   const { server } = buildServer({
     lifecycle, recordTraffic: false,
@@ -782,6 +802,8 @@ test("relay process: answers initialize without claiming a slot, exits 0 when st
   await new Promise((r) => probe.close(r));
   const env = {
     ...process.env,
+    // this test is about the legacy relay (broker mode: test/index-mode.test.js)
+    BROWSER_RELAY_MODE: "legacy",
     BROWSER_RELAY_POOL_DIR: poolDir,
     BROWSER_RELAY_INSPECTOR_PORT: String(inspectorPort),
     BROWSER_RELAY_INSPECTOR_BIND: "127.0.0.1",
@@ -820,6 +842,41 @@ test("relay process: answers initialize without claiming a slot, exits 0 when st
       new Promise((r) => setTimeout(() => r("timeout"), 15000)),
     ]);
     assert.strictEqual(code, 0, `relay should exit 0 after stdin EOF; stderr:\n${stderr}`);
+  } finally {
+    if (child.exitCode === null) child.kill();
+    fs.rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("relay process: a client message over the SDK's 10 MB stdio limit makes it exit 1 instead of going deaf", async () => {
+  const poolDir = path.join(os.tmpdir(), `bmr-overflow-${process.pid}-${Date.now()}`);
+  // the in-process inspector keeps the event loop busy (as upstream + Brave
+  // do), so a relay that stopped reading stdin would linger, not exit
+  const probe = net.createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  const inspectorPort = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  const env = {
+    ...process.env,
+    BROWSER_RELAY_MODE: "legacy",
+    BROWSER_RELAY_POOL_DIR: poolDir,
+    BROWSER_RELAY_INSPECTOR_PORT: String(inspectorPort),
+    BROWSER_RELAY_INSPECTOR_BIND: "127.0.0.1",
+  };
+  const child = spawn(process.execPath, [ENTRY], { stdio: ["pipe", "pipe", "pipe"], env });
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr += d; });
+  child.stdin.on("error", () => {}); // EPIPE once the relay exits mid-write
+  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  try {
+    await waitFor(() => /inspector running at/.test(stderr), 10000);
+    child.stdin.write(Buffer.alloc(11 * 1024 * 1024, 0x61));
+    const code = await Promise.race([
+      exited,
+      new Promise((r) => setTimeout(() => r("timeout"), 15000)),
+    ]);
+    assert.strictEqual(code, 1, `relay should exit 1 after an oversized message; stderr:\n${stderr}`);
+    assert.match(stderr, /10 MB stdio limit/);
   } finally {
     if (child.exitCode === null) child.kill();
     fs.rmSync(poolDir, { recursive: true, force: true });

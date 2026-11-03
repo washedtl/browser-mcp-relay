@@ -1,4 +1,4 @@
-// extract_structured — schema-driven data extraction from the active page.
+// extract_structured — schema-driven data extraction from this tab.
 // Schema is { fieldName: { selector, attribute?, multiple? }, ... }.
 // Uses the authed session — sees logged-in content unlike unauthenticated scrapers.
 //
@@ -7,7 +7,6 @@
 // a maxBytes budget shared fairly across fields (cut fields are listed in
 // `truncated`).
 
-const { withActivePage } = require("./_active-page.js");
 const { errorResult, intArg, fitJson } = require("./_tool-args.js");
 
 const DEFAULT_MAX_ITEMS = 100;
@@ -77,7 +76,7 @@ const EXTRACT_IN_PAGE = new Function("arg", `const fitJson = ${fitJson}; return 
 module.exports = {
   name: "extract_structured",
   description:
-    "Extract data from the active page with a CSS-selector schema: { field: { selector, attribute?, multiple? } }. " +
+    "Extract data from this tab with a CSS-selector schema: { field: { selector, attribute?, multiple? } }. " +
     "attribute defaults to textContent; also innerText (rendered text only, slow on big lists), innerHTML, value, or any attribute name. " +
     "Output is capped by maxItems (per multiple field) and maxBytes (all values); cut fields are listed in truncated.",
   inputSchema: {
@@ -103,7 +102,7 @@ module.exports = {
     },
     required: ["schema"],
   },
-  handler: async (_args) => withActivePage(async ({ page }) => {
+  handler: async (_args, { page }) => {
     const args = _args || {};
     const { navigateToUrl, waitForSelector, schema } = args;
     // T0-5: validate schema before passing to page.evaluate. Object.entries(null)
@@ -186,5 +185,5 @@ module.exports = {
     const payload = { url: page.url(), data: result.data };
     if (Object.keys(result.truncated).length > 0) payload.truncated = result.truncated;
     return { content: [{ type: "text", text: JSON.stringify(payload) }] };
-  }),
+  },
 };

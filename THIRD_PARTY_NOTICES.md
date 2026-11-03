@@ -32,7 +32,7 @@ this is a non-issue.
 
 ## Direct dependencies
 
-### `@modelcontextprotocol/sdk@^1.23.0`
+### `@modelcontextprotocol/sdk@^1.32.2`
 
 - **License:** MIT
 - **Author:** Anthropic, PBC

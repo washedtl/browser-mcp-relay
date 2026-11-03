@@ -603,18 +603,19 @@ test("inputSchemaPreview: returns comma-separated top-level field names", () => 
   assert.strictEqual(s, "url, formFactor, onlyCategories");
 });
 
-test("buildToolsCatalog: total = own + forwarded = 71 (20 + 51)", () => {
+test("buildToolsCatalog: total = own + forwarded = 72 (21 + 51)", () => {
   // Updated 2026-05-09: added storage_get-local / storage_set-local /
   // storage_clear-local own-tools (auth tokens for Discord/Notion/etc live
   // in localStorage, not HTTP cookies). 16 → 19 own-tools.
   // Updated 2026-11-03 (W1B): + toolsets (hidden-toolset control). 19 → 20.
+  // Updated 2026-11-03 (W2D): + browser_show (window on-screen). 20 → 21.
   const c = buildToolsCatalog();
-  assert.strictEqual(c.total, 71);
-  assert.strictEqual(c.ownCount, 20);
+  assert.strictEqual(c.total, 72);
+  assert.strictEqual(c.ownCount, 21);
   assert.strictEqual(c.forwardedCount, 51);
   assert.ok(Array.isArray(c.own));
   assert.ok(Array.isArray(c.forwarded));
-  assert.strictEqual(c.own.length, 20);
+  assert.strictEqual(c.own.length, 21);
   assert.strictEqual(c.forwarded.length, 51);
 });
 
@@ -771,6 +772,32 @@ test("startInspector: standalone mode → /api/slot/:n has empty recentTraffic",
     assert.strictEqual(r.status, 200);
     const body = JSON.parse(r.body);
     assert.deepStrictEqual(body.recentTraffic, []);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("W2P startInspector({ brokerMode }): the standalone Inspector of a broker-mode relay says 'broker' and probes no legacy pool", async () => {
+  const seams = makeSeams({ extra: {
+    _listBraveProcessesRaw: () => { throw new Error("must not list Brave processes"); },
+    _getProcessStartTimes: () => { throw new Error("must not probe start times"); },
+  } });
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams, brokerMode: true });
+  try {
+    const status = JSON.parse((await fetch(handle.port, "/api/status")).body);
+    assert.strictEqual(status.config.mode, "broker");
+    assert.deepStrictEqual(status.slots, []);
+    assert.strictEqual(JSON.parse((await fetch(handle.port, "/api/settings")).body).config.mode, "broker");
+    assert.strictEqual((await fetch(handle.port, "/api/broker")).status, 404, "no broker sessions view without the broker");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("W2P startInspector without brokerMode (legacy relay): mode from the pool config, as before", async () => {
+  const handle = await startInspector({ port: 0, bind: "127.0.0.1", seams: makeSeams() });
+  try {
+    assert.strictEqual(JSON.parse((await fetch(handle.port, "/api/settings")).body).config.mode, "pool");
   } finally {
     await handle.close();
   }
@@ -1845,6 +1872,17 @@ test("W1E-2: buildStatus awaits async process probes", async () => {
   const status = await buildStatus(seams);
   assert.strictEqual(status.slots[0].state, "claimed");
   assert.deepStrictEqual(status.slots[0].bravePids, [1111]);
+});
+
+test("W2E: buildStatus in broker mode runs no legacy pool probes (no slots, mode 'broker')", async () => {
+  const seams = makeSeams({ extra: {
+    _listBraveProcessesRaw: () => { throw new Error("must not list Brave processes"); },
+    _getProcessStartTimes: () => { throw new Error("must not probe start times"); },
+  } });
+  const status = await buildStatus(seams, { brokerMode: true });
+  assert.deepStrictEqual(status.slots, []);
+  assert.strictEqual(status.config.mode, "broker");
+  assert.deepStrictEqual(status.config.poolDirs, []);
 });
 
 test("W1E-2: Brave PIDs from the live process listing aren't re-probed for liveness", async () => {

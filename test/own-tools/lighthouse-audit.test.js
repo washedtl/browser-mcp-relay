@@ -10,17 +10,16 @@ test("lighthouse_audit has required tool shape", () => {
   assert.strictEqual(tool.inputSchema.required[0], "url");
 });
 
-test("lighthouse_audit returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({ url: "https://example.com" });
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|initialized/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+// W2D: lighthouse opens its own tab over CDP, so it needs the endpoint,
+// not a session page (needsPage:false — no tab is opened for the call).
+test("W2D: lighthouse_audit is page-less and needs ctx.cdpUrl", async () => {
+  assert.strictEqual(tool.needsPage, false);
+  const result = await tool.handler({ url: "https://example.com" }, {});
+  assert.strictEqual(result.isError, true);
+  assert.match(result.content[0].text, /^lighthouse_audit unavailable: no browser CDP endpoint/);
 });
+
+const CTX = { cdpUrl: "http://127.0.0.1:9333" };
 
 // ──────────────────────────────────────────────────────────────────
 // T0-6: bad URL / dead Brave must return structured isError, not throw.
@@ -28,27 +27,15 @@ test("lighthouse_audit returns isError when bridge missing", async () => {
 // ──────────────────────────────────────────────────────────────────
 
 test("T0-6: lighthouse_audit rejects malformed URL with isError", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { port: 9333 };
-  try {
-    const r = await tool.handler({ url: "not-a-url" });
-    assert.strictEqual(r.isError, true);
-    assert.match(r.content[0].text, /invalid URL/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const r = await tool.handler({ url: "not-a-url" }, CTX);
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /invalid URL/i);
 });
 
 test("T0-6: lighthouse_audit rejects empty url string", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { port: 9333 };
-  try {
-    const r = await tool.handler({ url: "" });
-    assert.strictEqual(r.isError, true);
-    assert.match(r.content[0].text, /non-empty string/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const r = await tool.handler({ url: "" }, CTX);
+  assert.strictEqual(r.isError, true);
+  assert.match(r.content[0].text, /non-empty string/i);
 });
 
 test("T1-1: lighthouse import is hoisted as a memoized lazy promise (source-level guard)", () => {
@@ -105,26 +92,25 @@ function fakeLighthouseModule(result) {
 }
 
 async function withFakes({ fetchImpl, result }, fn) {
-  const prevBridge = globalThis.__relayBridge;
   const prevFetch = globalThis.fetch;
   const fake = fakeLighthouseModule(result);
-  globalThis.__relayBridge = { port: 9333, context: { pages: () => [] } };
-  globalThis.fetch = fetchImpl || (async () => ({ ok: true, status: 200 }));
+  fake.probes = [];
+  const probe = fetchImpl || (async () => ({ ok: true, status: 200 }));
+  globalThis.fetch = async (url, opts) => { fake.probes.push(String(url)); return probe(url, opts); };
   tool._setLighthouseForTest(fake.mod);
   try {
     return await fn(fake);
   } finally {
     tool._setLighthouseForTest(null);
-    globalThis.__relayBridge = prevBridge;
     globalThis.fetch = prevFetch;
   }
 }
 
 test("W1C2: desktop audit passes Lighthouse's desktopConfig; mobile uses the default config", async () => {
   await withFakes({}, async (fake) => {
-    const d = await tool.handler({ url: "https://example.com/" });
+    const d = await tool.handler({ url: "https://example.com/" }, CTX);
     assert.notStrictEqual(d.isError, true, d.content[0].text);
-    const m = await tool.handler({ url: "https://example.com/", formFactor: "mobile" });
+    const m = await tool.handler({ url: "https://example.com/", formFactor: "mobile" }, CTX);
     assert.notStrictEqual(m.isError, true, m.content[0].text);
     assert.strictEqual(fake.calls.length, 2);
     assert.strictEqual(fake.calls[0].config, fake.desktopConfig, "desktop must run with desktopConfig");
@@ -136,7 +122,21 @@ test("W1C2: desktop audit passes Lighthouse's desktopConfig; mobile uses the def
       assert.strictEqual(c.flags.screenEmulation, undefined);
       assert.strictEqual(c.flags.emulatedUserAgent, undefined);
       assert.strictEqual(c.flags.port, 9333);
+      assert.strictEqual(c.flags.hostname, "127.0.0.1");
     }
+  });
+});
+
+// W2D: the reset clears the origin's service workers / Cache Storage and the
+// browser-wide HTTP cache in the profile every session shares.
+test("W2D: lighthouse_audit never resets storage (disableStorageReset), on the ctx.cdpUrl endpoint", async () => {
+  await withFakes({}, async (fake) => {
+    for (const formFactor of ["desktop", "mobile"]) {
+      const r = await tool.handler({ url: "https://example.com/", formFactor }, { cdpUrl: "http://127.0.0.1:9555" });
+      assert.notStrictEqual(r.isError, true, r.content[0].text);
+    }
+    assert.deepStrictEqual(fake.calls.map((c) => [c.flags.disableStorageReset, c.flags.port]), [[true, 9555], [true, 9555]]);
+    assert.deepStrictEqual(fake.probes, ["http://127.0.0.1:9555/json/version", "http://127.0.0.1:9555/json/version"]);
   });
 });
 
@@ -166,7 +166,7 @@ test("W1C2: CDP probe failures give current advice (no Cursor restart / 'call an
   ];
   for (const fetchImpl of cases) {
     await withFakes({ fetchImpl }, async (fake) => {
-      const r = await tool.handler({ url: "https://example.com/" });
+      const r = await tool.handler({ url: "https://example.com/" }, CTX);
       assert.strictEqual(r.isError, true);
       const text = r.content[0].text;
       assert.doesNotMatch(text, /Cursor/);
@@ -177,14 +177,15 @@ test("W1C2: CDP probe failures give current advice (no Cursor restart / 'call an
   }
 });
 
-test("W1C2: lighthouse_audit description warns about clearing data in the shared profile", () => {
-  assert.match(tool.description, /cache/i);
-  assert.match(tool.description, /service worker/i);
+test("W2D: lighthouse_audit description says storage is not reset (warm cache, shared profile)", () => {
+  assert.match(tool.description, /does not reset storage/i);
+  assert.match(tool.description, /warm/i);
+  assert.doesNotMatch(tool.description, /wipes|clears/i);
 });
 
 test("W1C2: lighthouse_audit 'no result' error carries the tool-name prefix", async () => {
   await withFakes({ result: {} }, async () => {
-    const r = await tool.handler({ url: "https://example.com/" });
+    const r = await tool.handler({ url: "https://example.com/" }, CTX);
     assert.strictEqual(r.isError, true);
     assert.match(r.content[0].text, /^lighthouse_audit: /);
   });

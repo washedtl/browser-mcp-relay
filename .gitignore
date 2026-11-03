@@ -2,6 +2,7 @@ node_modules/
 *.log
 .cache/
 .browser-data*/
+.tmp-profiles/
 local-config.json
 coverage/
 .DS_Store

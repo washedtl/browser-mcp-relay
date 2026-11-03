@@ -1,21 +1,28 @@
 #!/usr/bin/env node
 // scripts/smoke.js — non-interactive smoke test.
 //
-// Spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
-// waits for the response, verifies ≥60 tools (51 forwarded + 20 own = 71),
-// kills the relay, exits 0 on success / non-zero on failure.
+// Resolves Brave the way the relay does and fails clearly without it, then
+// spawns `node src/index.js`, sends MCP handshake + tools/list over stdin,
+// waits for the response, verifies ≥60 tools (51 forwarded + 21 own = 72 with
+// every toolset on), kills the relay, exits 0 on success / non-zero on
+// failure. Checks broker mode (the Windows default) and legacy mode; see
+// smokeModes. `--without-brave` (CI: no Brave on the runner) checks the
+// catalog alone.
 //
 // For CI / sanity checks. <60 seconds. No prompts. Reads local-config.json
 // (via the relay itself) and falls through to env vars + auto-detect
 // otherwise — same precedence as a real run.
 
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { spawn, execSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_ENTRY = path.join(REPO_ROOT, "src", "index.js");
 // W0-9 (2026-05-09): bumped from 50 → 60. Expectation today is 51 forwarded
-// + 20 own = 71 (smoke enables every toolset). The previous 50 threshold allowed ~34/51 forwarded missing
+// + 21 own = 72 (smoke enables every toolset). The previous 50 threshold allowed ~34/51 forwarded missing
 // (2/3 of the catalog) and still reported "healthy" — false positive. 60
 // catches catastrophic upstream-tool registration failures while still
 // tolerating minor upstream churn (one new tool added, one renamed).
@@ -50,13 +57,79 @@ function killTree(child) {
   }
 }
 
-function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+/**
+ * The relay's env for one check. Every check counts the whole catalog (all
+ * toolsets) from a refreshed catalog cache, so the upstream really starts.
+ * Broker mode runs on a private pipe, an empty temp profile and a temp
+ * broker home, and that broker exits 2 s after the check: nothing is left
+ * running, and the real broker (its pipe, profile, key) is never touched.
+ */
+function modeEnv(mode, scratchDir) {
+  const env = { BROWSER_RELAY_MODE: mode, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" };
+  if (mode === "broker") {
+    Object.assign(env, {
+      BROWSER_RELAY_BROKER_PIPE: process.platform === "win32"
+        ? `\\\\.\\pipe\\browser-mcp-relay-smoke-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+        : path.join(scratchDir, "smoke.sock"),
+      BROWSER_RELAY_BROKER_PROFILE_DIR: path.join(scratchDir, "profile"),
+      BROWSER_RELAY_BROKER_LOG: path.join(scratchDir, "broker.log"),
+      BROWSER_RELAY_BROKER_IDLE_EXIT_MS: "2000",
+      // the broker home (its key, work dir) too: never the real one under LOCALAPPDATA
+      LOCALAPPDATA: scratchDir,
+      XDG_STATE_HOME: scratchDir,
+    });
+  }
+  return env;
+}
+
+// Broker mode is only the default (and only checked) on Windows.
+const SMOKE_MODES = process.platform === "win32" ? ["broker", "legacy"] : ["legacy"];
+
+/** smokeTest for each mode, in order. Resolves [{ mode, ok, count, reason, seconds }]. */
+async function smokeModes({ modes = SMOKE_MODES, log = () => {} } = {}) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-smoke-"));
+  fs.mkdirSync(path.join(scratch, "profile")); // exists, so the smoke broker seeds nothing into it
+  const results = [];
+  try {
+    for (const mode of modes) {
+      log(`[smoke] ${mode} mode: spawning the relay, sending tools/list...\n`);
+      const t0 = Date.now();
+      const r = await smokeTest({ env: modeEnv(mode, scratch) });
+      results.push({ mode, ...r, seconds: (Date.now() - t0) / 1000 });
+    }
+  } finally {
+    await removeScratch(scratch, log);
+  }
+  return results;
+}
+
+/**
+ * The smoke broker exits 2 s after its check and may still hold its work dir
+ * in `dir` a moment longer; Node 24's rmSync doesn't retry EPERM itself.
+ * Cleanup never fails the smoke test.
+ */
+async function removeScratch(dir, log, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (e) {
+      if (Date.now() > deadline) {
+        log(`[smoke] could not remove ${dir} (${e.code}); delete it later\n`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
+
+/** One check: legacy mode unless `env` says otherwise (see modeEnv). */
+function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS, env = { BROWSER_RELAY_MODE: "legacy", BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" } } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [RELAY_ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
-      // Count the whole catalog, including the hidden-by-default toolsets,
-      // and refresh the cached upstream catalog so the upstream really starts.
-      env: { ...process.env, BROWSER_RELAY_TOOLSETS: "all", BROWSER_RELAY_CATALOG_REFRESH: "true" },
+      env: { ...process.env, ...env },
     });
 
     let resolved = false;
@@ -145,29 +218,46 @@ function smokeTest({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   });
 }
 
-async function main() {
-  process.stderr.write("[smoke] spawning relay, sending tools/list...\n");
-  const t0 = Date.now();
-  const result = await smokeTest();
-  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+/** One line per checked mode; true when every mode is healthy. */
+function report(results, write = (s) => process.stdout.write(s)) {
+  for (const r of results) {
+    const t = `[${r.mode}, ${r.seconds.toFixed(1)}s]`;
+    if (r.ok && r.count >= MIN_TOOLS) write(`✓ Relay healthy. ${r.count} tools available (≥${MIN_TOOLS}). ${t}\n`);
+    else if (r.ok) write(`✗ Smoke test FAILED: only ${r.count} tools returned (expected ≥${MIN_TOOLS}). ${t}\n`);
+    else write(`✗ Smoke test FAILED: ${r.reason} ${t}\n`);
+  }
+  return results.every((r) => r.ok && r.count >= MIN_TOOLS);
+}
 
-  if (result.ok && result.count >= MIN_TOOLS) {
-    process.stdout.write(`✓ Relay healthy. ${result.count} tools available (≥${MIN_TOOLS}). [${elapsed}s]\n`);
-    process.exit(0);
+/**
+ * @param {object} [opts]
+ * @param {() => {bravePath: string|null, braveDetectError: Error|null}} [opts.loadConfig] — Brave
+ *   as the relay resolves it: BROWSER_RELAY_BRAVE_PATH (env or local-config.json), the pool
+ *   wrapper's, then auto-detect (braveDetectError is set whenever bravePath is null)
+ * @returns {Promise<number>} exit code
+ */
+async function run({ argv = process.argv.slice(2), loadConfig = () => require("../src/pool-shared.js").CONFIG, modes = smokeModes, write = (s) => process.stdout.write(s) } = {}) {
+  const { bravePath, braveDetectError } = loadConfig();
+  if (bravePath) {
+    write(`[smoke] Brave: ${bravePath}\n`);
+  } else if (argv.includes("--without-brave")) {
+    write(`[smoke] Brave not found (--without-brave): checking the tool catalog only; tool calls would fail. ${braveDetectError.message}\n`);
+  } else {
+    write(
+      `✗ Smoke test FAILED: Brave not found. ${braveDetectError.message}\n` +
+      "  Install Brave (https://brave.com/), or set BROWSER_RELAY_BRAVE_PATH (env or local-config.json; `npm run setup` writes it), then re-run.\n",
+    );
+    return 1;
   }
-  if (result.ok) {
-    process.stdout.write(`✗ Smoke test FAILED: only ${result.count} tools returned (expected ≥${MIN_TOOLS}). [${elapsed}s]\n`);
-    process.exit(1);
-  }
-  process.stdout.write(`✗ Smoke test FAILED: ${result.reason} [${elapsed}s]\n`);
-  process.exit(1);
+  const results = await modes({ log: (m) => process.stderr.write(m) });
+  return report(results, write) ? 0 : 1;
 }
 
 if (require.main === module) {
-  main().catch((e) => {
+  run().then((code) => process.exit(code), (e) => {
     process.stderr.write(`[smoke] fatal: ${e.stack || e.message}\n`);
     process.exit(1);
   });
 }
 
-module.exports = { smokeTest, killTree };
+module.exports = { smokeTest, smokeModes, modeEnv, report, killTree, run, MIN_TOOLS };

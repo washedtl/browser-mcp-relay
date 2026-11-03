@@ -8,8 +8,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-763%20passing-brightgreen.svg)](#)
-[![Tools](https://img.shields.io/badge/tools-71%20%2851%20forwarded%20%2B%2020%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
+[![Tests](https://img.shields.io/badge/tests-1156%20passing-brightgreen.svg)](#)
+[![Tools](https://img.shields.io/badge/tools-72%20%2851%20forwarded%20%2B%2021%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](docs/REFERENCE.md#platform-support)
 
 </div>
@@ -20,7 +20,7 @@
 
 When you ask Claude or Cursor to *"check what's on this page"*, *"fill out this form"*, or *"run Lighthouse on production"* — your AI doesn't actually have a browser. It needs a tool that drives one.
 
-`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the [Model Context Protocol](https://modelcontextprotocol.io/), and turns them into actual browser actions. Your AI gets **71 commands** ("tools") it can call; the relay does the work behind the scenes.
+`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the [Model Context Protocol](https://modelcontextprotocol.io/), and turns them into actual browser actions. Your AI gets **72 commands** ("tools") it can call; the relay does the work behind the scenes.
 
 ## What you can ask your AI to do
 
@@ -35,7 +35,7 @@ When you ask Claude or Cursor to *"check what's on this page"*, *"fill out this 
 | 💾 **Save outputs** | Capture downloads, record video, save heap snapshots |
 | 🔍 **Extract data** | CSS-selector schema → JSON, even from authed pages |
 
-For the full 71-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
+For the full 72-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 **22 specialist tools are hidden by default** to keep your AI's context lean: `debug` (JS debugger probes), `react` (component ↔ DOM lookup), `scenario` (saved multi-step scripts) and `trace` (OpenTelemetry trace ids). When a task would clearly benefit from one, your AI asks you first (clients with MCP elicitation also show you an approve/decline prompt), then turns it on with the `toolsets` tool. To keep a group on, set `BROWSER_RELAY_TOOLSETS=debug,react` (or `all`) in the relay's env or `local-config.json`. Details: [`docs/REFERENCE.md#toolsets`](docs/REFERENCE.md#toolsets).
 
@@ -44,16 +44,19 @@ For the full 71-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 ```bash
 git clone https://github.com/washedtl/browser-mcp-relay.git
 cd browser-mcp-relay
-npm install
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install   # PowerShell: $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1; npm install
 npm run setup
 ```
+
+The relay drives your installed Brave. `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` stops a dependency from downloading ~1.2 GB of Playwright browsers (Chromium, Firefox, WebKit) that the relay never uses. Without it, `npm install` takes much longer, and fails where that download is blocked.
 
 The setup wizard:
 
 1. Auto-detects your Brave install + profile dir
-2. Writes a gitignored `local-config.json`
-3. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools)
-4. Prints a paste-ready snippet for your MCP client config
+2. Asks for the mode: broker (the Windows default) or legacy standalone / pool
+3. Writes a gitignored `local-config.json`
+4. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools; on Windows in broker mode, on a private pipe, and in legacy mode)
+5. Prints a paste-ready snippet for your MCP client config
 
 Paste the printed snippet into your MCP client's config file (`~/.claude.json` for Claude Code; `mcp.json` for Cursor) and restart the client. **Under two minutes on a clean machine.**
 
@@ -63,21 +66,25 @@ To re-verify anytime:
 
 ```bash
 npm run smoke
-# → ✓ Relay healthy. 71 tools available (≥60). 3.2s
+# → [smoke] Brave: C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe
+# → ✓ Relay healthy. 72 tools available (≥60). [broker, 3.5s]
+# → ✓ Relay healthy. 72 tools available (≥60). [legacy, 2.2s]
 ```
 
 ## The Inspector
 
-Optional read-only web UI at `localhost:9091` showing the live state of pool slots, the tool catalog, and a real-time feed of every `tools/call` your AI makes.
+Optional read-only web UI at `localhost:9090` showing the relay's live state (legacy pool slots, or the broker's sessions and tabs), the tool catalog, and a real-time feed of every `tools/call` your AI makes.
 
 ```bash
 npm run inspector
 ```
 
+In broker mode, set `BROWSER_RELAY_INSPECTOR_PORT` and the broker hosts the one Inspector for every session: live traffic from all of them, plus a **Broker** section with sessions, tabs and Brave.
+
 | Page | What you see |
 |---|---|
 | **Pool overview** | Slot grid (claimed / idle / orphan), cookie freshness, vault summary |
-| **Tools catalog** | All 71 tools with filter + per-tool detail |
+| **Tools catalog** | All 72 tools with filter + per-tool detail |
 | **Slot detail** | Live request/response feed with timing, args, and full payloads |
 | **Activity history** | Cross-slot ring buffer of the last ~200 tool calls |
 | **Settings** | Resolved config + paste-ready `local-config.json` snippet |
@@ -89,14 +96,28 @@ For inspector details (in-process vs standalone modes, security defenses, screen
 ## How it works (in 30 seconds)
 
 ```
-   MCP client ──stdio──▶ browser-mcp-relay ──▶ ┬─▶ browser-devtools-mcp (51 tools, forwarded)
-   (Claude/Cursor)                              └─▶ relay's own tools (20 tools, this repo)
-                                                       │
-                                                       ▼
-                                                     Brave (one per relay; lazy-launched)
+   Claude session 1 ──stdio──▶ shim ─┐
+   Claude session 2 ──stdio──▶ shim ─┼─ named pipe ─▶ broker ──▶ ONE Brave, ONE profile
+   Claude session N ──stdio──▶ shim ─┘                (51 forwarded + 21 own tools, one window per session)
 ```
 
-The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **20 of its own** into a single 71-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
+**Broker mode is the default on Windows.** In 5 lines:
+
+1. Each MCP session runs `node src/index.js`, which is now a ~23 MB shim.
+2. The first shim starts a shared **broker** in the background, de-elevated when the session is elevated. The others join it over a per-user named pipe.
+3. The broker runs one Brave on one persistent profile. Logins persist, and every session shares them live.
+4. Each session gets its own window. Parallel subagents call `tabs_new` and pass the returned `tabId` so they don't share a tab.
+5. If Brave crashes, the next call relaunches it. If the broker dies, the next call starts a new one. Both happen without restarting the client. Brave closes after 20 idle minutes, and the broker exits 10 minutes after its last session.
+
+**Upgrading from v0.3:** nothing to change in your MCP config. On first start, the broker profile is seeded once from your freshest legacy profile (a pool slot, or v0.3's standalone `.browser-data`), so your logins carry over.
+
+**Recovery:**
+- `npm run broker:status` shows sessions, tabs and Brave.
+- `npm run broker:stop` closes Brave cleanly and stops the broker. It stays stopped until a session's next tool call starts a fresh one, with that session's settings.
+- The log is `%LOCALAPPDATA%\browser-mcp-relay\broker\broker.log`.
+- **Fallback:** set `BROWSER_RELAY_MODE=legacy` (in the MCP server's `env`, or in `local-config.json`) to get the old one-relay-and-one-Brave-per-session model back. On macOS and Linux, legacy stays the default: the broker's unix-socket code ships but is untested.
+
+The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **21 of its own** into a single 72-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
 
 For the full architecture deep-dive, configuration env vars, modes, optional features (proxy whitelist, credential vault, autofill), troubleshooting, and worked examples, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
@@ -112,7 +133,8 @@ For the full architecture deep-dive, configuration env vars, modes, optional fea
 
 - 📜 Upstream `browser-devtools-mcp` is **Elastic-2.0** licensed — permissive but not OSI-open-source. See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 - 🦁 Requires Brave installed locally. Other Chromium browsers may work via `BROWSER_RELAY_BRAVE_PATH` but are untested.
-- 🧍 **One Brave per relay process.** Run multiple relays for parallel sessions.
+- 🤝 **One broker serves every session** (broker mode): a hung tool or a crash affects all of them for a moment, and `execute` runs agent JavaScript inside that shared broker process. See [the known risks](docs/REFERENCE.md#broker-mode-known-risks).
+- 🚧 Not in broker mode yet: the credential vault's autofill and authenticated proxies (`user:pass@`). Use `BROWSER_RELAY_MODE=legacy` if you need them.
 
 ## Contributing
 

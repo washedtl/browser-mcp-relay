@@ -640,8 +640,9 @@ function tryClaimDir(dir, lockPath, opts = {}) {
   // and cause a brief double-claim. fdatasync closes that window.
   try { fs.fdatasyncSync(fd); } catch { /* fdatasync unsupported on platform */ }
 
-  // Reap orphan brave AFTER lock acquired.
-  (opts._reapOrphansFor || reapOrphansFor)(dir);
+  // Reap orphan brave AFTER lock acquired (not for a claim that must kill
+  // nothing: the broker profile seed, profile-seed.js).
+  if (opts.reap !== false) (opts._reapOrphansFor || reapOrphansFor)(dir);
 
   const role = (CONFIG.slotRoles || {})[dir] || "default";
 
@@ -737,11 +738,13 @@ function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false } =
 
 module.exports = {
   CONFIG,
+  WRAPPER_LOCK,
   COOKIE_FILES,
   SNAPSHOT_FILES,
   SNAPSHOT_DIRS,
   loadConfig,
   claimSlot,
+  tryClaimDir,
   findBraveProcessesForDir,
   listBraveProcessesRaw,
   reapOrphansFor,

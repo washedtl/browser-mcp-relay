@@ -3,6 +3,27 @@
 
   "_comment_2": "These keys map 1:1 to environment variables. If both are set, the env var wins. The example below shows the env-var name next to each key.",
 
+  "BROWSER_RELAY_MODE": "",
+  "_BROWSER_RELAY_MODE_doc": "'broker' or 'legacy'. Empty = broker on Windows (every session shares one background broker: one Brave, one persistent profile, a window per session), legacy on macOS/Linux (one relay + Brave per session, as before v0.4; the broker's unix paths are not verified yet). Set 'legacy' to go back to the old model.",
+
+  "BROWSER_RELAY_BROKER_PROFILE_DIR": "",
+  "_BROWSER_RELAY_BROKER_PROFILE_DIR_doc": "Broker mode: the one persistent Brave profile. Empty = <broker home>/profile (Windows: %LOCALAPPDATA%\\browser-mcp-relay\\broker\\profile). Seeded once, on the broker's first start, from the legacy pool slot with the freshest cookies.",
+
+  "BROWSER_RELAY_BROKER_WINDOWS": "",
+  "_BROWSER_RELAY_BROKER_WINDOWS_doc": "Broker mode: 'cascade' (default: one visible window per session tab, stepped) or 'offscreen' (windows left of every display; they still render, and browser_show brings one into view).",
+
+  "BROWSER_RELAY_BROKER_IDLE_EXIT_MS": "",
+  "_BROWSER_RELAY_BROKER_IDLE_EXIT_MS_doc": "Broker mode: the broker exits this long after its last session disconnected. Default 600000 (10 min).",
+
+  "BROWSER_RELAY_BROKER_BROWSER_IDLE_MS": "",
+  "_BROWSER_RELAY_BROKER_BROWSER_IDLE_MS_doc": "Broker mode: Brave closes gracefully after this long without a tool call; the next call relaunches it. Default 1200000 (20 min).",
+
+  "BROWSER_RELAY_BROKER_WATCHDOG_MS": "",
+  "_BROWSER_RELAY_BROKER_WATCHDOG_MS_doc": "Broker mode: kill and restart a broker whose event loop is blocked this long (e.g. a runaway execute). Default 60000; minimum 10000; '0' turns it off.",
+
+  "BROWSER_RELAY_BROKER_RECYCLE_RSS_MB": "",
+  "_BROWSER_RELAY_BROKER_RECYCLE_RSS_MB_doc": "Broker mode: restart an idle broker whose memory exceeds this many MB (never under a session's open browser). Default 1024; '0' turns it off. (BROWSER_RELAY_BROKER_DEELEVATE and BROWSER_RELAY_BROKER_LOG are read from the MCP server's env only, not from this file.)",
+
   "BROWSER_RELAY_BRAVE_PATH": "",
   "_BROWSER_RELAY_BRAVE_PATH_doc": "Absolute path to the Brave executable. Leave empty to auto-detect (Win/Mac/Linux standard install locations + Windows registry probe). Examples: 'C:\\\\Program Files\\\\BraveSoftware\\\\Brave-Browser\\\\Application\\\\brave.exe', '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', '/usr/bin/brave-browser'.",
 

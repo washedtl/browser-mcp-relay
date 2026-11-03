@@ -2,14 +2,17 @@
 // to upstream OR to our own-tool handlers based on the tool name. Merges
 // upstream's tools/list with our own tool list.
 //
-// Two async dependencies (both injected by the entrypoint):
+// Upstream tools run through callUpstream(name, args) when the caller
+// injects one (the broker: upstream in-process, routed by tabId).
+// Otherwise (legacy) through two async dependencies injected by the entrypoint:
 //   - getUpstream(): returns the upstream MCP client. Called ONLY by
 //     tools/call for forwarded tools (~50MB node process once spawned).
 //   - ensureBrave(): launches our Brave instance via Playwright. Slow
-//     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools need the
-//     globalThis.__relayBridge handle; forwarded tools need Brave running
-//     so upstream's lazy `chromium.connectOverCDP` succeeds when its tool
-//     handler runs).
+//     (~3-5s, ~250MB). Called ONLY by tools/call (own-tools get their ctx
+//     from the bridge it resolves; forwarded tools need Brave running so
+//     upstream's lazy `chromium.connectOverCDP` succeeds when its tool
+//     handler runs). peekBrave() returns the running bridge or null, for
+//     tools that must never launch Brave (needsBrave:false).
 //
 // tools/list (every client's first call at MCP connect) is answered from
 // the cached upstream catalog (tool-catalog.js) + own-tool definitions, so
@@ -28,6 +31,8 @@ const { EventEmitter } = require("node:events");
 const toolCatalog = require("./tool-catalog.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { toolsetOf, parseToolsets, hiddenToolMessage } = require("./own-tools/toolsets.js");
+const { toolContext } = require("./own-tools/_tool-context.js");
+const { legacyRegistry, LEGACY_CONN } = require("./own-tools/_legacy-context.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -58,35 +63,59 @@ function truncateForEmit(value, max = MAX_TRAFFIC_BODY_CHARS) {
 const SENSITIVE_TOOL_RE = /^(?:cookies_export|cookies_import|form_fill|interaction_fill|storage_.+)$/;
 const REDACTED = "[redacted]";
 
-function redactStrings(value) {
-  if (typeof value === "string") return REDACTED;
-  if (Array.isArray(value)) return value.map(redactStrings);
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = redactStrings(v);
-    return out;
-  }
-  return value;
-}
-
 // Credential headers, redacted in EVERY recorded event: as object keys at
 // any depth (any case) and as "key": "value" pairs inside JSON text (tool
 // results usually carry their data as JSON in content[].text).
 const SECRET_HEADERS = ["authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"];
 const SECRET_HEADER_SET = new Set(SECRET_HEADERS);
-const SECRET_HEADER_IN_TEXT_RE = new RegExp(`("(?:${SECRET_HEADERS.join("|")})"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, "gi");
+// The value may end mid-string (a string cut to the event's budget): an
+// unterminated value at the end is redacted too, never left as a prefix.
+const SECRET_HEADER_IN_TEXT_RE = new RegExp(`("(?:${SECRET_HEADERS.join("|")})"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*(?:"|$)`, "gi");
 
-function redactSecretHeaders(value) {
-  if (typeof value === "string") return value.replace(SECRET_HEADER_IN_TEXT_RE, `$1"${REDACTED}"`);
-  if (Array.isArray(value)) return value.map(redactSecretHeaders);
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = SECRET_HEADER_SET.has(k.toLowerCase()) ? REDACTED : redactSecretHeaders(v);
+/**
+ * What an event records of `value`: every string "[redacted]" for a
+ * sensitive tool, credential headers redacted for the rest, image data
+ * summarized, and strings cut to `max` chars in total WHILE walking, so a
+ * multi-MB screenshot or capture is never scanned, copied or serialized
+ * whole. A string is cut before the header regex runs on it.
+ */
+function redactForEmit(value, sensitive, max = MAX_TRAFFIC_BODY_CHARS) {
+  let budget = max;
+  const str = (v) => {
+    if (budget <= 0) return TRUNCATED_MARKER;
+    if (sensitive) {
+      budget -= REDACTED.length;
+      return REDACTED;
     }
-    return out;
-  }
-  return value;
+    const cut = v.length > budget;
+    const part = cut ? v.slice(0, budget) : v;
+    budget -= part.length;
+    return part.replace(SECRET_HEADER_IN_TEXT_RE, `$1"${REDACTED}"`) + (cut ? TRUNCATED_MARKER : "");
+  };
+  const walk = (v) => {
+    if (typeof v === "string") return str(v);
+    if (Array.isArray(v)) {
+      const out = [];
+      for (const x of v) {
+        if (budget <= 0) { out.push(TRUNCATED_MARKER); break; }
+        out.push(walk(x));
+      }
+      return out;
+    }
+    if (v && typeof v === "object") {
+      const image = v.type === "image" && typeof v.data === "string";
+      const out = {};
+      for (const [k, x] of Object.entries(v)) {
+        if (budget <= 0) { out[TRUNCATED_MARKER] = true; break; }
+        if (image && k === "data") out[k] = `[image data: ${x.length} chars]`;
+        else if (!sensitive && SECRET_HEADER_SET.has(k.toLowerCase())) out[k] = REDACTED;
+        else out[k] = walk(x);
+      }
+      return out;
+    }
+    return v;
+  };
+  return walk(value);
 }
 
 // Our own deadline for an elicitation prompt — under the MCP SDK's 60s
@@ -122,8 +151,11 @@ class TrafficEmitter extends EventEmitter {
 class RelayServer {
   /**
    * @param {object} opts
-   * @param {() => Promise<object>} opts.getUpstream
+   * @param {() => Promise<object>} [opts.getUpstream] — legacy: the upstream child's client
+   * @param {(name: string, args: object|undefined) => Promise<object>} [opts.callUpstream] — runs an
+   *   upstream tool and returns its CallToolResult (the broker's in-process path); one of the two is required
    * @param {() => Promise<unknown>} [opts.ensureBrave]
+   * @param {() => object|null} [opts.peekBrave] — the running bridge, without launching
    * @param {TrafficEmitter} [opts.trafficEmitter]
    * @param {() => Promise<object[]>} [opts.loadUpstreamCatalog] — raw upstream tools (test seam)
    * @param {() => unknown} [opts.notifyToolsChanged] — sends MCP notifications/tools/list_changed
@@ -131,20 +163,24 @@ class RelayServer {
    *        — MCP elicitation (user prompt); resolves null when the client can't prompt
    * @param {number} [opts.elicitTimeoutMs]
    * @param {boolean} [opts.recordTraffic=true] — false: no traffic ring buffer / events (no Inspector)
+   * @param {string} [opts.trafficConn] — tags this server's request events (`conn`): the broker's
+   *   sessions share one emitter
    * @param {object} [opts.env] — reads BROWSER_RELAY_TOOLSETS (default: process.env + local-config.json)
    */
   constructor({
-    getUpstream, ensureBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
-    elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, env,
+    getUpstream, callUpstream, ensureBrave, peekBrave, trafficEmitter, loadUpstreamCatalog, notifyToolsChanged,
+    elicit, elicitTimeoutMs = ELICIT_TIMEOUT_MS, recordTraffic = true, trafficConn, env,
   } = {}) {
-    if (typeof getUpstream !== "function") {
-      throw new Error("RelayServer: constructor expects { getUpstream } async function");
+    if (typeof getUpstream !== "function" && typeof callUpstream !== "function") {
+      throw new Error("RelayServer: constructor expects { getUpstream } (legacy stdio upstream) or { callUpstream } async function");
     }
     if (ensureBrave != null && typeof ensureBrave !== "function") {
       throw new Error("RelayServer: ensureBrave, if provided, must be an async function");
     }
     this.getUpstream = getUpstream;
+    this.callUpstream = callUpstream || ((name, args) => this._callStdioUpstream(name, args));
     this.ensureBrave = ensureBrave || null;
+    this.peekBrave = peekBrave || (() => null);
     this.env = env || applyLocalConfigToEnv(process.env);
     // Raw upstream tools (disk-cached; test seam). Loaded once, on first use.
     this.loadUpstreamCatalog = loadUpstreamCatalog || toolCatalog.loadUpstreamCatalog;
@@ -158,22 +194,23 @@ class RelayServer {
     const { sets, unknown } = parseToolsets(this.env.BROWSER_RELAY_TOOLSETS);
     if (unknown.length) logStderr(`[mcp-relay] BROWSER_RELAY_TOOLSETS: ignoring unknown toolset(s) ${unknown.join(", ")}`);
     this.enabledToolsets = new Set(sets);
-    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
+    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave, needsPage }
     // The emitter always exists (callers subscribe to it unconditionally);
     // recordTraffic decides whether handleToolsCall feeds it at all.
     this.trafficEmitter = trafficEmitter || new TrafficEmitter();
     this.recordTraffic = Boolean(recordTraffic);
+    this.trafficConn = trafficConn;
   }
 
-  // needsBrave=false: relay-local tool (e.g. toolsets) — skip ensureBrave.
-  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true }) {
+  // needsBrave / needsPage: see own-tools/index.js.
+  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true, needsPage = true }) {
     if (this.ownTools.has(name)) {
       throw new Error(`relay: tool "${name}" already registered`);
     }
     if (typeof handler !== "function") {
       throw new Error(`relay: tool "${name}" handler must be a function`);
     }
-    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave });
+    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave, needsPage });
   }
 
   /** Name of the disabled toolset `toolName` belongs to, or null if it's visible. */
@@ -267,18 +304,19 @@ class RelayServer {
     }
   }
 
-  async handleToolsCall({ name, arguments: args }) {
-    const own = this.ownTools.get(name);
-    const isOwn = !!own;
-    const hiddenSet = this.hiddenToolsetFor(name);
+  /**
+   * Run one tools/call (`run` returns its result), recorded as a request and
+   * a response traffic event when recordTraffic is on. `source` is "own" or
+   * "upstream".
+   */
+  async _recordCall(name, args, source, run) {
     // recordTraffic=false (no Inspector): no ids, events or per-call serialization.
-    const record = this.recordTraffic;
+    if (!this.recordTraffic) return run();
     const sensitive = SENSITIVE_TOOL_RE.test(name);
-    const forEmit = (v) => truncateForEmit(sensitive ? redactStrings(v) : redactSecretHeaders(v));
-    const id = record ? this.trafficEmitter.nextId() : 0;
+    const forEmit = (v) => truncateForEmit(redactForEmit(v, sensitive));
+    const id = this.trafficEmitter.nextId();
     const startHr = process.hrtime.bigint();
     const recordResponse = (status, body) => {
-      if (!record) return;
       this._emitTraffic("response", {
         id,
         time: new Date().toISOString(),
@@ -290,40 +328,19 @@ class RelayServer {
 
     // Emit `request` BEFORE forwarding/handling. Inspector buffers this so
     // the activity feed can show "in-flight" until the response lands.
-    if (record) {
-      this._emitTraffic("request", {
-        id,
-        time: new Date().toISOString(),
-        method: "tools/call",
-        name,
-        args: forEmit(args || {}),
-        source: isOwn ? "own" : "upstream",
-      });
-    }
+    this._emitTraffic("request", {
+      id,
+      time: new Date().toISOString(),
+      method: "tools/call",
+      name,
+      args: forEmit(args),
+      source,
+      ...(this.trafficConn ? { conn: this.trafficConn } : {}),
+    });
 
     let response;
     try {
-      if (hiddenSet) {
-        // Owner rule: the agent asks the user before enabling a toolset.
-        response = { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
-      } else if (isOwn) {
-        // Own-tool handlers read globalThis.__relayBridge. ensureBrave
-        // populates that. Call it before invoking the handler.
-        if (own.needsBrave && this.ensureBrave) await this.ensureBrave();
-        try {
-          response = await own.handler(args || {}, this);
-        } catch (e) {
-          response = {
-            content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
-            isError: true,
-          };
-        }
-      } else {
-        // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
-        if (this.ensureBrave) await this.ensureBrave();
-        const upstream = await this.getUpstream();
-        response = await upstream.request("tools/call", { name, arguments: args });
-      }
+      response = await run();
     } catch (e) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.
       recordResponse("error", { error: e.message });
@@ -331,6 +348,62 @@ class RelayServer {
     }
     recordResponse(response && response.isError ? "error" : "ok", response);
     return response;
+  }
+
+  async handleToolsCall({ name, arguments: args }) {
+    const callArgs = args || {};
+    const own = this.ownTools.get(name);
+    return this._recordCall(name, callArgs, own ? "own" : "upstream", () => this._dispatch(name, args, callArgs, own));
+  }
+
+  async _dispatch(name, args, callArgs, own) {
+    const hiddenSet = this.hiddenToolsetFor(name);
+    if (hiddenSet) {
+      // Owner rule: the agent asks the user before enabling a toolset.
+      return { content: [{ type: "text", text: hiddenToolMessage(name, hiddenSet) }], isError: true };
+    }
+    if (own) {
+      // Legacy mode: tabs are pages of this relay's own Brave (LegacyTabs).
+      // needsBrave:false tools never launch it: without a running Brave
+      // they get just the relay.
+      const bridge = own.needsBrave ? (this.ensureBrave && await this.ensureBrave()) : this.peekBrave();
+      try {
+        const ctx = bridge
+          ? await toolContext(legacyRegistry(bridge.context), LEGACY_CONN, own, callArgs,
+            { context: bridge.context, cdpUrl: bridge.cdpConnectUrl, relay: this })
+          : { relay: this };
+        return await own.handler(callArgs, ctx);
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+    return this.callUpstream(name, args);
+  }
+
+  /** Legacy: upstream is the child process getUpstream() returns. */
+  async _callStdioUpstream(name, args) {
+    const callArgs = args || {};
+    if (callArgs.tabId != null && callArgs.tabId !== "main") {
+      // Upstream runs in its own process here and its schemas drop tabId,
+      // so the call would silently act on the main tab.
+      return {
+        content: [{ type: "text", text: `${name}: tabId is only supported for relay tools in this mode (upstream tools act on your main tab); omit tabId` }],
+        isError: true,
+      };
+    }
+    // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
+    if (this.ensureBrave) await this.ensureBrave();
+    const upstream = await this.getUpstream();
+    // tabId "main" is where upstream acts anyway; don't pass it on.
+    let forwardArgs = args;
+    if (callArgs.tabId != null) {
+      forwardArgs = { ...callArgs };
+      delete forwardArgs.tabId;
+    }
+    return upstream.request("tools/call", { name, arguments: forwardArgs });
   }
 }
 

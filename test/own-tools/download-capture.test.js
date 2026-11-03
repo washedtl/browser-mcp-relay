@@ -9,15 +9,17 @@ test("download_capture has required tool shape", () => {
   assert.strictEqual(typeof tool.handler, "function");
 });
 
-test("download_capture returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
+test("W2D: download_capture waits on ctx.page only, not on the context's other pages", async () => {
+  const download = makeDownload();
+  const mine = makeDownloadPage({ download });
+  const other = makeDownloadPage({ download });
   try {
-    const result = await tool.handler({});
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|initialized|missing/i);
+    const result = await tool.handler({}, { page: mine, context: { pages: () => [other, mine] } });
+    assert.notStrictEqual(result.isError, true, result.content[0].text);
+    assert.strictEqual(mine.waitCalls.length, 1);
+    assert.strictEqual(other.waitCalls.length, 0);
   } finally {
-    globalThis.__relayBridge = prev;
+    removeSaved(download);
   }
 });
 
@@ -27,7 +29,6 @@ test("download_capture returns isError when bridge missing", async () => {
 // ──────────────────────────────────────────────────────────────────
 
 test("T0-9: download_capture short-circuits when page closes before download", async () => {
-  const prev = globalThis.__relayBridge;
   let registeredCloseHandler = null;
   // Fake page where waitForEvent("download") never resolves; close fires.
   const fakePage = {
@@ -39,22 +40,18 @@ test("T0-9: download_capture short-circuits when page closes before download", a
     },
     off: () => {},
   };
-  globalThis.__relayBridge = { context: { pages: () => [fakePage] } };
-  try {
-    // Long timeoutMs to prove the close path is what triggers fast resolution.
-    const promise = tool.handler({ timeoutMs: 30000 });
-    setTimeout(() => {
-      if (registeredCloseHandler) registeredCloseHandler();
-    }, 10);
-    const result = await Promise.race([
-      promise,
-      new Promise((_, rej) => setTimeout(() => rej(new Error("hung > 1s after close")), 1000)),
-    ]);
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /page closed before download started/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+  const ctx = { page: fakePage };
+  // Long timeoutMs to prove the close path is what triggers fast resolution.
+  const promise = tool.handler({ timeoutMs: 30000 }, ctx);
+  setTimeout(() => {
+    if (registeredCloseHandler) registeredCloseHandler();
+  }, 10);
+  const result = await Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error("hung > 1s after close")), 1000)),
+  ]);
+  assert.strictEqual(result.isError, true);
+  assert.match(result.content[0].text, /page closed before download started/i);
 });
 
 // ───── F1-14: sanitizeDownloadFilename ─────
@@ -175,9 +172,7 @@ function removeSaved(download) {
 }
 
 async function onPage(page, fn) {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { context: { pages: () => [page] } };
-  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+  return fn({ page });
 }
 
 async function collectUnhandled(fn, settleMs) {
@@ -198,8 +193,8 @@ test("W1C1: a failed click does not leave the download wait as an unhandled reje
     waitRejectMs: 30,
     click: async () => { throw new Error("No node found for selector: #export"); },
   });
-  const seen = await collectUnhandled(() => onPage(page, async () => {
-    const r = await tool.handler({ clickSelector: "#export", timeoutMs: 30 });
+  const seen = await collectUnhandled(() => onPage(page, async (ctx) => {
+    const r = await tool.handler({ clickSelector: "#export", timeoutMs: 30 }, ctx);
     assert.strictEqual(r.isError, true);
     assert.match(r.content[0].text, /click failed/);
   }), 120);
@@ -211,8 +206,8 @@ test("W1C1: the page closing during the click is not an unhandled rejection", as
   page = makeDownloadPage({
     click: async () => { page._close(); throw new Error("Target page, context or browser has been closed"); },
   });
-  const seen = await collectUnhandled(() => onPage(page, async () => {
-    const r = await tool.handler({ clickSelector: "#export", timeoutMs: 1000 });
+  const seen = await collectUnhandled(() => onPage(page, async (ctx) => {
+    const r = await tool.handler({ clickSelector: "#export", timeoutMs: 1000 }, ctx);
     assert.strictEqual(r.isError, true);
   }), 50);
   assert.deepStrictEqual(seen.map(String), [], "close-promise rejection must be handled");
@@ -221,8 +216,8 @@ test("W1C1: the page closing during the click is not an unhandled rejection", as
 test("W1C1: relative savePath is rejected before listening for a download", async () => {
   const download = makeDownload();
   const page = makeDownloadPage({ download });
-  await onPage(page, async () => {
-    const r = await tool.handler({ savePath: "exports/report.csv" });
+  await onPage(page, async (ctx) => {
+    const r = await tool.handler({ savePath: "exports/report.csv" }, ctx);
     assert.strictEqual(r.isError, true);
     assert.match(r.content[0].text, /absolute/);
     assert.strictEqual(page.waitCalls.length, 0, "must not start waiting");
@@ -237,16 +232,16 @@ test("W1C1: an existing savePath is not overwritten unless overwrite: true", asy
     fs.writeFileSync(existing, "keep");
     const d1 = makeDownload();
     const p1 = makeDownloadPage({ download: d1 });
-    await onPage(p1, async () => {
-      const r = await tool.handler({ savePath: existing });
+    await onPage(p1, async (ctx) => {
+      const r = await tool.handler({ savePath: existing }, ctx);
       assert.strictEqual(r.isError, true);
       assert.match(r.content[0].text, /exists/);
       assert.strictEqual(p1.waitCalls.length, 0, "checked before waiting");
       assert.deepStrictEqual(d1.saved, []);
     });
     const d2 = makeDownload();
-    await onPage(makeDownloadPage({ download: d2 }), async () => {
-      const r = await tool.handler({ savePath: existing, overwrite: true });
+    await onPage(makeDownloadPage({ download: d2 }), async (ctx) => {
+      const r = await tool.handler({ savePath: existing, overwrite: true }, ctx);
       assert.ok(!r.isError, r.content[0].text);
       assert.deepStrictEqual(d2.saved, [existing]);
       assert.strictEqual(JSON.parse(r.content[0].text).savedTo, existing);
@@ -263,8 +258,8 @@ test("W1C1 V2-3: a savePath that appears while waiting is kept; the download goe
     const download = makeDownload();
     const page = makeDownloadPage();
     page.waitForEvent = async () => { fs.writeFileSync(target, "someone else's file"); return download; };
-    await onPage(page, async () => {
-      const r = await tool.handler({ savePath: target });
+    await onPage(page, async (ctx) => {
+      const r = await tool.handler({ savePath: target }, ctx);
       assert.ok(!r.isError, r.content[0].text);
       const sibling = path.join(dir, "report-1.csv");
       assert.strictEqual(JSON.parse(r.content[0].text).savedTo, sibling, "reports the path actually written");
@@ -283,8 +278,8 @@ test("W1C1 V2-3: a failed saveAs removes the placeholder it claimed", async () =
     const target = path.join(dir, "report.csv");
     const download = makeDownload();
     download.saveAs = async () => { throw new Error("disk full"); };
-    await onPage(makeDownloadPage({ download }), async () => {
-      const r = await tool.handler({ savePath: target });
+    await onPage(makeDownloadPage({ download }), async (ctx) => {
+      const r = await tool.handler({ savePath: target }, ctx);
       assert.strictEqual(r.isError, true);
       assert.match(r.content[0].text, /saveAs failed: disk full/);
       assert.deepStrictEqual(fs.readdirSync(dir), [], "no empty placeholder left behind");
@@ -297,8 +292,8 @@ test("W1C1 V2-3: a failed saveAs removes the placeholder it claimed", async () =
 test("W1C1: default save path is under the OS temp dir with the sanitized name", async () => {
   const download = makeDownload("../../evil.csv");
   try {
-    await onPage(makeDownloadPage({ download }), async () => {
-      const r = await tool.handler({});
+    await onPage(makeDownloadPage({ download }), async (ctx) => {
+      const r = await tool.handler({}, ctx);
       assert.ok(!r.isError, r.content[0].text);
       const saved = download.saved[0];
       assert.strictEqual(path.dirname(saved), os.tmpdir(), "traversal in the suggested name must not escape tmpdir");
@@ -313,11 +308,11 @@ test("W1C1: timeoutMs null → 30000 default; non-positive rejected (0 would wai
   const download = makeDownload();
   const page = makeDownloadPage({ download });
   try {
-    await onPage(page, async () => {
-      const ok = await tool.handler({ timeoutMs: null });
+    await onPage(page, async (ctx) => {
+      const ok = await tool.handler({ timeoutMs: null }, ctx);
       assert.ok(!ok.isError, ok.content[0].text);
       assert.strictEqual(page.waitCalls[0].timeout, 30000);
-      const zero = await tool.handler({ timeoutMs: 0 });
+      const zero = await tool.handler({ timeoutMs: 0 }, ctx);
       assert.strictEqual(zero.isError, true);
       assert.match(zero.content[0].text, /timeoutMs/);
     });

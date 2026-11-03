@@ -125,8 +125,8 @@ function makeDoc({ userAgent = WIN_UA, uaData = BRAVE_NATIVE_UAD } = {}) {
 // Cross-realm values have foreign prototypes; normalize before deepStrictEqual.
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
-/** Fake BrowserContext that records init scripts and returns Playwright-style disposables. */
-function makeContext({ pages = [], disposable = true } = {}) {
+/** Records init scripts and returns Playwright-style disposables. */
+function initScriptRecorder(disposable) {
   const scripts = [];
   const disposed = [];
   return {
@@ -136,28 +136,48 @@ function makeContext({ pages = [], disposable = true } = {}) {
       const idx = scripts.push(s) - 1;
       return disposable ? { dispose: async () => { disposed.push(idx); } } : undefined;
     },
-    pages: () => pages,
+  };
+}
+
+/** Fake Page (stealth_apply's target, ctx.page); `doc` is its open document. */
+function makePage({ disposable = true, doc = null } = {}) {
+  return { ...initScriptRecorder(disposable), evaluate: async (s) => (doc ? doc.run(s) : undefined) };
+}
+
+/** Fake BrowserContext: in legacy mode the session's whole context is patched. */
+function makeContext({ pages = [], disposable = true } = {}) {
+  return { ...initScriptRecorder(disposable), pages: () => pages };
+}
+
+/** Broker-style (per-connection) registry: connId → [tab pages]; getCtx opens main. */
+function tabsRegistry(byConn) {
+  return {
+    listTabs: async (connId) => (byConn[connId] || []).map((page, i) => ({ tabKey: i ? `t${i}` : "main", page })),
+    getCtx: async (connId, tabKey) => {
+      assert.strictEqual(tabKey, "main");
+      byConn[connId] = [makePage()];
+      return { page: byConn[connId][0] };
+    },
   };
 }
 
 /** Run a page "load": every still-registered init script, in registration order. */
-function loadNewDoc(context, docOpts) {
+function loadNewDoc(target, docOpts) {
   const doc = makeDoc(docOpts);
-  context.scripts.forEach((s, i) => { if (!context.disposed.includes(i)) doc.run(s); });
+  target.scripts.forEach((s, i) => { if (!target.disposed.includes(i)) doc.run(s); });
   return doc;
 }
 
-async function withBridge(context, fn) {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = { context };
-  try { return await fn(); } finally { globalThis.__relayBridge = prev; }
+/** Calls fn with the ctx a handler gets in a broker session whose only tab is `tab`. */
+async function withTab(tab, fn) {
+  return fn({ page: tab, registry: tabsRegistry({ c1: [tab] }), connId: "c1" });
 }
 
-/** Returns the script the handler injects for one fresh context. */
+/** Returns the script the handler injects for one fresh tab. */
 async function captureScript(args = {}) {
-  const context = makeContext();
-  await withBridge(context, () => tool.handler(args));
-  return context.scripts[0];
+  const tab = makePage();
+  await withTab(tab, (ctx) => tool.handler(args, ctx));
+  return tab.scripts[0];
 }
 
 // ─── Tool shape + handler contract ────────────────────────────────────
@@ -167,6 +187,8 @@ test("stealth_apply has required tool shape", () => {
   assert.strictEqual(typeof tool.description, "string");
   assert.strictEqual(typeof tool.inputSchema, "object");
   assert.strictEqual(typeof tool.handler, "function");
+  // V2-3: it patches the whole session, so it takes no tabId.
+  assert.strictEqual(tool.needsPage, false);
 });
 
 test("stealth_apply description stays compact (model-visible catalog weight)", () => {
@@ -176,43 +198,94 @@ test("stealth_apply description stays compact (model-visible catalog weight)", (
   assert.match(tool.description, /emulate_device/);
 });
 
-test("stealth_apply returns isError when bridge missing", async () => {
-  const prev = globalThis.__relayBridge;
-  globalThis.__relayBridge = undefined;
-  try {
-    const result = await tool.handler({});
-    assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /bridge|initialized|missing/i);
-  } finally {
-    globalThis.__relayBridge = prev;
-  }
+// W2D: stealth patches the calling session only. Broker: each of the
+// connection's tabs (the shared context holds other sessions' tabs).
+// Legacy: the session's whole BrowserContext (registry.scope "context").
+test("W2D: stealth_apply patches every tab of the calling connection — never another connection's tab or the shared context", async () => {
+  const docs = [makeDoc(), makeDoc()];
+  const [main, t1] = docs.map((doc) => makePage({ doc }));
+  const otherDoc = makeDoc();
+  const other = makePage({ doc: otherDoc });
+  const context = makeContext({ pages: [main, t1, other] });
+  const registry = tabsRegistry({ c1: [main, t1], c2: [other] });
+  const body = JSON.parse((await tool.handler({ languages: ["fr-FR"] }, { page: main, context, registry, connId: "c1" })).content[0].text);
+  assert.deepStrictEqual(body.applied, ["main", "t1"]);
+  assert.deepStrictEqual(body.alreadyApplied, []);
+  assert.strictEqual(body.patchedOpenPages, 2);
+  assert.deepStrictEqual([main.scripts.length, t1.scripts.length], [1, 1], "init script on each tab");
+  for (const doc of docs) assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["fr-FR"]);
+  assert.strictEqual(context.scripts.length, 0, "nothing registered context-wide");
+  assert.strictEqual(other.scripts.length, 0);
+  assert.deepStrictEqual(plain(otherDoc.get("navigator.languages")), ["en-US"], "another session's document is untouched");
 });
 
-// T0-4 + T1-7: idempotent per context — second call without force no-ops.
-test("T0-4/T1-7: stealth_apply is idempotent per context (second call no-ops)", async () => {
-  const context = makeContext();
-  await withBridge(context, async () => {
-    const r1 = await tool.handler({ languages: ["en-US", "en"] });
-    const r2 = await tool.handler({ languages: ["fr-FR", "fr"] });
+test("W2D: a connection with no tab yet gets its main tab opened and patched", async () => {
+  const byConn = {};
+  const body = JSON.parse((await tool.handler({}, { registry: tabsRegistry(byConn), connId: "c1" })).content[0].text);
+  assert.deepStrictEqual(body.applied, ["main"]);
+  assert.strictEqual(byConn.c1[0].scripts.length, 1);
+});
+
+test("W2D: a tab opened after stealth_apply is patched by the next call; patched tabs report alreadyApplied", async () => {
+  const tabs = [makePage()];
+  const ctx = { registry: tabsRegistry({ c1: tabs }), connId: "c1" };
+  await tool.handler({}, ctx);
+  tabs.push(makePage());
+  const body = JSON.parse((await tool.handler({}, ctx)).content[0].text);
+  assert.deepStrictEqual(body.applied, ["t1"]);
+  assert.deepStrictEqual(body.alreadyApplied, ["main"]);
+  assert.deepStrictEqual(tabs.map((t) => t.scripts.length), [1, 1]);
+});
+
+// Spec-review regression: legacy "stealth, then navigate" — upstream opens
+// its page AFTER the call, so patching the open tabs alone missed it.
+test("W2D legacy: the session's whole BrowserContext is patched, covering pages opened later", async () => {
+  const openDoc = makeDoc();
+  const context = makeContext({ pages: [makePage({ doc: openDoc })] });
+  const registry = { scope: "context", context, listTabs: async () => { throw new Error("not used in legacy"); } };
+  const body = JSON.parse((await tool.handler({ languages: ["de-DE"] }, { registry, connId: "legacy" })).content[0].text);
+  assert.deepStrictEqual(body.applied, ["all tabs"]);
+  assert.strictEqual(body.patchedOpenPages, 1);
+  assert.strictEqual(context.scripts.length, 1, "one context init script");
+  assert.deepStrictEqual(plain(openDoc.get("navigator.languages")), ["de-DE"]);
+  assert.deepStrictEqual(plain(loadNewDoc(context, {}).get("navigator.languages")), ["de-DE"], "a page upstream opens later is patched");
+});
+
+test("W2D: every tab of this browser gets the same audio perturbation (like one real device)", async () => {
+  const a = makePage();
+  const b = makePage();
+  await withTab(a, (ctx) => tool.handler({}, ctx));
+  await withTab(b, (ctx) => tool.handler({}, ctx));
+  const read = (tab) => Array.from(loadNewDoc(tab, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
+  assert.notDeepStrictEqual(read(a), read(makePage()), "the tab's audio is perturbed");
+  assert.deepStrictEqual(read(b), read(a));
+});
+
+// T0-4 + T1-7: idempotent per tab — second call without force no-ops.
+test("T0-4/T1-7: stealth_apply is idempotent per tab (second call no-ops)", async () => {
+  const tab = makePage();
+  await withTab(tab, async (ctx) => {
+    const r1 = await tool.handler({ languages: ["en-US", "en"] }, ctx);
+    const r2 = await tool.handler({ languages: ["fr-FR", "fr"] }, ctx);
     assert.strictEqual(r1.isError, undefined, "first call must not error");
     assert.strictEqual(r2.isError, undefined, "second call must not error");
-    assert.strictEqual(context.scripts.length, 1, "addInitScript called ONCE — second call must be no-op (T1-7)");
+    assert.strictEqual(tab.scripts.length, 1, "addInitScript called ONCE — second call must be no-op (T1-7)");
     const r2Body = JSON.parse(r2.content[0].text);
-    assert.strictEqual(r2Body.alreadyApplied, true);
-    assert.strictEqual(r2Body.applied, false);
+    assert.deepStrictEqual(r2Body.alreadyApplied, ["main"]);
+    assert.deepStrictEqual(r2Body.applied, []);
     assert.deepStrictEqual(r2Body.languages, ["en-US", "en"]);
   });
 });
 
 test("T1-7: force=true registers a new init script and reports the new languages", async () => {
   // Older playwright-core: addInitScript returns nothing disposable.
-  const context = makeContext({ disposable: false });
-  await withBridge(context, async () => {
-    await tool.handler({ languages: ["en-US"] });
-    const r2 = await tool.handler({ languages: ["fr-FR"], force: true });
-    assert.strictEqual(context.scripts.length, 2, "force=true must register a new init script");
+  const tab = makePage({ disposable: false });
+  await withTab(tab, async (ctx) => {
+    await tool.handler({ languages: ["en-US"] }, ctx);
+    const r2 = await tool.handler({ languages: ["fr-FR"], force: true }, ctx);
+    assert.strictEqual(tab.scripts.length, 2, "force=true must register a new init script");
     const r2Body = JSON.parse(r2.content[0].text);
-    assert.strictEqual(r2Body.applied, true);
+    assert.deepStrictEqual(r2Body.applied, ["main"]);
     assert.deepStrictEqual(r2Body.languages, ["fr-FR"]);
   });
 });
@@ -230,62 +303,61 @@ test("handler injects syntactically valid JS that runs cleanly in a bare realm (
 // ─── W1D-1: force:true must actually take effect ──────────────────────
 
 test("W1D-1: force re-apply changes navigator.languages on NEW documents (both scripts registered)", async () => {
-  const context = makeContext({ disposable: false }); // worst case: old script can't be removed
-  await withBridge(context, async () => {
-    await tool.handler({ languages: ["en-US", "en"] });
-    await tool.handler({ languages: ["fr-FR", "fr"], force: true });
+  const tab = makePage({ disposable: false }); // worst case: old script can't be removed
+  await withTab(tab, async (ctx) => {
+    await tool.handler({ languages: ["en-US", "en"] }, ctx);
+    await tool.handler({ languages: ["fr-FR", "fr"], force: true }, ctx);
   });
-  const doc = loadNewDoc(context, {});
+  const doc = loadNewDoc(tab, {});
   assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["fr-FR", "fr"],
     "the newer apply must win even though the older init script runs first on every load");
 });
 
 test("W1D-1: force re-apply is order-independent (newer generation wins even if it runs first)", async () => {
-  const context = makeContext({ disposable: false });
-  await withBridge(context, async () => {
-    await tool.handler({ languages: ["en-US"] });
-    await tool.handler({ languages: ["de-DE"], force: true });
+  const tab = makePage({ disposable: false });
+  await withTab(tab, async (ctx) => {
+    await tool.handler({ languages: ["en-US"] }, ctx);
+    await tool.handler({ languages: ["de-DE"], force: true }, ctx);
   });
   const doc = makeDoc();
-  doc.run(context.scripts[1]);
-  doc.run(context.scripts[0]);
+  doc.run(tab.scripts[1]);
+  doc.run(tab.scripts[0]);
   assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["de-DE"]);
 });
 
 test("W1D-1: force re-apply updates ALREADY-OPEN pages (page.evaluate path)", async () => {
   const doc = makeDoc();
-  const page = { evaluate: async (s) => doc.run(s) };
-  const context = makeContext({ pages: [page] });
-  await withBridge(context, async () => {
-    const r1 = JSON.parse((await tool.handler({ languages: ["en-US"] })).content[0].text);
+  const tab = makePage({ doc });
+  await withTab(tab, async (ctx) => {
+    const r1 = JSON.parse((await tool.handler({ languages: ["en-US"] }, ctx)).content[0].text);
     assert.strictEqual(r1.patchedOpenPages, 1);
     assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["en-US"]);
-    await tool.handler({ languages: ["ja-JP", "ja"], force: true });
+    await tool.handler({ languages: ["ja-JP", "ja"], force: true }, ctx);
   });
   assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["ja-JP", "ja"],
     "open page must reflect the forced languages, not stay on the first apply");
 });
 
 test("W1D-1: force re-apply retires the previous init script when Playwright returns a disposable", async () => {
-  const context = makeContext({ disposable: true });
-  await withBridge(context, async () => {
-    await tool.handler({ languages: ["en-US"] });
-    await tool.handler({ languages: ["fr-FR"], force: true });
-    await tool.handler({ languages: ["es-ES"], force: true });
+  const tab = makePage({ disposable: true });
+  await withTab(tab, async (ctx) => {
+    await tool.handler({ languages: ["en-US"] }, ctx);
+    await tool.handler({ languages: ["fr-FR"], force: true }, ctx);
+    await tool.handler({ languages: ["es-ES"], force: true }, ctx);
   });
-  assert.deepStrictEqual(context.disposed, [0, 1], "each force must dispose the script it replaces (no accumulation)");
-  const doc = loadNewDoc(context, {});
+  assert.deepStrictEqual(tab.disposed, [0, 1], "each force must dispose the script it replaces (no accumulation)");
+  const doc = loadNewDoc(tab, {});
   assert.deepStrictEqual(plain(doc.get("navigator.languages")), ["es-ES"]);
 });
 
 test("W1D-1: re-running the script on one document never chains permissions.query", async () => {
-  const context = makeContext({ disposable: false });
-  await withBridge(context, async () => {
-    await tool.handler({ languages: ["en-US"] });
-    await tool.handler({ languages: ["fr-FR"], force: true });
+  const tab = makePage({ disposable: false });
+  await withTab(tab, async (ctx) => {
+    await tool.handler({ languages: ["en-US"] }, ctx);
+    await tool.handler({ languages: ["fr-FR"], force: true }, ctx);
   });
-  const doc = loadNewDoc(context, {});
-  doc.run(context.scripts[1]); // e.g. page.evaluate on an open page after the init scripts
+  const doc = loadNewDoc(tab, {});
+  doc.run(tab.scripts[1]); // e.g. page.evaluate on an open page after the init scripts
   await doc.get("navigator.permissions.query({ name: 'x-unknown' })");
   assert.deepStrictEqual(plain(doc.get("__nativeQueryCalls")), ["x-unknown"], "native query must be hit exactly once");
 });
@@ -361,40 +433,40 @@ test("W1D-2: each channel and each buffer is perturbed exactly once", async () =
 });
 
 test("W1D-2: concurrent first calls register ONE init script (one audio seed per session)", async () => {
-  const context = makeContext();
-  await withBridge(context, () => Promise.all([tool.handler({}), tool.handler({})]));
-  assert.strictEqual(context.scripts.length, 1);
+  const tab = makePage();
+  await withTab(tab, (ctx) => Promise.all([tool.handler({}, ctx), tool.handler({}, ctx)]));
+  assert.strictEqual(tab.scripts.length, 1);
 });
 
-test("W1D-2: a failed addInitScript releases the context so a retry can apply", async () => {
-  const context = makeContext();
-  const realAdd = context.addInitScript;
-  context.addInitScript = async () => { throw new Error("Target closed"); };
-  await withBridge(context, async () => {
-    await assert.rejects(tool.handler({}), /Target closed/);
-    context.addInitScript = realAdd;
-    const body = JSON.parse((await tool.handler({ languages: ["en-US"] })).content[0].text);
-    assert.strictEqual(body.applied, true, "retry must apply, not report alreadyApplied");
+test("W1D-2: a failed addInitScript releases the tab so a retry can apply", async () => {
+  const tab = makePage();
+  const realAdd = tab.addInitScript;
+  tab.addInitScript = async () => { throw new Error("Target closed"); };
+  await withTab(tab, async (ctx) => {
+    await assert.rejects(tool.handler({}, ctx), /Target closed/);
+    tab.addInitScript = realAdd;
+    const body = JSON.parse((await tool.handler({ languages: ["en-US"] }, ctx)).content[0].text);
+    assert.deepStrictEqual(body.applied, ["main"], "retry must apply, not report alreadyApplied");
   });
-  assert.strictEqual(context.scripts.length, 1);
+  assert.strictEqual(tab.scripts.length, 1);
 });
 
 test("W1D-2: the audio perturbation is identical across documents in one session", async () => {
-  const context = makeContext();
-  await withBridge(context, () => tool.handler({}));
+  const tab = makePage();
+  await withTab(tab, (ctx) => tool.handler({}, ctx));
   const read = (doc) => Array.from(doc.get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
-  const docA = loadNewDoc(context, {});
-  const docB = loadNewDoc(context, {});
+  const docA = loadNewDoc(tab, {});
+  const docB = loadNewDoc(tab, {});
   assert.deepStrictEqual(read(docB), read(docA), "a per-page random seed is its own tell — must be per-session");
 });
 
 test("W1D-2: force re-apply keeps the session's audio seed", async () => {
-  const context = makeContext({ disposable: true });
-  await withBridge(context, async () => {
-    await tool.handler({ languages: ["en-US"] });
-    const before = Array.from(loadNewDoc(context, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
-    await tool.handler({ languages: ["fr-FR"], force: true });
-    const after = Array.from(loadNewDoc(context, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
+  const tab = makePage({ disposable: true });
+  await withTab(tab, async (ctx) => {
+    await tool.handler({ languages: ["en-US"] }, ctx);
+    const before = Array.from(loadNewDoc(tab, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
+    await tool.handler({ languages: ["fr-FR"], force: true }, ctx);
+    const after = Array.from(loadNewDoc(tab, {}).get("new AudioBuffer({ numberOfChannels: 1, length: 800 }).getChannelData(0)"));
     assert.deepStrictEqual(after, before);
   });
 });

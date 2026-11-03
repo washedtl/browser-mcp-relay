@@ -7,6 +7,9 @@
 //   2. In-process — booted from src/index.js when
 //      BROWSER_RELAY_INSPECTOR_PORT is set on the relay process. The relay
 //      passes its trafficEmitter, so /ws/traffic streams real MCP traffic.
+//      In broker mode (W2E) the broker hosts the one Inspector: every
+//      session's traffic, plus /api/broker (sessions, tabs, Brave) from the
+//      brokerStatus option.
 //
 // Hard rules (carried over from W7-W9 inspector.js):
 //   - Bind 127.0.0.1 by default; LAN exposure requires explicit bind override.
@@ -26,10 +29,10 @@ const http = require("node:http");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
 const { WebSocketServer } = require("ws");
 
 const pool = require("./pool-shared.js");
+const { runProbeAsync } = require("./process-shim.js");
 const { summarizeVaultFromEnv, getLoadedVault } = require("./vault.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { detectBraveProfileDir } = require("./detect-browser.js");
@@ -66,6 +69,18 @@ const MIME = {
 function redactPath(p) {
   if (!p) return p;
   return path.basename(p);
+}
+
+/** A URL without its query and fragment (they carry tokens). */
+const stripQuery = (u) => (typeof u === "string" ? u.replace(/[?#].*$/s, "") : u);
+
+/** /api/broker: the broker's status under the inspector's rules: no absolute paths, URLs without query / fragment. */
+function redactBrokerStatus(st) {
+  return {
+    ...st,
+    profileDir: redactPath(st.profileDir),
+    connections: (st.connections || []).map((c) => ({ ...c, tabs: (c.tabs || []).map((t) => ({ ...t, url: stripQuery(t.url) })) })),
+  };
 }
 
 /** Redact any absolute-path-looking tokens inside a free-form string (e.g.
@@ -112,50 +127,6 @@ function formatDuration(seconds) {
   return `${h}h ${m % 60}m`;
 }
 
-/** spawnSync's result shape from an async execFile, so a probe written
- *  against spawnSync can be fed a non-blocking run's output. */
-function spawnAsync(cmd, args, options = {}) {
-  const opts = { encoding: options.encoding || "utf8" };
-  for (const k of ["windowsHide", "timeout", "maxBuffer", "env"]) {
-    if (options[k] !== undefined) opts[k] = options[k];
-  }
-  return new Promise((resolve) => {
-    execFile(cmd, args, opts, (err, stdout, stderr) => {
-      if (!err) return resolve({ status: 0, stdout, stderr });
-      // Non-zero exit: err.code is the exit status (spawnSync: status=N,
-      // no error). Anything else (spawn failure, timeout, maxBuffer) is
-      // spawnSync's status=null + error.
-      if (typeof err.code === "number") return resolve({ status: err.code, stdout, stderr });
-      resolve({ status: null, stdout, stderr, error: err });
-    });
-  });
-}
-
-/**
- * W1E-2 (2026-11-03): run a spawnSync-based probe without blocking the
- * event loop. The pool/process-shim probes (PowerShell on Windows, ~1s
- * each) are synchronous and take a `_spawnSync` seam: a dry run captures
- * the exact command the probe would spawn, that command runs async, and the
- * probe runs again on the real output — so command construction and
- * parsing stay in one place (process-shim) with no duplicate.
- *
- * @param {(spawn?: Function) => T} probe — calls its probe with `{ _spawnSync: spawn }`
- * @returns {Promise<T>}
- */
-async function runProbeAsync(probe) {
-  const calls = [];
-  probe((cmd, args, options) => {
-    calls.push({ cmd, args, options });
-    return { status: 0, stdout: "", stderr: "" };
-  });
-  // No spawn needed (e.g. empty pid list), or a shape we can't replay
-  // faithfully: run it as-is.
-  if (calls.length !== 1) return probe();
-  const { cmd, args, options } = calls[0];
-  const result = await spawnAsync(cmd, args, options);
-  return probe(() => result);
-}
-
 // The vault for the status page: the one the relay loaded in this process.
 // Standalone inspector (no relay here): parse once and keep only the
 // summary — counts and file names, never the credentials (W1E V1-4).
@@ -173,10 +144,15 @@ const listBraveProcessesAsync = () =>
 const getProcessStartTimesAsync = (pids) =>
   runProbeAsync((spawn) => pool.getProcessStartTimes(pids, spawn ? { _spawnSync: spawn } : {}));
 
+/** The relay mode the Inspector shows: broker, or legacy's standalone / pool. */
+function modeOf(cfg, brokerMode) {
+  return brokerMode ? "broker" : cfg.standalone ? "standalone" : "pool";
+}
+
 /** Build the /api/status payload. Pure-ish (everything stateful is injected
  *  via the seams object). Async (W1E-2): the process probes run off the
  *  event loop; process seams may return values or promises. */
-async function buildStatus(seams = {}) {
+async function buildStatus(seams = {}, { brokerMode = false } = {}) {
   const _loadConfig = seams._loadConfig || pool.loadConfig;
   const _findBraveProcessesForDir =
     seams._findBraveProcessesForDir || pool.findBraveProcessesForDir;
@@ -197,6 +173,8 @@ async function buildStatus(seams = {}) {
   const _ownTools = seams._ownTools || ownTools;
 
   const cfg = _loadConfig();
+  // W2E: hosted by the broker there is no legacy pool to probe
+  const poolDirs = brokerMode ? [] : (cfg.poolDirs || []);
 
   // W0-2 (2026-11-03): read every lock up front so the recycled-PID check is
   // ONE batched start-time probe per poll, not one per slot.
@@ -207,18 +185,18 @@ async function buildStatus(seams = {}) {
     try { return { exists: true, meta: JSON.parse(_readFile(lockPath)) }; }
     catch { return { exists: true, meta: null, malformed: true }; }
   };
-  const locks = (cfg.poolDirs || []).map((dir) => readLock(path.join(dir, ".mcp-wrapper-lock")));
+  const locks = poolDirs.map((dir) => readLock(path.join(dir, pool.WRAPPER_LOCK)));
   const livePids = locks
     .map((l) => l.meta && l.meta.pid)
     .filter((p) => Number.isFinite(p) && _isPidAlive(p));
   // The two probes are independent — run them concurrently.
   const [braveProcessText, startTimes] = await Promise.all([
-    _listBraveProcessesRaw(),
+    poolDirs.length > 0 ? _listBraveProcessesRaw() : "",
     livePids.length > 0 ? _getProcessStartTimes(livePids) : new Map(),
   ]);
 
-  const slots = (cfg.poolDirs || []).map((dir, idx) => {
-    const lockPath = path.join(dir, ".mcp-wrapper-lock");
+  const slots = poolDirs.map((dir, idx) => {
+    const lockPath = path.join(dir, pool.WRAPPER_LOCK);
     let pid = null;
     let pidAlive = null;
     let lockHeldMs = null;
@@ -345,12 +323,12 @@ async function buildStatus(seams = {}) {
   const ownCount = _ownTools.length;
   const forwardedCount = 51;
   const uptimeSeconds = Math.floor((_now() - _startedAt) / 1000);
-  let mode = cfg.standalone ? "standalone" : "pool";
+  const mode = modeOf(cfg, brokerMode);
 
   return {
     config: {
       mode,
-      poolDirs: (cfg.poolDirs || []).map(redactPath),
+      poolDirs: poolDirs.map(redactPath),
       slotRoles: Object.fromEntries(
         Object.entries(cfg.slotRoles || {}).map(([k, v]) => [redactPath(k), v]),
       ),
@@ -381,7 +359,7 @@ async function buildStatus(seams = {}) {
   };
 }
 
-function buildSettings(seams = {}) {
+function buildSettings(seams = {}, { brokerMode = false } = {}) {
   const _loadConfig = seams._loadConfig || pool.loadConfig;
   const _detectBraveProfileDir = seams._detectBraveProfileDir || detectBraveProfileDir;
   const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
@@ -430,7 +408,7 @@ function buildSettings(seams = {}) {
         ? redactPath(cfg.cookieSourceProfile)
         : null,
       cookieFreshnessWarnDays: cfg.cookieFreshnessWarnDays,
-      mode: cfg.standalone ? "standalone" : "pool",
+      mode: modeOf(cfg, brokerMode),
     },
     env: envBooleans,
     localConfigExists,
@@ -447,6 +425,7 @@ const OWN_TOOL_META = {
   tabs_new: { sourceFile: "tabs-new.js", category: "tabs" },
   tabs_select: { sourceFile: "tabs-select.js", category: "tabs" },
   tabs_close: { sourceFile: "tabs-close.js", category: "tabs" },
+  browser_show: { sourceFile: "browser-show.js", category: "tabs" },
   dialog_handle: { sourceFile: "dialog-handle.js", category: "forms" },
   file_upload: { sourceFile: "file-upload.js", category: "forms" },
   form_fill: { sourceFile: "form-fill.js", category: "forms" },
@@ -693,7 +672,7 @@ function readJsonBody(req, maxBytes = 65536) {
 // take ~1-2s on Windows). Concurrent requests share the in-flight build.
 const STATUS_CACHE_MS = 5000;
 
-function makeStatusCache(seams, ttlMs) {
+function makeStatusCache(seams, ttlMs, opts) {
   let entry = null; // { at, promise }
   return {
     get({ fresh = false } = {}) {
@@ -701,7 +680,7 @@ function makeStatusCache(seams, ttlMs) {
         return entry.promise;
       }
       const e = { at: null, promise: null };
-      e.promise = buildStatus(seams).then(
+      e.promise = buildStatus(seams, opts).then(
         (status) => { e.at = Date.now(); return status; },
         (err) => { if (entry === e) entry = null; throw err; },
       );
@@ -713,10 +692,12 @@ function makeStatusCache(seams, ttlMs) {
 }
 
 /** Build the request handler. */
-function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs } = {}) {
+// brokerMode: the relay runs in broker mode, so there is no legacy pool to
+// probe (default: hosted by the broker, i.e. brokerStatus given).
+function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutators, statusCacheMs, brokerStatus, brokerMode = Boolean(brokerStatus) } = {}) {
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
   const _mutators = mutators || {};
-  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs);
+  const statusCache = makeStatusCache(seams, statusCacheMs == null ? STATUS_CACHE_MS : statusCacheMs, { brokerMode });
   const slotDetail = async (n, opts) => (getSlotDetail
     ? getSlotDetail(n, seams)
     : buildSlotDetail(n, seams, await statusCache.get(opts)));
@@ -812,7 +793,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         const absDir = (_loadConfig().poolDirs || [])[n - 1];
         const readLockRaw = () => {
           if (!absDir) return null;
-          try { return _readFile(path.join(absDir, ".mcp-wrapper-lock")); } catch { return null; }
+          try { return _readFile(path.join(absDir, pool.WRAPPER_LOCK)); } catch { return null; }
         };
         // W1E-2: remember the lock as it was when judged. A new relay can
         // claim the slot while the (slow) process probes run; reaping then
@@ -857,7 +838,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
           // the one judged stale — a relay that claimed the slot during the
           // kill has written its own.
           const killed = _reapOrphansFor(dir);
-          _clearStaleLock(path.join(dir, ".mcp-wrapper-lock"), lockRaw, "reaped via inspector");
+          _clearStaleLock(path.join(dir, pool.WRAPPER_LOCK), lockRaw, "reaped via inspector");
           return killed;
         });
         // G0-8 (2026-05-10): cap the reap operation at 10s. taskkill /F /T
@@ -881,7 +862,7 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
         // lockCleared: the stale lock is gone. False when it was left in
         // place (a relay replaced it during the reap, or unlink failed).
         const _existsFile = seams._existsFile || ((p) => fs.existsSync(p));
-        const lockCleared = !_existsFile(path.join(absDir, ".mcp-wrapper-lock"));
+        const lockCleared = !_existsFile(path.join(absDir, pool.WRAPPER_LOCK));
         const parts = ["Reaped orphan slot " + n];
         if (Number.isFinite(killed)) parts.push(killed + " brave process" + (killed === 1 ? "" : "es"));
         parts.push(lockCleared ? "lock cleared" : "lock left in place");
@@ -959,10 +940,12 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
 
     const apiBuilders = {
       "/api/status": () => statusCache.get(),
-      "/api/settings": buildSettings,
+      "/api/settings": (s) => buildSettings(s, { brokerMode }),
       "/api/tools": buildToolsCatalog,
       "/api/activity": buildActivity,
     };
+    // W2E: the broker hosts the Inspector; /api/broker is its sessions view
+    if (brokerStatus) apiBuilders["/api/broker"] = () => redactBrokerStatus(brokerStatus());
     const apiBuilder = apiBuilders[pathname];
     if (apiBuilder) {
       try {
@@ -1196,6 +1179,8 @@ function startInspector(opts = {}) {
     allowedOrigins: opts.allowedOrigins,
     mutators: opts.mutators,
     statusCacheMs: opts.statusCacheMs,
+    brokerStatus: opts.brokerStatus,
+    brokerMode: opts.brokerMode,
   });
   const server = http.createServer(handler);
 
@@ -1307,6 +1292,7 @@ function createInspector(seamsOrOpts = {}) {
     allowedOrigins: opts.allowedOrigins,
     mutators: opts.mutators,
     statusCacheMs: opts.statusCacheMs,
+    brokerMode: opts.brokerMode,
   });
   const server = http.createServer(handler);
   const wss = attachWebsocket(server, {

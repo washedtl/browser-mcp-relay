@@ -15,7 +15,7 @@ import os
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 # Paths
-REPO = r"C:\Users\tlip9\.claude\scripts\browser-mcp-relay"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repo root
 SCREENSHOT = os.path.join(REPO, "docs", "screenshots", "03-tools-catalog.png")
 OUT = os.path.join(REPO, "docs", "hero.png")
 

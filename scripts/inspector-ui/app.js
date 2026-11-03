@@ -390,8 +390,42 @@
     }
   }
 
+  // Broker mode (W2E): the broker hosts this Inspector and /api/broker lists
+  // its sessions and their tabs (404 from a legacy relay: section hidden).
+  function renderBroker(b) {
+    const title = document.getElementById("broker-title");
+    const card = document.getElementById("broker-card");
+    const meta = document.getElementById("broker-meta");
+    if (!title || !card || !meta) return;
+    // CSSOM, not the hidden attribute: .section-title's display:flex wins over it
+    title.style.display = card.style.display = b ? "" : "none";
+    if (!b) return;
+    clearChildren(card);
+    clearChildren(meta);
+    meta.appendChild(b.brave.up
+      ? el("span", { class: "ok" }, "Brave up · pid " + b.brave.pid)
+      : el("span", null, "Brave not running (starts on the next tool call)"));
+    const tabs = [];
+    for (const c of b.connections) for (const t of c.tabs) tabs.push(c.id + " · " + t.tabId + " · " + (t.state === "open" ? t.url || "about:blank" : t.state));
+    card.appendChild(el("div", { class: "vault-row" }, [
+      el("span", null, [el("span", { class: "k" }, "Sessions"), String(b.connections.length)]),
+      el("span", null, [el("span", { class: "k" }, "Tabs"), String(tabs.length)]),
+      el("span", null, [el("span", { class: "k" }, "Memory"), b.rssMB + " MB"]),
+      el("span", null, [el("span", { class: "k" }, "Uptime"), formatDuration(b.uptimeS)]),
+    ]));
+    if (tabs.length) card.appendChild(el("div", { class: "vault-files" }, tabs.map((t) => el("div", { class: "file" }, t))));
+  }
+
   function buildHomeShell(main) {
     clearChildren(main);
+    main.appendChild(
+      el("div", { class: "section-title", id: "broker-title" }, [
+        el("h2", null, "Broker"),
+        el("span", { class: "meta", id: "broker-meta" }),
+      ]),
+    );
+    main.appendChild(el("div", { class: "vault-card", id: "broker-card" }));
+    renderBroker(null); // shown once /api/broker answers
     main.appendChild(
       el("div", { class: "section-title" }, [
         el("h2", null, "Pool"),
@@ -426,8 +460,12 @@
     homeFetchAbort = new AbortController();
     const signal = homeFetchAbort.signal;
     try {
-      const status = await fetchJson("/api/status", { signal });
+      const [status, broker] = await Promise.all([
+        fetchJson("/api/status", { signal }),
+        fetchJson("/api/broker", { signal }).catch((e) => { if (e.status === 404) return null; throw e; }),
+      ]);
       renderHeader(status);
+      renderBroker(broker);
       renderSidebar(status);
       renderSlotGrid(status, document.getElementById("slot-grid"), document.getElementById("pool-meta"));
       renderCookieSourceCard(status, document.getElementById("cookie-source-wrap"));

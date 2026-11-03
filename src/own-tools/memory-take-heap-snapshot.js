@@ -28,7 +28,6 @@ const path = require("node:path");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
-const { withActivePage } = require("./_active-page.js");
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
@@ -46,7 +45,7 @@ function withPageLock(page, fn) {
 module.exports = {
   name: "memory_take-heap-snapshot",
   description:
-    "Take a V8 heap snapshot of the active page via CDP HeapProfiler. " +
+    "Take a V8 heap snapshot of this tab via CDP HeapProfiler. " +
     "Saves the .heapsnapshot file to disk and returns its path. " +
     "The file can be loaded into Chrome DevTools' Memory tab for analysis. " +
     "Chunks are streamed directly to disk so memory overhead stays constant " +
@@ -69,7 +68,7 @@ module.exports = {
       },
     },
   },
-  handler: async (_args = {}) => withActivePage(async ({ bridge, page }) => {
+  handler: async (_args = {}, { page, context }) => {
     // F0-9 reviewer V1 (2026-05-10): null/undefined → use default; reject
     // empty-string explicitly so `outputPath: ""` doesn't sneak past as a
     // truthy-but-useless path.
@@ -90,8 +89,8 @@ module.exports = {
     // W1C2: pid + counter so same-millisecond calls (and other relays
     // sharing the temp dir) never pick the same default file.
     const dst = outputPath || path.join(os.tmpdir(), `heap-${Date.now()}-${process.pid}-${++defaultPathSeq}.heapsnapshot`);
-    return withPageLock(page, () => snapshotToFile(bridge.context, page, dst, timeoutMs));
-  }),
+    return withPageLock(page, () => snapshotToFile(context, page, dst, timeoutMs));
+  },
 };
 
 async function snapshotToFile(context, page, dst, timeoutMs) {
