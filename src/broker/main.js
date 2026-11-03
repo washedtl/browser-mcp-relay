@@ -40,7 +40,6 @@ const LOG_ROTATE_BYTES = 1024 * 1024;
 const DEFAULT_WATCHDOG_MS = 60_000;
 const MIN_WATCHDOG_MS = 10_000; // shorter would kill a healthy broker busy for a few seconds
 const KEY_CHECK_MS = 30_000;
-const STALE_LAUNCH_FILE_MS = 5 * 60_000;
 const DEFAULT_RECYCLE_RSS_MB = 1024;
 const RECYCLE_CHECK_MS = 60_000;
 // W2C's message for a CDP port another process holds (it never switches ports)
@@ -875,25 +874,6 @@ function watchdogSetting(raw) {
 }
 
 /**
- * Delete launch-*.json files older than 5 min from `dir`: an earlier
- * launcher passed settings that way, and a broker that never started left
- * them behind (they may hold settings such as a proxy URL).
- */
-function sweepLaunchFiles(dir, { now = Date.now(), maxAgeMs = STALE_LAUNCH_FILE_MS } = {}) {
-  let removed = 0;
-  let names = [];
-  try { names = fs.readdirSync(dir); } catch { return 0; }
-  for (const name of names) {
-    if (!/^launch-.*\.json$/.test(name)) continue;
-    const file = path.join(dir, name);
-    try {
-      if (now - fs.statSync(file).mtimeMs > maxAgeMs) { fs.rmSync(file, { force: true }); removed++; }
-    } catch { /* gone meanwhile */ }
-  }
-  return removed;
-}
-
-/**
  * The broker's env: process.env + local-config.json. Keys only in
  * local-config are also copied into processEnv, because the in-process
  * upstream (W2B) reads process.env only: the catalog (built from this env)
@@ -914,8 +894,6 @@ async function main(argv = process.argv.slice(2)) {
   const profileDir = args.profileDir || endpoint.profileDir;
   const logFile = args.logFile || env.BROWSER_RELAY_BROKER_LOG || path.join(brokerHome(env), "broker.log");
   const log = fileLogger(logFile);
-  const swept = sweepLaunchFiles(brokerHome(env));
-  if (swept) log(`removed ${swept} stale launch settings file(s)`);
   try {
     prepareWorkDir(env);
   } catch (e) {
@@ -969,7 +947,6 @@ module.exports = {
   parseArgs,
   brokerEnv,
   watchdogSetting,
-  sweepLaunchFiles,
   startWatchdog,
   prepareWorkDir,
   toCallToolResult,

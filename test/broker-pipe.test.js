@@ -552,19 +552,6 @@ test("watchdogSetting: default 60 s, 0 turns it off, anything else at least 10 s
   assert.strictEqual(watchdogSetting("junk"), 60_000);
 });
 
-test("sweepLaunchFiles: removes launch-*.json older than 5 min, keeps fresh ones and other files", (t) => {
-  const { sweepLaunchFiles } = require("../src/broker/main.js");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-sweep-"));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  for (const n of ["launch-1-a.json", "launch-2-b.json", "broker.key", "broker.log"]) fs.writeFileSync(path.join(dir, n), "x");
-  const old = new Date(Date.now() - 10 * 60_000);
-  fs.utimesSync(path.join(dir, "launch-1-a.json"), old, old);
-  fs.utimesSync(path.join(dir, "broker.log"), old, old);
-  assert.strictEqual(sweepLaunchFiles(dir), 1);
-  assert.deepStrictEqual(fs.readdirSync(dir).sort(), ["broker.key", "broker.log", "launch-2-b.json"]);
-  assert.strictEqual(sweepLaunchFiles(path.join(dir, "missing")), 0);
-});
-
 test("startBroker: the supervisor gets a fixed CDP port chosen up front", async (t) => {
   const b = await startTestBroker(t);
   assert.ok(Number.isInteger(b.sup.opts.port) && b.sup.opts.port > 0);
