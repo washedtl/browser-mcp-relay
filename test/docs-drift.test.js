@@ -230,3 +230,16 @@ test("W2E: the broker npm scripts the docs name exist", () => {
   }
   assert.ok(README.includes("npm run broker:status") && README.includes("npm run broker:stop"));
 });
+
+test("W2E: no control characters in the docs (a mangled \\b once became a backspace in README)", () => {
+  const docs = ["README.md", "CONTRIBUTING.md", "THIRD_PARTY_NOTICES.md", "local-config.example.json",
+    ...fs.readdirSync(path.join(REPO, "docs")).filter((f) => f.endsWith(".md")).map((f) => path.join("docs", f))];
+  const bad = [];
+  for (const doc of docs) {
+    fs.readFileSync(path.join(REPO, doc), "utf8").split("\n").forEach((line, i) => {
+      // eslint-disable-next-line no-control-regex
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(line)) bad.push(`${doc}:${i + 1}`);
+    });
+  }
+  assert.deepStrictEqual(bad, [], "control characters (below 0x20, except tab/CR/LF)");
+});

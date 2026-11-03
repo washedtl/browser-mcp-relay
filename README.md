@@ -110,7 +110,7 @@ On first start, the broker profile is seeded once from your freshest legacy pool
 **Recovery:**
 - `npm run broker:status` shows sessions, tabs and Brave.
 - `npm run broker:stop` closes Brave cleanly and stops the broker. Open sessions start a fresh one on their next call.
-- The log is `%LOCALAPPDATA%rowser-mcp-relayrokerroker.log`.
+- The log is `%LOCALAPPDATA%\browser-mcp-relay\broker\broker.log`.
 - **Fallback:** set `BROWSER_RELAY_MODE=legacy` (in the MCP server's `env`, or in `local-config.json`) to get the old one-relay-and-one-Brave-per-session model back. On macOS and Linux, legacy stays the default until the broker's unix-socket paths are verified.
 
 The relay merges **51 upstream tools** from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) with **21 of its own** into a single 72-tool MCP. Your AI doesn't know or care where each tool comes from — to it, it's just one MCP server.
