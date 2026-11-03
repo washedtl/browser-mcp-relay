@@ -833,3 +833,24 @@ test("processes (V1-2): broker:stop with a session open really stops the broker;
   assert.notStrictEqual(second, first);
   assert.ok(pidAlive(second));
 });
+
+// ── oversized client messages (deps review V2-2) ───────────────────────────
+
+test("shim: MAX_CLIENT_MESSAGE_BYTES matches the MCP SDK's stdio buffer cap (drift guard)", () => {
+  const { MAX_CLIENT_MESSAGE_BYTES } = require("../src/shim.js");
+  const { STDIO_DEFAULT_MAX_BUFFER_SIZE } = require("@modelcontextprotocol/sdk/shared/stdio.js");
+  assert.strictEqual(MAX_CLIENT_MESSAGE_BYTES, STDIO_DEFAULT_MAX_BUFFER_SIZE);
+});
+
+test("shim: an oversized call fails locally with the real reason and never reaches (or starts) a broker", async (t) => {
+  const pipe = testPipe("oversize");
+  const h = shimHarness(t, pipe);
+  const big = { jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "x", arguments: { blob: "a".repeat(10 * 1024 * 1024) } } };
+  h.send(big);
+  const res = await h.response(42);
+  assert.strictEqual(res.error.code, -32600);
+  assert.match(res.error.message, /too large/);
+  assert.doesNotMatch(res.error.message, /restarted/);
+  assert.strictEqual(h.launches.length, 0, "no broker launch for a rejected message");
+  assert.ok(h.logs.some((m) => /dropped a .* MB message/.test(m)));
+});

@@ -44,6 +44,11 @@ const CONNECT_TIMEOUT_MS = 30_000; // a cold broker under load needs a few secon
 const RESPAWN_AFTER_MS = 5_000; // pipe still missing this long after a launch: launch again
 const EXIT_GRACE_MS = 2_000;
 const RESTARTED = "browser broker restarted; please retry the call";
+// The broker reads us with the MCP SDK's stdio buffer, which drops the whole
+// connection on a message over STDIO_DEFAULT_MAX_BUFFER_SIZE (drift-guarded in
+// test/shim.test.js). Reject such a message here with the real reason instead
+// of letting it surface as RESTARTED, which invites the client to retry it.
+const MAX_CLIENT_MESSAGE_BYTES = 10 * 1024 * 1024;
 // the one answer to a key the pipe's owner doesn't match (main.js restores a deleted key file every 30 s)
 const KEY_ADVICE = "the broker key changed or is missing: the running broker restores a missing key file within ~30 s, so retry then; " +
   "if it persists, run `npm run broker:stop` (close sessions first) and retry. (Or another program holds the pipe name: set BROWSER_RELAY_BROKER_PIPE.)";
@@ -224,6 +229,19 @@ class Shim {
 
   _fromClient(line) {
     if (this.ending) return;
+    if (Buffer.byteLength(line) + 1 > MAX_CLIENT_MESSAGE_BYTES) {
+      const msg = tryParse(line);
+      const mb = (Buffer.byteLength(line) / 1048576).toFixed(1);
+      this.log(`dropped a ${mb} MB message from the client (limit 10 MB)`);
+      if (msg && msg.id !== undefined && msg.method) {
+        this._toClient({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32600, message: `message too large (${mb} MB; the limit is 10 MB). Send smaller arguments, e.g. write the data to a file and pass its path.` },
+        });
+      }
+      return;
+    }
     if (this.sock && !this.connecting) {
       this._toBroker(line);
       return;
@@ -463,4 +481,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) main();
 
-module.exports = { Shim, runLauncher, launchEnv, launcherArgs, resolveShimOptions, onLines, main, SHIM_FILE, BROKER_MAIN, RESTARTED };
+module.exports = { Shim, runLauncher, launchEnv, launcherArgs, resolveShimOptions, onLines, main, SHIM_FILE, BROKER_MAIN, RESTARTED, MAX_CLIENT_MESSAGE_BYTES };
