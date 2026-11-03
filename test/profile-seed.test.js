@@ -51,6 +51,7 @@ const fakePool = (poolDirs, { standalone = false } = {}) => ({ ...pool, CONFIG: 
 /** Probes that must not run, or fixed answers. */
 const noProbes = { braveCommands: async () => { throw new Error("must not list processes"); }, startTimes: async () => { throw new Error("must not probe"); } };
 const probes = (commands = [], startTimes = new Map()) => ({ braveCommands: async () => commands, startTimes: async () => startTimes });
+const dirsOf = (r) => r.candidates.map((c) => c.dir);
 
 function lockSlot(dir, meta) {
   fs.writeFileSync(path.join(dir, pool.WRAPPER_LOCK), JSON.stringify({ host: "h", relay: true, ...meta }));
@@ -73,23 +74,25 @@ const snapshot = (dir) => listTree(dir).map((r) => [r, fs.statSync(path.join(dir
 
 // ───────────────────────────── picking the source ─────────────────────────────
 
-test("findSeedSource: the slot whose Default/Network/Cookies was written most recently", async () => {
+test("findSeedSource: candidates freshest Default/Network/Cookies first", async () => {
   const old = fakeSlot("old", { ageMs: 3 * 86400e3 });
   const fresh = fakeSlot("fresh", { ageMs: 60e3 });
   const none = fakeSlot("nocookies", { cookies: false });
   const r = await seed.findSeedSource({ pool: fakePool([]), dirs: [old, none, fresh], probes: probes() });
-  assert.strictEqual(r.dir, fresh);
-  assert.ok(Math.abs(r.cookiesMtimeMs - (Date.now() - 60e3)) < 5000);
+  assert.deepStrictEqual(dirsOf(r), [fresh, old]);
+  assert.ok(Math.abs(r.candidates[0].cookiesMtimeMs - (Date.now() - 60e3)) < 5000);
   assert.deepStrictEqual(r.skipped.map((s) => [s.dir, s.why]), [[none, "no Default/Network/Cookies"]]);
 });
 
-test("findSeedSource: no slot with cookies → no process probes at all", async () => {
-  const r = await seed.findSeedSource({ pool: fakePool([]), dirs: [fakeSlot("nc", { cookies: false }), tmp("missing")], probes: noProbes });
-  assert.strictEqual(r.dir, null);
-  assert.strictEqual(r.skipped.length, 2);
+test("findSeedSource: no slot left after the cookie + lockfile checks → no process probes at all", async () => {
+  const running = fakeSlot("lockfile");
+  write(path.join(running, "lockfile"), "");
+  const r = await seed.findSeedSource({ pool: fakePool([]), dirs: [fakeSlot("nc", { cookies: false }), tmp("missing"), running], probes: noProbes });
+  assert.deepStrictEqual(r.candidates, []);
+  assert.deepStrictEqual(r.skipped.map((s) => s.why), ["no Default/Network/Cookies", "no Default/Network/Cookies", "Brave is running on it (its lockfile is present)"]);
 });
 
-test("findSeedSource: a slot with a running Brave (exact --user-data-dir) or a live relay's lock is skipped", async () => {
+test("findSeedSource: a running Brave (exact --user-data-dir) or a live relay's lock is skipped", async () => {
   const busy = fakeSlot("busy", { ageMs: 1e3 });
   const claimed = fakeSlot("claimed", { ageMs: 2e3 });
   const idle = fakeSlot("idle", { ageMs: 86400e3 });
@@ -99,19 +102,21 @@ test("findSeedSource: a slot with a running Brave (exact --user-data-dir) or a l
     `"C:\\brave.exe" --user-data-dir=${idle}-other`, // a different dir that merely starts the same
   ];
   const r = await seed.findSeedSource({ pool: fakePool([]), dirs: [busy, claimed, idle], probes: probes(commands, new Map([[process.pid, Date.now() - 60e3]])) });
-  assert.strictEqual(r.dir, idle);
+  assert.deepStrictEqual(dirsOf(r), [idle]);
   assert.deepStrictEqual(r.skipped.map((s) => s.why), ["Brave is running on it", "a legacy relay holds it"]);
 });
 
-test("findSeedSource: pool-shared's lock rules — a dead or recycled PID's lock doesn't block the slot", async () => {
+test("findSeedSource: pool-shared's lock rules — a dead or recycled PID's lock doesn't block the slot (handed over to be cleared)", async () => {
   const dead = fakeSlot("deadlock", { ageMs: 1e3 });
   lockSlot(dead, { pid: 999999999, startedAt: new Date().toISOString() });
-  assert.strictEqual((await seed.findSeedSource({ pool: fakePool([]), dirs: [dead], probes: probes() })).dir, dead);
+  const r1 = await seed.findSeedSource({ pool: fakePool([]), dirs: [dead], probes: probes() });
+  assert.deepStrictEqual(dirsOf(r1), [dead]);
+  assert.match(r1.candidates[0].staleLockRaw, /999999999/);
   const recycled = fakeSlot("recycled", { ageMs: 1e3 });
   // the lock was written a year ago; this PID's process started now: a recycled PID
   lockSlot(recycled, { pid: process.pid, startedAt: new Date(Date.now() - 365 * 86400e3).toISOString() });
-  const r = await seed.findSeedSource({ pool: fakePool([]), dirs: [recycled], probes: probes([], new Map([[process.pid, Date.now()]])) });
-  assert.strictEqual(r.dir, recycled);
+  const r2 = await seed.findSeedSource({ pool: fakePool([]), dirs: [recycled], probes: probes([], new Map([[process.pid, Date.now()]])) });
+  assert.deepStrictEqual(dirsOf(r2), [recycled]);
 });
 
 test("poolCandidates: pool-shared's slots; none in standalone mode", () => {
@@ -182,6 +187,85 @@ test("copySeed: refuses an existing target; a failed copy leaves neither target 
   assert.deepStrictEqual(fs.existsSync(parent) ? fs.readdirSync(parent) : [], []);
 });
 
+test("copySeed: the final rename is retried on EPERM (AV / indexer), then given up", async () => {
+  const src = fakeSlot("eperm");
+  let tries = 0;
+  const flaky = async (a, b) => {
+    if (++tries < 3) throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+    return fs.promises.rename(a, b);
+  };
+  const dst = path.join(tmp("eperm-ok"), "profile");
+  assert.deepStrictEqual(await seed.copySeed(src, dst, { rename: flaky }), { files: 5 });
+  assert.strictEqual(tries, 3);
+  const parent = tmp("eperm-never");
+  await assert.rejects(seed.copySeed(src, path.join(parent, "profile"), { rename: async () => { throw Object.assign(new Error("EPERM"), { code: "EPERM" }); } }), /EPERM/);
+  assert.deepStrictEqual(fs.readdirSync(parent), [], "temp dir removed");
+});
+
+test("V2-b: a source whose Default or Local State is a symlink / junction is refused (it could point anywhere)", async () => {
+  const outside = tmp("outside");
+  write(path.join(outside, "Network", "Cookies"), "x");
+  write(path.join(outside, "secret.txt"), "TOP SECRET");
+  const linked = tmp("linked-default");
+  fs.mkdirSync(linked);
+  fs.symlinkSync(outside, path.join(linked, "Default"), "junction");
+  await assert.rejects(seed.copySeed(linked, path.join(tmp("dst-link"), "profile")), /refusing .*Default.*symlink or junction/);
+  await assert.rejects(seed.planSeed(linked), /symlink or junction/);
+
+  const linkedState = fakeSlot("linked-state");
+  fs.rmSync(path.join(linkedState, "Local State"));
+  write(path.join(outside, "state.json"), "{}");
+  try {
+    fs.symlinkSync(path.join(outside, "state.json"), path.join(linkedState, "Local State"), "file");
+  } catch (e) {
+    if (e.code !== "EPERM") throw e; // file symlinks need a privilege on Windows: Default covers the rule
+    return;
+  }
+  await assert.rejects(seed.copySeed(linkedState, path.join(tmp("dst-link2"), "profile")), /Local State.*symlink or junction/);
+});
+
+test("V2-a: the slot's relay lock is held (by this process, no reap) for the whole copy, then released; a stale lock is cleared first", async () => {
+  const slot = fakeSlot("locked");
+  lockSlot(slot, { pid: 999999999, startedAt: new Date().toISOString() }); // a dead relay's
+  const { candidates } = await seed.findSeedSource({ pool: fakePool([]), dirs: [slot], probes: probes() });
+  const seen = [];
+  const copyFile = async (a, b) => {
+    seen.push(JSON.parse(fs.readFileSync(path.join(slot, pool.WRAPPER_LOCK), "utf8")).pid);
+    return fs.promises.copyFile(a, b);
+  };
+  const dst = path.join(tmp("dst-locked"), "profile");
+  await seed.copyFromSlot(fakePool([slot]), candidates[0], dst, { copyFile });
+  assert.ok(seen.length === 5 && seen.every((pid) => pid === process.pid), `lock held by us during every copy: ${seen}`);
+  assert.strictEqual(fs.existsSync(path.join(slot, pool.WRAPPER_LOCK)), false, "released after");
+});
+
+test("V2-a: a slot a relay claimed after it was picked is not copied", async () => {
+  const slot = fakeSlot("raced");
+  const { candidates } = await seed.findSeedSource({ pool: fakePool([]), dirs: [slot], probes: probes() });
+  lockSlot(slot, { pid: process.pid, startedAt: new Date().toISOString() }); // a relay claims it now
+  const dst = path.join(tmp("dst-raced"), "profile");
+  await assert.rejects(seed.copyFromSlot(fakePool([slot]), candidates[0], dst), /claimed it meanwhile/);
+  assert.strictEqual(fs.existsSync(dst), false);
+});
+
+test("V1-3: a source that changes during the copy (cookies written, Brave started) is discarded for the next slot", async () => {
+  const fresh = fakeSlot("changes", { ageMs: 1e3 });
+  const older = fakeSlot("steady", { ageMs: 60e3 });
+  let calls = 0;
+  const copyFile = async (a, b) => {
+    if (++calls === 2 && a.startsWith(fresh)) write(path.join(fresh, "lockfile"), ""); // a Brave starts on it mid-copy
+    return fs.promises.copyFile(a, b);
+  };
+  const profileDir = path.join(tmp("p-change"), "profile");
+  const logs = [];
+  const r = await seed.seedOnFirstStart({ profileDir, log: (m) => logs.push(m), pool: fakePool([fresh, older]), probes: probes(), copyFile });
+  assert.strictEqual(r.from, older);
+  assert.strictEqual(fs.readFileSync(path.join(profileDir, "Default", "Network", "Cookies"), "utf8"), "cookies-steady");
+  assert.ok(logs.some((l) => l.includes(fresh) && /changed during the copy/.test(l)), logs.join("\n"));
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(profileDir)), ["profile"], "the discarded copy left nothing");
+  assert.strictEqual(fs.existsSync(path.join(fresh, pool.WRAPPER_LOCK)), false, "its lock was released too");
+});
+
 // ───────────────────────────── on the broker's first start ─────────────────────────────
 
 test("seedOnFirstStart: an existing profile is left alone (nothing listed, nothing read)", async () => {
@@ -191,6 +275,17 @@ test("seedOnFirstStart: an existing profile is left alone (nothing listed, nothi
   const r = await seed.seedOnFirstStart({ profileDir, log: (m) => logs.push(m), pool: fakePool([fakeSlot("ignored")]), probes: noProbes });
   assert.strictEqual(r, null);
   assert.deepStrictEqual(logs, []);
+});
+
+test("seedOnFirstStart: an unfinished seed by a dead process is removed; a live one's is left", async () => {
+  const parent = tmp("orphans");
+  fs.mkdirSync(path.join(parent, "profile"), { recursive: true });
+  write(path.join(parent, "profile.seeding-999999999", "Default", "x"), "half");
+  write(path.join(parent, `profile.seeding-${process.pid}`, "Default", "x"), "in progress");
+  const logs = [];
+  await seed.seedOnFirstStart({ profileDir: path.join(parent, "profile"), log: (m) => logs.push(m), pool: fakePool([]), probes: noProbes });
+  assert.deepStrictEqual(fs.readdirSync(parent).sort(), ["profile", `profile.seeding-${process.pid}`]);
+  assert.ok(logs.some((l) => /profile\.seeding-999999999/.test(l)), logs.join("\n"));
 });
 
 test("seedOnFirstStart: standalone (no pool) → a fresh profile, said once in the log", async () => {
@@ -231,6 +326,7 @@ test("seedOnFirstStart: a failed copy or probe is logged and the broker starts w
     const r = await seed.seedOnFirstStart({ profileDir, log: (m) => logs.push(m), pool: fakePool([a]), ...opts });
     assert.strictEqual(r, null);
     assert.strictEqual(fs.existsSync(profileDir), false);
-    assert.ok(logs.some((l) => /EACCES|powershell failed/.test(l) && /fresh/i.test(l)), logs.join("\n"));
+    assert.ok(logs.some((l) => /EACCES|powershell failed/.test(l)), logs.join("\n"));
+    assert.ok(logs.some((l) => /fresh profile/i.test(l)), logs.join("\n"));
   }
 });

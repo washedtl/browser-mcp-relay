@@ -9,12 +9,15 @@
 // Copied: `Default/` minus caches and the last session's tabs, plus `Local
 // State` (it holds the cookie key, DPAPI-wrapped for this same user). Nothing
 // else at the top level (shader caches, crash dumps, locks). The source is
-// only read. Skipped sources: a slot without cookies, one Brave runs on (a
-// live profile copies inconsistently), one a live legacy relay holds (its
-// Brave may start any moment; and a de-elevated broker can't read an
-// elevated Brave's command line, so the lock is the reliable sign). The copy
-// lands in a temp dir next to the target and is renamed into place: a crash
-// mid-copy never leaves a half profile that counts as "exists".
+// only read, and refused when `Default` or `Local State` is a symlink or
+// junction (it could point anywhere). Skipped sources: a slot without
+// cookies, one Brave runs on (its `lockfile`, which a de-elevated broker
+// sees even for an elevated Brave, or its command line), one a live legacy
+// relay holds. The slot's relay lock is held for the whole copy, so no
+// legacy relay claims and writes it meanwhile, and a source that changed
+// anyway (cookies, Local State, a Brave starting) is discarded for the next
+// slot. The copy lands in a temp dir next to the target and is renamed into
+// place: a crash mid-copy never leaves a half profile that counts as "exists".
 //
 // Shared with scripts/migrate-profile.js.
 
@@ -32,9 +35,13 @@ const EXCLUDED = [
   "GraphiteDawnCache", "ShaderCache", "Service Worker/CacheStorage", "Service Worker/ScriptCache",
   "Shared Dictionary/cache", "component_crx_cache", "extensions_crx_cache", "Sessions",
 ].map((p) => `Default/${p}`.toLowerCase());
+// Chromium's <user-data-dir>/lockfile exists exactly while a Brave runs on it
+const LOCKFILE = "lockfile";
 const COPY_PARALLEL = 12;
+const RENAME_TRIES = 5; // the final rename can hit EPERM while AV / indexing scans the new dir
 
 const toPath = (root, rel) => path.join(root, ...rel.split("/"));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** The legacy pool slots (pool-shared's config); none in standalone mode. */
 function poolCandidates(pool = require("../pool-shared.js")) {
@@ -52,11 +59,13 @@ function defaultProbes(pool) {
 }
 
 /**
- * The slot to seed from: the freshest Default/Network/Cookies among `dirs`
- * that no Brave runs on and no live legacy relay holds (pool-shared's lock
- * rules: a recycled PID's lock is stale). Cookies are stat'ed first; the
- * process probes run only if some slot has cookies.
- * @returns {Promise<{dir: string|null, cookiesMtimeMs?: number, skipped: Array<{dir: string, why: string}>}>}
+ * The slots to seed from, freshest Default/Network/Cookies first: those no
+ * Brave runs on (lockfile, command line) and no live legacy relay holds
+ * (pool-shared's lock rules: a dead or recycled PID's lock is stale, and is
+ * returned as staleLockRaw to be cleared before the copy claims the slot).
+ * Cookies and lockfiles are stat'ed first; the process probes run only if
+ * some slot is still a candidate.
+ * @returns {Promise<{candidates: Array<{dir: string, cookiesMtimeMs: number, staleLockRaw: string|null}>, skipped: Array<{dir: string, why: string}>}>}
  */
 async function findSeedSource({ pool = require("../pool-shared.js"), dirs = poolCandidates(pool), probes = defaultProbes(pool) } = {}) {
   const stats = await Promise.all(dirs.map((dir) => fsp.stat(path.join(dir, ...COOKIES)).then((s) => s.mtimeMs, () => null)));
@@ -64,23 +73,45 @@ async function findSeedSource({ pool = require("../pool-shared.js"), dirs = pool
   const withCookies = [];
   dirs.forEach((dir, i) => {
     if (stats[i] === null) skipped.push({ dir, why: "no Default/Network/Cookies" });
+    else if (fs.existsSync(path.join(dir, LOCKFILE))) skipped.push({ dir, why: "Brave is running on it (its lockfile is present)" });
     else withCookies.push({ dir, cookiesMtimeMs: stats[i] });
   });
-  if (!withCookies.length) return { dir: null, skipped };
+  if (!withCookies.length) return { candidates: [], skipped };
   withCookies.sort((a, b) => b.cookiesMtimeMs - a.cookiesMtimeMs);
 
   const commands = await probes.braveCommands();
   const locks = new Map(withCookies.map(({ dir }) => [dir, pool.readLockState(path.join(dir, pool.WRAPPER_LOCK))]));
   const livePids = [...locks.values()].filter((l) => l && l.state === "alive").map((l) => l.meta.pid);
   const startTimes = livePids.length ? await probes.startTimes(livePids) : new Map();
+  const candidates = [];
   for (const { dir, cookiesMtimeMs } of withCookies) {
     const lock = locks.get(dir);
     if (commands.some(pool.userDataDirMatcher(dir))) skipped.push({ dir, why: "Brave is running on it" });
     else if (lock && (lock.state === "young" || (lock.state === "alive" && pool.isLockOwnerAlive(lock.meta, { startTimes })))) {
       skipped.push({ dir, why: "a legacy relay holds it" });
-    } else return { dir, cookiesMtimeMs, skipped };
+    } else candidates.push({ dir, cookiesMtimeMs, staleLockRaw: lock ? lock.raw : null });
   }
-  return { dir: null, skipped };
+  return { candidates, skipped };
+}
+
+const sameFsPath = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+
+/** Refuse a source whose Default or Local State is a symlink / junction: it could point anywhere. */
+function refuseLinks(src) {
+  const real = fs.realpathSync.native(src);
+  for (const name of ["Default", "Local State"]) {
+    const p = path.join(src, name);
+    let st;
+    try {
+      st = fs.lstatSync(p);
+    } catch (e) {
+      if (e.code === "ENOENT") continue;
+      throw e;
+    }
+    if (st.isSymbolicLink() || !sameFsPath(fs.realpathSync.native(p), path.join(real, name))) {
+      throw new Error(`refusing ${p}: it is a symlink or junction`);
+    }
+  }
 }
 
 /**
@@ -88,6 +119,7 @@ async function findSeedSource({ pool = require("../pool-shared.js"), dirs = pool
  * dirs that hold them (rel, "/"-separated), and the excluded dirs present.
  */
 async function listSeed(src) {
+  refuseLinks(src);
   const files = [];
   const dirs = [];
   const excluded = [];
@@ -107,7 +139,7 @@ async function listSeed(src) {
         else await walk(r);
       } else if (e.isFile()) {
         files.push(r);
-      }
+      } // links / junctions inside Default are never followed
     }
   }
   await walk("Default");
@@ -139,11 +171,12 @@ async function planSeed(src, { measureExcluded = false } = {}) {
 
 /**
  * Copy listSeed(src) into the new profile dir `dst` (must not exist): one
- * mkdir per dir, then COPY_PARALLEL files at a time.
- * @param {{copyFile?: (from: string, to: string) => Promise<void>}} [opts] — test seam
+ * mkdir per dir, then COPY_PARALLEL files at a time; `check()` runs before
+ * the final rename (throw to discard the copy).
+ * @param {{copyFile?: Function, rename?: Function, check?: () => void}} [opts] — copyFile / rename: test seams
  * @returns {Promise<{files: number}>}
  */
-async function copySeed(src, dst, { copyFile = fsp.copyFile } = {}) {
+async function copySeed(src, dst, { copyFile = fsp.copyFile, rename = fsp.rename, check = () => {} } = {}) {
   if (fs.existsSync(dst)) throw new Error(`${dst} already exists`);
   const { files, dirs } = await listSeed(src);
   const tmp = `${dst}.seeding-${process.pid}`;
@@ -159,7 +192,16 @@ async function copySeed(src, dst, { copyFile = fsp.copyFile } = {}) {
       }
     };
     await Promise.all(Array.from({ length: Math.min(COPY_PARALLEL, files.length) }, worker));
-    await fsp.rename(tmp, dst);
+    await check();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await rename(tmp, dst);
+        break;
+      } catch (e) {
+        if (e.code !== "EPERM" || attempt >= RENAME_TRIES) throw e;
+        await sleep(100 * attempt);
+      }
+    }
   } catch (e) {
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
     throw e;
@@ -167,37 +209,91 @@ async function copySeed(src, dst, { copyFile = fsp.copyFile } = {}) {
   return { files: files.length };
 }
 
-/**
- * The broker's first start: seed `profileDir` if it doesn't exist and a pool
- * slot qualifies. Never throws; logs the source used (or why none was).
- * @returns {Promise<{from: string, files: number}|null>}
- */
-async function seedOnFirstStart({ profileDir, log, pool = require("../pool-shared.js"), probes, copyFile }) {
-  if (fs.existsSync(profileDir)) return null;
-  const dirs = poolCandidates(pool);
-  if (!dirs.length) {
-    log(`broker profile ${profileDir}: fresh profile (no legacy pool to seed it from)`);
-    return null;
-  }
-  let from = null;
-  try {
-    const pick = await findSeedSource({ pool, dirs, probes: probes || defaultProbes(pool) });
-    for (const s of pick.skipped) log(`broker profile seed: not using ${s.dir} (${s.why})`);
-    if (!pick.dir) {
-      log(`broker profile ${profileDir}: fresh profile (no idle pool slot with cookies)`);
-      return null;
+/** What the copy depends on: Cookies*, Local State and the lockfile (size + mtime, or absent). */
+function sourceState(dir) {
+  const network = path.join(dir, "Default", "Network");
+  let cookieFiles = [];
+  try { cookieFiles = fs.readdirSync(network).filter((n) => n.startsWith("Cookies")).map((n) => path.join("Default", "Network", n)); } catch { /* none */ }
+  return JSON.stringify(["Local State", LOCKFILE, ...cookieFiles].sort().map((rel) => {
+    try {
+      const st = fs.statSync(path.join(dir, rel));
+      return [rel, st.size, st.mtimeMs];
+    } catch {
+      return [rel, null];
     }
-    from = pick.dir;
-    log(`broker profile: seeding ${profileDir} once from ${from} (cookies written ${new Date(pick.cookiesMtimeMs).toISOString()})`);
-    const t0 = Date.now();
-    const r = await copySeed(from, profileDir, { copyFile });
-    log(`broker profile: seeded ${r.files} files from ${from} in ${Date.now() - t0} ms`);
-    return { from, ...r };
-  } catch (e) {
-    log(`broker profile: seeding${from ? ` from ${from}` : ""} failed (${e.message}); starting with a fresh profile ` +
-      `(to retry: npm run broker:stop, delete ${profileDir}, npm run migrate-profile)`);
-    return null;
+  }));
+}
+
+/**
+ * Seed `dst` from one findSeedSource candidate, holding the slot's relay
+ * lock for the whole copy; the copy is discarded (and this throws) if the
+ * slot changed meanwhile.
+ */
+async function copyFromSlot(pool, { dir, staleLockRaw }, dst, opts = {}) {
+  const lockPath = path.join(dir, pool.WRAPPER_LOCK);
+  if (staleLockRaw) pool.clearStaleLock(lockPath, staleLockRaw, "stale; seeding the broker profile from this slot");
+  const claim = pool.tryClaimDir(dir, lockPath, { reap: false });
+  if (!claim) throw new Error("a legacy relay claimed it meanwhile");
+  try {
+    const before = sourceState(dir);
+    if (fs.existsSync(path.join(dir, LOCKFILE))) throw new Error("a Brave started on it");
+    return await copySeed(dir, dst, {
+      ...opts,
+      check: () => { if (sourceState(dir) !== before) throw new Error("it changed during the copy"); },
+    });
+  } finally {
+    claim.release();
   }
 }
 
-module.exports = { poolCandidates, findSeedSource, planSeed, copySeed, seedOnFirstStart };
+/** Remove `<profileDir>.seeding-<pid>` dirs a dead process left behind. */
+function removeOrphanSeedingDirs(profileDir, log, isAlive = require("../process-shim.js").isPidAlive) {
+  const parent = path.dirname(profileDir);
+  const prefix = `${path.basename(profileDir)}.seeding-`;
+  let names = [];
+  try { names = fs.readdirSync(parent); } catch { return; }
+  for (const name of names) {
+    const pid = name.startsWith(prefix) ? Number(name.slice(prefix.length)) : NaN;
+    if (!Number.isInteger(pid) || isAlive(pid)) continue;
+    fs.rmSync(path.join(parent, name), { recursive: true, force: true });
+    log(`broker profile: removed ${name}, an unfinished seed by a process that is gone`);
+  }
+}
+
+/**
+ * The broker's first start: seed `profileDir` if it doesn't exist and a pool
+ * slot qualifies (the next one if a copy fails). Never throws; logs the
+ * source used (or why none was).
+ * @returns {Promise<{from: string, files: number}|null>}
+ */
+async function seedOnFirstStart({ profileDir, log, pool = require("../pool-shared.js"), probes, copyFile }) {
+  try {
+    removeOrphanSeedingDirs(profileDir, log);
+    if (fs.existsSync(profileDir)) return null;
+    const dirs = poolCandidates(pool);
+    if (!dirs.length) {
+      log(`broker profile ${profileDir}: fresh profile (no legacy pool to seed it from)`);
+      return null;
+    }
+    const { candidates, skipped } = await findSeedSource({ pool, dirs, probes: probes || defaultProbes(pool) });
+    for (const s of skipped) log(`broker profile seed: not using ${s.dir} (${s.why})`);
+    for (const cand of candidates) {
+      log(`broker profile: seeding ${profileDir} once from ${cand.dir} (cookies written ${new Date(cand.cookiesMtimeMs).toISOString()})`);
+      const t0 = Date.now();
+      try {
+        const r = await copyFromSlot(pool, cand, profileDir, { copyFile });
+        log(`broker profile: seeded ${r.files} files from ${cand.dir} in ${Date.now() - t0} ms`);
+        return { from: cand.dir, ...r };
+      } catch (e) {
+        log(`broker profile seed: not using ${cand.dir} (${e.message})`);
+      }
+    }
+    log(`broker profile ${profileDir}: fresh profile (no idle pool slot with cookies could be copied)`);
+  } catch (e) {
+    log(`broker profile: seeding failed (${e.message}); starting with a fresh profile ` +
+      `(to retry: npm run broker:stop, delete ${profileDir}, npm run migrate-profile)`);
+  }
+  return null;
+}
+
+module.exports = { poolCandidates, findSeedSource, planSeed, copySeed, copyFromSlot, seedOnFirstStart };

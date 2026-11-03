@@ -7,9 +7,10 @@
 // The broker does this by itself on its first start (src/broker/profile-seed.js,
 // freshest idle pool slot). This is the inspectable, hand-picked version:
 // --from chooses the source, --dry-run prints what would be copied and how
-// much. Copies Default/ minus caches and old session tabs, plus Local State;
-// never modifies the source. Refuses when the broker profile already exists
-// (npm run broker:stop, then move it away) or the source is in use.
+// much. Copies Default/ minus caches and old session tabs, plus Local State,
+// holding the slot's relay lock meanwhile; never modifies the source.
+// Refuses when the broker profile already exists (npm run broker:stop, then
+// move it away), the source is in use, or Default / Local State is a link.
 
 "use strict";
 
@@ -58,31 +59,42 @@ async function run({
     out(`${args.from} is not a Brave profile (no Default/ dir).`);
     return 1;
   }
-  const candidates = args.from ? [args.from] : seed.poolCandidates(pool);
-  if (!candidates.length) {
+  const dirs = args.from ? [args.from] : seed.poolCandidates(pool);
+  if (!dirs.length) {
     out("No legacy pool configured to pick a source from; name one with --from <profile dir>.");
     return 1;
   }
-  const pick = await seed.findSeedSource({ pool, dirs: candidates, probes });
-  for (const s of pick.skipped) out(`not using ${s.dir}: ${s.why}${args.from ? " (close the session or Brave using it first)" : ""}`);
-  if (!pick.dir) {
-    out(args.from ? "Nothing copied." : "No idle pool slot with cookies; name one with --from <profile dir>.");
-    return 1;
+  const { candidates, skipped } = await seed.findSeedSource({ pool, dirs, probes });
+  const why = args.from ? " (close the session or Brave using it first)" : "";
+  for (const s of skipped) out(`not using ${s.dir}: ${s.why}${why}`);
+  // freshest first; a slot that can't be copied (link, changed meanwhile) → the next
+  for (const cand of candidates) {
+    let plan;
+    try {
+      plan = await seed.planSeed(cand.dir, { measureExcluded: args.dryRun });
+    } catch (e) {
+      out(`not using ${cand.dir}: ${e.message}`);
+      continue;
+    }
+    out(`source:  ${cand.dir} (cookies written ${new Date(cand.cookiesMtimeMs).toISOString()})`);
+    out(`target:  ${target}${targetExists ? " (exists: a real run would refuse)" : ""}`);
+    out(`copy:    ${plan.files.length} files, ${mb(plan.bytes)} (Default/ minus caches and old session tabs, plus Local State)`);
+    if (args.dryRun) {
+      if (plan.excluded.length) out(`skip:    ${plan.excluded.map((e) => `${e.rel} (${mb(e.bytes)})`).join(", ")}`);
+      out("dry run: nothing copied");
+      return 0;
+    }
+    const t0 = Date.now();
+    try {
+      const r = await seed.copyFromSlot(pool, cand, target);
+      out(`seeded ${r.files} files (${mb(plan.bytes)}) in ${Date.now() - t0} ms. The broker uses it from its next start.`);
+      return 0;
+    } catch (e) {
+      out(`not using ${cand.dir}: ${e.message}`);
+    }
   }
-
-  const plan = await seed.planSeed(pick.dir, { measureExcluded: args.dryRun });
-  out(`source:  ${pick.dir} (cookies written ${new Date(pick.cookiesMtimeMs).toISOString()})`);
-  out(`target:  ${target}${targetExists ? " (exists: a real run would refuse)" : ""}`);
-  out(`copy:    ${plan.files.length} files, ${mb(plan.bytes)} (Default/ minus caches and old session tabs, plus Local State)`);
-  if (args.dryRun) {
-    if (plan.excluded.length) out(`skip:    ${plan.excluded.map((e) => `${e.rel} (${mb(e.bytes)})`).join(", ")}`);
-    out("dry run: nothing copied");
-    return 0;
-  }
-  const t0 = Date.now();
-  const r = await seed.copySeed(pick.dir, target);
-  out(`seeded ${r.files} files (${mb(plan.bytes)}) in ${Date.now() - t0} ms. The broker uses it from its next start.`);
-  return 0;
+  out(args.from ? "Nothing copied." : "No idle pool slot with cookies could be copied; name one with --from <profile dir>.");
+  return 1;
 }
 
 if (require.main === module) {
