@@ -28,7 +28,8 @@ const {
   BraveSupervisor,
   buildBraveArgs,
   disableMemorySaver,
-  resolveProxyServer,
+  resolveProxy,
+  isLoopbackHost,
   braveEnv,
 } = require("../src/broker/brave-supervisor.js");
 
@@ -161,61 +162,84 @@ test("disableMemorySaver: does NOT write Default/Preferences (measured: Brave 14
   assert.ok(!fs.existsSync(path.join(dir, "Default")));
 });
 
-test("resolveProxyServer: no proxy configured → null, no warning", async () => {
+test("isLoopbackHost: 127.0.0.0/8, localhost (+ subdomains, trailing dot), ::1 — nothing else (W1E policy)", () => {
+  for (const h of ["127.0.0.1", "127.5.6.7", "localhost", "LOCALHOST.", "proxy.localhost", "::1"]) assert.ok(isLoopbackHost(h), h);
+  for (const h of ["10.255.255.1", "128.0.0.1", "0.0.0.0", "example.com", "127.example.com", "::2", "192.168.1.5"]) assert.ok(!isLoopbackHost(h), h);
+});
+
+test("resolveProxy: no proxy configured → null, no warning", async () => {
   const log = collectLog();
-  assert.strictEqual(await resolveProxyServer(null, { log }), null);
-  assert.strictEqual(await resolveProxyServer("", { log }), null);
+  assert.strictEqual(await resolveProxy(null, { log }), null);
+  assert.strictEqual(await resolveProxy("", { log }), null);
   assert.deepStrictEqual(log.lines, []);
 });
 
-test("resolveProxyServer: proxy accepting TCP → its server string", async () => {
+test("resolveProxy: proxy accepting TCP → its server string", async () => {
   const s = net.createServer((sock) => sock.destroy());
   const port = await listen(s);
   try {
-    assert.strictEqual(await resolveProxyServer(`http://127.0.0.1:${port}`, { log: collectLog() }), `http://127.0.0.1:${port}`);
-    assert.strictEqual(await resolveProxyServer(`127.0.0.1:${port}`, { log: collectLog() }), `http://127.0.0.1:${port}`, "bare host:port means http");
-    assert.strictEqual(await resolveProxyServer(`socks5://127.0.0.1:${port}/`, { log: collectLog() }), `socks5://127.0.0.1:${port}`);
+    const noCreds = { server: `http://127.0.0.1:${port}`, credentials: null };
+    assert.deepStrictEqual(await resolveProxy(`http://127.0.0.1:${port}`, { log: collectLog() }), noCreds);
+    assert.deepStrictEqual(await resolveProxy(`127.0.0.1:${port}`, { log: collectLog() }), noCreds, "bare host:port means http");
+    assert.deepStrictEqual(await resolveProxy(`socks5://127.0.0.1:${port}/`, { log: collectLog() }), { server: `socks5://127.0.0.1:${port}`, credentials: null });
   } finally {
     s.close();
   }
 });
 
-test("resolveProxyServer: dead proxy → null + warning, decided within ~1.5 s", async () => {
+test("resolveProxy: LOOPBACK proxy not listening → direct (null) + warning, decided within ~1.5 s", async () => {
   const port = await deadPort();
-  const log = collectLog();
-  const t0 = Date.now();
-  assert.strictEqual(await resolveProxyServer(`http://127.0.0.1:${port}`, { log }), null);
-  const ms = Date.now() - t0;
-  assert.ok(ms < 2500, `probe took ${ms} ms`);
-  assert.ok(log.lines.some((l) => /proxy/i.test(l) && /direct/i.test(l)), log.lines.join("\n"));
+  for (const url of [`http://127.0.0.1:${port}`, `http://localhost:${port}`]) {
+    const log = collectLog();
+    const t0 = Date.now();
+    assert.strictEqual(await resolveProxy(url, { log }), null, url);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 2500, `probe took ${ms} ms`);
+    assert.ok(log.lines.some((l) => /proxy/i.test(l) && /direct/i.test(l)), log.lines.join("\n"));
+  }
 });
 
-test("resolveProxyServer: a proxy that never answers the handshake is cut off at the timeout", async () => {
+test("resolveProxy: REMOTE proxy unreachable or slow → KEPT (never silently direct) + loud warning", async () => {
   // 10.255.255.1 is non-routable: connect() neither succeeds nor fails fast.
+  // Going direct here would expose the real IP (e.g. to PX-protected sites).
   const log = collectLog();
   const t0 = Date.now();
-  assert.strictEqual(await resolveProxyServer("http://10.255.255.1:8888", { log, timeoutMs: 300 }), null);
-  assert.ok(Date.now() - t0 < 1500);
+  const res = await resolveProxy("http://10.255.255.1:8080", { log, timeoutMs: 300 });
+  assert.ok(Date.now() - t0 < 1500, "probe must still be cut off at the timeout");
+  assert.deepStrictEqual(res, { server: "http://10.255.255.1:8080", credentials: null });
+  assert.ok(log.lines.some((l) => /WARNING/.test(l) && /NOT reachable/.test(l) && /keeping/i.test(l)), log.lines.join("\n"));
+  assert.ok(!log.lines.some((l) => /launching Brave direct/i.test(l)), log.lines.join("\n"));
 });
 
-test("resolveProxyServer: credentials in the URL are warned about (--proxy-server can't carry them)", async () => {
+test("resolveProxy: credentials are split off (decoded) and no log line carries them", async () => {
   const s = net.createServer((sock) => sock.destroy());
   const port = await listen(s);
+  const dead = await deadPort();
   try {
-    const log = collectLog();
-    assert.strictEqual(await resolveProxyServer(`http://user:secret@127.0.0.1:${port}`, { log }), `http://127.0.0.1:${port}`);
-    assert.ok(log.lines.some((l) => /credentials/i.test(l)), log.lines.join("\n"));
-    assert.ok(!log.lines.some((l) => l.includes("secret")), "never log the password");
+    let log = collectLog();
+    assert.deepStrictEqual(
+      await resolveProxy(`http://us%40er:p%3Asecret@127.0.0.1:${port}`, { log }),
+      { server: `http://127.0.0.1:${port}`, credentials: { username: "us@er", password: "p:secret" } },
+    );
+    // Every logging branch: reachable, loopback-dead, remote-unreachable.
+    for (const url of [`http://user:secret@127.0.0.1:${port}`, `http://user:secret@127.0.0.1:${dead}`, "http://user:secret@10.255.255.1:8080"]) {
+      log = collectLog();
+      await resolveProxy(url, { log, timeoutMs: 300 });
+      assert.ok(!log.lines.some((l) => l.includes("secret") || l.includes("user:")), `${url} → ${log.lines}`);
+    }
   } finally {
     s.close();
   }
 });
 
-test("resolveProxyServer: unusable URL → null + warning", async () => {
-  for (const bad of ["ftp://127.0.0.1:21", "http://", "::::", "ftp://user:secret@127.0.0.1:21", "htp://user:secret@h:1"]) {
+test("resolveProxy: unusable URL → throws (W1E policy: never guess direct), message never echoes it", async () => {
+  for (const bad of ["ftp://127.0.0.1:21", "http://", "::::", "ftp://user:secret@127.0.0.1:21", "htp://user:secret@h:1", "http://us%zzer:secret@h:1"]) {
     const log = collectLog();
-    assert.strictEqual(await resolveProxyServer(bad, { log }), null, bad);
-    assert.ok(log.lines.length > 0, `no warning for ${bad}`);
+    await assert.rejects(resolveProxy(bad, { log }), (e) => {
+      assert.ok(/proxy/i.test(e.message), e.message);
+      assert.ok(!e.message.includes("secret") && !e.message.includes("user:secret"), `echoed: ${e.message}`);
+      return true;
+    }, bad);
     assert.ok(!log.lines.some((l) => l.includes("secret")), `password logged for ${bad}: ${log.lines}`);
   }
 });
@@ -407,6 +431,49 @@ test("ensure(): dead proxy → launched direct with a warning; live proxy → --
   } finally {
     proxy.close();
   }
+});
+
+test("ensure(): unreachable REMOTE proxy is kept on the command line; credentials never are, but are exposed", async () => {
+  const dir = tmpProfile("fake-proxy-remote");
+  const { sup, log } = fakeSupervisor(dir, { proxyUrl: "http://bob:hunter2@10.255.255.1:8080", proxyProbeTimeoutMs: 300 });
+  assert.strictEqual(sup.proxyCredentials, null, "nothing before a launch");
+  await sup.ensure();
+  const { args } = launchesOf(dir)[0];
+  assert.ok(args.includes("--proxy-server=http://10.255.255.1:8080"), args.join(" "));
+  assert.ok(!args.some((a) => a.includes("hunter2") || a.includes("bob")), "credentials on Brave's command line");
+  assert.deepStrictEqual(sup.proxyCredentials, { username: "bob", password: "hunter2" });
+  assert.ok(!log.lines.some((l) => l.includes("hunter2") || l.includes("bob")), log.lines.join("\n"));
+  assert.ok(log.lines.some((l) => /NOT reachable/.test(l)), log.lines.join("\n"));
+});
+
+test("ensure(): proxyCredentials is null without a proxy, and when a dead loopback proxy sent Brave direct", async () => {
+  const { sup: plain } = fakeSupervisor(tmpProfile("fake-nocreds"));
+  await plain.ensure();
+  assert.strictEqual(plain.proxyCredentials, null);
+  const { sup: direct } = fakeSupervisor(tmpProfile("fake-creds-direct"), { proxyUrl: `http://u:p@127.0.0.1:${await deadPort()}` });
+  await direct.ensure();
+  assert.strictEqual(direct.proxyCredentials, null);
+});
+
+test("ensure(): an unusable proxy URL fails the launch (no guessing direct), nothing spawned", async () => {
+  const dir = tmpProfile("fake-proxy-bad");
+  const { sup } = fakeSupervisor(dir, { proxyUrl: "ftp://user:secret@127.0.0.1:21" });
+  await assert.rejects(sup.ensure(), (e) => /proxy/i.test(e.message) && !e.message.includes("secret"));
+  assert.strictEqual(launchesOf(dir).length, 0);
+});
+
+test("ensure() that joined a launch closeGracefully() then tears down → relaunches, returns a live Brave", async () => {
+  const dir = tmpProfile("fake-join-close");
+  const { sup } = fakeSupervisor(dir, { delay: 300 });
+  const joined = sup.ensure(); // launch in flight
+  const closing = sup.closeGracefully(); // queued behind that launch, then closes it
+  const info = await joined;
+  await closing;
+  const launches = launchesOf(dir);
+  assert.strictEqual(launches.length, 2, "the torn-down launch plus a relaunch");
+  assert.strictEqual(info.pid, launches[1].pid, "must return the relaunched Brave");
+  assert.ok(isAlive(info.pid));
+  assert.ok(sup.isUp());
 });
 
 test("crash: 'down' fires once, next ensure() relaunches on the same port", async () => {

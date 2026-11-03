@@ -23,6 +23,7 @@ const KILL_WAIT_MS = 5000;
  *   ensure()          → {cdpUrl, pid}; launches if needed, concurrent calls share one launch
  *   closeGracefully() → Browser.close over CDP, kill fallback after closeTimeoutMs
  *   isUp()            → launched, CDP connected, PID alive
+ *   proxyCredentials  → {username, password} of the proxy the last launched Brave uses, or null
  *   'down' (reason)   → once per launch that came up: "closed" | "cdp disconnected" | "exited (code=N)"
  *   'fatal' (reason)  → a relaunch cannot get back the CDP port a Brave of
  *                       ours already served cdpUrl on (still taken after
@@ -50,7 +51,8 @@ class BraveSupervisor extends EventEmitter {
    *   launch fails; it never switches ports.
    * @param {string} [opts.executablePath] — default: detectBravePath() at first launch
    * @param {string|null} [opts.extensionPath] — unpacked extension for --load-extension
-   * @param {string|null} [opts.proxyUrl] — --proxy-server, only if it accepts TCP
+   * @param {string|null} [opts.proxyUrl] — --proxy-server (scheme://host:port only);
+   *   policy in resolveProxy(); credentials go to `proxyCredentials`
    * @param {(msg: string) => void} [opts.log] — default: stderr
    * @param {number} [opts.launchTimeoutMs=20000] — spawn → CDP ready
    * @param {number} [opts.closeTimeoutMs=10000] — Browser.close → exit, then kill
@@ -84,6 +86,7 @@ class BraveSupervisor extends EventEmitter {
     this._launching = null;
     this._closing = null;
     this._launches = 0;
+    this._proxyCredentials = null;
   }
 
   /** @returns {boolean} */
@@ -92,15 +95,41 @@ class BraveSupervisor extends EventEmitter {
     return !!p && p.up && isPidAlive(p.pid);
   }
 
+  /**
+   * Credentials of the proxy the last launched Brave routes through, or null
+   * (no proxy, or a dead loopback proxy sent it direct). They are never on
+   * Brave's command line, so an authenticating proxy answers 407 until the
+   * broker supplies them (W2A/W2E).
+   *
+   * Answer ONLY proxy challenges: CDP Fetch.enable({handleAuthRequests: true})
+   * and, on Fetch.authRequired, ProvideCredentials when
+   * authChallenge.source === "Proxy", else "Default". Do NOT use Playwright's
+   * context.setHTTPCredentials(): its handler (crNetworkManager
+   * _onAuthRequired) ignores authChallenge.source, so it would also hand the
+   * proxy password to any website that sends a 401 Basic challenge.
+   * Chromium cannot authenticate to SOCKS proxies at all.
+   *
+   * @returns {{username: string, password: string} | null}
+   */
+  get proxyCredentials() {
+    return this._proxyCredentials ? { ...this._proxyCredentials } : null;
+  }
+
   /** @returns {Promise<{cdpUrl: string, pid: number}>} */
   async ensure() {
-    // Never race a relaunch against a planned close of the same profile.
-    while (this._closing) await this._closing;
-    if (this.isUp()) return cdpInfo(this._proc);
-    if (!this._launching) {
-      this._launching = this._launch().finally(() => { this._launching = null; });
+    for (;;) {
+      // Never race a relaunch against a planned close of the same profile.
+      while (this._closing) await this._closing;
+      if (this.isUp()) return cdpInfo(this._proc);
+      if (!this._launching) {
+        this._launching = this._launch().finally(() => { this._launching = null; });
+      }
+      const info = await this._launching;
+      // A closeGracefully() that started while this launch was in flight is
+      // tearing that Brave down: go round again (wait for it, relaunch)
+      // rather than hand out a Brave that is about to close.
+      if (!this._closing) return info;
     }
-    return this._launching;
   }
 
   /**
@@ -147,7 +176,8 @@ class BraveSupervisor extends EventEmitter {
     const exe = this._executablePath || (this._executablePath = detectBravePath());
     fs.mkdirSync(this.profileDir, { recursive: true });
     disableMemorySaver(this.profileDir, this._log);
-    const proxyServer = await resolveProxyServer(this._proxyUrl, { log: this._log, timeoutMs: this._t.proxyProbeTimeoutMs });
+    const proxy = await resolveProxy(this._proxyUrl, { log: this._log, timeoutMs: this._t.proxyProbeTimeoutMs });
+    const proxyServer = proxy ? proxy.server : null;
     // Last step before the spawn: the proxy probe can take 1.5 s, and a port
     // taken in that window must fail loudly here, not as a 20 s CDP timeout.
     const port = await this._choosePort();
@@ -162,6 +192,7 @@ class BraveSupervisor extends EventEmitter {
       throw e;
     }
     this._portUsed = true; // from here on cdpUrl is out there: the port is pinned
+    this._proxyCredentials = proxy ? proxy.credentials : null;
     this._launches++;
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
     this._log(`brave pid=${proc.pid} up on :${port} in ${Date.now() - t0} ms (launch #${this._launches}${via})`);
@@ -238,6 +269,9 @@ class BraveSupervisor extends EventEmitter {
     // Only adopt the CDP endpoint if it is OUR process behind it: after an
     // AutoDeElevate-style handoff, or with a foreign browser on the port,
     // /json/version answers but the PID we track is not the browser.
+    // Deliberately fail-OPEN (V2-6): if getProcessInfo itself errors or times
+    // out we only warn and adopt the endpoint, so a Brave that drops or
+    // changes this method can't brick every launch. A PID mismatch fails.
     const browserPid = await cdpBrowserPid(proc);
     if (proc.down || proc.exited) throw new Error(`${PREFIX} Brave pid ${proc.pid} went away during launch`);
     if (browserPid === null) {
@@ -499,54 +533,81 @@ function isObject(v) {
 const PROXY_DEFAULT_PORTS = { http: 80, https: 443, socks4: 1080, socks5: 1080 };
 
 /**
- * The `--proxy-server` value for `proxyUrl`, or null to launch direct.
+ * The proxy for one Brave launch: `{server, credentials}`, or null to launch
+ * direct. Same policy as the legacy relay (W1E-6, cdp-bridge.js), ported
+ * rather than required because cdp-bridge.js is a W3 deletion:
  *
- * Only returns a server when its host:port accepts a TCP connection within
- * `timeoutMs`: the owner's local debug proxy is usually off, and Brave routed
- * through a dead proxy fails every navigation. (A closed localhost port takes
- * ~2.3 s to refuse on Windows, hence the cap.)
+ *   reachable                 → use it
+ *   LOOPBACK + not listening  → direct (the owner's local debug proxy is
+ *                               usually off; a dead --proxy-server fails every
+ *                               navigation, and a local proxy can't hide the
+ *                               real IP anyway)
+ *   REMOTE + unreachable/slow → KEEP it, loud warning: going direct would
+ *                               silently expose the real IP (PX-protected sites)
+ *   unusable URL              → throw (never guess "direct")
  *
- * @param {string|null} proxyUrl — e.g. http://127.0.0.1:8888, socks5://h:1080, or bare host:port
+ * Probed with a TCP connect capped at `timeoutMs` (a closed localhost port
+ * takes ~2.3 s to refuse on Windows). Logs and errors show scheme://host:port
+ * only, never the raw URL or its credentials. Credentials come back
+ * separately: --proxy-server cannot carry them, and on a command line they
+ * would be visible in any process listing.
+ *
+ * @param {string|null} proxyUrl — e.g. http://user:pass@host:port, socks5://h:1080, or bare host:port
  * @param {object} [opts]
  * @param {(msg: string) => void} [opts.log]
  * @param {number} [opts.timeoutMs=1500]
- * @returns {Promise<string|null>}
+ * @returns {Promise<{server: string, credentials: {username: string, password: string}|null} | null>}
  */
-async function resolveProxyServer(proxyUrl, { log = () => {}, timeoutMs = 1500 } = {}) {
+async function resolveProxy(proxyUrl, { log = () => {}, timeoutMs = 1500 } = {}) {
   if (!proxyUrl) return null;
   const target = parseProxyUrl(proxyUrl);
-  if (!target) {
-    const shown = String(proxyUrl).replace(/\/\/[^@/]*@/, "//***@"); // never log a password
-    log(`warning: proxy URL "${shown}" is not usable (want http|https|socks4|socks5://host:port); launching Brave direct`);
+  const reachable = await tcpAccepts(target.host, target.port, timeoutMs);
+  if (!reachable && isLoopbackHost(target.host)) {
+    log(`warning: proxy ${target.server} is not listening; launching Brave direct (no proxy). The next Brave launch checks again.`);
     return null;
   }
-  if (!(await tcpAccepts(target.host, target.port, timeoutMs))) {
-    log(`warning: proxy ${target.server} is not accepting connections (checked for ${timeoutMs} ms); launching Brave direct`);
-    return null;
+  if (!reachable) {
+    log(
+      `WARNING: proxy ${target.server} is NOT reachable (checked for ${timeoutMs} ms); keeping it anyway, so Brave's ` +
+      `requests fail until it is up. Not falling back to direct, which would expose the real IP.`,
+    );
   }
-  if (target.hasCredentials) {
-    log(`warning: --proxy-server cannot carry credentials; using ${target.server} without them (an authenticating proxy will answer 407)`);
-  }
-  return target.server;
+  return { server: target.server, credentials: target.credentials };
 }
 
+/** Same as cdp-bridge.js (W1E): 127.0.0.0/8, localhost and its subdomains, ::1. */
+function isLoopbackHost(host) {
+  const h = String(host).toLowerCase().replace(/\.$/, "");
+  if (h === "localhost" || h.endsWith(".localhost") || h === "::1") return true;
+  return net.isIPv4(h) && h.startsWith("127.");
+}
+
+/** Throws on anything unusable; messages never echo the value (it may hold a password). */
 function parseProxyUrl(proxyUrl) {
   const s = String(proxyUrl).trim();
   let u;
   try {
     u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`);
   } catch {
-    return null;
+    u = null;
+  }
+  if (!u || !u.hostname) {
+    throw new Error(`${PREFIX} the proxy URL is not valid (expected scheme://[user:pass@]host:port)`);
   }
   const scheme = u.protocol.slice(0, -1).toLowerCase();
-  if (!(scheme in PROXY_DEFAULT_PORTS) || !u.hostname) return null;
+  if (!(scheme in PROXY_DEFAULT_PORTS)) {
+    throw new Error(`${PREFIX} proxy scheme "${scheme}" is not supported (use http, https, socks4 or socks5)`);
+  }
+  let credentials = null;
+  if (u.username || u.password) {
+    try {
+      credentials = { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) };
+    } catch {
+      throw new Error(`${PREFIX} the proxy credentials contain an invalid %-escape (write a literal % as %25)`);
+    }
+  }
   const port = u.port ? Number(u.port) : PROXY_DEFAULT_PORTS[scheme];
-  return {
-    server: `${scheme}://${u.hostname}:${port}`,
-    host: u.hostname.replace(/^\[|\]$/g, ""),
-    port,
-    hasCredentials: !!(u.username || u.password),
-  };
+  return { server: `${scheme}://${u.hostname}:${port}`, host: u.hostname.replace(/^\[|\]$/g, ""), port, credentials };
 }
 
 function tcpAccepts(host, port, timeoutMs) {
@@ -585,6 +646,7 @@ module.exports = {
   BraveSupervisor,
   buildBraveArgs,
   disableMemorySaver,
-  resolveProxyServer,
+  resolveProxy,
+  isLoopbackHost,
   braveEnv,
 };
