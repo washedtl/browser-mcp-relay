@@ -11,8 +11,9 @@
 // this: its token stays high-integrity and elevated, and it opens a console.
 //
 // The broker gets exactly the env block we pass (the launcher's allowlist),
-// never the user's full profile env: it is handed to the elevated PowerShell
-// step in an env var, which medium-integrity processes cannot read.
+// never the user's full profile env. The block goes to the elevated
+// PowerShell step on its stdin: an env var caps it at 32K characters, and a
+// larger env used to force an elevated broker.
 // Windows only; built-ins only (the launcher must start fast).
 
 "use strict";
@@ -49,8 +50,8 @@ function quoteArg(arg) {
 
 const commandLine = (args) => args.map(quoteArg).join(" ");
 
-// an env var holds at most 32767 characters
-const MAX_ENV_BLOCK_B64 = 32_000;
+// a sanity cap (a real allowlisted env is a few KB; PS 5.1 reads far more from stdin)
+const MAX_ENV_BLOCK_B64 = 1024 * 1024;
 
 /**
  * A CreateProcess environment block for `env` (UTF-16 "k=v\0...\0\0",
@@ -120,7 +121,7 @@ public static class BmrDeelevate {
   }
 }
 "@
-[Console]::Out.WriteLine([BmrDeelevate]::Run($env:BMR_DEELEVATE_CMDLINE, $env:BMR_DEELEVATE_CWD, $env:BMR_DEELEVATE_ENVBLOCK))
+[Console]::Out.WriteLine([BmrDeelevate]::Run($env:BMR_DEELEVATE_CMDLINE, $env:BMR_DEELEVATE_CWD, [Console]::In.ReadToEnd().Trim()))
 `;
 
 /**
@@ -137,7 +138,8 @@ function launchDeelevated({ args, cwd, childEnv, env = process.env, run = spawnS
       encoding: "utf8",
       windowsHide: true,
       timeout: 30_000,
-      env: { ...env, BMR_DEELEVATE_CMDLINE: commandLine([process.execPath, ...args]), BMR_DEELEVATE_CWD: cwd, BMR_DEELEVATE_ENVBLOCK: block },
+      env: { ...env, BMR_DEELEVATE_CMDLINE: commandLine([process.execPath, ...args]), BMR_DEELEVATE_CWD: cwd },
+      input: block,
     });
   const last = String(r.stdout || "").trim().split(/\r?\n/).pop() || "";
   let res = null;

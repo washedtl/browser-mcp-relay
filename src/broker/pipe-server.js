@@ -247,6 +247,18 @@ function restoreKeyFile(file, key) {
   return publishKey(file, key.toString("hex"));
 }
 
+/** The 32-byte key in `file`, or null when there is none (malformed: EKEY). */
+function readKey(file) {
+  try {
+    const hex = fs.readFileSync(file, "utf8").trim();
+    if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, "hex");
+    throw Object.assign(new Error(`[broker] key file ${file} is malformed; delete it and restart`), { code: "EKEY" });
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
+}
+
 /**
  * Read the 32-byte key, creating it if missing. Published atomically
  * (tmp file + link), so a concurrent reader never sees a half-written key.
@@ -254,13 +266,8 @@ function restoreKeyFile(file, key) {
  */
 function loadOrCreateKey(file) {
   for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      const hex = fs.readFileSync(file, "utf8").trim();
-      if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, "hex");
-      throw Object.assign(new Error(`[broker] key file ${file} is malformed; delete it and restart`), { code: "EKEY" });
-    } catch (e) {
-      if (e.code !== "ENOENT") throw e;
-    }
+    const key = readKey(file);
+    if (key) return key;
     publishKey(file, crypto.randomBytes(32).toString("hex")); // if another process published first, read theirs
   }
   throw new Error(`[broker] could not read or create the key file ${file}`);
@@ -401,5 +408,5 @@ function settingsHash(env, key) {
 
 module.exports = {
   pipeNameFor, resolveEndpoint, brokerHome, claimPipe, privateDirProblem, PIPE_PREFIX,
-  keyFileFor, loadOrCreateKey, restoreKeyFile, helloMac, macEquals, connectPipe, readLine, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS, HELLO_MAX_BYTES,
+  keyFileFor, readKey, loadOrCreateKey, restoreKeyFile, helloMac, macEquals, connectPipe, readLine, clientHello, serverHello, verifyPipeOwner, settingsHash, HELLO_TIMEOUT_MS, HELLO_MAX_BYTES,
 };

@@ -130,6 +130,7 @@ function shimHarness(t, pipe, opts = {}) {
     connectTimeoutMs: opts.connectTimeoutMs || 5000,
     respawnAfterMs: opts.respawnAfterMs || 5000,
     ...(opts.pipeDirProblem ? { pipeDirProblem: opts.pipeDirProblem } : {}),
+    ...(opts.keyRestoreWaitMs ? { keyRestoreWaitMs: opts.keyRestoreWaitMs } : {}),
   });
   if (opts.staleKey) shim.key = opts.staleKey; // as if read before the key file was recreated
   shim.start();
@@ -670,6 +671,19 @@ test("processes: the launched broker gets only the allowlisted env", async (t) =
   assert.strictEqual(who.secret, null);
 });
 
+test("W1: launchDeelevated hands the env block to PowerShell on stdin (no env var carries it), and refuses one over 1 MB", () => {
+  const { launchDeelevated, envBlock } = require("../src/broker/deelevate.js");
+  let seen = null;
+  const run = (cmd, args, opts) => { seen = opts; return { status: 0, stdout: '{"ok":true,"pid":7}\n', stderr: "" }; };
+  const childEnv = { BROWSER_RELAY_X: "x".repeat(20_000) };
+  assert.deepStrictEqual(launchDeelevated({ args: ["broker.js"], cwd: "C:\\h", childEnv, env: {}, run }), { pid: 7 });
+  assert.strictEqual(seen.input, envBlock(childEnv));
+  assert.ok(!Object.values(seen.env).some((v) => v === envBlock(childEnv)), "not in the PowerShell process's env");
+  seen = null;
+  assert.throws(() => launchDeelevated({ args: [], cwd: "C:\\h", childEnv: { A: "x".repeat(600_000) }, env: {}, run }), /too large/);
+  assert.strictEqual(seen, null, "nothing launched");
+});
+
 const elevatedHere = process.platform === "win32" && isElevated();
 test("processes: from an elevated session the broker runs de-elevated (medium integrity) with only the allowlisted env", { skip: !elevatedHere && "needs an elevated Windows session" }, async (t) => {
   const run = processRun(t, "deelevate");
@@ -677,11 +691,12 @@ test("processes: from an elevated session the broker runs de-elevated (medium in
   // the broker's working dir is in here; a just-killed broker may hold it a moment
   t.after(() => fs.rmSync(localAppData, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const c = await shimClient(t, run, {
-    env: { BROWSER_RELAY_BROKER_DEELEVATE: "auto", LOCALAPPDATA: localAppData, BROWSER_RELAY_TEST_MARK: "m-2", NOT_ALLOWLISTED_SECRET: "s3cr3t" },
+    // W1: ~20K chars of env (over the old 32K-char env-var transport once base64'd)
+    env: { BROWSER_RELAY_BROKER_DEELEVATE: "auto", LOCALAPPDATA: localAppData, BROWSER_RELAY_TEST_MARK: `m-2${"x".repeat(20_000)}`, NOT_ALLOWLISTED_SECRET: "s3cr3t" },
   });
   const who = await callJson(c, "fixture_whoami");
   assert.strictEqual(who.integrity, "Medium", "the broker is not elevated");
-  assert.strictEqual(who.mark, "m-2", "allowlisted settings arrive in its env block");
+  assert.strictEqual(who.mark, `m-2${"x".repeat(20_000)}`, "allowlisted settings arrive in its env block, a large one too");
   assert.strictEqual(who.secret, null, "a session-only var outside the allowlist is absent");
   assert.deepStrictEqual(who.profileOnly, [], "vars that only the user-profile env sets (ALLUSERSPROFILE, PUBLIC) are absent too");
   const leftover = fs.readdirSync(path.join(localAppData, "browser-mcp-relay", "broker")).filter((n) => n.startsWith("launch-"));
@@ -697,4 +712,70 @@ test("processes: the broker exits on its own after its last session leaves", asy
   const t0 = Date.now();
   await until(() => !pidAlive(pid), 8000, "the broker to exit");
   t.diagnostic(`broker gone ${Date.now() - t0} ms after the last session closed (idle 300 ms)`);
+});
+
+// ── W2 (W2A delta review): the shim never makes a key a running broker doesn't know ──
+
+function missingKeyFile(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-nokey-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return path.join(dir, "broker.key");
+}
+
+test("W2: a broker answers but the key file is missing: no key is created; the shim waits for the broker to restore it, then talks", async (t) => {
+  const pipe = testPipe("w2-restore");
+  const fb = await fakeBroker(t, pipe);
+  const keyFile = missingKeyFile(t);
+  const h = shimHarness(t, pipe, { keyFile, keyRestoreWaitMs: 5000 });
+  h.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+  await sleep(400);
+  assert.strictEqual(fs.existsSync(keyFile), false, "the shim made no key of its own");
+  assert.deepStrictEqual(fb.hellos, [], "nothing sent before the key is back");
+  assert.deepStrictEqual(h.launches, [], "a broker answers: no launch");
+  fs.writeFileSync(keyFile, KEY.toString("hex")); // the broker restores it (restoreKeyFile)
+  await until(() => fb.received.some((r) => r.msg && r.msg.id === 1), 5000, "the request to reach the broker");
+  assert.strictEqual(fs.readFileSync(keyFile, "utf8"), KEY.toString("hex"));
+  assert.ok(h.logs.some((l) => /key file .* is missing/.test(l)), h.logs.join("\n"));
+});
+
+test("W2: the key never comes back: the session gets an error after the wait, and still no key is created", async (t) => {
+  const pipe = testPipe("w2-never");
+  await fakeBroker(t, pipe);
+  const keyFile = missingKeyFile(t);
+  const h = shimHarness(t, pipe, { keyFile, keyRestoreWaitMs: 600, connectTimeoutMs: 300 });
+  h.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+  const r = await h.response(2);
+  assert.match(r.error.message, /key file .* is still missing/);
+  assert.strictEqual(fs.existsSync(keyFile), false);
+});
+
+test("W2: no broker and no key: the key is created right before the launch, not earlier", async (t) => {
+  const pipe = testPipe("w2-launch");
+  const keyFile = missingKeyFile(t);
+  let keyAtLaunch = null;
+  const h = shimHarness(t, pipe, { keyFile, connectTimeoutMs: 400, onLaunch: () => { keyAtLaunch = fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null; } });
+  await until(() => h.launches.length === 1, 3000, "a launch");
+  assert.match(keyAtLaunch || "", /^[0-9a-f]{64}$/, "the launched broker finds the key the shim will use");
+});
+
+// ── W3 (W2A delta review): the launch warning can't be forged, and goes with its broker ──
+
+test("W3: a session's env can't hand the broker a launch warning (any case)", () => {
+  const r = launcherHarness({ env: { BROWSER_RELAY_BROKER_LAUNCH_WARNING: "forged", browser_relay_broker_launch_warning: "forged too", BROWSER_RELAY_OK: "1" } });
+  const env = r.spawns[0].opts.env;
+  assert.ok(!Object.keys(env).some((k) => /^BROWSER_RELAY_BROKER_LAUNCH_WARNING$/i.test(k)), JSON.stringify(Object.keys(env)));
+  assert.strictEqual(env.BROWSER_RELAY_OK, "1");
+});
+
+test("W3: reconnecting to a broker without a warning clears the old one", async (t) => {
+  const pipe = testPipe("w3-clear");
+  const first = await fakeBroker(t, pipe, { warning: "the browser broker runs elevated" });
+  const h = shimHarness(t, pipe);
+  h.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+  await until(() => first.received.length === 1, 3000, "first broker");
+  assert.strictEqual(h.shim.warning, "the browser broker runs elevated");
+  await first.close();
+  await fakeBroker(t, pipe); // the restarted broker runs de-elevated: no warning
+  h.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+  await until(() => h.shim.sock && h.shim.warning === null, 5000, "the warning to clear on reconnect");
 });

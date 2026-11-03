@@ -44,6 +44,8 @@ const RESPAWN_AFTER_MS = 5_000; // pipe still missing this long after a launch: 
 const EXIT_GRACE_MS = 2_000;
 const QUICK_CLOSE_MS = 250; // a connection that dies this fast with no data: back off
 const MAX_RECONNECT_DELAY_MS = 2_000;
+// a running broker puts back a deleted key file within 30 s (main.js KEY_CHECK_MS)
+const KEY_RESTORE_WAIT_MS = 35_000;
 const RESTARTED = "browser broker restarted; please retry the call";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -82,6 +84,8 @@ const ENV_ALLOW_RE = /^(?:BROWSER_.*|TELEMETRY_ENABLE|TOOL_NAME_PREFIX|AVAILABLE
 function launchEnv(env) {
   const out = {};
   for (const [k, v] of Object.entries(env)) {
+    // set by the launcher itself, never taken from a session (it would be forgeable)
+    if (/^BROWSER_RELAY_BROKER_LAUNCH_WARNING$/i.test(k)) continue;
     if (v !== undefined && (OS_ENV_KEYS.has(k.toUpperCase()) || ENV_ALLOW_RE.test(k))) out[k] = v;
   }
   return out;
@@ -175,10 +179,11 @@ class Shim {
     pipeDirProblem = defaultPipeDirProblem,
     connectTimeoutMs = CONNECT_TIMEOUT_MS,
     respawnAfterMs = RESPAWN_AFTER_MS,
+    keyRestoreWaitMs = KEY_RESTORE_WAIT_MS,
   }) {
     Object.assign(this, {
       pipe, brokerEntry, brokerArgs, keyFile, settingsEnv, input, output, log, exitFn: exit, connectFn: connect,
-      spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs,
+      spawnLauncher, pipeDirProblem, connectTimeoutMs, respawnAfterMs, keyRestoreWaitMs,
     });
     this.key = null;
     this.warning = null; // from the broker's hello: shown once (stderr + first tool result)
@@ -283,7 +288,9 @@ class Shim {
     let lastLaunch = 0;
     let lastErr = null;
     let keyReloaded = false;
-    for (let attempt = 0; Date.now() - t0 < this.connectTimeoutMs; attempt++) {
+    let keyWaitSince = 0; // a broker answers but our key file is gone: wait for it to restore it
+    const deadline = () => (keyWaitSince ? Math.max(t0 + this.connectTimeoutMs, keyWaitSince + this.keyRestoreWaitMs) : t0 + this.connectTimeoutMs);
+    for (let attempt = 0; Date.now() < deadline(); attempt++) {
       if (this.closed) throw new Error("shim closed");
       // waiting won't fix it, and launching a broker there would be refused too
       const problem = this.pipeDirProblem(this.pipe);
@@ -292,6 +299,15 @@ class Shim {
         return await this._connectOnce();
       } catch (e) {
         if (e.code === "EKEY") throw e;
+        if (e.code === "ENOKEY") {
+          if (!keyWaitSince) {
+            keyWaitSince = Date.now();
+            this.log(e.message);
+          }
+          lastErr = e;
+          await sleep(250);
+          continue;
+        }
         if (e.code === "EAUTH" && !keyReloaded) {
           // our cached key may be stale (the key file was recreated): read it again, once
           keyReloaded = true;
@@ -306,6 +322,8 @@ class Shim {
         if (missing && Date.now() - lastLaunch >= this.respawnAfterMs) {
           lastLaunch = Date.now();
           this.log(`no broker on ${this.pipe}; starting one`);
+          // the only place a key is made: the broker started now reads it
+          if (!this.key) this.key = this._keyFileOp(() => pipeServer.loadOrCreateKey(this.keyFile));
           try {
             this.spawnLauncher(launcherArgs(this.brokerEntry, this.brokerArgs));
           } catch (se) {
@@ -315,17 +333,23 @@ class Shim {
         await sleep(Math.min(25 + attempt * 10, 200));
       }
     }
+    if (lastErr && lastErr.code === "ENOKEY") {
+      throw new Error(`the broker key file ${this.keyFile} is still missing after ${Math.round(this.keyRestoreWaitMs / 1000)} s while a broker runs on ${this.pipe}; run npm run broker:stop and retry`);
+    }
     throw new Error(`no broker answered on ${this.pipe} within ${this.connectTimeoutMs} ms (${lastErr ? lastErr.code || lastErr.message : "timeout"})`);
   }
 
-  _loadKey() {
-    if (!this.key) {
-      try {
-        this.key = pipeServer.loadOrCreateKey(this.keyFile);
-      } catch (e) {
-        throw Object.assign(new Error(`cannot use the broker key file ${this.keyFile}: ${e.message}`), { code: "EKEY" });
-      }
+  _keyFileOp(fn) {
+    try {
+      return fn();
+    } catch (e) {
+      throw Object.assign(new Error(`cannot use the broker key file ${this.keyFile}: ${e.message}`), { code: "EKEY" });
     }
+  }
+
+  /** This user's broker key, or null while its file is missing (a key is only made before a launch). */
+  _loadKey() {
+    if (!this.key) this.key = this._keyFileOp(() => pipeServer.readKey(this.keyFile));
     return this.key;
   }
 
@@ -337,14 +361,22 @@ class Shim {
       sock.once("error", onError);
       sock.once("connect", () => { sock.removeListener("error", onError); resolve(sock); });
     });
+    if (!key) {
+      // a broker answers, but this user's key file is gone. The broker puts
+      // it back; a key made here would not be the broker's.
+      s.destroy();
+      throw Object.assign(new Error(`the broker key file ${this.keyFile} is missing; waiting for the running broker to restore it`), { code: "ENOKEY" });
+    }
     try {
       // nothing of the session's goes out before the owner proves it is ours
       const settings = this.settingsEnv ? pipeServer.settingsHash(this.settingsEnv, key) : null;
       const { rest, warning } = await pipeServer.clientHello(s, key, { settings, reconnect: this.everAttached });
       if (rest.length) s.unshift(rest);
-      if (warning && warning !== this.warning) {
+      // per broker: a reconnect to one without a warning clears it
+      if (warning !== this.warning) {
         this.warning = warning;
-        this.log(`WARNING: ${warning}`);
+        this.warningShown = false;
+        if (warning) this.log(`WARNING: ${warning}`);
       }
       return s;
     } catch (e) {
