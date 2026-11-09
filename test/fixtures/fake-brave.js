@@ -16,6 +16,9 @@
 //                 exit after --fake-exit-ms (default 1200): a slow shutdown
 //   close-hang    ack Browser.close, close the pipe, then keep running until killed
 //   exit-early    exit 0 after 100 ms without answering CDP (a profile handoff)
+//   exit-early-once  exit-early on a profile's first launch only, then behave normally
+//   pipe-close-once  on a profile's first launch only, close the pipe and keep running
+//   exit-at-pid-check-once  on a profile's first launch only, exit 0 on SystemInfo.getProcessInfo
 //   no-cdp        run without ever answering CDP
 //   foreign-pid   getProcessInfo reports a browser pid that is not ours
 //   slow-certs    answer Security.setIgnoreCertificateErrors after --fake-exit-ms (the
@@ -41,11 +44,13 @@ const userDataDir = opt("user-data-dir");
 const braveArgs = argv.filter((a) => !a.startsWith("--fake-"));
 
 fs.mkdirSync(userDataDir, { recursive: true });
-fs.appendFileSync(path.join(userDataDir, "fake-launches.jsonl"), JSON.stringify({ pid: process.pid, args: braveArgs, t: Date.now() }) + "\n");
+const launchesFile = path.join(userDataDir, "fake-launches.jsonl");
+const firstLaunch = !fs.existsSync(launchesFile);
+fs.appendFileSync(launchesFile, JSON.stringify({ pid: process.pid, args: braveArgs, t: Date.now() }) + "\n");
 
 setInterval(() => {}, 1 << 30); // stay alive until told to exit (or killed)
 
-if (modes.has("exit-early")) setTimeout(() => process.exit(0), 100);
+if (modes.has("exit-early") || (modes.has("exit-early-once") && firstLaunch)) setTimeout(() => process.exit(0), 100);
 else if (!modes.has("no-cdp") && braveArgs.includes("--remote-debugging-pipe")) setTimeout(serve, delay);
 
 function serve() {
@@ -54,6 +59,7 @@ function serve() {
   inp.on("error", () => {});
   out.on("error", () => {});
   const drop = () => { out.end(); inp.destroy(); };
+  if (modes.has("pipe-close-once") && firstLaunch) return drop();
   let buf = "";
   inp.setEncoding("utf8");
   inp.on("data", (d) => {
@@ -78,6 +84,7 @@ function serve() {
     } else if (msg.method === "Browser.getVersion") {
       reply({ product: "FakeBrave/1.0", protocolVersion: "1.3" });
     } else if (msg.method === "SystemInfo.getProcessInfo") {
+      if (modes.has("exit-at-pid-check-once") && firstLaunch) process.exit(0);
       const id = modes.has("foreign-pid") ? process.pid + 100000 : process.pid;
       reply({ processInfo: [{ type: "browser", id, cpuTime: 0 }, { type: "GPU", id: id + 1, cpuTime: 0 }] });
     } else if (msg.method === "Fake.drop") {

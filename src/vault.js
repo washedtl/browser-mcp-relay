@@ -179,9 +179,18 @@ function summarizeVaultFromEnv({ env = process.env, localConfigPath } = {}) {
 }
 
 function buildVaultFromEnv(env) {
+  return new Vault(vaultFilesFromEnv(env));
+}
+
+/** Does BROWSER_RELAY_VAULT_FILES name a file that exists? (If not, no mode has a vault to load.) */
+function vaultFilesExist(env) {
+  return vaultFilesFromEnv(env).some((f) => fs.existsSync(f));
+}
+
+function vaultFilesFromEnv(env) {
   const envVal = env.BROWSER_RELAY_VAULT_FILES;
   // Unset OR empty string → empty vault (autofill becomes a no-op).
-  if (envVal === undefined || envVal === "") return new Vault([]);
+  if (envVal === undefined || envVal === "") return [];
   // F0-1 (2026-05-10): use the platform's native PATH delimiter. Node's
   // `path.delimiter` is `;` on Windows and `:` on POSIX — matches user
   // muscle-memory from PATH. Windows path `C:\foo` doesn't get
@@ -190,8 +199,7 @@ function buildVaultFromEnv(env) {
   // the natural `:`-separated form got ONE non-existent "file" with the
   // whole string and silently empty vault.
   const path = require("node:path");
-  const files = envVal.split(path.delimiter).map((s) => s.trim()).filter(Boolean);
-  return new Vault(files);
+  return envVal.split(path.delimiter).map((s) => s.trim()).filter(Boolean);
 }
 
-module.exports = { Vault, loadVaultFromEnv, summarizeVaultFromEnv, getLoadedVault, parseCsv, hostFromUrl, httpsOrigin };
+module.exports = { Vault, loadVaultFromEnv, summarizeVaultFromEnv, vaultFilesExist, getLoadedVault, parseCsv, hostFromUrl, httpsOrigin };

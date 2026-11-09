@@ -794,13 +794,16 @@ test("W2P stray Brave on our profile: only the PIDs on it are killed, and the la
 test("W2P stray Brave: a profile still locked after the reap fails the launch clearly; nothing is spawned", async () => {
   const dir = tmpProfile("fake-stray-stuck");
   let spawned = 0;
+  let lookups = 0;
   const { sup } = fakeSupervisor(dir, {
     strayExitWaitMs: 300,
+    launchRetryMs: 1,
     onSpawn: () => spawned++,
-    _strays: { lockHeld: () => true, find: async () => [], kill: () => assert.fail("nothing matched, so nothing is killed") },
+    _strays: { lockHeld: () => true, find: async () => { lookups++; return []; }, kill: () => assert.fail("nothing matched, so nothing is killed") },
   });
   await assert.rejects(sup.ensure(), /still locked by another browser \(and no process has exactly this --user-data-dir\); not launching on it/);
   assert.strictEqual(spawned, 0);
+  assert.strictEqual(lookups, 1, "a locked profile is not retried");
 });
 
 test("W2P profileLockHeld (Windows rule): no lockfile, or one no process holds open, is not a lock", () => {
@@ -856,32 +859,96 @@ test("ensure() during closeGracefully() waits for the close, then relaunches", a
   assert.strictEqual(sup.isUp(), true);
 });
 
-test("launch failure: a Brave that exits during launch (profile handoff) rejects, and the next ensure() retries", async () => {
+test("launch failure: a Brave that keeps exiting during launch rejects after 3 attempts, and the next ensure() tries again", async () => {
   const dir = tmpProfile("fake-exit-early");
-  const { sup } = fakeSupervisor(dir, { mode: "exit-early" });
-  sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
-  await assert.rejects(sup.ensure(), (e) => /exited during launch/.test(e.message) && e.message.includes(path.resolve(dir)));
+  const { sup, log } = fakeSupervisor(dir, { mode: "exit-early", launchRetryMs: 1 });
+  let downs = 0; // counted: a listener that throws is caught by _emitSafe
+  sup.on("down", () => downs++);
+  await assert.rejects(sup.ensure(), (e) => /exited during launch/.test(e.message) && e.message.includes(`Nothing holds ${path.resolve(dir)} now`));
+  assert.strictEqual(launchesOf(dir).length, 3);
   await assert.rejects(sup.ensure(), /exited during launch/);
-  assert.strictEqual(launchesOf(dir).length, 2);
+  assert.strictEqual(launchesOf(dir).length, 6);
   assert.strictEqual(sup.isUp(), false);
+  assert.strictEqual(downs, 0, "'down' must not fire for a launch that never came up");
+  assert.strictEqual(log.lines.filter((l) => /launch attempt \d of 3 failed: .*exited during launch \(code=0\)/.test(l)).length, 6, log.lines.join("\n"));
 });
 
-test("launch failure: a missing executable rejects with a clear error", async () => {
-  const sup = new BraveSupervisor({ profileDir: tmpProfile("fake-enoent"), executablePath: path.join(TMP_ROOT, "no-such-brave.exe"), log: collectLog() });
+test("launch retry: a Brave that exits during launch is relaunched, and the caller just gets the Brave", async () => {
+  const dir = tmpProfile("fake-exit-once");
+  const { sup, log, pipes } = fakeSupervisor(dir, { mode: "exit-early-once", launchRetryMs: 1 });
+  let downs = 0;
+  sup.on("down", () => downs++);
+  const { pid } = await sup.ensure();
+  assert.strictEqual(sup.isUp(), true);
+  assert.strictEqual(downs, 0, "'down' must not fire for a launch that never came up");
+  assert.deepStrictEqual(launchesOf(dir).map((l) => l.pid).slice(1), [pid]);
+  assert.strictEqual(pipes.length, 1, "only the launch that came up goes to the proxy");
+  assert.ok(log.lines.some((l) => /launch attempt 1 of 3 failed: .*exited during launch \(code=0\)/.test(l)), log.lines.join("\n"));
+});
+
+test("launch retry: a Brave that closes its CDP pipe during launch but keeps running is killed and relaunched", async () => {
+  const dir = tmpProfile("fake-pipe-close-once");
+  const { sup, log, pipes } = fakeSupervisor(dir, { mode: "pipe-close-once", launchRetryMs: 1 });
+  let downs = 0;
+  sup.on("down", () => downs++);
+  const { pid } = await sup.ensure();
+  assert.strictEqual(downs, 0, "'down' must not fire for a launch that never came up");
+  const [first, second] = launchesOf(dir);
+  assert.strictEqual(second.pid, pid);
+  assert.strictEqual(pipes.length, 1, "only the launch that came up goes to the proxy");
+  await waitFor(() => !isAlive(first.pid), 5000, "the pipe-closed fake to be killed");
+  assert.ok(log.lines.some((l) => /launch attempt 1 of 3 failed: .*closed its CDP pipe during launch/.test(l)), log.lines.join("\n"));
+});
+
+test("launch retry: a Brave that goes away at the PID check is relaunched", async () => {
+  const dir = tmpProfile("fake-exit-pid-check");
+  const { sup, log, pipes } = fakeSupervisor(dir, { mode: "exit-at-pid-check-once", launchRetryMs: 1 });
+  let downs = 0;
+  sup.on("down", () => downs++);
+  const { pid } = await sup.ensure();
+  assert.strictEqual(downs, 0, "'down' must not fire for a launch that never came up");
+  assert.strictEqual(launchesOf(dir)[1].pid, pid);
+  assert.strictEqual(pipes.length, 1, "only the launch that came up goes to the proxy");
+  assert.ok(log.lines.some((l) => /launch attempt 1 of 3 failed: .*went away during launch/.test(l)), log.lines.join("\n"));
+});
+
+test("launch retry: a Brave holding the profile after the early exit is named in the log and reaped before the relaunch", async () => {
+  const dir = tmpProfile("fake-exit-stray");
+  const kills = [];
+  let held = false;
+  const { sup, log } = fakeSupervisor(dir, {
+    mode: "exit-early-once",
+    launchRetryMs: 1,
+    onSpawn: () => { if (!kills.length) held = true; },
+    _strays: { lockHeld: () => held, find: async () => [4242], kill: (pid) => { kills.push(pid); held = false; } },
+  });
+  await sup.ensure();
+  assert.deepStrictEqual(kills, [4242]);
+  assert.strictEqual(launchesOf(dir).length, 2);
+  assert.ok(log.lines.some((l) => l.includes(`Another browser holds ${path.resolve(dir)}`)), log.lines.join("\n"));
+});
+
+test("launch failure: a missing executable rejects with a clear error, once (a relaunch can't fix it) and logged", async () => {
+  const log = collectLog();
+  const sup = new BraveSupervisor({ profileDir: tmpProfile("fake-enoent"), executablePath: path.join(TMP_ROOT, "no-such-brave.exe"), log, launchRetryMs: 1 });
   supervisors.push(sup);
   await assert.rejects(sup.ensure(), /could not start .*no-such-brave/);
   assert.strictEqual(sup.isUp(), false);
+  const attempts = log.lines.filter((l) => /launch attempt/.test(l));
+  assert.strictEqual(attempts.length, 1, attempts.join("\n"));
+  assert.match(attempts[0], /^launch attempt 1 of 3 failed: .*could not start/);
 });
 
 test("launch failure: CDP never comes up → rejects after launchTimeoutMs and kills the process", async () => {
   const dir = tmpProfile("fake-no-cdp");
   const before = spawnedChildren.length;
-  const { sup } = fakeSupervisor(dir, { mode: "no-cdp", launchTimeoutMs: 500 });
+  const { sup } = fakeSupervisor(dir, { mode: "no-cdp", launchTimeoutMs: 500, launchRetryMs: 1 });
   sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), /not ready/);
   // The spawn we recorded, not the fake's own launch record: on a loaded
   // machine the fake can be killed at 500 ms before it has written one.
-  const [child] = spawnedChildren.slice(before);
+  const [child, retried] = spawnedChildren.slice(before);
+  assert.strictEqual(retried, undefined, "a Brave that hung (it did not go away) is not relaunched");
   await waitFor(() => child.exitCode !== null || child.signalCode !== null, 5000, "no-cdp fake to be killed");
 });
 
@@ -891,6 +958,7 @@ test("launch failure: CDP answered by a different browser process → rejects, o
   sup.on("down", () => assert.fail("'down' must not fire for a launch that never came up"));
   await assert.rejects(sup.ensure(), /pid/i);
   assert.strictEqual(pipes.length, 0, "a browser that is not ours is never handed to the proxy");
+  assert.strictEqual(launchesOf(dir).length, 1, "a PID mismatch is not retried");
   const [{ pid }] = launchesOf(dir);
   await waitFor(() => !isAlive(pid), 5000, "foreign-pid fake to be killed");
 });

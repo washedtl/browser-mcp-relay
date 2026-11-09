@@ -352,10 +352,18 @@ test("V2-c: a session whose settings differ from the broker's is told so, in ITS
   assert.strictEqual(b.logs.filter((l) => /WARNING: session c\d+ has browser settings/.test(l)).length, 1, "and once in the broker log");
 });
 
-test("V1-4b: BROWSER_RELAY_VAULT_FILES set in broker mode: every session hears that autofill isn't available here", async (t) => {
-  const b = await startTestBroker(t, { env: { BROWSER_RELAY_VAULT_FILES: "C:\\x\\pw.csv" } });
+test("V1-4b: BROWSER_RELAY_VAULT_FILES naming a real file in broker mode: every session hears that autofill isn't available here", async (t) => {
+  const csv = path.join(HOME, "vault-pw.csv");
+  fs.writeFileSync(csv, "name,url,username,password,note\n");
+  const b = await startTestBroker(t, { env: { BROWSER_RELAY_VAULT_FILES: [path.join(HOME, "gone.csv"), csv].join(path.delimiter) } });
   for (let i = 0; i < 2; i++) assert.match(await helloWarning(b.pipe, null), /credential-vault autofill isn't available in broker mode; set BROWSER_RELAY_MODE=legacy if you need it/);
   assert.strictEqual(b.logs.filter((l) => /WARNING: credential-vault autofill/.test(l)).length, 1, "logged once");
   const quiet = await startTestBroker(t);
   assert.strictEqual(await helloWarning(quiet.pipe, null), null);
+});
+
+test("BROWSER_RELAY_VAULT_FILES naming only missing files: no warning on every session (legacy mode would load nothing either)", async (t) => {
+  const b = await startTestBroker(t, { env: { BROWSER_RELAY_VAULT_FILES: path.join(HOME, "no-such-pw.csv") } });
+  assert.strictEqual(await helloWarning(b.pipe, null), null);
+  assert.ok(!b.logs.some((l) => /credential-vault/.test(l)), b.logs.join("\n"));
 });
