@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **A Brave that exits during launch is relaunched** (up to 3 attempts, broker mode). A one-off early exit used to fail the tool call; a stray Brave that took the profile meanwhile is reaped before the relaunch. A missing executable or a Brave that hangs is not retried.
+- **Launch failures are in `broker.log`**, every attempt. They used to reach only the calling session.
+- **The early-exit error says what it found**: whether something holds the profile right now, instead of always guessing that another Brave does.
+- The "credential-vault autofill isn't available" warning appears only when `BROWSER_RELAY_VAULT_FILES` names a file that exists. A list of missing files had nothing to lose, but put the warning in every session's first tool result.
+
 ## v0.4.1 — CDP lockdown, stealth fixes, cookie bridge
 
 ### Security: no CDP port in broker mode

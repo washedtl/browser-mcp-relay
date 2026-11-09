@@ -635,7 +635,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   // launcher's warning (de-elevation failed) and settings this mode ignores.
   const brokerWarnings = [
     env.BROWSER_RELAY_BROKER_LAUNCH_WARNING,
-    env.BROWSER_RELAY_VAULT_FILES ? "credential-vault autofill isn't available in broker mode; set BROWSER_RELAY_MODE=legacy if you need it" : null,
+    require("../vault.js").vaultFilesExist(env) ? "credential-vault autofill isn't available in broker mode; set BROWSER_RELAY_MODE=legacy if you need it" : null,
   ].filter(Boolean);
   for (const w of brokerWarnings) log(`WARNING: ${w}`);
   // ...plus, for a session whose own settings differ, that it doesn't get them

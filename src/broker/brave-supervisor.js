@@ -36,6 +36,14 @@ const EXIT_WAIT_MS = 10000;
 const STDIO = Object.freeze(["ignore", "ignore", "ignore", "pipe", "pipe"]);
 // Chromium's exit code when another browser process holds the profile
 const RESULT_CODE_PROFILE_IN_USE = 21;
+// A launch can exit before CDP answers and the next one work. Seen once on a
+// live, de-elevated broker: exit 0 after 484 ms with the profile free and
+// nothing left running, and the next launch was up in 220 ms (trigger not
+// found: not elevation, an update, a stray Brave or the call order). Exit 0
+// says little: a handoff to a live Brave (58-339 ms) and a broken pipe
+// (200-358 ms) give it too.
+const LAUNCH_ATTEMPTS = 3;
+const LAUNCH_RETRY_MS = 300;
 
 /**
  * Supervises one Brave on one persistent profile.
@@ -74,6 +82,7 @@ class BraveSupervisor extends EventEmitter {
    *   policy in resolveProxy(); credentials go to `proxyCredentials`
    * @param {(msg: string) => void} [opts.log] — default: stderr
    * @param {number} [opts.launchTimeoutMs=20000] — spawn → CDP ready (first reply on the pipe)
+   * @param {number} [opts.launchRetryMs=300] — wait before relaunching a Brave that went away during launch
    * @param {number} [opts.closeTimeoutMs=10000] — Browser.close → exit, then kill
    *   (unless Brave accepted the close: see shutdownGraceMs)
    * @param {number} [opts.shutdownGraceMs=20000] — extra wait after closeTimeoutMs
@@ -98,6 +107,7 @@ class BraveSupervisor extends EventEmitter {
     this._log = opts.log || ((m) => process.stderr.write(`${PREFIX} ${m}\n`));
     this._t = {
       launchTimeoutMs: opts.launchTimeoutMs || 20000,
+      launchRetryMs: opts.launchRetryMs || LAUNCH_RETRY_MS,
       closeTimeoutMs: opts.closeTimeoutMs || CLOSE_TIMEOUT_MS,
       shutdownGraceMs: opts.shutdownGraceMs || SHUTDOWN_GRACE_MS,
       exitWaitMs: opts.exitWaitMs || EXIT_WAIT_MS,
@@ -223,7 +233,21 @@ class BraveSupervisor extends EventEmitter {
     return { graceful, ms };
   }
 
+  /** _launchOnce, again only when Brave itself went away before coming up. */
   async _launch() {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this._launchOnce();
+      } catch (e) {
+        // a session only sees the last error; the broker log keeps each one
+        this._log(`launch attempt ${attempt} of ${LAUNCH_ATTEMPTS} failed: ${e.message}`);
+        if (!e.wentAway || attempt >= LAUNCH_ATTEMPTS) throw e;
+        await sleep(this._t.launchRetryMs);
+      }
+    }
+  }
+
+  async _launchOnce() {
     const prev = this._proc;
     if (prev && !prev.exited) await this._reap(prev);
     const exe = this._executablePath || (this._executablePath = detectBravePath());
@@ -256,11 +280,11 @@ class BraveSupervisor extends EventEmitter {
    * Reap a Brave left on OUR profile by an earlier broker. It normally dies
    * with that broker (Node puts its children in a kill-on-close job object;
    * measured: gone ~30 ms after a hard kill of the broker), but one that
-   * survived anyway would make our launch hand off to it and exit with
-   * code 21. Chromium holds <profile>/lockfile open while it runs, so only
-   * then are processes listed: those whose --user-data-dir is exactly this
-   * profile are killed (nothing else, no tree walk), and the launch waits
-   * for the lock to go.
+   * survived anyway would make our launch hand off to it and exit (code 21
+   * or, handing off to a healthy one, 0). Chromium holds <profile>/lockfile
+   * open while it runs, so only then are processes listed: those whose
+   * --user-data-dir is exactly this profile are killed (nothing else, no
+   * tree walk), and the launch waits for the lock to go.
    */
   async _reapStrays(exe) {
     const { lockHeld, find, kill } = this._strays;
@@ -321,17 +345,18 @@ class BraveSupervisor extends EventEmitter {
       if (proc.spawnError) return new Error(`${PREFIX} could not start ${exe}: ${proc.spawnError.message}`);
       if (!proc.exited) return null;
       const inUse = proc.exitCode === RESULT_CODE_PROFILE_IN_USE ? ": the profile is in use" : "";
-      return new Error(
-        `${PREFIX} Brave exited during launch (code=${proc.exitCode}${inUse}) after ${Date.now() - t0} ms. ` +
-        `If another Brave already runs on ${this.profileDir}, a new one hands off to it and exits; close that Brave first.`,
-      );
+      const holder = this._strays.lockHeld(this.profileDir)
+        ? `Another browser holds ${this.profileDir} (a new Brave hands off to it and exits); close it first.`
+        : `Nothing holds ${this.profileDir} now; retry the call (the broker log has each attempt).`;
+      return wentAway(new Error(`${PREFIX} Brave exited during launch (code=${proc.exitCode}${inUse}) after ${Date.now() - t0} ms. ${holder}`));
     };
     for (;;) {
-      if (exitedError()) throw exitedError();
+      const gone = exitedError();
+      if (gone) throw gone;
       if (!proc.pipe || proc.pipe.closed) {
         // The pipe closes just before the process exits: wait for the exit code.
         await waitExit(proc, 2000);
-        throw exitedError() || new Error(`${PREFIX} Brave pid ${proc.pid} closed its CDP pipe during launch (after ${Date.now() - t0} ms)`);
+        throw exitedError() || wentAway(new Error(`${PREFIX} Brave pid ${proc.pid} closed its CDP pipe during launch (after ${Date.now() - t0} ms)`));
       }
       const left = this._t.launchTimeoutMs - (Date.now() - t0);
       if (left <= 0) throw new Error(`${PREFIX} Brave CDP (pipe) not ready after ${this._t.launchTimeoutMs} ms`);
@@ -346,7 +371,7 @@ class BraveSupervisor extends EventEmitter {
     // out we only warn and adopt it, so a Brave that drops or changes this
     // method can't brick every launch. A PID mismatch fails.
     const browserPid = await cdpBrowserPid(proc);
-    if (proc.down || proc.exited) throw new Error(`${PREFIX} Brave pid ${proc.pid} went away during launch`);
+    if (proc.down || proc.exited) throw wentAway(new Error(`${PREFIX} Brave pid ${proc.pid} went away during launch`));
     if (browserPid === null) {
       this._log(`warning: could not confirm that the CDP pipe is served by pid ${proc.pid} (SystemInfo.getProcessInfo failed)`);
     } else if (browserPid !== proc.pid) {
@@ -515,6 +540,12 @@ function waitExit(proc, ms) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Marks a launch failure a relaunch can fix: Brave itself went away before coming up. */
+function wentAway(e) {
+  e.wentAway = true;
+  return e;
+}
 
 /** The browser process id CDP reports, or null if it can't be read. */
 async function cdpBrowserPid(proc) {
