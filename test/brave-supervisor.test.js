@@ -925,7 +925,7 @@ test("launch retry: a Brave holding the profile after the early exit is named in
   await sup.ensure();
   assert.deepStrictEqual(kills, [4242]);
   assert.strictEqual(launchesOf(dir).length, 2);
-  assert.ok(log.lines.some((l) => l.includes(`Another browser holds ${path.resolve(dir)}`)), log.lines.join("\n"));
+  assert.ok(log.lines.some((l) => l.includes(`${path.resolve(dir)} was still locked when it exited`)), log.lines.join("\n"));
 });
 
 test("launch failure: a missing executable rejects with a clear error, once (a relaunch can't fix it) and logged", async () => {
