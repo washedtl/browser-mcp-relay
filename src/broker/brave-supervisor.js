@@ -36,12 +36,14 @@ const EXIT_WAIT_MS = 10000;
 const STDIO = Object.freeze(["ignore", "ignore", "ignore", "pipe", "pipe"]);
 // Chromium's exit code when another browser process holds the profile
 const RESULT_CODE_PROFILE_IN_USE = 21;
-// A launch can exit before CDP answers and the next one work. Seen once on a
-// live, de-elevated broker: exit 0 after 484 ms with the profile free and
-// nothing left running, and the next launch was up in 220 ms (trigger not
-// found: not elevation, an update, a stray Brave or the call order). Exit 0
-// says little: a handoff to a live Brave (58-339 ms) and a broken pipe
-// (200-358 ms) give it too.
+// A launch can exit before CDP answers and the next one work. Seen twice on a
+// live, de-elevated broker, each the first launch in a while (16 min after
+// Brave closed, 3 days after the last launch; quick restarts didn't do it):
+// exit 0 after 178 and 484 ms, and the next launch up in ~210 ms. At the 484 ms
+// exit no Brave was left; at the 178 ms one the lock was held, then free 300 ms
+// later (a stray isn't ruled out). Trigger not found (not elevation, an update
+// or the call order). Exit 0 says little: a handoff to a live Brave (58-339 ms)
+// and a broken pipe (200-358 ms) give it too.
 const LAUNCH_ATTEMPTS = 3;
 const LAUNCH_RETRY_MS = 300;
 
@@ -346,7 +348,7 @@ class BraveSupervisor extends EventEmitter {
       if (!proc.exited) return null;
       const inUse = proc.exitCode === RESULT_CODE_PROFILE_IN_USE ? ": the profile is in use" : "";
       const holder = this._strays.lockHeld(this.profileDir)
-        ? `Another browser holds ${this.profileDir} (a new Brave hands off to it and exits); close it first.`
+        ? `${this.profileDir} was still locked when it exited (another Brave, or this one's lock not released yet).`
         : `Nothing holds ${this.profileDir} now; retry the call (the broker log has each attempt).`;
       return wentAway(new Error(`${PREFIX} Brave exited during launch (code=${proc.exitCode}${inUse}) after ${Date.now() - t0} ms. ${holder}`));
     };
