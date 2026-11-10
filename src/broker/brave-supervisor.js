@@ -622,6 +622,12 @@ function buildBraveArgs({ profileDir, extensionPath = null, proxyServer = null, 
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    // A page restored from the back/forward cache fires no load event over
+    // CDP, so Playwright's goBack/goForward waits out its whole timeout
+    // (measured: navigation_go-back-or-forward on two plain pages failed after
+    // 8,001 ms although the page had gone back; 677 ms when the page could not
+    // be cached). Playwright passes the same switch to the browsers it launches.
+    "--disable-back-forward-cache",
   ];
   // Deliberately absent: Playwright's --enable-automation (infobar + bot
   // tells) and --use-mock-keychain (breaks DPAPI cookie decryption).

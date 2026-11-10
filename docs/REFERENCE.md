@@ -7,6 +7,7 @@ The slim README at the root of the repo is for getting up and running. This file
 - [Tool catalog](#tool-catalog)
   - [First-party tools (21)](#first-party-tools-21)
   - [Forwarded upstream tools (51)](#forwarded-upstream-tools-51)
+  - [Results in broker mode](#results-in-broker-mode)
   - [Toolsets (hidden by default)](#toolsets)
 - [Worked examples](#worked-examples)
 - [Architecture](#architecture)
@@ -119,7 +120,7 @@ Tools that act on a page take an optional `tabId` (from `tabs_new`); without it 
 
 ### Forwarded upstream tools (51)
 
-Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) — the relay forwards `tools/call` requests for these to the upstream child process verbatim. Brief summaries below; full schemas come straight from upstream and are visible to your MCP client via `tools/list`.
+Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp) — the relay forwards `tools/call` requests for these to upstream. Broker mode changes a few arguments and results on the way: see the notes in the tables and [Results in broker mode](#results-in-broker-mode). Brief summaries below; full schemas come straight from upstream and are visible to your MCP client via `tools/list`.
 
 #### ♿ Accessibility (2)
 
@@ -135,7 +136,7 @@ Provided by [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devt
 | `content_get-as-html` | Get the page's HTML |
 | `content_get-as-text` | Get the page's visible text |
 | `content_save-as-pdf` | Save current page as a PDF |
-| `content_take-screenshot` | Screenshot the page or a specific element |
+| `content_take-screenshot` | Screenshot the page, or one element with `selector` (CSS or a snapshot ref). In broker mode the image is that element; in legacy mode upstream returns the viewport (the whole page with `fullPage`) |
 | `content_start-recording` | Start video recording |
 | `content_stop-recording` | Stop recording and save the video file |
 
@@ -175,9 +176,9 @@ Hidden by default: `debug` [toolset](#toolsets).
 
 | Tool | Purpose |
 |---|---|
-| `navigation_go-to` | Navigate to a URL (with `navigation_reload` and `navigation_go-back-or-forward`, a 60 s default `timeout` in broker mode) |
+| `navigation_go-to` | Navigate to a URL (with `navigation_reload` and `navigation_go-back-or-forward`, a 60 s default `timeout` in broker mode. Called inside `execute` or `scenario-run` they keep upstream's default of no timeout, and the script's `timeoutMs` ends the call: 30 s unless set, 120 s at most, and no limit at all with `timeoutMs: 0`) |
 | `navigation_reload` | Reload the current page |
-| `navigation_go-back-or-forward` | Browser history navigation |
+| `navigation_go-back-or-forward` | Browser history navigation. Broker mode turns off Chromium's back/forward cache, so the earlier page loads again |
 
 #### 📈 Observability (6)
 
@@ -228,7 +229,24 @@ Hidden by default: `scenario` [toolset](#toolsets).
 | Tool | Purpose |
 |---|---|
 | `execute` | Batch-execute multiple tool calls in one request via custom JS — reduces round-trips |
-| `sync_wait-for-network-idle` | Wait until in-flight requests ≤ N for `idleMs` |
+| `sync_wait-for-network-idle` | Wait until in-flight requests ≤ N for `idleTimeMs`. In broker mode a request cut off by a navigation and an EventSource stream are not counted |
+
+### Results in broker mode
+
+What the broker changes in a forwarded tool's result before your MCP client gets it:
+
+- **A result over 30,000 characters is cut, and saved in full.** When the length is in a few long fields (a snapshot, a page's HTML or text), the cut is made inside them, the result is still valid JSON, and the file holds the full text of the fields that were cut. Anything else, such as a list of many short records, dozens of long fields or text that is not JSON, is cut as plain text at the last line break before the limit (at the limit itself when that would show half of it or less), and the file holds the whole text. The file goes to `results/` in the [broker home](#broker-settings) and is kept for at least 24 hours (older files are removed when the next one is saved). It holds what the tool returned, as plain text: page content, and from the request tool the URLs, request bodies and any headers or response bodies you asked it to include. On Linux and macOS only your user can read it (mode 600); on Windows it is under your `%LOCALAPPDATA%`. A note after the result names the file, the line where the cut text continues (when the cut falls on a line break), and the arguments that return less next time:
+  - navigation tools: `includeSnapshot: false`, or `snapshotOptions: {interactiveOnly: true}`
+  - `a11y_take-aria-snapshot`, `content_get-as-html` and `content_get-as-text`: a `selector` for the part you need
+  - console and request tools: `limit: {count: N}`
+
+  The limit counts characters, not tokens, and applies to each text part of a result on its own (a forwarded tool normally returns one). Text that takes more tokens per character (Chinese, Japanese, Korean) can still pass your client's own limit, so ask for less with the arguments above.
+
+  First-party tools are not cut. `capture_xhr`, `cookies_export`, `extract_structured` and `storage_get-local` have size limits of their own.
+- **Snapshots come without the `refs` map.** The map listed each ref again with its role, name and selector. Every ref is in the snapshot text as `[ref=eN]`: pass one as the `selector` of an `interaction_*` tool or of `content_take-screenshot`, `"e12"` or `"@e12"` (any other tool's `selector` is CSS). The two tool descriptions that promised the map are reworded to match. A script inside `execute` still gets the map from `callTool`, and it is in the result if the script returns that output whole.
+- **A screenshot with a `selector` is that element's image**, whatever `fullPage` says. The page is scrolled to bring the element into view and is left there. An element that is hidden or has no size fails after 5 seconds with `element is not visible`. Upstream alone checks that the element exists and returns the viewport, or the whole page with `fullPage`.
+- **Output files are named per call**, also for calls made with `callTool` inside `execute`, so two screenshots in one second are two files.
+- **Error text has no colour codes**, and neither do the lines an `execute` script logs. What the script returns is left as it is.
 
 ### Toolsets
 
@@ -473,7 +491,7 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_RELAY_BRIDGE_ALLOW` | unset | [Cookie bridge](#cookie-bridge), broker side only: comma-separated domains (each with its subdomains) or IPs the broker accepts even when the keyword guard would hold them. The extension still holds them until you turn them on in its review page, so it makes nothing sync on its own. Never lifts a denylisted category. |
 | `BROWSER_RELAY_BROKER_LOG` | `<broker home>/broker.log` | The broker log (rotated once at startup past 1 MB). The launcher also writes its warnings there; it reads this from the process env only. |
 
-The broker home is `%LOCALAPPDATA%\browser-mcp-relay\broker` on Windows, `~/Library/Application Support/browser-mcp-relay/broker` on macOS, and `$XDG_STATE_HOME/browser-mcp-relay/broker` (or `~/.local/state/…`) on Linux. It holds `broker.key`, `broker.log`, `profile/` and `work/` (the broker's working dir: relative output paths and project-scope scenarios land there), plus, with the [cookie bridge](#cookie-bridge), `cookie-bridge.log` and `cookie-bridge-<hash>.json`.
+The broker home is `%LOCALAPPDATA%\browser-mcp-relay\broker` on Windows, `~/Library/Application Support/browser-mcp-relay/broker` on macOS, and `$XDG_STATE_HOME/browser-mcp-relay/broker` (or `~/.local/state/…`) on Linux. It holds `broker.key`, `broker.log`, `profile/`, `work/` (the broker's working dir: relative output paths and project-scope scenarios land there) and `results/` (the full text of [results that were cut](#results-in-broker-mode), kept at least 24 hours), plus, with the [cookie bridge](#cookie-bridge), `cookie-bridge.log` and `cookie-bridge-<hash>.json`.
 
 **Which settings apply in broker mode.** These work as before: `BROWSER_RELAY_BRAVE_PATH`, `BROWSER_RELAY_UPSTREAM_PATH`, `BROWSER_RELAY_PROXY_URL` (without credentials, see below), `BROWSER_RELAY_IGNORE_HTTPS_ERRORS`, `BROWSER_HEADLESS_ENABLE`, `BROWSER_LOAD_EXTENSIONS`, `BROWSER_RELAY_TOOLSETS` (the broker's starting set; each session then enables toolsets for itself), `BROWSER_RELAY_INSPECTOR_PORT` and `_BIND`, and `BROWSER_RELAY_CATALOG_REFRESH`. Legacy-only: `BROWSER_RELAY_POOL_DIR`, `BROWSER_RELAY_POOL_SLOT`, `BROWSER_MCP_ROLE` and `BROWSER_RELAY_SNAPSHOT_INDEXEDDB` (no pool), and `BROWSER_RELAY_VAULT_FILES` (not wired into the broker yet). TLS works as in legacy mode: certificates are verified unless `BROWSER_RELAY_IGNORE_HTTPS_ERRORS=true` or Brave actually runs through `BROWSER_RELAY_PROXY_URL` (so a debug proxy's MITM certificate works); the broker then turns the checks off after every Brave launch and logs it once.
 
@@ -875,6 +893,7 @@ For code that imports `src/inspector-server.js` (or `scripts/inspector.js`) dire
 - **"the browser broker runs elevated"** warning: de-elevation failed (no desktop shell, or UAC off), so the broker and its Brave run as administrator. A process at medium integrity can then reach an elevated Brave through the pipe.
 - **A session's settings are ignored**: the broker keeps the settings it started with (the session is told so). Run `npm run broker:stop`; the next tool call, from any session, starts a broker with that session's settings.
 - **Logins missing after the switch**: the seed picks the freshest idle legacy profile (pool slot or `<repo>/.browser-data`), and the log says which. Log in once in a session window, or stop the broker, move `profile/` away and run `npm run migrate-profile -- --from <slot>`.
+- **Navigation takes 5 s or more on one site**: the page keeps a request open (a streaming `fetch`, a long poll), so the wait for a quiet network runs to its limit. Pass `waitForTimeoutMs` (say `1000`) to the navigation tool to wait less, or `waitForNavigation: false` to skip the wait. An EventSource stream does not count.
 - **Back to the old model**: set `BROWSER_RELAY_MODE=legacy` and restart the MCP client.
 
 ### "Brave not found"

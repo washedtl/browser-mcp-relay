@@ -30,8 +30,17 @@
 //                 AVAILABLE_TOOL_DOMAINS + the import-time env constants
 //   execute chunk Execute
 //   session ctx   writable `browserContext` field, `page` getter, close()
-//                 (CDP attach: closes only the page), ensureSessionPageOpen()
+//                 (CDP attach: closes only the page), ensureSessionPageOpen(),
+//                 _safeReadResponseBody(res), _attachPageListeners(page),
+//                 numOfInFlightRequests()
+//   tool registry addTool(tool) reads tool.outputSchema() once and parses a
+//                 nested call's result strictly against it
 //   zod v3        nested at browser-devtools-mcp/node_modules/zod
+//   playwright    its client emits "navigated" on frame._eventEmitter with
+//                 {newDocument: {request: channel}, error}; channel._object
+//                 is the Request (trackInFlightRequests); page.screenshot()
+//                 drops an `element` option, elementHandle.screenshot() is
+//                 the element's image (screenshotTheElement)
 //
 // One upstream per process: BDMCP reads BROWSER_CDP_ENDPOINT_URL once, at
 // import, and caches its CDP connection per endpoint. The broker gives it the
@@ -88,6 +97,116 @@ function capResponseBodies(ctx) {
     // through a Buffer: a plain slice is a view that keeps the whole string alive
     const kept = Buffer.from(body.slice(0, KEPT_BODY_CHARS), "utf8").toString("utf8");
     return `${kept}\n[response body cut at ${KEPT_BODY_CHARS} of ${body.length} characters; ${NOT_KEPT_ADVICE}]`;
+  };
+}
+
+/**
+ * Replaces a session context's count of requests in flight, which upstream's
+ * waits for a quiet network read. Upstream adds one per `request` and takes
+ * one off per `requestfinished` / `requestfailed`, but Playwright reports
+ * neither for a request cut off when its document is replaced, and an
+ * EventSource stream has no end: the count only grew, so every navigation
+ * waited out upstream's 5 s limit and sync_wait-for-network-idle timed out
+ * (measured: go-to took 5.3-6.3 s on pages that load in 0.2 s).
+ *
+ * Here a request is forgotten when its frame commits a new document or is
+ * detached, and EventSource requests are not counted. A fetch stream or long
+ * poll that stays open still counts, as it does upstream.
+ *
+ * Playwright's public `framenavigated` does not say whether a new document
+ * came: it fires for pushState and #hash too, and a data: URL, about:blank
+ * or an error page commits with no request before it. The event its client
+ * emits on each frame does (`newDocument`, with the request that brought the
+ * document, if one did), so that is what this listens to. It also fires,
+ * with `error`, for a navigation that brought nothing (204, a download, a
+ * refused connection); the page keeps its document then.
+ */
+function trackInFlightRequests(ctx) {
+  const attach = ctx._attachPageListeners;
+  if (typeof attach !== "function" || typeof ctx.numOfInFlightRequests !== "function") return;
+  let open = new Set();
+  const watch = (page) => {
+    const mine = new Set();
+    open = mine; // a page upstream re-creates starts from nothing
+    const frameOf = (req) => { try { return req.frame(); } catch { return null; } }; // a service worker's request has no frame
+    const dropFrame = (frame, keep) => { for (const r of mine) if (r !== keep && frameOf(r) === frame) mine.delete(r); };
+    const watchFrame = (frame) => frame._eventEmitter.on("navigated", (e) => {
+      if (e.newDocument && !e.error) dropFrame(frame, e.newDocument.request?._object);
+    });
+    // upstream leaves its telemetry posts (otelEnable) out of its count too
+    const counted = (req) => req.resourceType() !== "eventsource" && !ctx.otelController?.isOTELRequest?.(req);
+    page.on("request", (req) => { if (counted(req)) mine.add(req); });
+    page.on("requestfinished", (req) => mine.delete(req));
+    page.on("requestfailed", (req) => mine.delete(req));
+    page.frames().forEach(watchFrame);
+    page.on("frameattached", watchFrame);
+    page.on("framedetached", (frame) => dropFrame(frame));
+  };
+  ctx._attachPageListeners = function attachAndTrack(page) {
+    watch(page);
+    return attach.call(this, page);
+  };
+  ctx.numOfInFlightRequests = () => open.size;
+  if (ctx.page) watch(ctx.page); // upstream's init() attached its own listeners to the first page already
+}
+
+/**
+ * Makes content_take-screenshot with a `selector` return that element.
+ * Upstream finds the element, then hands it to page.screenshot() as
+ * `element`, an option Playwright does not have and drops: the image was the
+ * whole viewport (measured: a heading 37 px high came back 491 px high, the
+ * viewport's height). Upstream's annotation boxes are already relative to
+ * the element. Here a page.screenshot() call that carries `element` is taken
+ * from the element; any other call goes through as it came.
+ *
+ * An element's screenshot waits until the element is visible, 30 s by
+ * default, and upstream found the element without asking for that. So the
+ * wait is done here with its own limit: an element that is hidden or has no
+ * size fails after VISIBLE_WAIT_MS, and the capture keeps its 30 s.
+ */
+const VISIBLE_WAIT_MS = 5_000;
+function screenshotTheElement(ctx) {
+  const attach = ctx._attachPageListeners;
+  if (typeof attach !== "function") return;
+  const patch = (page) => {
+    const ofPage = page.screenshot;
+    page.screenshot = async function screenshot(options) {
+      if (!options?.element) return ofPage.call(this, options);
+      const { element, fullPage, ...rest } = options; // an element has no fullPage
+      await element.waitForElementState("visible", { timeout: VISIBLE_WAIT_MS });
+      return element.screenshot(rest);
+    };
+  };
+  ctx._attachPageListeners = function attachAndPatch(page) {
+    patch(page);
+    return attach.call(this, page);
+  };
+  if (ctx.page) patch(ctx.page); // the first page is open already
+}
+
+/**
+ * The tool as execute's and scenario-run's `callTool` reaches it. Upstream's
+ * registry parses a nested result strictly against the tool's output schema,
+ * and content_take-screenshot and the navigation tools return `_artifacts`
+ * without declaring it, so those calls failed ("Unrecognized key(s) in
+ * object: '_artifacts'"). A nested call also missed what the broker does to
+ * the arguments of a tools/call; `nestedArgs(name, args)` supplies that.
+ *
+ * @param {object} tool  upstream's tool
+ * @param {string} name  the name sessions call it by
+ * @param {(name: string, args: object) => object} [nestedArgs]  given the parsed arguments
+ */
+function nestedTool(tool, name, nestedArgs) {
+  const declared = tool.outputSchema(); // the registry builds its schema from this once, when the tool is added
+  return {
+    name: () => tool.name(),
+    inputSchema: () => tool.inputSchema(),
+    outputSchema: () => declared,
+    async handle(ctx, args) {
+      const out = await tool.handle(ctx, nestedArgs ? nestedArgs(name, args) : args);
+      if (!out || typeof out !== "object") return out;
+      return Object.fromEntries(Object.entries(out).filter(([k]) => Object.hasOwn(declared, k)));
+    },
   };
 }
 
@@ -231,9 +350,10 @@ let loaded = null; // { cdpUrl, promise }
 /**
  * Import upstream (once per process) bound to `cdpUrl`.
  *
- * @param {{cdpUrl: string, env?: object}} opts  cdpUrl: the broker's CDP proxy URL (ws://…, a
- *   secret in its path), or http(s)://host:port; env: the local-config-merged env (the broker's),
- *   for BROWSER_RELAY_UPSTREAM_PATH.
+ * @param {{cdpUrl: string, env?: object, nestedArgs?: Function}} opts  cdpUrl: the broker's CDP
+ *   proxy URL (ws://…, a secret in its path), or http(s)://host:port; env: the local-config-merged
+ *   env (the broker's), for BROWSER_RELAY_UPSTREAM_PATH; nestedArgs: see nestedTool (used by the
+ *   first load only: upstream is imported once per process).
  *   Upstream itself reads its settings from process.env at import: the broker's brokerEnv() puts
  *   local-config.json's keys there before anything loads.
  * @returns {Promise<{version: string,
@@ -242,7 +362,7 @@ let loaded = null; // { cdpUrl, promise }
  *   execute: (ctx: object, tool: object, args: object) => Promise<object>,
  *   Execute: Function, ScenarioRun: Function}>}
  */
-function loadUpstream({ cdpUrl, env = applyLocalConfigToEnv(process.env) } = {}) {
+function loadUpstream({ cdpUrl, env = applyLocalConfigToEnv(process.env), nestedArgs } = {}) {
   if (typeof cdpUrl !== "string" || !/^(https?|wss?):\/\/[^/]+/.test(cdpUrl)) {
     return Promise.reject(new Error(`[broker] loadUpstream needs cdpUrl as http(s)://host:port or ws(s)://…, got ${JSON.stringify(typeof cdpUrl === "string" ? redactCdpUrl(cdpUrl) : cdpUrl)}`));
   }
@@ -252,7 +372,7 @@ function loadUpstream({ cdpUrl, env = applyLocalConfigToEnv(process.env) } = {})
     }
     return loaded.promise;
   }
-  const promise = doLoad(cdpUrl, env);
+  const promise = doLoad(cdpUrl, env, nestedArgs);
   loaded = { cdpUrl, promise };
   // never cache a failed load: the next call retries from scratch
   promise.catch(() => { if (loaded && loaded.promise === promise) loaded = null; });
@@ -272,7 +392,7 @@ function applyBundleFixes(distDir) {
   }
 }
 
-async function doLoad(cdpUrl, env) {
+async function doLoad(cdpUrl, env, nestedArgs) {
   const pkg = resolveUpstreamPackage(env);
   applyBundleFixes(pkg.distDir);
   const chunks = locateUpstreamChunks(pkg.distDir);
@@ -314,8 +434,8 @@ async function doLoad(cdpUrl, env) {
     if (!isToolEnabled(t)) continue;
     const domain = t.name().split("_")[0]?.toLowerCase() ?? "";
     if (allowedDomains && !allowedDomains.has(domain)) continue;
-    registry.addTool(t);
-    upstreamTools.push(t);
+    registry.addTool(nestedTool(t, cfg.normalizeToolName(t.name()), nestedArgs)); // what callTool runs
+    upstreamTools.push(t); // what a tools/call runs
   }
   const executeTool = new Execute(registry, mcpText(toolsInfo.executeImportantDescription), mcpText(toolsInfo.executeDescription));
   registry.addTool(executeTool);
@@ -344,6 +464,8 @@ async function doLoad(cdpUrl, env) {
     const ctx = await toolsInfo.createToolSessionContext(() => sessionKey);
     scopeRoutesToPage(ctx);
     capResponseBodies(ctx);
+    trackInFlightRequests(ctx);
+    screenshotTheElement(ctx);
     const b = ctx.browserContext.browser();
     if (b) knownBrowser = b;
     return ctx;
@@ -377,8 +499,12 @@ module.exports = {
   loadUpstream,
   scopeRoutesToPage,
   capResponseBodies,
+  trackInFlightRequests,
+  screenshotTheElement,
+  nestedTool,
   KEPT_BODY_CHARS,
   READ_BUDGET_CHARS,
+  VISIBLE_WAIT_MS,
   // exported for tests and sibling broker modules
   CHUNK_SIGNATURES,
   FORCED_UPSTREAM_ENV,

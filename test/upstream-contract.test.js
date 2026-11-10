@@ -17,6 +17,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
+const { EventEmitter } = require("node:events");
+const { createRequire } = require("node:module");
 const { spawnSync } = require("node:child_process");
 
 // Catalog-shaping env must not leak in from the developer's shell: a set
@@ -37,6 +39,8 @@ Object.assign(process.env, {
 });
 
 const up = require("../src/broker/upstream-inproc.js");
+const { brokerCallArgs, SERVER_INSTRUCTIONS, REFS_MAP_PROMISES, withoutRefsMapPromise } = require("../src/broker/main.js");
+const { LESS_NEXT_TIME } = require("../src/broker/result-limit.js");
 const { braveAvailable, launchTempBrave } = require("./fixtures/temp-brave.js");
 
 const PINNED_UPSTREAM_VERSION = "0.6.12";
@@ -90,6 +94,13 @@ test("contract: the session context still reads response bodies through _safeRea
   assert.match(core, /await this\._safeReadResponseBody\(res\)/);
 });
 
+test("contract: the session context's browserContext is still a plain field (scopeRoutesToPage makes it an accessor)", () => {
+  // scopeRoutesToPage refuses a context without the field at broker start; this catches a bump in CI, which has no Brave
+  const core = fs.readdirSync(UPSTREAM_DIST).filter((f) => /^core-.*\.js$/.test(f)).map((f) => fs.readFileSync(path.join(UPSTREAM_DIST, f), "utf8")).join("\n");
+  assert.match(core, /get page\(\)\{return this\._page\}constructor\(sessionId,browserContext,page,options\)\{this\._sessionId=sessionId,this\.browserContext=browserContext,/);
+  assert.doesNotMatch(core, /[gs]et browserContext\(/);
+});
+
 const fakeResponse = (body, length) => ({ body, headers: () => (length === undefined ? {} : { "content-length": String(length) }) });
 
 test("capResponseBodies: small bodies are kept; a big one of unknown size is cut; one declared over the limit is never read", async () => {
@@ -140,6 +151,288 @@ test("capResponseBodies: a context without the method is left alone", () => {
   const ctx = {};
   up.capResponseBodies(ctx);
   assert.deepStrictEqual(ctx, {});
+});
+
+test("contract: the session context still counts in-flight requests where trackInFlightRequests replaces the count", () => {
+  const core = fs.readdirSync(UPSTREAM_DIST).filter((f) => /^core-.*\.js$/.test(f)).map((f) => fs.readFileSync(path.join(UPSTREAM_DIST, f), "utf8")).join("\n");
+  // one method attaches the request listeners: to the first page in init(), and to a page re-created after a close
+  assert.match(core, /_attachPageListeners\(page\)\{/);
+  assert.match(core, /this\._attachPageListeners\(this\._page\),this\.options\.otelEnable/);
+  assert.match(core, /this\._page=await this\.browserContext\.newPage\(\),this\._attachPageListeners\(this\._page\)/);
+  // every reader goes through the accessor on the context: a direct read of the field would miss the replacement
+  assert.match(core, /numOfInFlightRequests\(\)\{return this\._numOfInFlightRequests\}/);
+  assert.strictEqual(core.match(/_numOfInFlightRequests/g).length, 6, "field, ++, two --, reset, accessor");
+  assert.deepStrictEqual(core.match(/[\w.]*\.numOfInFlightRequests\(\)/g), Array(3).fill("context.numOfInFlightRequests()"));
+  // upstream's count leaves its own telemetry posts out, by this rule on the context
+  assert.match(core, /this\.otelController=new OTELController\(/);
+  assert.match(core, /me\.otelController\.isOTELRequest\(req\)\|\|\(me\._numOfInFlightRequests\+\+/);
+});
+
+test("contract: Playwright's client still emits the per-frame event trackInFlightRequests listens to", () => {
+  const client = path.join(path.dirname(createRequire(path.join(UPSTREAM_PKG_DIR, "package.json")).resolve("playwright-core/package.json")), "lib", "client");
+  const frame = fs.readFileSync(path.join(client, "frame.js"), "utf8");
+  // emitted for every navigation of the frame, before the public framenavigated, which is skipped on an error
+  assert.match(frame, /this\._eventEmitter\.emit\("navigated", event\);\s*if \(!event\.error && this\._page\)\s*this\._page\.emit\([\w.]+\.FrameNavigated, this\)/);
+  // a new document's request arrives as a channel, and Playwright itself reads the Request from it this way
+  assert.match(frame, /navigatedEvent\.newDocument \? [\w.]+\.Request\.fromNullable\(navigatedEvent\.newDocument\.request\) : null/);
+  assert.match(fs.readFileSync(path.join(client, "network.js"), "utf8"), /static from\(request\) \{\s*return request\._object;/);
+});
+
+function fakeRequest(frame, { type = "fetch" } = {}) {
+  return {
+    frame: () => { if (!frame) throw new Error("Service Worker requests do not have an associated frame."); return frame; },
+    resourceType: () => type,
+  };
+}
+
+const fakeFrame = () => ({ _eventEmitter: new EventEmitter() });
+/** What Playwright's client emits on a frame that navigated; `request` as a channel, the way it arrives. */
+const navigated = (frame, event) => frame._eventEmitter.emit("navigated", { url: "http://x/", ...event });
+const newDocument = (request) => ({ newDocument: { request: request && { _object: request } } });
+
+function fakeTrackedPage() {
+  const page = new EventEmitter();
+  const main = fakeFrame();
+  page.frames = () => [main];
+  return { page, main };
+}
+
+function trackedContext() {
+  const { page, main } = fakeTrackedPage();
+  const attached = [];
+  const ctx = {
+    page,
+    _attachPageListeners(p) { attached.push([this, p]); },
+    numOfInFlightRequests() { return -1; },
+  };
+  up.trackInFlightRequests(ctx);
+  const attachFrame = () => { const f = fakeFrame(); page.emit("frameattached", f); return f; };
+  return { ctx, page, main, attachFrame, attached };
+}
+
+test("trackInFlightRequests: a request counts until it finishes or fails", () => {
+  const { ctx, page, main: frame } = trackedContext();
+  const [a, b] = [fakeRequest(frame), fakeRequest(frame)];
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+  page.emit("request", a);
+  page.emit("request", b);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 2);
+  page.emit("requestfinished", a);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+  page.emit("requestfailed", b);
+  page.emit("requestfinished", a); // a second end event never takes the count below zero
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+});
+
+test("trackInFlightRequests: a new document drops the old document's requests, which Playwright never ends", () => {
+  const { ctx, page, main, attachFrame } = trackedContext();
+  const inIframe = fakeRequest(attachFrame());
+  for (const r of [fakeRequest(main), fakeRequest(main), inIframe]) page.emit("request", r);
+  const nav = fakeRequest(main, { type: "document" });
+  page.emit("request", nav);
+  page.emit("request", fakeRequest(main)); // the old document can still start requests until the commit
+  assert.strictEqual(ctx.numOfInFlightRequests(), 5);
+  navigated(main, newDocument(nav));
+  assert.strictEqual(ctx.numOfInFlightRequests(), 2, "the request that brought the document and the other frame's request stay");
+  const fromNewDocument = fakeRequest(main);
+  page.emit("request", fromNewDocument);
+  page.emit("requestfinished", nav);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 2);
+  page.emit("requestfinished", fromNewDocument);
+  page.emit("requestfinished", inIframe);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+});
+
+test("trackInFlightRequests: a new document that no request brought (data:, about:blank, an error page) drops the old one's requests", () => {
+  const { ctx, page, main } = trackedContext();
+  page.emit("request", fakeRequest(main));
+  page.emit("request", fakeRequest(main));
+  navigated(main, newDocument(undefined));
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+});
+
+test("trackInFlightRequests: a same-document navigation (pushState, #hash) keeps the document's requests", () => {
+  const { ctx, page, main } = trackedContext();
+  page.emit("request", fakeRequest(main));
+  const nav = fakeRequest(main, { type: "document" });
+  page.emit("request", nav); // even while a navigation to another document is on its way
+  navigated(main, {});
+  assert.strictEqual(ctx.numOfInFlightRequests(), 2);
+});
+
+test("trackInFlightRequests: a navigation that brought no document (204, download, refused) keeps the page's requests", () => {
+  const { ctx, page, main } = trackedContext();
+  page.emit("request", fakeRequest(main));
+  const nav = fakeRequest(main, { type: "document" });
+  page.emit("request", nav);
+  navigated(main, { ...newDocument(nav), error: "net::ERR_ABORTED" }); // Playwright names the document it expected
+  page.emit("requestfailed", nav);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+});
+
+test("trackInFlightRequests: an EventSource stream is never counted (it has no end)", () => {
+  const { ctx, page, main } = trackedContext();
+  const stream = fakeRequest(main, { type: "eventsource" });
+  page.emit("request", stream);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+  page.emit("requestfailed", stream);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+});
+
+test("trackInFlightRequests: a request upstream calls its own telemetry is never counted", () => {
+  const { ctx, page, main } = trackedContext();
+  const [telemetry, other] = [fakeRequest(main), fakeRequest(main)];
+  ctx.otelController = { isOTELRequest: (req) => req === telemetry };
+  page.emit("request", telemetry);
+  page.emit("request", other);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+});
+
+test("trackInFlightRequests: a frame added later is watched too, and its new document drops only its own requests", () => {
+  const { ctx, page, main, attachFrame } = trackedContext();
+  const iframe = attachFrame();
+  page.emit("request", fakeRequest(main));
+  page.emit("request", fakeRequest(iframe));
+  navigated(iframe, newDocument(undefined));
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+});
+
+test("trackInFlightRequests: a detached frame's requests are dropped, other frames' stay", () => {
+  const { ctx, page, main, attachFrame } = trackedContext();
+  const iframe = attachFrame();
+  page.emit("request", fakeRequest(main));
+  page.emit("request", fakeRequest(iframe));
+  page.emit("request", fakeRequest(iframe, { type: "document" }));
+  page.emit("framedetached", iframe);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+});
+
+test("trackInFlightRequests: a request with no frame (service worker) is counted and survives a navigation", () => {
+  const { ctx, page, main } = trackedContext();
+  const noFrame = fakeRequest(null);
+  page.emit("request", noFrame);
+  const nav = fakeRequest(main, { type: "document" });
+  page.emit("request", nav);
+  navigated(main, newDocument(nav));
+  assert.strictEqual(ctx.numOfInFlightRequests(), 2);
+  page.emit("requestfinished", noFrame);
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+});
+
+test("trackInFlightRequests: a page upstream re-creates starts from zero; upstream's own listeners still attach, once per page", () => {
+  const { ctx, page, main, attached } = trackedContext();
+  assert.deepStrictEqual(attached, [], "init() attached upstream's listeners to the first page already");
+  page.emit("request", fakeRequest(main));
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+  const next = fakeTrackedPage();
+  ctx._attachPageListeners(next.page); // what ensureSessionPageOpen() does after the page was closed
+  assert.strictEqual(attached.length, 1);
+  assert.ok(attached[0][0] === ctx && attached[0][1] === next.page, "upstream's method runs with the context as this");
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+  const onNext = fakeRequest(next.main);
+  next.page.emit("request", onNext);
+  page.emit("request", fakeRequest(main)); // a late event from the closed page
+  assert.strictEqual(ctx.numOfInFlightRequests(), 1);
+  navigated(next.main, newDocument(undefined)); // the new page's frames are watched as the first page's were
+  assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+});
+
+test("trackInFlightRequests: a context without the methods is left alone", () => {
+  const ctx = {};
+  up.trackInFlightRequests(ctx);
+  assert.deepStrictEqual(ctx, {});
+});
+
+function shotContext() {
+  const calls = [];
+  const fakeShotPage = () => ({ async screenshot(...args) { calls.push(["page", this, ...args]); return "page"; } });
+  const element = {
+    async waitForElementState(...args) { calls.push(["wait", this, ...args]); },
+    async screenshot(...args) { calls.push(["element", this, ...args]); return "element"; },
+  };
+  const attached = [];
+  const ctx = { page: fakeShotPage(), _attachPageListeners(p) { attached.push([this, p]); } };
+  up.screenshotTheElement(ctx);
+  return { ctx, calls, element, attached, fakeShotPage };
+}
+
+test("screenshotTheElement: a page.screenshot() call that carries an element is taken from the element once it is visible, without fullPage", async () => {
+  const { ctx, calls, element } = shotContext();
+  assert.strictEqual(await ctx.page.screenshot({ type: "jpeg", fullPage: true, quality: 80, element }), "element");
+  assert.deepStrictEqual(calls, [["wait", element, "visible", { timeout: 5000 }], ["element", element, { type: "jpeg", quality: 80 }]]);
+});
+
+test("screenshotTheElement: an element that does not become visible is not captured", async () => {
+  const { ctx, calls, element } = shotContext();
+  element.waitForElementState = async () => { throw new Error("element is not visible"); };
+  await assert.rejects(ctx.page.screenshot({ element }), /element is not visible/);
+  assert.deepStrictEqual(calls, []);
+});
+
+test("screenshotTheElement: any other page.screenshot() call reaches the page as it came", async () => {
+  const { ctx, calls } = shotContext();
+  const options = { type: "png", fullPage: true, element: null };
+  assert.strictEqual(await ctx.page.screenshot(options), "page");
+  assert.strictEqual(await ctx.page.screenshot(), "page");
+  assert.strictEqual(calls.length, 2);
+  assert.ok(calls[0][1] === ctx.page && calls[0][2] === options, "the page's own method, with the page as this and the caller's options");
+  assert.deepStrictEqual(calls[1], ["page", ctx.page, undefined]);
+});
+
+test("screenshotTheElement: a page upstream re-creates is patched too; upstream's own listeners still attach", async () => {
+  const { ctx, calls, element, attached, fakeShotPage } = shotContext();
+  assert.deepStrictEqual(attached, [], "init() attached upstream's listeners to the first page already");
+  const next = fakeShotPage();
+  ctx._attachPageListeners(next); // what ensureSessionPageOpen() does after the page was closed
+  assert.ok(attached.length === 1 && attached[0][0] === ctx && attached[0][1] === next, "upstream's method runs once, with the context as this");
+  assert.strictEqual(await next.screenshot({ element }), "element");
+  assert.strictEqual(await next.screenshot({}), "page");
+  assert.deepStrictEqual(calls.map((c) => c[0]), ["wait", "element", "page"]);
+});
+
+test("screenshotTheElement: a context without the method is left alone", () => {
+  const ctx = {};
+  up.screenshotTheElement(ctx);
+  assert.deepStrictEqual(ctx, {});
+});
+
+test("contract: upstream still passes the element to page.screenshot(), which has no such option; an element handle takes its own", () => {
+  // screenshotTheElement turns the first call into the second. When either side changes, the shim can go.
+  const core = fs.readdirSync(UPSTREAM_DIST).filter((f) => /^core-.*\.js$/.test(f)).map((f) => fs.readFileSync(path.join(UPSTREAM_DIST, f), "utf8")).join("\n");
+  assert.match(core, /scopedElement&&\(screenshotOptions\.element=scopedElement\);let rawBuffer=await context\.page\.screenshot\(screenshotOptions\)/);
+  assert.match(core, /scopedElement=await resolveSelectorOrRef\(context,options\.selector\)\.elementHandle\(/); // a handle, not a locator: only a handle has waitForElementState
+  const client = path.join(path.dirname(createRequire(path.join(UPSTREAM_PKG_DIR, "package.json")).resolve("playwright-core/package.json")), "lib", "client");
+  const [, body] = /\n {2}async screenshot\(options = \{\}\) \{([\s\S]*?)\n {2}\}/.exec(fs.readFileSync(path.join(client, "page.js"), "utf8")) || [];
+  assert.ok(body, "page.screenshot() not found in Playwright's client");
+  assert.doesNotMatch(body, /\.element\b/); // it sends its options on as they came, and the protocol has no `element`
+  const handle = fs.readFileSync(path.join(client, "elementHandle.js"), "utf8");
+  assert.match(handle, /\n {2}async screenshot\(options = \{\}\) \{/);
+  assert.match(handle, /\n {2}async waitForElementState\(state, options = \{\}\) \{/); // the shim's own wait for a visible element
+});
+
+test("nestedTool: the result keeps only the keys the tool declares, and the broker's arguments are applied", async () => {
+  const seen = [];
+  const tool = {
+    name: () => "upstream_name",
+    inputSchema: () => ({ a: 1 }),
+    outputSchema: () => ({ filePath: 1, image: 1 }),
+    async handle(ctx, args) { seen.push([this === tool, ctx, args]); return { filePath: "f", image: { data: 1 }, _artifacts: [1], extra: 2 }; },
+  };
+  const nested = up.nestedTool(tool, "listed_name", (name, args) => ({ ...args, tagged: name }));
+  assert.strictEqual(nested.name(), "upstream_name");
+  assert.deepStrictEqual(nested.inputSchema(), { a: 1 });
+  assert.deepStrictEqual(nested.outputSchema(), { filePath: 1, image: 1 });
+  const ctx = {};
+  assert.deepStrictEqual(await nested.handle(ctx, { x: 1 }), { filePath: "f", image: { data: 1 } });
+  assert.deepStrictEqual(seen, [[true, ctx, { x: 1, tagged: "listed_name" }]]);
+});
+
+test("nestedTool: without nestedArgs the arguments pass through; a result that is not an object is returned as it is", async () => {
+  let got;
+  const tool = { name: () => "t", inputSchema: () => ({}), outputSchema: () => ({}), handle: async (ctx, args) => { got = args; return "text"; } };
+  const args = { x: 1 };
+  assert.strictEqual(await up.nestedTool(tool, "t").handle({}, args), "text");
+  assert.strictEqual(got, args);
 });
 
 test("contract: package.json still pins browser-devtools-mcp to the version this contract covers", () => {
@@ -367,7 +660,9 @@ test.describe("loadUpstream (installed dist)", () => {
       brave = await launchTempBrave({ label: "contract" });
       cdpUrl = brave.cdpUrl;
     }
-    upstream = await up.loadUpstream({ cdpUrl });
+    // nested calls get the arguments the broker gives them (src/broker/main.js)
+    let nestedSeq = 0;
+    upstream = await up.loadUpstream({ cdpUrl, nestedArgs: (name, args) => brokerCallArgs(name, args, args, `x${++nestedSeq}`) });
   });
   test.after(async () => {
     if (brave) {
@@ -413,6 +708,134 @@ test.describe("loadUpstream (installed dist)", () => {
     assert.strictEqual(exec.tool.toolRegistry, run.tool._toolRegistry, "one registry shared by execute + scenario-run");
     assert.ok(exec.tool.toolRegistry.tools.has("navigation_go-to"), "execute can callTool upstream tools");
     assert.ok(exec.tool.toolRegistry.tools.has("execute"), "scenario scripts can callTool execute (upstream wiring)");
+  });
+
+  test("nested calls go through nestedTool; tools/call gets the tools themselves", () => {
+    const exec = upstream.tools.find((t) => t.name === "execute");
+    const registered = exec.tool.toolRegistry.tools;
+    for (const e of upstream.tools) {
+      if (e.name === "execute" || e.name === "scenario-run") continue;
+      const nested = registered.get(e.tool.name());
+      assert.ok(nested, `${e.name} is not callable from execute`);
+      assert.notStrictEqual(nested.tool, e.tool, `${e.name} is registered unwrapped`);
+      assert.strictEqual(nested.tool.name(), e.tool.name());
+    }
+    assert.strictEqual(registered.get("execute").tool, exec.tool);
+  });
+
+  test("contract: upstream's registry rejects a result with keys the tool does not declare; through nestedTool it passes", async () => {
+    // content_take-screenshot and the navigation tools return `_artifacts`
+    // without declaring it, so execute's callTool failed on them.
+    const Registry = upstream.tools.find((t) => t.name === "execute").tool.toolRegistry.constructor;
+    const z = up.resolveUpstreamPackage().require("zod");
+    const tool = {
+      name: () => "probe_tool",
+      inputSchema: () => ({ label: z.string().default("shot") }),
+      outputSchema: () => ({ filePath: z.string() }),
+      handle: async (ctx, args) => ({ filePath: `${args.label}.png`, _artifacts: [{ type: "IMAGE" }] }),
+    };
+    const unwrapped = new Registry();
+    unwrapped.addTool(tool);
+    await assert.rejects(unwrapped.runTool({}, "probe_tool", {}), /Unrecognized key/, "upstream accepts undeclared keys now: nestedTool's filter can go");
+    const wrapped = new Registry();
+    wrapped.addTool(up.nestedTool(tool, "probe_tool", (name, args) => ({ ...args, label: `${args.label}-${name}` })));
+    assert.deepStrictEqual(await wrapped.runTool({}, "probe_tool", {}), { filePath: "shot-probe_tool.png" }, "nestedArgs gets the parsed arguments, defaults filled in");
+  });
+
+  test("drift: the tools and arguments the broker's instructions and size advice name still exist", async () => {
+    const { normalizeObjectSchema, safeParseAsync } = require("@modelcontextprotocol/sdk/server/zod-compat.js");
+    const byName = new Map(upstream.tools.map((e) => [e.name, e]));
+    const ownNames = new Set(require("../src/own-tools/index.js").tools.map((t) => t.name));
+    const toolsIn = (text) => text.match(/\b[a-z0-9]+_[a-z][a-z0-9-]*[a-z0-9]\b/g) || [];
+    for (const [name, hint] of Object.entries(LESS_NEXT_TIME)) {
+      for (const n of [name, ...toolsIn(hint)]) assert.ok(byName.has(n), `LESS_NEXT_TIME names ${n}, which upstream no longer has`);
+    }
+    const named = toolsIn(SERVER_INSTRUCTIONS);
+    assert.ok(named.length >= 6, `expected tool names in the instructions, found ${named}`);
+    for (const name of [...named, "execute", "toolsets"]) assert.ok(byName.has(name) || ownNames.has(name), `the instructions name ${name}, which is not a tool`);
+
+    // zod drops an unknown key without an error, so each given key must come back out
+    const keysKept = (given, parsed, where) => {
+      for (const [k, v] of Object.entries(given)) {
+        assert.ok(parsed && Object.hasOwn(parsed, k), `${where}.${k} is no longer an argument`);
+        if (v && typeof v === "object") keysKept(v, parsed[k], `${where}.${k}`);
+      }
+    };
+    const snapshotLess = { includeSnapshot: false, snapshotOptions: { interactiveOnly: true } };
+    const examples = {
+      "navigation_go-to": { url: "https://example.com/", ...snapshotLess },
+      "navigation_reload": snapshotLess,
+      "navigation_go-back-or-forward": { direction: "back", ...snapshotLess },
+      "a11y_take-aria-snapshot": { selector: "main", interactiveOnly: true, maxDepth: 3 },
+      "content_get-as-html": { selector: "main", maxLength: 1000 },
+      "content_get-as-text": { selector: "main", maxLength: 1000 },
+      "o11y_get-console-messages": { limit: { count: 5 }, type: "error", search: "x" },
+      "o11y_get-http-requests": { limit: { count: 5 }, resourceType: "fetch", status: { min: 400, max: 599 } },
+      "execute": { code: "return 1;", timeoutMs: 1000 },
+      "content_take-screenshot": { name: "x", selector: "e12" },
+      "interaction_resize-viewport": { width: 390, height: 844 },
+      "interaction_click": { selector: "e12" },
+    };
+    for (const name of Object.keys(LESS_NEXT_TIME)) assert.ok(examples[name], `no example arguments for ${name}`);
+    for (const [name, args] of Object.entries(examples)) {
+      const parsed = await safeParseAsync(normalizeObjectSchema(byName.get(name).inputShape), args);
+      assert.ok(parsed.success, `${name} rejects ${JSON.stringify(args)}`);
+      keysKept(args, parsed.data, name);
+    }
+
+    // The examples are only a guard if they hold every argument the texts name: `backticked`, camelCase, or written key:value.
+    const notArguments = new Set(["output", "refs", "page", "callTool", "execute", "toolsets", "tabId"]); // result fields, a script's globals, tools, the broker's own argument
+    const argsNamed = (text) => new Set([...text.matchAll(/`([A-Za-z]\w*)`|\b([a-z]{2,}(?:[A-Z][a-z0-9]+)+)\b|\b([a-z][A-Za-z]*):(?=[{\w])/g)]
+      .map((m) => m[1] || m[2] || m[3]).filter((n) => !notArguments.has(n)));
+    const deepKeys = (v) => (v && typeof v === "object" ? Object.entries(v).flatMap(([k, x]) => [k, ...deepKeys(x)]) : []);
+    const inInstructions = argsNamed(SERVER_INSTRUCTIONS);
+    assert.ok(inInstructions.size >= 3, `expected argument names in the instructions, found ${[...inInstructions]}`);
+    const anyExample = new Set(Object.values(examples).flatMap(deepKeys));
+    for (const arg of inInstructions) assert.ok(anyExample.has(arg), `the instructions name the argument ${arg}: add it to an example above, so it is checked against upstream`);
+    for (const [name, hint] of Object.entries(LESS_NEXT_TIME)) {
+      const known = new Set([name, ...toolsIn(hint)].flatMap((n) => deepKeys(examples[n]))); // the tool's own, and those of a tool the advice sends the caller to
+      for (const arg of argsNamed(hint)) assert.ok(known.has(arg), `the advice for ${name} names the argument ${arg}: add it to that tool's example above`);
+    }
+  });
+
+  test("drift: the descriptions that promise a refs map are the ones the broker rewords, and nothing it serves still promises one", () => {
+    for (const [from] of REFS_MAP_PROMISES) {
+      const holders = upstream.tools.filter((t) => t.description.includes(from)).map((t) => t.name);
+      assert.strictEqual(holders.length, 1, `"${from}" is in ${holders.length} upstream descriptions (${holders}): upstream reworded it, update REFS_MAP_PROMISES`);
+    }
+    for (const t of upstream.tools) {
+      const served = withoutRefsMapPromise({ name: t.name, description: t.description }).description;
+      assert.doesNotMatch(served, /and `refs`|refs map/, `${t.name} still promises the refs map the broker leaves out`);
+    }
+  });
+
+  test("drift: an argument the Inspector's tool list names is still that tool's argument", () => {
+    const byName = new Map(upstream.tools.map((e) => [e.name, e]));
+    let checked = 0;
+    for (const { name, description } of require("../scripts/inspector-forwarded-tools.js").tools) {
+      for (const [arg] of description.matchAll(/\b[a-z]{2,}(?:[A-Z][a-z0-9]+)+\b/g)) { // camelCase: an argument name
+        assert.ok(Object.hasOwn(byName.get(name).inputShape, arg), `the Inspector describes ${name} with ${arg}, which is not one of its arguments`);
+        checked++;
+      }
+    }
+    assert.ok(checked >= 1, "no argument name found in the Inspector's descriptions: this test checks nothing");
+  });
+
+  test("contract: execute's timeoutMs is 30 s by default and 120 s at most, and 0 is accepted", async () => {
+    // docs/REFERENCE.md and the nestedArgs comment in main.js give these figures
+    const { normalizeObjectSchema, safeParseAsync } = require("@modelcontextprotocol/sdk/server/zod-compat.js");
+    const schema = normalizeObjectSchema(upstream.tools.find((t) => t.name === "execute").inputShape);
+    const parse = (timeoutMs) => safeParseAsync(schema, { code: "return 1;", timeoutMs });
+    assert.strictEqual((await parse(undefined)).data.timeoutMs, 30_000);
+    assert.strictEqual((await parse(0)).data.timeoutMs, 0);
+    assert.strictEqual((await parse(120_000)).success, true);
+    assert.strictEqual((await parse(120_001)).success, false);
+  });
+
+  test("contract: execute's callTool gives the script the output without a third argument", () => {
+    // the instructions teach the two-argument form; the size advice for execute says what the third one adds
+    const { description } = upstream.tools.find((t) => t.name === "execute");
+    assert.match(description, /Returns the tool output for in-code use\.\s+returnOutput=true also includes it in the response toolOutputs array; false \(default\) omits it\./);
   });
 
   test("tools: pinned count, unique names, {name, description, inputShape, tool}", () => {
@@ -547,6 +970,16 @@ test.describe("loadUpstream (installed dist)", () => {
     let site;
     let siteUrl;
     let harness;
+    let sseOpened = 0;
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    async function until(cond, what, timeoutMs = 5000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!(await cond())) {
+        if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+        await sleep(25);
+      }
+    }
 
     test.before(async () => {
       site = http.createServer((req, res) => {
@@ -554,6 +987,23 @@ test.describe("loadUpstream (installed dist)", () => {
         if (u.pathname === "/api/ping") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ real: "pong" }));
+          return;
+        }
+        if (u.pathname === "/slow") return; // never answered
+        if (u.pathname === "/204") {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        if (u.pathname === "/sse") {
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          res.write(": open\n\n"); // and never ended
+          sseOpened++;
+          return;
+        }
+        if (u.pathname === "/r1" || u.pathname === "/r2") {
+          res.writeHead(302, { location: u.pathname === "/r1" ? "/r2" : "/page?tag=REDIR" });
+          res.end();
           return;
         }
         res.writeHead(200, { "content-type": "text/html" });
@@ -565,7 +1015,11 @@ test.describe("loadUpstream (installed dist)", () => {
     });
     test.after(async () => {
       if (harness) await harness.close();
-      if (site) await new Promise((r) => site.close(r));
+      if (site) {
+        const closed = new Promise((r) => site.close(r));
+        site.closeAllConnections(); // /slow and /sse hold theirs open
+        await closed;
+      }
     });
 
     test("concurrent first createContext calls share one CDP connection", async () => {
@@ -710,6 +1164,173 @@ test.describe("loadUpstream (installed dist)", () => {
       const s = JSON.parse(await call("scenario-run", { tabId: "exec", name: "w2b-no-such-scenario" }));
       assert.strictEqual(s.scenarioName, "w2b-no-such-scenario");
       assert.match(s.error || "", /not found/i);
+    });
+
+    test("in-flight count: requests a navigation cut off are not counted on the next page", async () => {
+      // Playwright reports neither requestfinished nor requestfailed for them,
+      // so upstream's own count only grew and every later wait ran to its limit.
+      const { call, getCtx } = harness;
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=LEAK-A`, tabId: "leak" });
+      const ctx = await getCtx("leak");
+      await ctx.page.evaluate(() => { for (let i = 0; i < 3; i++) fetch(`/slow?i=${i}`).catch(() => {}); });
+      await until(() => ctx.numOfInFlightRequests() === 3, "three open requests");
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=LEAK-B`, tabId: "leak" });
+      assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+      await call("sync_wait-for-network-idle", { tabId: "leak", timeoutMs: 3000 });
+    });
+
+    test("in-flight count: an open EventSource does not keep the page busy", async () => {
+      const { call, getCtx } = harness;
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=SSE`, tabId: "sse" });
+      const ctx = await getCtx("sse");
+      const before = sseOpened;
+      await ctx.page.evaluate(() => new Promise((resolve, reject) => {
+        window.__es = new EventSource("/sse");
+        window.__es.onopen = () => resolve();
+        window.__es.onerror = () => reject(new Error("EventSource failed"));
+      }));
+      assert.strictEqual(sseOpened, before + 1);
+      assert.strictEqual(ctx.numOfInFlightRequests(), 0);
+      await call("sync_wait-for-network-idle", { tabId: "sse", timeoutMs: 3000 });
+    });
+
+    test("in-flight count: a redirect chain ends on the last page with nothing counted", async () => {
+      const { call, getCtx } = harness;
+      assert.match(await call("navigation_go-to", { url: `${siteUrl}/r1`, tabId: "redir" }), /page-REDIR/);
+      assert.strictEqual((await getCtx("redir")).numOfInFlightRequests(), 0);
+    });
+
+    test("in-flight count: a document that comes without a request (data:, about:blank, an error page) drops the old one's requests", async () => {
+      const { call, getCtx } = harness;
+      const closed = http.createServer();
+      await new Promise((r) => closed.listen(0, "127.0.0.1", r));
+      const refused = `http://127.0.0.1:${closed.address().port}/`;
+      await new Promise((r) => closed.close(r));
+      const ctx = await getCtx("norequest");
+      for (const target of ["data:text/html,<h1>page-DATA</h1>", "about:blank", refused]) {
+        await call("navigation_go-to", { url: `${siteUrl}/page?tag=NOREQ`, tabId: "norequest" });
+        await ctx.page.evaluate(() => { fetch("/slow").catch(() => {}); });
+        await until(() => ctx.numOfInFlightRequests() === 1, "one open request");
+        const went = call("navigation_go-to", { url: target, tabId: "norequest", includeSnapshot: false, waitForNavigation: false });
+        if (target === refused) await assert.rejects(went, /ERR_CONNECTION_REFUSED/);
+        else await went;
+        await until(() => ctx.numOfInFlightRequests() === 0, `nothing counted after ${target}`, 2000);
+      }
+    });
+
+    test("in-flight count: a navigation that brings no new document (204, pushState, #hash) keeps the page's requests", async () => {
+      const { call, getCtx } = harness;
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=STAY`, tabId: "stay" });
+      const ctx = await getCtx("stay");
+      await ctx.page.evaluate(() => { fetch("/slow").catch(() => {}); });
+      await until(() => ctx.numOfInFlightRequests() === 1, "one open request");
+      await assert.rejects(call("navigation_go-to", { url: `${siteUrl}/204`, tabId: "stay", waitForNavigation: false }), /ERR_ABORTED/);
+      assert.strictEqual(ctx.numOfInFlightRequests(), 1, "after a 204");
+      await ctx.page.evaluate(() => { history.pushState({}, "", "/pushed"); location.hash = "x"; });
+      assert.match(ctx.page.url(), /\/pushed#x$/);
+      assert.strictEqual(ctx.numOfInFlightRequests(), 1, "after pushState and #hash");
+    });
+
+    test("going back returns once the earlier page is showing", async () => {
+      // With the back/forward cache on, the restored page fires no load event
+      // over CDP and the call ran to its timeout (brave-supervisor.js).
+      const { call } = harness;
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=BACK-A`, tabId: "back" });
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=BACK-B`, tabId: "back" });
+      assert.match(await call("navigation_go-back-or-forward", { direction: "back", timeout: 8000, tabId: "back" }), /page-BACK-A/);
+    });
+
+    test("execute: screenshots at two widths in one call are two files", async () => {
+      const { call } = harness;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-shots-"));
+      try {
+        await call("navigation_go-to", { url: `${siteUrl}/page?tag=SHOT`, tabId: "shot" });
+        const r = JSON.parse(await call("execute", {
+          tabId: "shot",
+          code: `const files = [];
+            for (const width of [800, 400]) {
+              await callTool('interaction_resize-viewport', { width, height: 600 });
+              const shot = await callTool('content_take-screenshot', { outputPath: ${JSON.stringify(dir)}, name: 'w', type: 'png', fullPage: false });
+              files.push(shot.filePath);
+            }
+            return files;`,
+        }));
+        assert.ok(!r.error, r.error);
+        const [wide, narrow] = r.result;
+        assert.notStrictEqual(wide, narrow, "the second screenshot overwrote the first");
+        const pngWidth = (file) => fs.readFileSync(file).readUInt32BE(16);
+        assert.ok(pngWidth(wide) > pngWidth(narrow), `${pngWidth(wide)} px then ${pngWidth(narrow)} px`);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("execute: a nested navigation returns its screenshot file", async () => {
+      const { call } = harness;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-shots-"));
+      try {
+        const args = { url: `${siteUrl}/page?tag=NAVSHOT`, includeSnapshot: false, includeScreenshot: true, screenshotOptions: { outputPath: dir } };
+        const r = JSON.parse(await call("execute", {
+          tabId: "navshot",
+          code: `return (await callTool('navigation_go-to', ${JSON.stringify(args)})).screenshotFilePath;`,
+        }));
+        assert.ok(!r.error, r.error);
+        assert.ok(fs.existsSync(r.result), `no screenshot at ${r.result}`);
+        assert.strictEqual(path.dirname(r.result), dir);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("execute: timeoutMs 0 is no time limit, not an instant one", async () => {
+      const r = JSON.parse(await harness.call("execute", { tabId: "nolimit", timeoutMs: 0, code: "await page.waitForTimeout(200); return 'done';" }));
+      assert.ok(!r.error, r.error);
+      assert.strictEqual(r.result, "done");
+    });
+
+    test("content_take-screenshot with a selector, a snapshot ref or CSS, is that element's image", async () => {
+      // the broker's instructions say a ref works here; upstream alone returned the viewport
+      const { call, getCtx } = harness;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bmr-shots-"));
+      try {
+        const open = async () => {
+          const page = JSON.parse(await call("navigation_go-to", { url: `${siteUrl}/page?tag=REFSHOT`, tabId: "refshot" }));
+          const [, ref] = /page-REFSHOT.*\[ref=(e\d+)\]/.exec(page.output) || [];
+          assert.ok(ref, `no ref for the heading in ${page.output}`);
+          return ref;
+        };
+        const shot = async (name, more) => {
+          const r = JSON.parse(await call("content_take-screenshot", { tabId: "refshot", outputPath: dir, name, type: "png", ...more }));
+          return { height: fs.readFileSync(r.filePath).readUInt32BE(20), annotations: r.annotations };
+        };
+        const ref = await open();
+        const viewport = (await shot("viewport")).height;
+        const byRef = (await shot("by-ref", { selector: ref })).height;
+        assert.ok(byRef < viewport / 2, `the heading's screenshot is ${byRef} px high, the viewport's ${viewport} px`);
+        assert.strictEqual((await shot("by-css", { selector: "h1", fullPage: true })).height, byRef, "a CSS selector gives the same image, with fullPage or without");
+        const marked = await shot("marked", { selector: ref, annotate: true });
+        assert.strictEqual(marked.height, byRef);
+        assert.deepStrictEqual(marked.annotations.map((a) => [a.ref, a.box.x, a.box.y]), [[ref, 0, 0]], "upstream's annotation boxes are relative to the element");
+
+        await (await getCtx("refshot")).page.close(); // upstream opens a new page on the next call
+        assert.strictEqual((await shot("reopened", { selector: await open() })).height, byRef, "on a page upstream re-created");
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("content_take-screenshot of an element that is not visible fails within seconds and says so", async () => {
+      // an element's screenshot waits for the element to be visible: Playwright's default would be 30 s
+      const { call, getCtx } = harness;
+      await call("navigation_go-to", { url: `${siteUrl}/page?tag=HIDDEN`, tabId: "hidden" });
+      const { page } = await getCtx("hidden");
+      for (const css of ["display:none", "height:0;overflow:hidden"]) {
+        await page.evaluate((style) => { document.querySelector("h1").style.cssText = style; }, css);
+        const started = Date.now();
+        await assert.rejects(call("content_take-screenshot", { tabId: "hidden", selector: "h1", type: "png" }), /Timeout 5000ms exceeded[\s\S]*element is not visible/, css);
+        const took = Date.now() - started;
+        assert.ok(took < 10_000, `${css}: failed after ${took} ms`);
+      }
     });
 
     test("ctx.close() closes only that session's page", async () => {

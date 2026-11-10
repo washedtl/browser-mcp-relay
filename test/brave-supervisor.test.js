@@ -86,6 +86,7 @@ test("buildBraveArgs: exactly the broker's flag set, nothing else", () => {
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    "--disable-back-forward-cache",
   ]);
 });
 

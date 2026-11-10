@@ -273,3 +273,16 @@ test("v0.4.1: README + REFERENCE document --purge, what Pause / removal leave in
   }
   assert.match(fs.readFileSync(path.join(REPO, "scripts", "bridge-install.js"), "utf8"), /argv\.includes\("--purge"\)/);
 });
+
+test("REFERENCE states the result limit and how long cut results are kept as the code has them", () => {
+  const { MAX_RESULT_CHARS, KEEP_FILES_MS } = require("../src/broker/result-limit.js");
+  const hours = KEEP_FILES_MS / 3_600_000;
+  assert.ok(REFERENCE.includes(`A result over ${MAX_RESULT_CHARS.toLocaleString("en-US")} characters is cut`), "the size results are cut at");
+  assert.ok(REFERENCE.includes(`kept for at least ${hours} hours`) && REFERENCE.includes(`kept at least ${hours} hours`), "how long the full text is kept: the results section and the broker home");
+  assert.doesNotMatch(REFERENCE, /kept (for )?24 hours/, "files are only removed when a later one is saved, so it is \"at least\"");
+});
+
+test("REFERENCE states how long an element screenshot waits for a hidden element as the code has it", () => {
+  const { VISIBLE_WAIT_MS } = require("../src/broker/upstream-inproc.js");
+  assert.ok(REFERENCE.includes(`fails after ${VISIBLE_WAIT_MS / 1000} seconds with \`element is not visible\``), "the wait for an element that is hidden or has no size");
+});

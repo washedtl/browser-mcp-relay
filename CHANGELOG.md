@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Faster navigation, results that fit
+
+Found by measuring what an agent gets back from real sites. Broker mode.
+
+- **Navigation no longer waits 5 s for nothing.** Upstream waits until no request is in flight, but a request cut off when its page is replaced never reports an end, and an EventSource has none, so its count only grew: `navigation_go-to` took 5-6 s on pages that load in 0.2 s, `sync_wait-for-network-idle` timed out, and `interaction_click` with `waitForNavigation: true` took 30 s. The broker now forgets a frame's requests when the frame loads a new document, and leaves EventSource streams out (measured: go-to 5.1 s → 0.8 s, that click 30 s → 0.7 s). A page that keeps a streaming `fetch` or a long poll open is still busy: see Troubleshooting in the reference.
+- **A big result is cut at 30,000 characters and saved in full.** A page snapshot can be far over what Claude Code shows (measured: 947,174 characters for a 500-row table), and Claude Code then saves it as one unreadable line. When the length is in a few long fields (a snapshot, a page's HTML or text), a forwarded tool's result is now cut inside them, so it stays valid JSON, and their full text is saved under `results/` in the broker home for at least 24 hours. A result that is long for another reason (a list of many short records, dozens of long fields, text that is not JSON) is cut as plain text at the last line break before the limit, and saved whole. A note names the file, where the cut text continues in it and the arguments that return less.
+- **Snapshots come without the `refs` map.** It listed every `[ref=eN]` of the snapshot text again, with the role, name and selector upstream finds it by, and was 45-64% of the result on four measured pages. Refs work as before, and the two tool descriptions that promised the map no longer do.
+- **Screenshots work inside `execute`.** `callTool("content_take-screenshot", …)` failed with `Unrecognized key(s) in object: '_artifacts'`, and nested screenshots taken in the same second were written to one file. Nested calls now return what the tool declares and get the per-call file names direct calls have, so one `execute` can resize and screenshot a page at several widths.
+- **A screenshot with a `selector` is the element.** `content_take-screenshot` found the element and then returned the whole viewport, because upstream passes the element to Playwright's page screenshot as an option it does not have (measured: a heading 37 px high came back 491 px high). The broker now takes the image from the element, for a CSS selector or a snapshot ref, whatever `fullPage` says. The page is scrolled to bring the element into view, and an element that is hidden or has no size fails after 5 s instead of Playwright's 30.
+- **Going back works.** Chromium restored the earlier page from its back/forward cache without the load event Playwright waits for, so `navigation_go-back-or-forward` ran into its timeout. Brave now starts with `--disable-back-forward-cache` (measured: an 8 s error → 0.7 s).
+- **Error text is plain.** Playwright's colour codes are removed, also from the lines an `execute` script logs.
+- **The server instructions describe the working loop**: navigate, act on refs, snapshot again, ask for less on big pages, batch with `execute`, one tab per subagent.
+
 ### Brave 157
 
 - An elevated broker (the fallback when de-elevating fails) can launch Brave again. Brave removed the `AutoDeElevate` feature the relay used to stop it relaunching itself de-elevated, and the launched process exited at once. Brave now also gets `--do-not-de-elevate`. The normal de-elevated broker was never affected.

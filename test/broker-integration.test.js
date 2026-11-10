@@ -394,6 +394,85 @@ test("withNavTimeoutSchema: the catalog shows the broker's navigation default; o
   assert.strictEqual(withNavTimeoutSchema(other), other);
 });
 
+test("withoutRefsMapPromise: a description that promised the refs map the broker leaves out no longer does; other tools are untouched", () => {
+  const { withoutRefsMapPromise } = require("../src/broker/main.js");
+  const goTo = { name: "navigation_go-to", description: "Navigate. A snapshot is returned in `output` and `refs`; use refs in interaction tools." };
+  assert.strictEqual(withoutRefsMapPromise(goTo).description, "Navigate. A snapshot is returned in `output`; use refs in interaction tools.");
+  assert.match(goTo.description, /and `refs`/, "the cached catalog entry isn't mutated");
+  const snap = { name: "a11y_take-aria-snapshot", description: 'ARIA snapshot. Returns a tree with refs (e1, e2, ...) and a refs map. Use refs: selector "e1".' };
+  assert.strictEqual(withoutRefsMapPromise(snap).description, 'ARIA snapshot. Returns a tree with refs (e1, e2, ...). Use refs: selector "e1".');
+  const other = { name: "interaction_click", description: "Click a selector or a ref from a snapshot." };
+  assert.strictEqual(withoutRefsMapPromise(other), other);
+  const bare = { name: "own_bare" };
+  assert.strictEqual(withoutRefsMapPromise(bare), bare);
+});
+
+test("a page result too long to read is cut, without its refs map, and the full tree is saved where the note says", async (t) => {
+  const { MAX_RESULT_CHARS } = require("../src/broker/result-limit.js");
+  const b = await startTestBroker(t);
+  const c = await connectClient(t, b.pipe);
+  const r = await c.callTool({ name: "navigation_go-to", arguments: { url: "huge://" } });
+  assert.strictEqual(r.isError, false);
+  assert.strictEqual(r.content.length, 2, "the cut result, then the note");
+  assert.ok(r.content[0].text.length <= MAX_RESULT_CHARS, `${r.content[0].text.length} characters`);
+  const shown = JSON.parse(r.content[0].text);
+  assert.strictEqual(shown.refs, undefined);
+  assert.strictEqual(shown.url, "huge://");
+  assert.ok(shown.output.startsWith('- row "item 0" [ref=e0]\n'));
+  const note = r.content[1].text;
+  const file = /Full text \(kept[^)]*\): (.+)/.exec(note)[1].trim();
+  assert.strictEqual(path.dirname(file), path.join(path.dirname(KEY_FILE), "results"), "beside the broker's other state, not in a temp dir anyone can read");
+  assert.match(path.basename(file), /^navigation_go-to-.*-c\d+-\d+\.txt$/);
+  const full = fs.readFileSync(file, "utf8").split("\n");
+  assert.strictEqual(full.length, 2000);
+  assert.strictEqual(full[1999], '- row "item 1999" [ref=e1999]');
+  assert.match(note, /To get less next time: pass includeSnapshot:false/);
+  const small = await c.callTool({ name: "navigation_go-to", arguments: { url: "https://example.com/" } });
+  assert.strictEqual(small.content.length, 1, "a result under the limit is returned as it was");
+  const own = await c.callTool({ name: "own_probe", arguments: { v: "x".repeat(MAX_RESULT_CHARS + 1) } });
+  assert.ok(own.content.length === 1 && own.content[0].text.length > MAX_RESULT_CHARS, "one of the relay's own tools is not cut: those with big results have limits of their own");
+});
+
+test("tool calls made inside execute get the same argument fixes as direct calls: a unique output file name", async (t) => {
+  const mod = fakes.fakeUpstreamModule();
+  const b = await startTestBroker(t, { deps: { upstreamModule: () => mod } });
+  const c = await connectClient(t, b.pipe);
+  await c.callTool({ name: "content_get-as-text", arguments: {} });
+  const nested = mod.state.nestedArgs;
+  assert.strictEqual(typeof nested, "function", "the broker hands loadUpstream its argument fixer");
+  // two screenshots in one script used to share one file: upstream names it by the second
+  const shots = [1, 2].map(() => nested("content_take-screenshot", { name: "shot", type: "png" }));
+  for (const s of shots) assert.match(s.name, /^shot-x\d+$/);
+  assert.notStrictEqual(shots[0].name, shots[1].name);
+  assert.strictEqual(shots[0].type, "png", "other arguments pass through");
+  const click = { selector: "e1" };
+  assert.deepStrictEqual(nested("interaction_click", click), click, "a tool that writes no file is untouched");
+  // nested arguments arrive parsed, so upstream's own `timeout: 0` is already there: it is kept, and
+  // the script's timeoutMs (30 s unless the caller sets it) is what ends the call
+  const reload = nested("navigation_reload", { timeout: 0, includeScreenshot: true });
+  assert.strictEqual(reload.timeout, 0);
+  assert.match(reload.screenshotOptions.name, /^screenshot-x\d+$/);
+});
+
+test("error text carries no terminal colour codes, from a forwarded tool or from one of the relay's own", async (t) => {
+  const ownThrow = {
+    name: "own_throw",
+    description: "throws",
+    inputSchema: { type: "object", properties: {} },
+    needsPage: false,
+    handler: async () => { throw new Error("\u001b[2mlocator.click\u001b[22m: Timeout 800ms exceeded."); },
+  };
+  const b = await startTestBroker(t, { deps: { ownTools: () => [fakes.tabsNewTool, fakes.toolsetsTool, ownThrow] } });
+  const c = await connectClient(t, b.pipe);
+  const fwd = await c.callTool({ name: "navigation_go-to", arguments: { url: "ansi://" } });
+  assert.strictEqual(fwd.isError, true);
+  assert.strictEqual(fwd.content[0].text, "Error: locator.click: Timeout 800ms exceeded.");
+  const own = await c.callTool({ name: "own_throw", arguments: {} });
+  assert.strictEqual(own.isError, true);
+  assert.match(own.content[0].text, /locator\.click: Timeout 800ms exceeded\./);
+  assert.doesNotMatch(own.content[0].text, /\u001b/);
+});
+
 test("V1-4b: BROWSER_RELAY_VAULT_FILES naming a real file in broker mode: every session hears that autofill isn't available here", async (t) => {
   const csv = path.join(HOME, "vault-pw.csv");
   fs.writeFileSync(csv, "name,url,username,password,note\n");

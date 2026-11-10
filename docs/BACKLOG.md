@@ -26,6 +26,16 @@ This file is the canonical source for "what's known but not yet shipped." Items 
 
 **TODO:** file an upstream issue at https://github.com/serkan-ozal/browser-devtools-mcp/issues. The fix is one line: extend the `HttpResourceType` enum to include the 6 missing values. Once shipped + bumped in our `package.json` dep range, we can delete `scripts/patch-bdmcp-bundle.js` and its tests.
 
+### Three defects the broker works around (found 2026-11-10, none filed yet)
+
+Each has a contract test in `test/upstream-contract.test.js` that fails when upstream changes the code its workaround depends on, which is the signal to look at the workaround again.
+
+| Defect in `browser-devtools-mcp` | Still in 0.9.1? | Workaround in `src/broker/upstream-inproc.js` |
+|---|---|---|
+| `content_take-screenshot` with a `selector` returns the viewport: `captureScreenshot` passes the element to `page.screenshot()` as `element`, an option Playwright does not have. The fix upstream is `scopedElement.screenshot(…)` | Yes | `screenshotTheElement` |
+| The count of requests in flight only grows: a request cut off by a navigation gets no end event, and an EventSource has no end. Every navigation then waits out the 5 s network-idle limit | Yes (same `++` / `--` code) | `trackInFlightRequests` |
+| `content_take-screenshot` and the navigation tools return `_artifacts` without declaring it in their output schema, so a nested call from `execute` fails its strict parse | Yes (still returned, still not declared, the parse still strict) | `nestedTool` |
+
 ## Stealth — Tier 2 (SHIPPED in v0.3.5 — 2026-05-10)
 
 The four stealth-fingerprint patches in Tier 2 shipped together. The fifth Tier 2 item (humanlike interaction tools) was different scope and ship-gated separately as Tier 2.5 below.
@@ -157,6 +167,22 @@ Lower-priority items not specifically about stealth.
 **Why deferred:** lighthouse 13 needs Node ≥ 22.19; the relay supports Node ≥ 20. The API `lighthouse_audit` uses (`lighthouse(url, flags, config)`, `desktopConfig`) is unchanged, but the `pwa` category is gone (its `VALID_CATS` still lists it) and puppeteer-core jumps from 22 to 25. Broker mode also calls `lighthouse(url, flags, config, page)` with a page of Lighthouse's own puppeteer-core, connected with `puppeteer.connect({browserWSEndpoint})` (the broker has no CDP port): check both against 25. None of the flagged code runs here: Lighthouse attaches to the relay's Brave over CDP.
 
 **Ship gate:** When the relay's Node floor reaches 22.19, OR when one of those advisories becomes reachable.
+
+### `browser-devtools-mcp` 0.9.x upgrade
+
+**What:** The relay pins `browser-devtools-mcp@0.6.12`. npm has 0.9.1, which adds three tool groups (`db_*`, `log_*`, `request_*`: 42 tools) and removes none.
+
+**Why deferred:** Broker mode imports upstream's bundled chunks by export name, creates each session's context with upstream's factory, fills its own registry for `execute`'s `callTool`, and changes these, which an upgrade can move: on the session context, the in-flight request count (replaced), the response-body reader `_safeReadResponseBody` (wrapped with a size limit), the `browserContext` field (made an accessor, so one tab's request mocks stay in that tab) and `_attachPageListeners` (wrapped, to reach each page the context opens); Playwright's `page.screenshot` on each of those pages (wrapped); and each upstream tool in the registry (wrapped, so a nested result holds only what the tool declares; `execute` itself is added as it is). `test/upstream-contract.test.js` checks each against 0.6.12 without a browser, and the tool counts in the docs and tests are pinned to it. 0.9.1 still has the three defects the broker works around ([the table above](#three-defects-the-broker-works-around-found-2026-11-10-none-filed-yet), from reading its bundle, not from running it), so an upgrade removes none of the workarounds.
+
+**Ship gate:** Someone needs a 0.9.x tool or fix. Then: bump on a branch, bring the contract test up to date, measure navigation time and result sizes again, and decide which of the new groups are hidden by default.
+
+### Saved results: size cap, token-based limit
+
+**What:** A result over the size limit is saved under `results/` in the broker home ([Results in broker mode](REFERENCE.md#results-in-broker-mode) has the numbers). Files past the keep time are removed only when the next result is saved, the folder has no size cap, and each save lists the folder to find the old ones. The limit counts characters, so a page mostly in Chinese, Japanese or Korean text can still pass the client's token limit.
+
+**Why deferred:** Not seen to matter yet: a save happens only for an oversized result, and a day of them is small next to the browser profile.
+
+**Ship gate:** The folder is seen above a few hundred MB, a cut result is slow because of the folder listing, or a real page passes the client's limit after the cut.
 
 ---
 

@@ -614,6 +614,19 @@ test("W2G redaction: an upstream error or result carrying the CDP URL (Playwrigh
   assert.ok(!b.logs.some((l) => l.includes(secret)), b.logs.join("\n"));
 });
 
+test("W2G redaction: a result too long to return has the secret taken out before it is cut, so the saved full text never holds it", async (t) => {
+  const b = await startTestBroker(t);
+  const secret = SECRET_URL_RE.exec(b.handle.cdpUrl)[2];
+  const c = await connectClient(t, b.pipe);
+  const r = await c.callTool({ name: "navigation_go-to", arguments: { url: "leak-huge://" } });
+  assert.ok(!r.isError && r.content.length === 2, textOf(r));
+  const saved = fs.readFileSync(/Full text \(kept[^)]*\): (.+)/.exec(r.content[1].text)[1], "utf8");
+  // the URL was the first and the last line: one is in what is shown, the other only in the file
+  assert.ok(JSON.parse(r.content[0].text).output.startsWith(`${redactedUrl(b)}\n`), r.content[0].text.slice(0, 300));
+  assert.ok(saved.endsWith(`\n${redactedUrl(b)}`), saved.slice(-300));
+  for (const text of [JSON.stringify(r), saved]) assert.ok(!text.includes(secret));
+});
+
 test("W2G redaction: own tools get the real CDP URL (they connect with it); their results and errors are redacted", async (t) => {
   let seen = null;
   const leaky = {
@@ -689,11 +702,12 @@ test("tools/list: cached catalog + own tools, tabId on page tools only, hidden t
   }
   assert.deepStrictEqual(byName.get("own_probe").inputSchema, probeOwnTool.inputSchema, "own-tool schemas are W2D's, untouched");
   assert.deepStrictEqual(byName.get("navigation_go-to").inputSchema.required, ["url"], "tabId is never required");
+  assert.strictEqual(byName.get("navigation_go-to").description, "Navigate. A snapshot is returned in `output`.", "the refs map the broker leaves out is not promised");
   assert.strictEqual(FAKE_CATALOG[1].inputSchema.properties.tabId, undefined, "the cached catalog is not mutated");
+  assert.match(FAKE_CATALOG[1].description, /and `refs`/, "the cached catalog is not mutated");
   assert.strictEqual(b.sup.ensures, 0, "no Brave");
   assert.deepStrictEqual(b.up.loads, [], "no upstream import");
-  assert.match(c.getInstructions(), /tabs_new/);
-  assert.match(c.getInstructions(), /toolsets/);
+  assert.strictEqual(c.getInstructions(), require("../src/broker/main.js").SERVER_INSTRUCTIONS);
   assert.strictEqual(c.getServerCapabilities().tools.listChanged, true);
 });
 
@@ -1003,6 +1017,54 @@ test("toCallToolResult: an image that is not a Buffer stays in the JSON (as upst
 test("toCallToolResult: a non-object result is wrapped instead of crashing", () => {
   assert.deepStrictEqual(JSON.parse(toCallToolResult("done").content[0].text), { result: "done" });
   assert.deepStrictEqual(JSON.parse(toCallToolResult(undefined).content[0].text), {});
+});
+
+test("toCallToolResult: a snapshot's `refs` map is left out (every ref is already in the tree text); other `refs` stay, and so does what a script returns", () => {
+  const tree = '- button "Save" [ref=e1]';
+  const refs = { e1: { role: "button", name: "Save" } };
+  assert.deepStrictEqual(JSON.parse(toCallToolResult({ url: "https://x/", output: tree, refs }).content[0].text), { url: "https://x/", output: tree });
+  // execute and scenario-run nest each tool's output; a script that returns a snapshot whole asked for its map
+  const nested = toCallToolResult({ toolOutputs: [{ name: "a11y_take-aria-snapshot", output: { output: tree, refs } }, { name: "x", output: null }], logs: [], result: { output: tree, refs } });
+  assert.deepStrictEqual(JSON.parse(nested.content[0].text), {
+    toolOutputs: [{ name: "a11y_take-aria-snapshot", output: { output: tree } }, { name: "x", output: null }],
+    logs: [],
+    result: { output: tree, refs },
+  });
+  assert.deepStrictEqual(JSON.parse(toCallToolResult({ refs }).content[0].text), { refs }, "no tree text beside it: not a snapshot");
+  assert.deepStrictEqual(JSON.parse(toCallToolResult({ output: tree, refs: "e1" }).content[0].text), { output: tree, refs: "e1" });
+});
+
+test("toCallToolResult: the colour codes Playwright puts in its errors are removed from execute's error fields and logged lines; what the script returned is kept", () => {
+  const raw = "locator.click: \u001b[2mTimeout 800ms exceeded.\u001b[22m";
+  const clean = "locator.click: Timeout 800ms exceeded.";
+  const r = toCallToolResult({
+    toolOutputs: [],
+    logs: [{ level: "error", message: raw }, { level: "log", message: "plain" }],
+    result: { pageText: raw },
+    error: raw,
+    failedTool: { name: "interaction_click", error: raw },
+  });
+  assert.deepStrictEqual(JSON.parse(r.content[0].text), {
+    toolOutputs: [],
+    logs: [{ level: "error", message: clean }, { level: "log", message: "plain" }],
+    result: { pageText: raw },
+    error: clean,
+    failedTool: { name: "interaction_click", error: clean },
+  });
+});
+
+test("SERVER_INSTRUCTIONS: says how to read a page, keep results small and batch steps; fits the smallest client limit", () => {
+  const { SERVER_INSTRUCTIONS } = require("../src/broker/main.js");
+  const { MAX_RESULT_CHARS } = require("../src/broker/result-limit.js");
+  assert.ok(SERVER_INSTRUCTIONS.length < 2048, `${SERVER_INSTRUCTIONS.length} characters: Claude Code cut instructions at 2,048 before v2.1.296`);
+  assert.ok(SERVER_INSTRUCTIONS.includes(`${MAX_RESULT_CHARS.toLocaleString("en-US")} characters`), "the size the instructions give is the one results are cut at");
+  for (const re of [/navigation_go-to/, /\[ref=eN\]/, /a11y_take-aria-snapshot/, /includeSnapshot:false/, /interactiveOnly:true/, /30,000 characters/,
+    /content_take-screenshot/, /interaction_resize-viewport/, /callTool\(/, /tabs_new/, /tabs_close/,
+    /hidden to save context/, /Debug \/ React \/ scenario \/ trace/, /ask the user/, /`toolsets`/]) {
+    assert.match(SERVER_INSTRUCTIONS, re);
+  }
+  // the script gets a nested output without a third argument; `true` also copies each one into the result
+  assert.doesNotMatch(SERVER_INSTRUCTIONS, /callTool\([^)]*,\s*true\s*\)/);
 });
 
 test("brokerEnv: local-config.json values reach process.env (in-process upstream reads only that); real env wins", () => {

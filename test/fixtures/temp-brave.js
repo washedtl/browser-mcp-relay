@@ -15,6 +15,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const { removeDir } = require("./remove-dir.js");
+const { buildBraveArgs } = require("../../src/broker/brave-supervisor.js");
 
 const BRAVE_PATH = "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe";
 const PROFILES_ROOT = path.resolve(__dirname, "..", "..", ".tmp-profiles");
@@ -86,19 +87,9 @@ function makeProfileDir(label) {
 async function launchTempBrave(opts = {}) {
   const headless = opts.headless ?? !headfulRequested();
   const profileDir = makeProfileDir(opts.label);
-  const args = [
-    "--remote-debugging-port=0",
-    `--user-data-dir=${profileDir}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--no-startup-window",
-    "--do-not-de-elevate",
-    "--disable-features=AutoDeElevate,CalculateNativeWinOcclusion",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-  ];
-  if (headless) args.push("--headless=new");
+  // The broker's own flag set, so pages here behave as they do under the
+  // broker; only the CDP transport differs (a port the test can connect to).
+  const args = buildBraveArgs({ profileDir, headless }).map((a) => (a === "--remote-debugging-pipe" ? "--remote-debugging-port=0" : a));
   const child = spawn(BRAVE_PATH, args, { stdio: "ignore" });
   child.on("error", () => { /* surfaces as "exited during launch" / port timeout */ });
   let port;

@@ -31,7 +31,7 @@ const FAKE_CATALOG = [
   },
   {
     name: "navigation_go-to",
-    description: "Navigate",
+    description: "Navigate. A snapshot is returned in `output` and `refs`.", // upstream's wording, which the broker rewords
     inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
   },
   { name: "scenario-list", description: "List scenarios", inputSchema: { type: "object", properties: {} } },
@@ -94,7 +94,12 @@ function fakeCtx(sessionKey) {
  * `execute` runs `tool.run(ctx, args)`, recording each call in `state.executed`.
  * Like the real one, loadUpstream puts cdpUrl in process.env.BROWSER_CDP_ENDPOINT_URL.
  * navigation_go-to leaks the CDP URL on purpose for url "leak-error://" (in an
- * error, as Playwright's call log does) and "leak-result://" (in its result).
+ * error, as Playwright's call log does), "leak-result://" (in its result) and
+ * "leak-huge://" (in the first and the last line of a result too long to
+ * return whole). "huge://" returns a snapshot of a 2,000-row page (the tree text in `output`
+ * plus the `refs` map upstream adds beside it); "ansi://" throws with the
+ * colour codes Playwright puts in its errors. `state.nestedArgs` is the
+ * function the broker passed to loadUpstream.
  */
 function fakeUpstreamModule() {
   const state = { loads: [], contexts: [], executed: [], order: [], cdpUrl: null };
@@ -123,6 +128,12 @@ function fakeUpstreamModule() {
         if (args.url === "boom://") throw new Error("net::ERR_NAME_NOT_RESOLVED");
         if (args.url === "leak-error://") throw new Error(`browserType.connectOverCDP: connect ECONNREFUSED\nCall log:\n  - <ws connecting> ${state.cdpUrl}`);
         if (args.url === "leak-result://") return { endpoint: state.cdpUrl };
+        if (args.url === "huge://" || args.url === "leak-huge://") {
+          const rows = Array.from({ length: 2000 }, (_, i) => `- row "item ${i}" [ref=e${i}]`);
+          if (args.url === "leak-huge://") return { url: args.url, output: [state.cdpUrl, ...rows, state.cdpUrl].join("\n") };
+          return { url: args.url, output: rows.join("\n"), refs: Object.fromEntries(rows.map((_, i) => [`e${i}`, { role: "row", name: `item ${i}` }])) };
+        }
+        if (args.url === "ansi://") throw new Error("locator.click: \u001b[2mTimeout 800ms exceeded.\u001b[22m");
         return { navigated: args.url, session: ctx.sessionKey };
       }),
     },
@@ -175,9 +186,10 @@ function fakeUpstreamModule() {
     state,
     SESSIONLESS_TOOLS: ["scenario-list"],
     FORCED_UPSTREAM_ENV: { TELEMETRY_ENABLE: "false", BROWSER_CDP_OPEN_INSPECT: "false", TOOL_OUTPUT_SCHEMA_DISABLE: "true" },
-    async loadUpstream({ cdpUrl }) {
+    async loadUpstream({ cdpUrl, nestedArgs }) {
       state.loads.push(cdpUrl);
       state.cdpUrl = cdpUrl;
+      state.nestedArgs = nestedArgs;
       process.env.BROWSER_CDP_ENDPOINT_URL = cdpUrl; // as upstream-inproc's forceUpstreamEnv does
       state.order.push("loadUpstream");
       return {
