@@ -859,6 +859,42 @@ test("ensure() during closeGracefully() waits for the close, then relaunches", a
   assert.strictEqual(sup.isUp(), true);
 });
 
+test("heartbeat: a Brave that stops answering (hung; pid and pipe alive) is killed, and the next ensure() relaunches it", async () => {
+  const dir = tmpProfile("fake-silent");
+  const { sup, log, pipes } = fakeSupervisor(dir, { heartbeatEveryMs: 20, heartbeatTimeoutMs: 40 });
+  const { pid } = await sup.ensure();
+  const down = nextEvent(sup, "down");
+  pipes[0].call("Fake.silent", null, { timeoutMs: 100 });
+  await down;
+  await waitFor(() => !isAlive(pid), 5000, "the hung fake to be killed");
+  assert.ok(log.lines.some((l) => new RegExp(`brave pid=${pid} has not answered CDP .*killing it`).test(l)), log.lines.join("\n"));
+  assert.notStrictEqual((await sup.ensure()).pid, pid);
+});
+
+test("heartbeat: a Brave that answers is left alone, and pings stop with a close", async () => {
+  const dir = tmpProfile("fake-heartbeat-ok");
+  const { sup, log } = fakeSupervisor(dir, { heartbeatEveryMs: 20, heartbeatTimeoutMs: 200 });
+  const { pid } = await sup.ensure();
+  const pingsOf = () => cdpCallsOf(dir, "Browser.getVersion").length;
+  await waitFor(() => pingsOf() >= 4, 5000, "a few pings");
+  assert.strictEqual(sup.pid, pid);
+  assert.ok(!log.lines.some((l) => /has not answered/.test(l)), log.lines.join("\n"));
+  await sup.closeGracefully();
+  const atClose = pingsOf();
+  await sleep(150);
+  assert.strictEqual(pingsOf(), atClose);
+});
+
+test("heartbeat: a ping in flight during a close isn't mistaken for a hung Brave", async () => {
+  const dir = tmpProfile("fake-heartbeat-close");
+  const { sup, log } = fakeSupervisor(dir, { heartbeatEveryMs: 1, heartbeatTimeoutMs: 200 });
+  await sup.ensure();
+  await sleep(50); // pings back to back, so one is on the wire when the close lands
+  await sup.closeGracefully();
+  await sleep(100);
+  assert.ok(!log.lines.some((l) => /has not answered/.test(l)), log.lines.join("\n"));
+});
+
 test("launch failure: a Brave that keeps exiting during launch rejects after 3 attempts, and the next ensure() tries again", async () => {
   const dir = tmpProfile("fake-exit-early");
   const { sup, log } = fakeSupervisor(dir, { mode: "exit-early", launchRetryMs: 1 });

@@ -19,6 +19,17 @@ test("tabs_list has required tool shape", () => {
   assert.strictEqual(tool.needsBrave, false, "listing never launches the browser");
 });
 
+test("tabs_list: a tab that can't answer (page stuck in a loop) doesn't hold up the list", async () => {
+  const registry = fakeRegistry();
+  (await registry.getCtx("c1", "main")).page.title = () => new Promise(() => {});
+  await registry.getCtx("c1", "t1");
+  const t0 = Date.now();
+  const b = body(await run(registry));
+  assert.ok(Date.now() - t0 < 5000);
+  assert.strictEqual(b.count, 2);
+  assert.strictEqual(b.tabs.find((x) => x.tabId === "main").title, "");
+});
+
 test("W2D: tabs_list lists the calling connection's tabs with tabId, url and title", async () => {
   const registry = fakeRegistry();
   const main = (await registry.getCtx("c1", "main")).page;

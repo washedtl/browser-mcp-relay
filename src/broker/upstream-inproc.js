@@ -61,6 +61,36 @@ const FORCED_UPSTREAM_ENV = Object.freeze({
   PLATFORM: "browser",
 });
 
+// Upstream reads the response body of every non-static request, whether or
+// not anyone asks for it, into the one heap all sessions share, and Playwright
+// then caches each body it read for as long as the page lives (measured: 8 tabs
+// fetching 360 MB of JSON per round grew the broker ~780 MB a round, without
+// end). So the size limit has to stop the read, not trim its result: a body
+// declared over the limit is never fetched, and a tab stops reading bodies
+// altogether once it has read READ_BUDGET_CHARS.
+const KEPT_BODY_CHARS = 64 * 1024;
+const READ_BUDGET_CHARS = 32 * 1024 * 1024;
+const NOT_KEPT_ADVICE = "capture_xhr can save response bodies to a file";
+
+/** Bounds what one session context reads and keeps of response bodies. */
+function capResponseBodies(ctx) {
+  const read = ctx._safeReadResponseBody;
+  if (typeof read !== "function") return;
+  let charsRead = 0;
+  ctx._safeReadResponseBody = async function cappedResponseBody(res) {
+    const declared = Number(res.headers()["content-length"]);
+    if (declared > KEPT_BODY_CHARS) return `[response body not kept: ${declared} bytes; ${NOT_KEPT_ADVICE}]`;
+    if (charsRead >= READ_BUDGET_CHARS) return `[response body not kept: this tab has already read ${charsRead} characters of bodies; ${NOT_KEPT_ADVICE}]`;
+    const body = await read.call(this, res);
+    if (typeof body !== "string") return body;
+    charsRead += body.length;
+    if (body.length <= KEPT_BODY_CHARS) return body;
+    // through a Buffer: a plain slice is a view that keeps the whole string alive
+    const kept = Buffer.from(body.slice(0, KEPT_BODY_CHARS), "utf8").toString("utf8");
+    return `${kept}\n[response body cut at ${KEPT_BODY_CHARS} of ${body.length} characters; ${NOT_KEPT_ADVICE}]`;
+  };
+}
+
 // Export names that identify each chunk. A chunk matches when its trailing
 // export statement names all of them.
 const CHUNK_SIGNATURES = Object.freeze({
@@ -313,6 +343,7 @@ async function doLoad(cdpUrl, env) {
   const create = async (sessionKey) => {
     const ctx = await toolsInfo.createToolSessionContext(() => sessionKey);
     scopeRoutesToPage(ctx);
+    capResponseBodies(ctx);
     const b = ctx.browserContext.browser();
     if (b) knownBrowser = b;
     return ctx;
@@ -345,6 +376,9 @@ async function doLoad(cdpUrl, env) {
 module.exports = {
   loadUpstream,
   scopeRoutesToPage,
+  capResponseBodies,
+  KEPT_BODY_CHARS,
+  READ_BUDGET_CHARS,
   // exported for tests and sibling broker modules
   CHUNK_SIGNATURES,
   FORCED_UPSTREAM_ENV,

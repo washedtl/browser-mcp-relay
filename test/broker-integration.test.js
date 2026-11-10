@@ -352,6 +352,48 @@ test("V2-c: a session whose settings differ from the broker's is told so, in ITS
   assert.strictEqual(b.logs.filter((l) => /WARNING: session c\d+ has browser settings/.test(l)).length, 1, "and once in the broker log");
 });
 
+test("output files: two sessions saving in the same second get different names (upstream's name has 1 s resolution)", async (t) => {
+  const mod = fakes.fakeUpstreamModule();
+  const b = await startTestBroker(t, { deps: { upstreamModule: () => mod } });
+  const clients = [await connectClient(t, b.pipe), await connectClient(t, b.pipe)];
+  await Promise.all(clients.map((c) => c.callTool({ name: "content_save-as-pdf", arguments: {} })));
+  await clients[0].callTool({ name: "content_save-as-pdf", arguments: { name: "report" } });
+  const names = mod.state.executed.filter((e) => e.name === "content_save-as-pdf").map((e) => e.args.name);
+  assert.strictEqual(new Set(names).size, 3, names.join());
+  assert.match(names[0], /^page-c\d+-main-\d+$/);
+  assert.match(names[2], /^report-c\d+-main-\d+$/, "a chosen name is kept as the base");
+  await clients[0].callTool({ name: "content_start-recording", arguments: {} });
+  assert.match(mod.state.executed.filter((e) => e.name === "content_start-recording").pop().args.name, /^recording-c\d+-main-\d+$/, "its name has no schema default");
+});
+
+test("navigation: no timeout given means 60 s, not forever; an explicit one (even 0) is kept; screenshots get unique names", async (t) => {
+  const mod = fakes.fakeUpstreamModule();
+  const b = await startTestBroker(t, { deps: { upstreamModule: () => mod } });
+  const c = await connectClient(t, b.pipe);
+  const reload = async (args) => {
+    await c.callTool({ name: "navigation_reload", arguments: args });
+    return mod.state.executed.filter((e) => e.name === "navigation_reload").pop().args;
+  };
+  assert.strictEqual((await reload({})).timeout, 60_000);
+  assert.strictEqual((await reload({ timeout: 5000 })).timeout, 5000);
+  assert.strictEqual((await reload({ timeout: 0 })).timeout, 0);
+  const noShot = await reload({});
+  assert.strictEqual(noShot.screenshotOptions, undefined);
+  assert.match((await reload({ includeScreenshot: true })).screenshotOptions.name, /^screenshot-c\d+-main-\d+$/);
+  assert.match((await reload({ includeScreenshot: true, screenshotOptions: { name: "after" } })).screenshotOptions.name, /^after-c\d+-main-\d+$/);
+});
+
+test("withNavTimeoutSchema: the catalog shows the broker's navigation default; other tools are untouched", () => {
+  const { withNavTimeoutSchema } = require("../src/broker/main.js");
+  const nav = { name: "navigation_go-to", inputSchema: { type: "object", properties: { url: { type: "string" }, timeout: { type: "integer", default: 0, description: "Max wait ms. 0=no timeout." } } } };
+  const shown = withNavTimeoutSchema(nav).inputSchema.properties.timeout;
+  assert.strictEqual(shown.default, 60_000);
+  assert.match(shown.description, /60000.*0=no timeout/);
+  assert.strictEqual(nav.inputSchema.properties.timeout.default, 0, "the cached catalog entry isn't mutated");
+  const other = { name: "content_get-as-text", inputSchema: { type: "object", properties: {} } };
+  assert.strictEqual(withNavTimeoutSchema(other), other);
+});
+
 test("V1-4b: BROWSER_RELAY_VAULT_FILES naming a real file in broker mode: every session hears that autofill isn't available here", async (t) => {
   const csv = path.join(HOME, "vault-pw.csv");
   fs.writeFileSync(csv, "name,url,username,password,note\n");

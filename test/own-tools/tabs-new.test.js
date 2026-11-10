@@ -18,6 +18,24 @@ test("tabs_new has required tool shape", () => {
   assert.match(tool.description, /subagent/, "the parallel-subagent guidance lives here");
 });
 
+test("tabIds start at a random number per process, so one held across a broker restart won't name a sibling's new tab", async () => {
+  const file = require.resolve("../../src/own-tools/tabs-new.js");
+  const firstIdOfFreshProcess = async () => {
+    delete require.cache[file];
+    return body(await require(file).handler({}, { registry: fakeRegistry(), connId: "c1" })).tabId;
+  };
+  const ids = [await firstIdOfFreshProcess(), await firstIdOfFreshProcess(), await firstIdOfFreshProcess()];
+  for (const id of ids) {
+    assert.match(id, /^t\d+$/);
+    assert.ok(Number(id.slice(1)) > 1000, id);
+  }
+  assert.ok(new Set(ids).size > 1, ids.join());
+});
+
+test("tabs_new tells agents to close the tab when done (the broker can't see a subagent finish)", () => {
+  assert.match(tool.description, /tabs_close when (it is )?done/);
+});
+
 // W2D regression: tabs_new used to open a relay tab AND navigate upstream's
 // page to the same URL (_propagate-active-page), so every URL loaded twice,
 // in two tabs. Now the new tab is a registry tab that upstream tools use too.

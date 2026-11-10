@@ -48,6 +48,24 @@ function getLighthouse() {
   return _lhPromise;
 }
 
+// Lighthouse keeps process-global state: a second audit in the same process
+// fails the first (measured: 'The "start lh:runner:gather" performance mark
+// has not been set'). Sessions take turns.
+const AUDIT_DEADLINE_MS = 5 * 60_000; // a stuck audit must not block every later one for good
+let _auditTurn = Promise.resolve();
+function oneAuditAtATime(run) {
+  const turn = _auditTurn.then(() => {
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`the audit did not finish in ${AUDIT_DEADLINE_MS / 60_000} min`)), AUDIT_DEADLINE_MS);
+      timer.unref();
+    });
+    return Promise.race([run(), deadline]).finally(() => clearTimeout(timer));
+  });
+  _auditTurn = turn.then(() => {}, () => {});
+  return turn;
+}
+
 /**
  * puppeteer-core's ESM entry, resolved from lighthouse: the very module
  * Lighthouse imports, so the page we hand it is one of its own.
@@ -198,8 +216,10 @@ module.exports = {
       }
       let page = null;
       try {
-        page = await browser.newPage();
-        result = await lighthouse(url, flags, config, page);
+        result = await oneAuditAtATime(async () => {
+          page = await browser.newPage();
+          return lighthouse(url, flags, config, page);
+        });
       } catch (e) {
         return errorResult(`lighthouse_audit: ${e.message || String(e)}`);
       } finally {
@@ -243,7 +263,7 @@ module.exports = {
     }
 
     try {
-      result = await lighthouse(url, { hostname, port: Number(port), ...flags }, config);
+      result = await oneAuditAtATime(() => lighthouse(url, { hostname, port: Number(port), ...flags }, config));
     } catch (e) {
       return {
         content: [{ type: "text", text: `lighthouse_audit: ${e.message || String(e)}` }],

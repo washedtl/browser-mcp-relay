@@ -41,7 +41,7 @@ const DEFAULT_EXIT_IDLE_MS = 10 * MINUTE;
 const DEFAULT_BROWSER_IDLE_MS = 20 * MINUTE;
 const LOG_ROTATE_BYTES = 1024 * 1024;
 const DEFAULT_WATCHDOG_MS = 60_000;
-const MIN_WATCHDOG_MS = 10_000; // shorter would kill a healthy broker busy for a few seconds
+const MIN_WATCHDOG_MS = 30_000; // code is stopped at a third of this: shorter would hit a healthy broker busy for a few seconds
 const KEY_CHECK_MS = 30_000;
 const DEFAULT_RECYCLE_RSS_MB = 1024;
 const RECYCLE_CHECK_MS = 60_000;
@@ -50,8 +50,13 @@ const RECYCLE_CHECK_MS = 60_000;
  * Watchdog, in a worker thread: one broker serves every session, and code
  * upstream runs (execute / scenario-run) can block the event loop for good
  * (a vm timeout only covers the code before its first await). The main
- * thread stamps a shared clock every second; if it stops for timeoutMs, the
- * worker logs and kills the process, and the shims start a fresh broker.
+ * thread stamps a shared clock every second. If it stops for a third of
+ * timeoutMs, the worker stops the code holding the thread
+ * (Runtime.terminateExecution, in-process: every other session keeps its tabs).
+ * Stopped code's promises never settle, so onStopped lets the broker answer
+ * the calls left in flight. If it stops for all of timeoutMs (blocked in
+ * native code, or frozen again), the worker logs and kills the process, and
+ * the shims start a fresh broker.
  * A gap in the worker's own ticks means the machine slept: skip that check.
  * While an inspector is attached (a debugger may hold the thread at a
  * breakpoint), the main thread raises a flag and the worker stands down.
@@ -60,35 +65,51 @@ const WATCHDOG_SOURCE = `
 "use strict";
 const { workerData } = require("node:worker_threads");
 const fs = require("node:fs");
-const beat = new BigInt64Array(workerData.sab); // [0] heartbeat ms, [1] inspector attached
+const inspector = require("node:inspector");
+const beat = new BigInt64Array(workerData.sab); // [0] heartbeat ms, [1] inspector attached, [2] code was stopped
 const { timeoutMs, logFile, pid } = workerData;
-const every = Math.max(50, Math.min(1000, Math.floor(timeoutMs / 4)));
+const stopAfterMs = Math.floor(timeoutMs / 3);
+const every = Math.max(50, Math.min(1000, Math.floor(stopAfterMs / 4)));
+const note = (msg) => {
+  if (!logFile) return;
+  try { fs.appendFileSync(logFile, new Date().toISOString() + " [broker " + pid + "] watchdog: " + msg + "\\n"); } catch {}
+};
 let lastTick = Date.now();
+let stopSent = false;
 setInterval(() => {
   const now = Date.now();
   const slept = now - lastTick > every * 5;
   lastTick = now;
   if (slept || Atomics.load(beat, 1) !== 0n) return;
   const silent = now - Number(Atomics.load(beat, 0));
-  if (silent < timeoutMs) return;
-  if (logFile) {
+  if (silent < stopAfterMs) { stopSent = false; return; }
+  if (!stopSent) {
+    stopSent = true;
+    note("the event loop has been blocked for " + silent + " ms; stopping the code that blocks it");
+    Atomics.store(beat, 2, 1n);
     try {
-      fs.appendFileSync(logFile, new Date().toISOString() + " [broker " + pid + "] watchdog: the event loop has been blocked for " + silent + " ms (limit " + timeoutMs + " ms); killing the broker so the shims start a fresh one\\n");
-    } catch {}
+      const session = new inspector.Session();
+      session.connectToMainThread();
+      session.post("Runtime.terminateExecution", () => session.disconnect());
+    } catch (e) { note("could not stop it: " + e.message); }
+    return; // never stop and kill in one tick: the stop needs a chance to land
   }
+  if (silent < timeoutMs) return;
+  note("the event loop has been blocked for " + silent + " ms (limit " + timeoutMs + " ms); killing the broker so the shims start a fresh one");
   process.kill(pid, "SIGKILL");
 }, every);
 `;
 
 /** Start the watchdog; returns stop(). */
-function startWatchdog({ timeoutMs, logFile = null, heartbeatMs = 1000 }, log) {
+function startWatchdog({ timeoutMs, logFile = null, heartbeatMs = 1000, onStopped = null }, log) {
   const { Worker } = require("node:worker_threads");
   const inspector = require("node:inspector");
-  const sab = new SharedArrayBuffer(16);
+  const sab = new SharedArrayBuffer(24);
   const beat = new BigInt64Array(sab);
   const tick = () => {
     Atomics.store(beat, 1, inspector.url() ? 1n : 0n);
     Atomics.store(beat, 0, BigInt(Date.now()));
+    if (onStopped && Atomics.exchange(beat, 2, 0n) !== 0n) onStopped();
   };
   tick();
   const hb = setInterval(tick, heartbeatMs);
@@ -111,7 +132,7 @@ const TAB_ID_SCHEMA = Object.freeze({
 const SERVER_INSTRUCTIONS =
   "Debug / React / scenario / trace tools are hidden to save context. " +
   "If a task clearly needs one, ask the user, then call the `toolsets` tool. " +
-  "Parallel subagents share this session's browser tab: each should call tabs_new and pass the returned tabId on every call.";
+  "Parallel subagents share this session's browser tab: each should call tabs_new, pass the returned tabId on every call, and call tabs_close when done.";
 
 // Tools that need a rendering window: a minimized one stalls rAF and
 // screenshots for 3-5 s, so it is restored first.
@@ -261,6 +282,10 @@ function redactResult(result) {
   return clean === json ? result : JSON.parse(clean);
 }
 
+const ORPHANED_CALL_MESSAGE =
+  "[browser-mcp-relay] This call never answered after the broker's watchdog stopped code that was freezing it " +
+  "(a script that never yields?). It may be the call that was stopped: check the page, then retry.";
+
 const SETTINGS_DIFFER_WARNING =
   "this session's browser settings (BROWSER_*, telemetry, upstream tool options) differ from the ones the running broker " +
   "started with, and it keeps its own: run `npm run broker:stop`, and the next tool call starts a broker with the calling session's settings";
@@ -298,6 +323,40 @@ function withNotice(result, notice) {
   return { ...result, content: [{ type: "text", text: notice }, ...((result && result.content) || [])] };
 }
 
+// Upstream's navigation tools default to no timeout: a page whose load event
+// never fires holds the call open for good, and with it Brave's idle close.
+const NAV_TOOLS = new Set(["navigation_go-to", "navigation_reload", "navigation_go-back-or-forward"]);
+const NAV_DEFAULT_TIMEOUT_MS = 60_000;
+// Upstream names output files <name>-<time to the second> and overwrites, so
+// two sessions saving in the same second got one path and read each other's page.
+const OUTPUT_FILE_TOOLS = new Set(["content_take-screenshot", "content_save-as-pdf", "content_start-recording"]);
+
+/**
+ * The arguments upstream gets: `data` (parsed, defaults filled in) with the
+ * broker's navigation timeout and a per-call `tag` on output file names.
+ * `raw` is what the session sent, to tell an explicit timeout from the default.
+ */
+function brokerCallArgs(tool, raw, data, tag) {
+  const out = { ...data };
+  const base = out.name ?? (tool === "content_start-recording" ? "recording" : undefined); // the one name with no schema default
+  if (OUTPUT_FILE_TOOLS.has(tool) && base !== undefined) out.name = `${base}-${tag}`;
+  if (NAV_TOOLS.has(tool)) {
+    if (raw.timeout === undefined) out.timeout = NAV_DEFAULT_TIMEOUT_MS;
+    if (out.includeScreenshot) {
+      out.screenshotOptions = { ...out.screenshotOptions, name: `${(out.screenshotOptions && out.screenshotOptions.name) || "screenshot"}-${tag}` };
+    }
+  }
+  return out;
+}
+
+/** tools/list shows the broker's navigation default instead of upstream's 0. */
+function withNavTimeoutSchema(tool) {
+  const timeout = NAV_TOOLS.has(tool.name) && tool.inputSchema && tool.inputSchema.properties && tool.inputSchema.properties.timeout;
+  if (!timeout) return tool;
+  const properties = { ...tool.inputSchema.properties, timeout: { ...timeout, default: NAV_DEFAULT_TIMEOUT_MS, description: `Max wait ms. Default ${NAV_DEFAULT_TIMEOUT_MS}; 0=no timeout.` } };
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
+}
+
 function withTabIdSchema(tool) {
   const schema = tool.inputSchema || { type: "object" };
   if (schema.properties && schema.properties.tabId) return tool;
@@ -317,7 +376,7 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {{exitMs?: number, browserMs?: number}} [opts.idle]
  * @param {(reason: string) => void} [opts.onExit] — the broker has shut down by itself (idle, recycle, broker:stop)
  * @param {string} [opts.keyFile] — this user's broker key (default: keyFileFor(env)); the shim passes its own
- * @param {{timeoutMs: number, logFile?: string}|null} [opts.watchdog] — kill the process if the event loop blocks this long
+ * @param {{timeoutMs: number, logFile?: string}|null} [opts.watchdog] — stop code that blocks the event loop for a third of this; kill the process at all of it
  * @param {{rssBytes: number, checkMs: number}|null} [opts.recycle] — exit while idle when RSS exceeds rssBytes
  * @param {((opts: {profileDir: string, log: Function}) => Promise<unknown>)|null} [opts.seedProfile] — the
  *   profile's one-time seed (profile-seed.js), done before Brave first opens the profile
@@ -527,6 +586,26 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     return redactResult(await callUpstreamRaw(connId, name, rawArgs));
   }
 
+  // Calls in flight. Code the watchdog stopped never settles, and the stop can
+  // also drop other continuations queued behind it: after a stop, a call that
+  // still hasn't answered within the grace period gets an error instead of
+  // hanging its session and holding off Brave's idle close for good.
+  const inFlightCalls = new Set();
+  const orphanGraceMs = ((watchdog && watchdog.timeoutMs) || DEFAULT_WATCHDOG_MS) * 2;
+  function trackCall() {
+    let timer = null;
+    let answer;
+    const orphaned = new Promise((resolve) => { answer = resolve; });
+    const entry = {
+      orphaned,
+      arm() { timer = timer || setTimeout(() => answer(errorResult(ORPHANED_CALL_MESSAGE)), orphanGraceMs); },
+      done() { clearTimeout(timer); inFlightCalls.delete(entry); },
+    };
+    inFlightCalls.add(entry);
+    return entry;
+  }
+
+  let outputSeq = 0;
   async function callUpstreamRaw(connId, name, rawArgs) {
     try {
       const { tabId, ...args } = rawArgs || {};
@@ -546,7 +625,8 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
       checkProxyCredentials();
       const notice = registry.takeResetNotice(connId, tabKey);
       if (NEEDS_RENDERING_RE.test(name)) await restoreWindow(ctx.page);
-      return withNotice(await runUpstream(up, ctx, entry, parsed.data), notice);
+      const callArgs = brokerCallArgs(name, args, parsed.data, `${connId}-${tabKey}-${++outputSeq}`);
+      return withNotice(await runUpstream(up, ctx, entry, callArgs), notice);
     } catch (e) {
       return errorResult(`Error: ${e.message}`);
     }
@@ -736,13 +816,15 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     for (const tool of ownTools) relay.registerOwnTool(brokerOwnTool(tool, connId, relay));
     mcp.setRequestHandler(ListToolsRequestSchema, async () => {
       const list = await relay.handleToolsList();
-      return { ...list, tools: list.tools.map((t) => (takesTabId(t.name) ? withTabIdSchema(t) : t)) };
+      return { ...list, tools: list.tools.map((t) => (takesTabId(t.name) ? withTabIdSchema(withNavTimeoutSchema(t)) : t)) };
     });
     mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       policy.callStarted();
+      const call = trackCall();
       try {
-        return await relay.handleToolsCall(req.params);
+        return await Promise.race([relay.handleToolsCall(req.params), call.orphaned]);
       } finally {
+        call.done();
         policy.callEnded();
       }
     });
@@ -813,7 +895,8 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     },
   });
 
-  const stopWatchdog = watchdog && watchdog.timeoutMs ? startWatchdog(watchdog, log) : () => {};
+  const onStopped = () => { for (const call of inFlightCalls) call.arm(); };
+  const stopWatchdog = watchdog && watchdog.timeoutMs ? startWatchdog({ ...watchdog, onStopped }, log) : () => {};
   // if our key file vanishes while we run, put it back, so new sessions still match us
   const keyTimer = setInterval(() => {
     try {
@@ -1034,6 +1117,7 @@ module.exports = {
   startWatchdog,
   prepareWorkDir,
   toCallToolResult,
+  withNavTimeoutSchema,
   tabKeyOf,
   TAB_ID_SCHEMA,
   NEEDS_RENDERING_RE,

@@ -500,7 +500,7 @@ test("launcher: elevated → the broker starts de-elevated with exactly the allo
   assert.strictEqual(r.spawns.length, 0);
   assert.strictEqual(r.deelevated.length, 1);
   const { args, cwd, childEnv } = r.deelevated[0];
-  assert.deepStrictEqual(args, ["C:\\x\\broker.js", "--pipe", "P"], "no --env-file");
+  assert.deepStrictEqual(args, ["--no-force-async-hooks-checks", "C:\\x\\broker.js", "--pipe", "P"], "no --env-file");
   assert.ok(fs.statSync(cwd).isDirectory(), "its working dir exists");
   assert.strictEqual(childEnv.BROWSER_RELAY_TEST_MARK, "m");
   assert.strictEqual(childEnv.SECRET_TOKEN, undefined);
@@ -553,7 +553,7 @@ test("runLauncher: starts the broker detached, hidden, stdio ignored, then exits
     isElevated: () => false,
   });
   assert.strictEqual(calls[0].cmd, process.execPath);
-  assert.deepStrictEqual(calls[0].args, ["C:\\x\\broker.js", "--pipe", "P"]);
+  assert.deepStrictEqual(calls[0].args, ["--no-force-async-hooks-checks", "C:\\x\\broker.js", "--pipe", "P"]);
   assert.strictEqual(calls[0].opts.detached, true);
   assert.strictEqual(calls[0].opts.stdio, "ignore");
   assert.strictEqual(calls[0].opts.windowsHide, true);
@@ -673,22 +673,23 @@ test("processes: tree-killing a shim leaves the broker running (it is not in the
   assert.strictEqual((await callJson(b, "fixture_pid")).pid, pid, "and still serves new sessions");
 });
 
-test("processes: a blocked event loop is caught by the watchdog: the broker is killed and the session recovers", async (t) => {
-  const run = processRun(t, "watchdog");
-  const c = await shimClient(t, run, { watchdogMs: 1500 });
-  const { pid: first } = await callJson(c, "fixture_pid");
-  await sleep(2500); // heartbeats flow while idle: no false kill
-  assert.ok(pidAlive(first), "an idle broker is not killed");
-  const t0 = Date.now();
-  const spun = await c.client.callTool({ name: "fixture_spin", arguments: {} }).then(() => "resolved", (e) => e);
-  assert.ok(spun instanceof Error && /browser broker restarted/.test(spun.message), String(spun));
-  const killedAfter = Date.now() - t0;
-  assert.ok(!pidAlive(first));
-  const { pid: second } = await callJson(c, "fixture_pid");
-  assert.notStrictEqual(second, first);
-  assert.match(fs.readFileSync(path.join(run.markerDir, "broker.log"), "utf8"), /watchdog: the event loop has been blocked for \d+ ms/);
-  t.diagnostic(`busy loop → broker killed and the call failed after ${killedAfter} ms (watchdog 1500 ms)`);
-});
+for (const tool of ["fixture_spin", "fixture_spin_timer"]) {
+  test(`processes: ${tool}: the watchdog stops the frozen code, the broker lives on, and the call gets an error instead of hanging`, async (t) => {
+    const run = processRun(t, `watchdog-${tool}`);
+    const c = await shimClient(t, run, { watchdogMs: 1500 });
+    const { pid: first } = await callJson(c, "fixture_pid");
+    await sleep(1200); // heartbeats flow while idle: nothing is stopped
+    assert.doesNotMatch(fs.readFileSync(path.join(run.markerDir, "broker.log"), "utf8"), /watchdog:/, "an idle broker is left alone");
+    const t0 = Date.now();
+    const r = await c.client.callTool({ name: tool, arguments: {} });
+    assert.ok(r.isError, JSON.stringify(r));
+    assert.match(r.content[0].text, /never answered after the broker's watchdog stopped code/);
+    assert.ok(pidAlive(first), "the broker survived");
+    assert.strictEqual((await callJson(c, "fixture_pid")).pid, first);
+    assert.match(fs.readFileSync(path.join(run.markerDir, "broker.log"), "utf8"), /watchdog: the event loop has been blocked for \d+ ms; stopping the code/);
+    t.diagnostic(`frozen → stopped, and the call answered after ${Date.now() - t0} ms (watchdog 1500 ms)`);
+  });
+}
 
 test("processes: the launched broker gets only the allowlisted env", async (t) => {
   const run = processRun(t, "allowlist");

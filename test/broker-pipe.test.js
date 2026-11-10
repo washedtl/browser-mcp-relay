@@ -529,24 +529,49 @@ test("recycle: never while a tool call is running", async (t) => {
   await until(() => b.exits.length === 1, 3000, "the recycle once idle");
 });
 
-test("watchdog: kills a blocked process, but stands down while an inspector is attached", () => {
+test("watchdog: stops the code freezing the loop and the process lives on (other sessions keep their tabs)", (t) => {
+  const { spawnSync } = require("node:child_process");
+  const main = path.resolve(__dirname, "../src/broker/main.js");
+  const logFile = path.join(os.tmpdir(), `bmr-watchdog-${process.pid}-${Date.now()}.log`);
+  t.after(() => fs.rmSync(logFile, { force: true }));
+  // frozen for good after an await, which no vm timeout covers; the timer proves the loop runs again
+  const script = `require(${JSON.stringify(main)}).startWatchdog({ timeoutMs: 3000, heartbeatMs: 50, logFile: ${JSON.stringify(logFile)} }, () => {});
+    setTimeout(() => { process.stdout.write("recovered"); process.exit(0); }, 2600);
+    setTimeout(async () => { await null; while (true) {} }, 100);`;
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+  assert.strictEqual(r.stdout, "recovered", `status ${r.status}, stderr: ${r.stderr}`);
+  assert.strictEqual(r.status, 0);
+  assert.match(fs.readFileSync(logFile, "utf8"), /watchdog: the event loop has been blocked for \d+ ms; stopping the code that blocks it/);
+});
+
+test("watchdog: kills the process when stopping the code doesn't help (blocked in native code)", () => {
+  const { spawnSync } = require("node:child_process");
+  const main = path.resolve(__dirname, "../src/broker/main.js");
+  // spawnSync never returns to JS while its child runs, so a terminate can't land
+  const script = `require(${JSON.stringify(main)}).startWatchdog({ timeoutMs: 900, heartbeatMs: 50 }, () => {});
+    setTimeout(() => { require("node:child_process").spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 7000)"]); process.stdout.write("survived"); process.exit(0); }, 100);`;
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+  assert.notStrictEqual(r.stdout, "survived", "killed by the watchdog");
+  assert.notStrictEqual(r.status, 0);
+  assert.ok(Date.now() - t0 < 6000, "killed at the limit, not when the blocking call finally returned");
+});
+
+test("watchdog: stands down while an inspector is attached", () => {
   const { spawnSync } = require("node:child_process");
   const main = path.resolve(__dirname, "../src/broker/main.js");
   // block the event loop for 1.5 s with a 300 ms watchdog
   const script = `require(${JSON.stringify(main)}).startWatchdog({ timeoutMs: 300 }, () => {});
     setTimeout(() => { const t = Date.now(); while (Date.now() - t < 1500) {} process.stdout.write("survived"); process.exit(0); }, 100);`;
-  const plain = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000, windowsHide: true });
-  assert.notStrictEqual(plain.stdout, "survived", "killed by the watchdog");
-  assert.notStrictEqual(plain.status, 0);
   const inspected = spawnSync(process.execPath, ["--inspect=127.0.0.1:0", "-e", script], { encoding: "utf8", timeout: 20_000, windowsHide: true });
   assert.strictEqual(inspected.stdout, "survived", `a debugging session is left alone (status ${inspected.status})`);
 });
 
-test("watchdogSetting: default 60 s, 0 turns it off, anything else at least 10 s", () => {
+test("watchdogSetting: default 60 s, 0 turns it off, anything else at least 30 s", () => {
   const { watchdogSetting } = require("../src/broker/main.js");
   assert.strictEqual(watchdogSetting(undefined), 60_000);
   assert.strictEqual(watchdogSetting("0"), 0);
-  assert.strictEqual(watchdogSetting("500"), 10_000);
+  assert.strictEqual(watchdogSetting("500"), 30_000);
   assert.strictEqual(watchdogSetting("90000"), 90_000);
   assert.strictEqual(watchdogSetting("junk"), 60_000);
 });

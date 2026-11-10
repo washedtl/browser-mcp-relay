@@ -16,15 +16,18 @@ const { legacyNote } = require("./_tabs.js");
 
 const WAIT_UNTIL = ["load", "domcontentloaded", "networkidle", "commit"];
 
-// tabIds are unique per process (one broker, or one legacy relay).
-let lastTabNumber = 0;
+// tabIds are unique per process (one broker, or one legacy relay), and start
+// at a random number: after a broker restart a counter from 0 handed a
+// subagent's old tabId to its sibling's new tab.
+let lastTabNumber = require("node:crypto").randomInt(1000, 1_000_000);
 
 module.exports = {
   name: "tabs_new",
   description:
     "Open a new tab, optionally navigating to a URL, and return its tabId. Pass the tabId on later calls " +
     "to act on that tab (a tool that can't take it says so); without it, calls act on your main tab. " +
-    "Parallel subagents share one connection: each should open its own tab and pass its tabId.",
+    "Parallel subagents share one connection: each should open its own tab, pass its tabId, and call tabs_close when done " +
+    "(the broker can't see a subagent finish, so its window otherwise stays until the session ends).",
   inputSchema: {
     type: "object",
     properties: {
