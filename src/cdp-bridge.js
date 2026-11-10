@@ -138,7 +138,9 @@ async function launchBrave({
     }
   }
 
-  const args = [`--remote-debugging-port=${port}`];
+  // --do-not-de-elevate: precaution, as in the broker's launch (there, Brave
+  // 157 relaunched itself from an elevated parent and the process exited).
+  const args = [`--remote-debugging-port=${port}`, "--do-not-de-elevate"];
   // Strip Playwright's default `--use-mock-keychain`. That flag tells Chromium
   // to bypass the OS keychain (DPAPI on Windows, Keychain on macOS, libsecret
   // on Linux), which prevents Brave from unwrapping `Local State.os_crypt
