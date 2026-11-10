@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Brave 157
+
+- An elevated broker (the fallback when de-elevating fails) can launch Brave again. Brave removed the `AutoDeElevate` feature the relay used to stop it relaunching itself de-elevated, and the launched process exited at once. Brave now also gets `--do-not-de-elevate`. The normal de-elevated broker was never affected.
+
 ### Several sessions at once
 
 Found by running 5 sessions with 4 parallel agents each against one broker.

@@ -92,6 +92,7 @@ async function launchTempBrave(opts = {}) {
     "--no-first-run",
     "--no-default-browser-check",
     "--no-startup-window",
+    "--do-not-de-elevate",
     "--disable-features=AutoDeElevate,CalculateNativeWinOcclusion",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",

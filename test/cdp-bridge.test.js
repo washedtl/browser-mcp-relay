@@ -78,6 +78,13 @@ async function withMockChromium(fn) {
   }
 }
 
+test("launchBrave: passes --do-not-de-elevate, as the broker's launch does", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    await fresh.launchBrave({ userDataDir: "/tmp/x", port: 9999, headless: false, executablePath: "/fake/brave" });
+    assert.ok(captured.launchOpts.args.includes("--do-not-de-elevate"), captured.launchOpts.args.join(" "));
+  });
+});
+
 test("launchBrave: ignoreDefaultArgs always includes --use-mock-keychain", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({

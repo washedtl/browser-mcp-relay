@@ -81,6 +81,7 @@ test("buildBraveArgs: exactly the broker's flag set, nothing else", () => {
     "--no-first-run",
     "--no-default-browser-check",
     "--no-startup-window",
+    "--do-not-de-elevate",
     "--disable-features=AutoDeElevate,CalculateNativeWinOcclusion",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
@@ -93,7 +94,8 @@ test("W2G buildBraveArgs: CDP over a pipe, never a TCP debugging port (any local
     assert.ok(args.includes("--remote-debugging-pipe"), args.join(" "));
     assert.ok(!args.some((a) => /^--remote-debugging-(port|address)/.test(a)), args.join(" "));
     // elevated parent: without it Brave relaunches de-elevated and the pipe is gone (measured: exit 0 at 393 ms)
-    assert.ok(args.some((a) => /^--disable-features=.*\bAutoDeElevate\b/.test(a)));
+    assert.ok(args.includes("--do-not-de-elevate"), "the switch Brave 157 still honours");
+    assert.ok(args.some((a) => /^--disable-features=.*\bAutoDeElevate\b/.test(a)), "and the feature older builds use");
   }
 });
 

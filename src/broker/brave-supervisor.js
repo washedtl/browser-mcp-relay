@@ -608,12 +608,16 @@ function buildBraveArgs({ profileDir, extensionPath = null, proxyServer = null, 
     // CDP still comes up (0 pages) and Target.createTarget{newWindow} still
     // works; without it Brave opens a window and steals the OS foreground.
     "--no-startup-window",
-    // AutoDeElevate: spawned from an elevated process, brave.exe relaunches
-    // itself de-elevated and the PID we spawned exits in ~150-750 ms, so
-    // kills and crash detection hit nothing, and the relaunched Brave has no
-    // pipe (measured: exit 0 at 393 ms, pipe EOF, no CDP). Keep this ONE switch: Chromium
-    // reads only the last copy of a repeated switch (measured: adding a second
-    // --disable-features dropped AutoDeElevate and Brave exited, code 0, 183 ms).
+    // Spawned from an elevated process, brave.exe relaunches itself de-elevated
+    // and the PID we spawned exits in ~150-750 ms, so kills and crash detection
+    // hit nothing, and the relaunched Brave has no pipe (measured: exit 0 at
+    // 393 ms, pipe EOF, no CDP). --do-not-de-elevate stops that; Brave 157 no
+    // longer has the AutoDeElevate feature older builds were told off through
+    // (measured: gone from chrome.dll, and exit 0 in 82 ms without the switch).
+    "--do-not-de-elevate",
+    // Keep this ONE switch: Chromium reads only the last copy of a repeated
+    // switch (measured: adding a second --disable-features dropped
+    // AutoDeElevate and Brave exited, code 0, 183 ms).
     "--disable-features=AutoDeElevate,CalculateNativeWinOcclusion",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
