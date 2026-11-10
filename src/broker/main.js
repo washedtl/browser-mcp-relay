@@ -141,7 +141,8 @@ const SERVER_INSTRUCTIONS = [
     "with a `selector` for the part you need. A result over about 30,000 characters is cut and the full text is saved to a file " +
     "named in the result; Read that file with offset/limit or Grep it.",
   "content_take-screenshot saves an image file and returns its path: Read the path to see it. For checks at several widths, run " +
-    "interaction_resize-viewport then content_take-screenshot per width (e.g. 1920, 1440, 1024, 390) inside one `execute` call.",
+    "interaction_resize-viewport then content_take-screenshot per width (e.g. 1920, 1440, 1024, 390) inside one `execute` call, " +
+    "in a tab from tabs_new that you close after: the last width stays until its page is closed.",
   "`execute` batches steps in one call: `await callTool(name, input)` runs a tool and returns its output to the script; `page` is the Playwright page. " +
     "Return only what you need from the script.",
   "Parallel subagents share this session's browser tab: each should call tabs_new, pass the returned tabId on every call, and call tabs_close when done.",

@@ -13,7 +13,7 @@ Found by measuring what an agent gets back from real sites. Broker mode.
 - **A screenshot with a `selector` is the element.** `content_take-screenshot` found the element and then returned the whole viewport, because upstream passes the element to Playwright's page screenshot as an option it does not have (measured: a heading 37 px high came back 491 px high). The broker now takes the image from the element, for a CSS selector or a snapshot ref, whatever `fullPage` says. The page is scrolled to bring the element into view, and an element that is hidden or has no size fails after 5 s instead of Playwright's 30.
 - **Going back works.** Chromium restored the earlier page from its back/forward cache without the load event Playwright waits for, so `navigation_go-back-or-forward` ran into its timeout. Brave now starts with `--disable-back-forward-cache` (measured: an 8 s error → 0.7 s).
 - **Error text is plain.** Playwright's colour codes are removed, also from the lines an `execute` script logs.
-- **The server instructions describe the working loop**: navigate, act on refs, snapshot again, ask for less on big pages, batch with `execute`, one tab per subagent.
+- **The server instructions describe the working loop**: navigate, act on refs, snapshot again, ask for less on big pages, batch with `execute`, one tab per subagent, and check widths in a tab from `tabs_new` that is closed after (a resized page keeps its size until it is closed: Playwright cannot hand it back to the window's size).
 
 ### Brave 157
 

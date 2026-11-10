@@ -169,7 +169,7 @@ Hidden by default: `debug` [toolset](#toolsets).
 | `interaction_drag` | Drag an element to a target |
 | `interaction_press-key` | Press a keyboard key (with optional hold + repeat) |
 | `interaction_scroll` | Scroll the viewport or a scrollable element |
-| `interaction_resize-viewport` | Resize the page viewport (Playwright emulation) |
+| `interaction_resize-viewport` | Resize the page viewport (Playwright emulation). The size stays until the page is closed: Playwright cannot hand the page back to the window's size. In broker mode, check widths in a tab from `tabs_new` and close it after |
 | `interaction_resize-window` | Resize the OS-level browser window via CDP |
 
 #### 🧭 Navigation (3)
