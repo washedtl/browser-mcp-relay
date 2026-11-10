@@ -11,7 +11,7 @@ const { connectionTabs, safeUrl } = require("./_tabs.js");
 
 // title() runs in the page: one stuck in a loop must not hold up the whole list.
 const TITLE_WAIT_MS = 2000;
-const noTitleAfterWait = () => new Promise((resolve) => setTimeout(resolve, TITLE_WAIT_MS, "").unref());
+const noTitleAfterWait = () => new Promise((resolve) => setTimeout(resolve, TITLE_WAIT_MS, ""));
 
 module.exports = {
   name: "tabs_list",
