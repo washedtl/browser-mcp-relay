@@ -21,6 +21,30 @@ test("W2D: lighthouse_audit is page-less and needs ctx.cdpUrl", async () => {
 
 const CTX = { cdpUrl: "http://127.0.0.1:9333" };
 
+test("audits run one at a time across sessions, and a failed one doesn't block the next", async (t) => {
+  // Lighthouse keeps process-global state: measured, a second concurrent audit fails with
+  // 'The "start lh:runner:gather" performance mark has not been set'.
+  let running = 0, peak = 0, calls = 0;
+  tool._setLighthouseForTest({
+    desktopConfig: {},
+    default: async () => {
+      calls++;
+      const n = calls;
+      peak = Math.max(peak, ++running);
+      await new Promise((r) => setTimeout(r, 20));
+      running--;
+      if (n === 2) throw new Error("boom");
+      return { lhr: { categories: {}, finalUrl: "https://a.example/", fetchTime: "t" } };
+    },
+  });
+  tool._setPuppeteerForTest({ connect: async () => ({ newPage: async () => ({ close: async () => {} }), disconnect: async () => {} }) });
+  t.after(() => { tool._setLighthouseForTest(null); tool._setPuppeteerForTest(null); });
+  const ctx = { cdpUrl: "ws://127.0.0.1:1/secret/devtools/browser" };
+  const results = await Promise.all([1, 2, 3].map(() => tool.handler({ url: "https://a.example/" }, ctx)));
+  assert.strictEqual(peak, 1, "never two at once");
+  assert.deepStrictEqual(results.map((r) => !!r.isError), [false, true, false]);
+});
+
 // ──────────────────────────────────────────────────────────────────
 // T0-6: bad URL / dead Brave must return structured isError, not throw.
 // T1-1: lighthouse import is memoized (lazy + cached).
@@ -67,9 +91,9 @@ test("T0-6: lighthouse_audit catches lighthouse() throws and returns isError", a
     "utf8",
   );
   // The lighthouse() call must be inside a try/catch.
-  // Match `try { ... result = await lighthouse(... } catch`.
+  // Match `try { ... result = await oneAuditAtATime(... lighthouse(... } catch`.
   assert.ok(
-    /try\s*\{[\s\S]*?result\s*=\s*await\s+lighthouse\([\s\S]*?\}\s*catch\s*\(/m.test(src),
+    /try\s*\{[\s\S]*?result\s*=\s*await\s+oneAuditAtATime\([\s\S]*?lighthouse\([\s\S]*?\}\s*catch\s*\(/m.test(src),
     "lighthouse() call must be wrapped in try/catch",
   );
 });

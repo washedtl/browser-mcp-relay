@@ -127,6 +127,29 @@ function fakeUpstreamModule() {
       }),
     },
     {
+      name: "content_save-as-pdf",
+      description: "Save a PDF",
+      inputShape: { name: z.string().default("page"), tabId },
+      pageTool: true,
+      tool: tool("content_save-as-pdf", async () => ({ saved: true })),
+    },
+    {
+      name: "content_start-recording",
+      description: "Start a recording",
+      // like upstream: optional, with no schema default
+      inputShape: { name: z.string().optional(), tabId },
+      pageTool: true,
+      tool: tool("content_start-recording", async () => ({ recording: true })),
+    },
+    {
+      name: "navigation_reload",
+      description: "Reload",
+      // like upstream: 0 (no timeout) is the schema default
+      inputShape: { timeout: z.number().default(0), includeScreenshot: z.boolean().default(false), screenshotOptions: z.object({ name: z.string().optional() }).optional(), tabId },
+      pageTool: true,
+      tool: tool("navigation_reload", async () => ({ reloaded: true })),
+    },
+    {
       name: "content_get-as-text",
       description: "Page text",
       inputShape: { tabId },

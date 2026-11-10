@@ -9,6 +9,10 @@
 
 const { connectionTabs, safeUrl } = require("./_tabs.js");
 
+// title() runs in the page: one stuck in a loop must not hold up the whole list.
+const TITLE_WAIT_MS = 2000;
+const noTitleAfterWait = () => new Promise((resolve) => setTimeout(resolve, TITLE_WAIT_MS, "").unref());
+
 module.exports = {
   name: "tabs_list",
   description:
@@ -20,7 +24,7 @@ module.exports = {
     const tabs = await connectionTabs(ctx);
     const list = await Promise.all(tabs.map(async ({ tabKey, page }) => {
       let title = "";
-      try { title = await page.title(); } catch { /* closed mid-call, or no page */ }
+      try { title = await Promise.race([page.title(), noTitleAfterWait()]); } catch { /* closed mid-call, or no page */ }
       return { tabId: tabKey, url: safeUrl(page), title };
     }));
     return { content: [{ type: "text", text: JSON.stringify({ count: list.length, tabs: list }, null, 2) }] };

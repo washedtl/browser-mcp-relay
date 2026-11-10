@@ -50,6 +50,14 @@ const fixtureTools = [
     handler: async () => { await new Promise((r) => setTimeout(r, 1)); for (;;) { /* spin */ } },
   },
   {
+    // the same, inside a timer callback (a terminate there trips Node's async-hook check)
+    name: "fixture_spin_timer",
+    description: "blocks the event loop forever, from a timer",
+    inputSchema: { type: "object" },
+    needsBrave: false,
+    handler: () => new Promise(() => { setTimeout(() => { for (;;) { /* spin */ } }, 1); }),
+  },
+  {
     name: "fixture_whoami",
     description: "this broker's integrity level and launch env mark",
     inputSchema: { type: "object" },
@@ -79,7 +87,7 @@ startBroker({
   log,
   keyFile,
   idle: { exitMs, browserMs: 60_000 },
-  watchdog: watchdogMs ? { timeoutMs: watchdogMs, logFile } : null,
+  watchdog: watchdogMs ? { timeoutMs: watchdogMs, heartbeatMs: 100, logFile } : null,
   onExit: () => process.exit(0),
   deps: {
     createSupervisor: (opts) => fakes.fakeSupervisor(opts),

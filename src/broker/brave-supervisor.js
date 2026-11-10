@@ -36,16 +36,23 @@ const EXIT_WAIT_MS = 10000;
 const STDIO = Object.freeze(["ignore", "ignore", "ignore", "pipe", "pipe"]);
 // Chromium's exit code when another browser process holds the profile
 const RESULT_CODE_PROFILE_IN_USE = 21;
-// A launch can exit before CDP answers and the next one work. Seen twice on a
-// live, de-elevated broker, each the first launch in a while (16 min after
-// Brave closed, 3 days after the last launch; quick restarts didn't do it):
-// exit 0 after 178 and 484 ms, and the next launch up in ~210 ms. At the 484 ms
-// exit no Brave was left; at the 178 ms one the lock was held, then free 300 ms
-// later (a stray isn't ruled out). Trigger not found (not elevation, an update
-// or the call order). Exit 0 says little: a handoff to a live Brave (58-339 ms)
-// and a broken pipe (200-358 ms) give it too.
+// A launch can exit before CDP answers and the next one work. Traced on a live
+// broker, on the first launch after Brave had been closed for 8+ min: CCleaner's
+// Performance Optimizer had put Brave to sleep, so the spawn ran its
+// CCleanerReactivator.exe, which woke Brave and started a second brave.exe
+// without our pipe. That copy took the profile, ours exited 0 in 130-480 ms,
+// and it shut itself down ~0.6 s later; the next launch was direct. Exit 0
+// says little: a handoff to a live Brave (58-339 ms) and a broken pipe
+// (200-358 ms) give it too.
 const LAUNCH_ATTEMPTS = 3;
 const LAUNCH_RETRY_MS = 300;
+// A hung browser thread keeps its PID and its pipe, so nothing else notices,
+// and every session's next tab waits on it (measured: tabs_new from two
+// sessions still pending after 45 s). Three unanswered pings in a row (about
+// 45 s): kill it.
+const HEARTBEAT_EVERY_MS = 5000;
+const HEARTBEAT_TIMEOUT_MS = 10000;
+const HEARTBEAT_MISSES = 3;
 
 /**
  * Supervises one Brave on one persistent profile.
@@ -92,6 +99,8 @@ class BraveSupervisor extends EventEmitter {
    * @param {number} [opts.exitWaitMs=10000] — unexpected 'down' → exit, then kill
    * @param {number} [opts.proxyProbeTimeoutMs=1500]
    * @param {number} [opts.strayExitWaitMs=10000] — a reaped stray Brave → its profile lock freed
+   * @param {number} [opts.heartbeatEveryMs=5000] — wait between pings of a running Brave
+   * @param {number} [opts.heartbeatTimeoutMs=10000] — a ping unanswered this long is a miss
    * @param {typeof spawn} [opts._spawn] — test seam
    * @param {{lockHeld?: (profileDir: string) => boolean, find?: (profileDir: string, exeName: string) => Promise<number[]>,
    *   kill?: (pid: number) => void}} [opts._strays] — test seams for _reapStrays
@@ -115,6 +124,8 @@ class BraveSupervisor extends EventEmitter {
       exitWaitMs: opts.exitWaitMs || EXIT_WAIT_MS,
       proxyProbeTimeoutMs: opts.proxyProbeTimeoutMs || 1500,
       strayExitWaitMs: opts.strayExitWaitMs || 10000,
+      heartbeatEveryMs: opts.heartbeatEveryMs || HEARTBEAT_EVERY_MS,
+      heartbeatTimeoutMs: opts.heartbeatTimeoutMs || HEARTBEAT_TIMEOUT_MS,
     };
     this._spawn = opts._spawn || spawn;
     this._strays = { lockHeld: profileLockHeld, find: findBraveOnProfile, kill: killPid, ...opts._strays };
@@ -270,6 +281,7 @@ class BraveSupervisor extends EventEmitter {
     }
     await this._setCertificateChecks(proc, this._certificateChecksOffReason(proxyServer));
     this._proxyCredentials = proxy ? proxy.credentials : null;
+    this._startHeartbeat(proc);
     this._launches++;
     const via = proxyServer ? `, traffic via proxy ${proxyServer}` : "";
     this._log(`brave pid=${proc.pid} up (CDP over a pipe, no port) in ${Date.now() - t0} ms (launch #${this._launches}${via})`);
@@ -316,7 +328,7 @@ class BraveSupervisor extends EventEmitter {
     const child = this._spawn(exe, args, { stdio: [...STDIO], env: braveEnv(process.env) });
     const proc = {
       child, pid: child.pid, pipe: null,
-      up: false, down: false, closing: false, killed: false, exited: false, exitCode: null, spawnError: null, reaping: null,
+      up: false, down: false, closing: false, killed: false, exited: false, exitCode: null, spawnError: null, reaping: null, heartbeat: null,
     };
     if (child.stdio && child.stdio[3] && child.stdio[4]) {
       proc.pipe = new PipeConnection(child.stdio[3], child.stdio[4]);
@@ -415,9 +427,28 @@ class BraveSupervisor extends EventEmitter {
     }
   }
 
+  /** Pings a Brave that came up, until it goes down or closes; kills it when it stops answering. */
+  _startHeartbeat(proc) {
+    let misses = 0;
+    const schedule = () => {
+      proc.heartbeat = setTimeout(beat, this._t.heartbeatEveryMs);
+      proc.heartbeat.unref();
+    };
+    const beat = async () => {
+      const reply = await proc.pipe.call("Browser.getVersion", null, { timeoutMs: this._t.heartbeatTimeoutMs });
+      if (proc.down || proc.closing) return;
+      misses = reply ? 0 : misses + 1;
+      if (misses < HEARTBEAT_MISSES) return schedule();
+      this._log(`brave pid=${proc.pid} has not answered CDP for ${misses} pings in a row (hung); killing it, and the next call relaunches it`);
+      if (!(await this._kill(proc))) this._log(`brave pid=${proc.pid} survived the kill`);
+    };
+    schedule();
+  }
+
   _onDown(proc, reason) {
     if (proc.down) return;
     proc.down = true;
+    clearTimeout(proc.heartbeat);
     const wasUp = proc.up;
     proc.up = false;
     if (proc.pipe) proc.pipe.close(); // the proxy stops serving it (503) at once

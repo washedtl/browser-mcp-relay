@@ -122,12 +122,18 @@ function runLauncher(argv, {
   log = (msg) => appendLog(brokerLogFile(env), msg),
 } = {}) {
   const [brokerEntry, ...brokerArgs] = argv;
+  // The watchdog stops frozen code with Runtime.terminateExecution; landing
+  // in a timer or event callback, that trips Node's async-hook stack check,
+  // which aborts the process (measured). Without the check the broker lives
+  // (Node 24+: before that AsyncLocalStorage turns the check back on, and such
+  // a freeze still ends the broker, as it did at the watchdog's limit).
+  const nodeArgs = ["--no-force-async-hooks-checks", brokerEntry, ...brokerArgs];
   const childEnv = launchEnv(env);
   if (String(env.BROWSER_RELAY_BROKER_DEELEVATE || "").toLowerCase() !== "off" && isElevated()) {
     try {
       const home = pipeServer.brokerHome(env);
       fs.mkdirSync(home, { recursive: true }); // its working dir
-      launchDeelevated({ args: [brokerEntry, ...brokerArgs], cwd: home, childEnv, env });
+      launchDeelevated({ args: nodeArgs, cwd: home, childEnv, env });
       exit(0);
       return;
     } catch (e) {
@@ -136,7 +142,7 @@ function runLauncher(argv, {
       childEnv.BROWSER_RELAY_BROKER_LAUNCH_WARNING = warning;
     }
   }
-  spawnFn(process.execPath, [brokerEntry, ...brokerArgs], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv }).unref();
+  spawnFn(process.execPath, nodeArgs, { detached: true, stdio: "ignore", windowsHide: true, env: childEnv }).unref();
   exit(0);
 }
 

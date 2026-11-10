@@ -10,7 +10,8 @@ module.exports = {
   name: "storage_clear-local",
   description:
     "Clear localStorage or sessionStorage on this tab's origin and return how many keys were removed. " +
-    "keys limits it to those keys; omit keys to clear the whole store.",
+    "keys limits it to those keys; omit keys to clear the whole store. localStorage is shared with every session " +
+    "on the same origin, so clearing it can log them out too.",
   inputSchema: {
     type: "object",
     properties: {

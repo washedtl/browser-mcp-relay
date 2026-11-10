@@ -84,6 +84,64 @@ test("findChunkByExports: throws when no chunk, or more than one, exports the si
 
 // ─────────────────── installed dist (static, no import) ───────────────────
 
+test("contract: the session context still reads response bodies through _safeReadResponseBody (capResponseBodies wraps it)", () => {
+  const core = fs.readdirSync(UPSTREAM_DIST).filter((f) => /^core-.*\.js$/.test(f)).map((f) => fs.readFileSync(path.join(UPSTREAM_DIST, f), "utf8")).join("\n");
+  assert.match(core, /async _safeReadResponseBody\(res\)/);
+  assert.match(core, /await this\._safeReadResponseBody\(res\)/);
+});
+
+const fakeResponse = (body, length) => ({ body, headers: () => (length === undefined ? {} : { "content-length": String(length) }) });
+
+test("capResponseBodies: small bodies are kept; a big one of unknown size is cut; one declared over the limit is never read", async () => {
+  const reads = [];
+  const ctx = { _safeReadResponseBody: async function (res) { reads.push(this === ctx); return res.body; } };
+  up.capResponseBodies(ctx);
+  assert.strictEqual(await ctx._safeReadResponseBody(fakeResponse("small", 5)), "small");
+  assert.strictEqual(await ctx._safeReadResponseBody(fakeResponse(undefined)), undefined);
+  const big = "x".repeat(up.KEPT_BODY_CHARS + 500);
+  const cut = await ctx._safeReadResponseBody(fakeResponse(big));
+  assert.ok(cut.startsWith("x".repeat(up.KEPT_BODY_CHARS)));
+  assert.ok(cut.length < big.length);
+  assert.match(cut, /cut at \d+ of \d+ characters; capture_xhr/);
+  const before = reads.length;
+  const declared = up.KEPT_BODY_CHARS + 1;
+  assert.strictEqual(await ctx._safeReadResponseBody(fakeResponse(big, declared)), `[response body not kept: ${declared} bytes; capture_xhr can save response bodies to a file]`);
+  assert.strictEqual(reads.length, before, "reading it is what makes Playwright cache it for the page's lifetime");
+  assert.ok(reads.every(Boolean), "the original runs with the context as this");
+});
+
+test("capResponseBodies: a tab stops reading bodies at its budget, per tab", async () => {
+  let reads = 0;
+  const makeCtx = () => ({ _safeReadResponseBody: async (res) => { reads++; return res.body; } });
+  const [a, b] = [makeCtx(), makeCtx()];
+  up.capResponseBodies(a);
+  up.capResponseBodies(b);
+  const chunk = fakeResponse("y".repeat(1024 * 1024));
+  for (let i = 0; i < Math.ceil(up.READ_BUDGET_CHARS / (1024 * 1024)); i++) await a._safeReadResponseBody(chunk);
+  const readSoFar = reads;
+  assert.match(await a._safeReadResponseBody(chunk), /not kept: this tab has already read \d+ characters/);
+  assert.strictEqual(reads, readSoFar);
+  assert.ok((await b._safeReadResponseBody(fakeResponse("fine"))) === "fine", "another tab has its own budget");
+});
+
+test("contract: the tools the broker's call arguments apply to still exist with those arguments", () => {
+  const core = fs.readdirSync(UPSTREAM_DIST).filter((f) => /^core-.*\.js$/.test(f)).map((f) => fs.readFileSync(path.join(UPSTREAM_DIST, f), "utf8")).join("\n");
+  // each search stops at the next tool class, so a neighbour's keys can't satisfy it
+  const inTool = `(?:(?!name\\(\\)\\{return")[\\s\\S])*?`;
+  for (const tool of ["navigation_go-to", "navigation_reload", "navigation_go-back-or-forward"]) {
+    assert.match(core, new RegExp(`name\\(\\)\\{return"${tool}"\\}${inTool}timeout:${inTool}includeScreenshot:${inTool}screenshotOptions:`), tool);
+  }
+  for (const tool of ["content_take-screenshot", "content_save-as-pdf", "content_start-recording"]) {
+    assert.match(core, new RegExp(`name\\(\\)\\{return"${tool}"\\}${inTool}\\bname:`), tool);
+  }
+});
+
+test("capResponseBodies: a context without the method is left alone", () => {
+  const ctx = {};
+  up.capResponseBodies(ctx);
+  assert.deepStrictEqual(ctx, {});
+});
+
 test("contract: package.json still pins browser-devtools-mcp to the version this contract covers", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
   assert.strictEqual(pkg.dependencies["browser-devtools-mcp"], PINNED_UPSTREAM_VERSION,

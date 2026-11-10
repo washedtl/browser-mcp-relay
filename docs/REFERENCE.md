@@ -175,7 +175,7 @@ Hidden by default: `debug` [toolset](#toolsets).
 
 | Tool | Purpose |
 |---|---|
-| `navigation_go-to` | Navigate to a URL |
+| `navigation_go-to` | Navigate to a URL (with `navigation_reload` and `navigation_go-back-or-forward`, a 60 s default `timeout` in broker mode) |
 | `navigation_reload` | Reload the current page |
 | `navigation_go-back-or-forward` | Browser history navigation |
 
@@ -186,7 +186,7 @@ The three trace-context tools are hidden by default: `trace` [toolset](#toolsets
 | Tool | Purpose |
 |---|---|
 | `o11y_get-console-messages` | Page console output |
-| `o11y_get-http-requests` | Captured HTTP requests |
+| `o11y_get-http-requests` | Captured HTTP requests. In broker mode a response body over 64 KB isn't kept, and a tab stops keeping them after 32 MB; `capture_xhr` can save them |
 | `o11y_get-web-vitals` | LCP / INP / CLS / TTFB / FCP |
 | `o11y_get-trace-context` | Current OpenTelemetry trace context |
 | `o11y_set-trace-context` | Set / inject a trace context |
@@ -468,7 +468,7 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_RELAY_BROKER_IDLE_EXIT_MS` | `600000` (10 min) | The broker exits this long after its last session disconnected, closing Brave gracefully first. |
 | `BROWSER_RELAY_BROKER_BROWSER_IDLE_MS` | `1200000` (20 min) | Brave closes gracefully after this long without any tool call, even with sessions connected. The next call relaunches it (~1-2 s), and its tabs answer with a reset notice. |
 | `BROWSER_RELAY_BROKER_DEELEVATE` | on | `off` keeps a broker started from an elevated session elevated, and its Brave with it. Read by the launcher from the **process env only** (the MCP server's `env` block), not from `local-config.json`. |
-| `BROWSER_RELAY_BROKER_WATCHDOG_MS` | `60000` | A watchdog thread kills the broker if its event loop is blocked this long (e.g. a runaway `execute`); the next tool call starts a fresh one. Minimum 10 s; `0` turns it off. It is also off while Node's own debugger is attached. |
+| `BROWSER_RELAY_BROKER_WATCHDOG_MS` | `60000` | A watchdog thread stops the code blocking the broker's event loop after a third of this (e.g. a runaway `execute`; every other session keeps its tabs) and kills the broker if it is still blocked at this limit; the next tool call then starts a fresh one. Minimum 30 s; `0` turns it off. It is also off while Node's own debugger is attached. |
 | `BROWSER_RELAY_BROKER_RECYCLE_RSS_MB` | `1024` | A broker whose memory (RSS) is above this restarts itself once no tool call has run for a minute and either no session is connected or Brave has idled out (no session loses an open tab). `0` turns it off. |
 | `BROWSER_RELAY_BRIDGE_ALLOW` | unset | [Cookie bridge](#cookie-bridge), broker side only: comma-separated domains (each with its subdomains) or IPs the broker accepts even when the keyword guard would hold them. The extension still holds them until you turn them on in its review page, so it makes nothing sync on its own. Never lifts a denylisted category. |
 | `BROWSER_RELAY_BROKER_LOG` | `<broker home>/broker.log` | The broker log (rotated once at startup past 1 MB). The launcher also writes its warnings there; it reads this from the process env only. |
@@ -521,7 +521,9 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 | No session for 10 min | The broker closes Brave gracefully and exits. The next session starts a new one. |
 | Brave crashes or is killed | The broker sees the PID gone, drops every tab, and the next call relaunches Brave (measured ≈ 1.5 s) and answers with the reset notice. A hard kill can lose the last ~30 s of cookie changes; a graceful close loses nothing. |
 | The broker dies | On Windows its Brave goes with it: Node keeps the processes it starts in a job object that is killed when the broker is (measured: Brave gone ≈ 30 ms after a hard kill of the broker). Should a Brave still be left on the broker profile, the next broker finds it by the profile's `lockfile` before launching, kills the processes whose `--user-data-dir` is exactly that profile (nothing else) and launches its own. A request that was in flight gets *"browser broker restarted; please retry the call"*. Each shim reconnects on its session's next message (not before, so a stopped broker stays stopped), restarting the broker if needed, and replays the session's `initialize`; the next call works (measured ≈ 4.5 s, including that retry). |
-| Event loop blocked ≥ 60 s | The watchdog kills the broker, and the next tool call starts a fresh one. |
+| Brave hung (process alive, about 45 s without answering CDP) | The supervisor kills it. Every tab gets a reset notice, and the next call relaunches Brave. |
+| Event loop blocked ≥ 20 s | The watchdog stops the blocking code and the broker carries on. A call that still hasn't answered 2 minutes later gets an error. On Node 20/22, code frozen inside a timer or event callback still ends the broker at this point; the next tool call starts a fresh one. |
+| Event loop still blocked at 60 s | The watchdog kills the broker, and the next tool call starts a fresh one. |
 | Memory above 1 GB while idle | The broker restarts itself, but never under a session's open browser. |
 
 **A graceful close** sends Brave `Browser.close` and waits up to 10 s for it to exit. Brave accepts at once (it closes its CDP pipe within ~6-55 ms) and then writes its cookies and settings, which took 6 s on a machine at 100% CPU. So once it has accepted, it gets up to 30 s in all before it is killed; one that ignores the close is killed at 10 s.
@@ -1038,7 +1040,7 @@ Then `Get-Content <absolute-path>/relay-stderr.log -Tail 50 -Wait` to follow it 
 ### Broker mode: known risks
 
 - **Shared blast radius.** One broker serves every session. A hung tool, a leak or a crash in it affects all sessions at once, where a legacy relay affected one. Mitigations: per-call timeouts on the data-out tools, `uncaughtException` is logged and the broker keeps serving, a watchdog for a blocked event loop, a recycle on high idle memory, and the next call reconnects within seconds.
-- **`execute` runs in-process.** Upstream's `execute` (and `scenario-run`) evaluate agent-written JavaScript inside the broker process, shared by every session. A runaway script blocks all of them until the watchdog restarts the broker.
+- **`execute` runs in-process.** Upstream's `execute` (and `scenario-run`) evaluate agent-written JavaScript inside the broker process, shared by every session. A runaway script blocks all of them until the watchdog stops it (20 s), or restarts the broker if it can't.
 - **Pipe access is browser access.** Any process of yours that can open the pipe drives the logged-in Brave. `broker.key` only stops a fake broker from impersonating the real one; it does not keep any client out. That is why the broker de-elevates; when it can't, it says so in the log and in every session.
 - **CDP port: broker mode: none; legacy: unauthenticated port.** In broker mode Brave has no DevTools port (`--remote-debugging-pipe`), and CDP is served only behind the broker's secret URL (see *Idle, crashes, restarts*). A process that can read the broker's memory can find the secret, but a process running as you can likely read the profile on disk anyway (not measured). Legacy mode keeps an unauthenticated port: while its Brave is up, any local process can connect to the fixed `9333 + slot - 1` port (127.0.0.1 only), drive the logged-in Brave and read its cookies.
 - **Cookie bridge: what it puts in Brave, every session can use.** With the [cookie bridge](#cookie-bridge) installed, your Chrome logins for every non-denylisted domain you approved are in the shared Brave, so any session (and any page script, `execute` included) can act as you there. Tool results hide those values (`cookies_export`), but nothing stops a page script from reading non-HttpOnly cookies. Anything holding `broker.key` can also push cookies into Brave over the pipe, and a cookie flagged `userOverride: true` passes the broker's policy. That adds little: `broker.key` already gives a session, which drives Brave fully.

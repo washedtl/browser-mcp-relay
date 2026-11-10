@@ -2,7 +2,22 @@
 
 ## Unreleased
 
-- **A Brave that exits during launch is relaunched** (up to 3 attempts, broker mode). A one-off early exit used to fail the tool call; a stray Brave that took the profile meanwhile is reaped before the relaunch. A missing executable or a Brave that hangs is not retried.
+### Several sessions at once
+
+Found by running 5 sessions with 4 parallel agents each against one broker.
+
+- **Screenshots, PDFs and recordings no longer overwrite each other.** Upstream named files to the second, so agents saving in the same second got one path and read each other's page. Broker-mode names now carry the session, tab and a counter.
+- **Navigation has a 60 s default timeout.** Upstream's default is none, so a page whose load event never fires held the call open for good. An explicit `timeout` (even `0`) is kept.
+- **`lighthouse_audit` runs one audit at a time**, each bounded at 5 minutes. A second concurrent audit failed the first (`performance mark has not been set`).
+- **A runaway `execute` no longer takes every session down.** The watchdog stops the blocking code at a third of its limit (20 s) and only kills the broker if that doesn't help; a call left unanswered gets an error. `BROWSER_RELAY_BROKER_WATCHDOG_MS` now has a 30 s minimum.
+- **A hung Brave is detected.** Its PID and pipe stay alive, so nothing noticed, and every session's next tab waited on it for good. After three unanswered pings (about 45 s) it's killed and the next call relaunches it.
+- **Response bodies are bounded.** Upstream read every non-static body into the shared heap, and Playwright caches what it read for the page's lifetime: 8 tabs fetching 360 MB per round grew the broker ~780 MB a round, without end. A body declared over 64 KB is no longer read (`o11y_get-http-requests` shows a note; `capture_xhr` can save it), one of unknown size is kept up to 64 KB, and a tab stops reading bodies after 32 MB.
+- **tabIds don't repeat after a broker restart.** A counter from 0 could give a subagent's old tabId to a sibling's new tab.
+- `tabs_list` no longer waits on a page stuck in a loop. `tabs_new` and the server instructions tell agents to `tabs_close` when done; `storage_clear-local` says localStorage is shared.
+
+### Launching
+
+- **A Brave that exits during launch is relaunched** (up to 3 attempts, broker mode). An early exit used to fail the tool call (traced to CCleaner's Performance Optimizer waking a "sleeping" Brave on the first launch after idle: exclude Brave there to avoid the retry); a stray Brave that took the profile meanwhile is reaped before the relaunch. A missing executable or a Brave that hangs is not retried.
 - **Launch failures are in `broker.log`**, every attempt. They used to reach only the calling session.
 - **The early-exit error says what it found**: whether something holds the profile right now, instead of always guessing that another Brave does.
 - The "credential-vault autofill isn't available" warning appears only when `BROWSER_RELAY_VAULT_FILES` names a file that exists. A list of missing files had nothing to lose, but put the warning in every session's first tool result.

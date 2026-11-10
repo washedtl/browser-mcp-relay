@@ -25,8 +25,9 @@
 //                 window between "CDP up" and "launch done")
 //   linger        after Fake.drop, keep running 1500 ms, then exit 0
 //   hang          after Fake.drop, keep running until killed
-// Test-only CDP method: Fake.drop closes the pipe (a CDP disconnect while the
-// process stays up); without linger/hang the process then exits.
+// Test-only CDP methods: Fake.drop closes the pipe (a CDP disconnect while the
+// process stays up); without linger/hang the process then exits. Fake.silent
+// stops every reply while pipe and process stay (a hung browser thread).
 
 const fs = require("node:fs");
 const net = require("node:net");
@@ -70,8 +71,11 @@ function serve() {
       onMessage(msg);
     }
   });
+  let silent = false;
   function onMessage(msg) {
     fs.appendFileSync(path.join(userDataDir, "fake-cdp.jsonl"), JSON.stringify({ pid: process.pid, method: msg.method, params: msg.params || null }) + "\n");
+    if (msg.method === "Fake.silent") silent = true;
+    if (silent) return;
     const reply = (result) => out.write(JSON.stringify({ id: msg.id, result, ...(msg.sessionId ? { sessionId: msg.sessionId } : {}) }) + "\0");
     if (msg.method === "Browser.close") {
       reply({});
