@@ -1065,6 +1065,8 @@ test("SERVER_INSTRUCTIONS: says how to read a page, keep results small and batch
   }
   // the script gets a nested output without a third argument; `true` also copies each one into the result
   assert.doesNotMatch(SERVER_INSTRUCTIONS, /callTool\([^)]*,\s*true\s*\)/);
+  // Playwright cannot hand a resized page back to its window's size, so the width check gets a tab of its own
+  assert.match(SERVER_INSTRUCTIONS, /several widths[^\n]*in a tab from tabs_new that you close after: the last width stays until its page is closed\./);
 });
 
 test("brokerEnv: local-config.json values reach process.env (in-process upstream reads only that); real env wins", () => {
