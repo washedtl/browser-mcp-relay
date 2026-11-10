@@ -88,6 +88,6 @@ module.exports = {
 
     // Other (2)
     { name: "execute", description: "Batch-execute multiple tool calls in one request via custom JS — reduces round-trips", category: "execute" },
-    { name: "sync_wait-for-network-idle", description: "Wait until in-flight requests ≤ N for idleMs", category: "sync" },
+    { name: "sync_wait-for-network-idle", description: "Wait until in-flight requests ≤ N for idleTimeMs", category: "sync" },
   ],
 };

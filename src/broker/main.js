@@ -129,10 +129,24 @@ const TAB_ID_SCHEMA = Object.freeze({
   description: "Tab from tabs_new; omit for your main tab.",
 });
 
-const SERVER_INSTRUCTIONS =
-  "Debug / React / scenario / trace tools are hidden to save context. " +
-  "If a task clearly needs one, ask the user, then call the `toolsets` tool. " +
-  "Parallel subagents share this session's browser tab: each should call tabs_new, pass the returned tabId on every call, and call tabs_close when done.";
+// What every session is told about using the browser. Claude Code keeps the
+// first 2,048 characters (4,096 from v2.1.296). test/upstream-contract.test.js
+// checks every tool and argument named here against upstream.
+const SERVER_INSTRUCTIONS = [
+  "Start with navigation_go-to: it returns the page as an accessibility tree in `output`, where each element carries [ref=eN]. " +
+    "Pass a ref as the `selector` of interaction_* tools and content_take-screenshot (\"e12\" or \"@e12\"); any other tool's `selector` is CSS. " +
+    "Refs last until the next snapshot or navigation, so take a new snapshot (a11y_take-aria-snapshot) after the page changes. " +
+    "The separate `refs` map is left out of results: every ref is in the tree.",
+  "Big pages: pass includeSnapshot:false or snapshotOptions:{interactiveOnly:true} to navigation tools, then a11y_take-aria-snapshot " +
+    "with a `selector` for the part you need. A result over about 30,000 characters is cut and the full text is saved to a file " +
+    "named in the result; Read that file with offset/limit or Grep it.",
+  "content_take-screenshot saves an image file and returns its path: Read the path to see it. For checks at several widths, run " +
+    "interaction_resize-viewport then content_take-screenshot per width (e.g. 1920, 1440, 1024, 390) inside one `execute` call.",
+  "`execute` batches steps in one call: `await callTool(name, input)` runs a tool and returns its output to the script; `page` is the Playwright page. " +
+    "Return only what you need from the script.",
+  "Parallel subagents share this session's browser tab: each should call tabs_new, pass the returned tabId on every call, and call tabs_close when done.",
+  "Debug / React / scenario / trace tools are hidden to save context. If a task clearly needs one, ask the user, then call the `toolsets` tool.",
+].join("\n");
 
 // Tools that need a rendering window: a minimized one stalls rAF and
 // screenshots for 3-5 s, so it is restored first.
@@ -266,7 +280,10 @@ function tabKeyOf(tabId) {
 
 const unknownTabMessage = (tabKey) => `unknown tabId ${JSON.stringify(tabKey)}; call tabs_new or tabs_list`;
 
-const errorResult = (text) => ({ content: [{ type: "text", text }], isError: true });
+// Playwright colours its error text for a terminal; in a tool result the codes are noise.
+const stripAnsi = (s) => String(s).replace(/\u001b\[[0-9;]*m/g, "");
+
+const errorResult = (text) => ({ content: [{ type: "text", text: stripAnsi(text) }], isError: true });
 
 /**
  * A tools/call result with the CDP secret taken out, wherever it sits
@@ -299,6 +316,14 @@ const SYNC_CONTEXT_MEMBERS = new Set(["pages", "browser", "on", "once", "off", "
  * becomes image content (SVG as text), "_"-prefixed keys are dropped, the
  * rest is pretty-printed JSON text. No structuredContent: W1B serves no
  * outputSchema, so it would only repeat the text.
+ *
+ * Two things differ from upstream's server. A snapshot's `refs` map is left
+ * out: it lists each [ref=eN] of the tree text beside it again, with the
+ * role, name and selector upstream finds it by, and a caller passes only the
+ * ref. It was two thirds of the result (measured: 27 of 42 thousand
+ * characters on a dashboard). And execute's error text and the lines its
+ * script logged lose Playwright's colour codes; what the script returns is
+ * left as it is (it can be page content).
  */
 function toCallToolResult(response) {
   const res = response && typeof response === "object" ? response : { result: response };
@@ -309,6 +334,11 @@ function toCallToolResult(response) {
     delete res.image;
   }
   for (const key of Object.keys(res)) if (key.startsWith("_")) delete res[key];
+  dropRefs(res);
+  if (Array.isArray(res.toolOutputs)) for (const t of res.toolOutputs) dropRefs(t && t.output); // execute, scenario-run
+  if (typeof res.error === "string") res.error = stripAnsi(res.error);
+  if (res.failedTool && typeof res.failedTool.error === "string") res.failedTool = { ...res.failedTool, error: stripAnsi(res.failedTool.error) };
+  if (Array.isArray(res.logs)) res.logs = res.logs.map((l) => (l && typeof l.message === "string" ? { ...l, message: stripAnsi(l.message) } : l)); // a caught error the script logged
   const content = [{ type: "text", text: JSON.stringify(res, null, 2) }];
   if (image) {
     content.push(image.mimeType === "image/svg+xml"
@@ -316,6 +346,11 @@ function toCallToolResult(response) {
       : { type: "image", data: image.data.toString("base64"), mimeType: image.mimeType });
   }
   return { content, isError: false };
+}
+
+/** Removes the `refs` map of a snapshot result: one with the tree text in `output` beside it. */
+function dropRefs(o) {
+  if (o && typeof o === "object" && typeof o.output === "string" && o.refs && typeof o.refs === "object") delete o.refs;
 }
 
 function withNotice(result, notice) {
@@ -355,6 +390,19 @@ function withNavTimeoutSchema(tool) {
   if (!timeout) return tool;
   const properties = { ...tool.inputSchema.properties, timeout: { ...timeout, default: NAV_DEFAULT_TIMEOUT_MS, description: `Max wait ms. Default ${NAV_DEFAULT_TIMEOUT_MS}; 0=no timeout.` } };
   return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
+}
+
+// Upstream's descriptions that promise the `refs` map toCallToolResult leaves out.
+const REFS_MAP_PROMISES = [
+  ["returned in `output` and `refs`", "returned in `output`"], // navigation_go-to
+  ["Returns a tree with refs (e1, e2, ...) and a refs map.", "Returns a tree with refs (e1, e2, ...)."], // a11y_take-aria-snapshot
+];
+
+/** tools/list describes the results the broker returns: a snapshot comes without the `refs` map. */
+function withoutRefsMapPromise(tool) {
+  if (typeof tool.description !== "string") return tool;
+  const description = REFS_MAP_PROMISES.reduce((text, [from, to]) => text.replace(from, to), tool.description);
+  return description === tool.description ? tool : { ...tool, description };
 }
 
 function withTabIdSchema(tool) {
@@ -428,6 +476,8 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   const PKG = require("../../package.json");
 
   const { redact } = require("./cdp-proxy.js");
+  const { limitResult } = require("./result-limit.js");
+  const resultsDir = path.join(path.dirname(keyFile), "results"); // where the full text of a cut result goes
   // The only CDP endpoint, with its secret: for upstream and own-tools, never for display.
   const cdpUrl = cdpProxy.wsUrl;
   const startedAt = Date.now();
@@ -450,13 +500,20 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   // Upstream in-process, once, bound to our fixed CDP URL. Needs no Brave:
   // upstream only connects inside a session context.
   let upstreamPromise = null;
+  let outputSeq = 0; // numbers each call's output files and saved results
+  // A tool called from inside execute or scenario-run gets its output files
+  // named apart like a tools/call does. Its arguments are parsed already, so
+  // upstream's own navigation timeout (none) stands: the script's timeoutMs
+  // (30 s unless the caller sets it, 120 s at most) is what ends the call,
+  // and with timeoutMs: 0 nothing does.
+  const nestedArgs = (name, args) => brokerCallArgs(name, args, args, `x${++outputSeq}`);
   function getUpstream() {
     if (!upstreamPromise) {
       upstreamPromise = (async () => {
         const t0 = Date.now();
         let up;
         try {
-          up = await upstreamModule.loadUpstream({ cdpUrl, env });
+          up = await upstreamModule.loadUpstream({ cdpUrl, env, nestedArgs });
         } finally {
           // Upstream read it at import (into a constant): no child process
           // or env dump of this one should see the secret.
@@ -581,9 +638,10 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     }
   }
 
-  /** A forwarded (upstream) tools/call, as upstream's own server would answer it; never carries the CDP secret. */
+  /** A forwarded (upstream) tools/call: the CDP secret taken out first, then cut to a size a session can read (the saved full text is the redacted one). */
   async function callUpstream(connId, name, rawArgs) {
-    return redactResult(await callUpstreamRaw(connId, name, rawArgs));
+    const result = redactResult(await callUpstreamRaw(connId, name, rawArgs));
+    return limitResult(result, { dir: resultsDir, tool: name, tag: `${connId}-${++outputSeq}`, log });
   }
 
   // Calls in flight. Code the watchdog stopped never settles, and the stop can
@@ -605,7 +663,6 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     return entry;
   }
 
-  let outputSeq = 0;
   async function callUpstreamRaw(connId, name, rawArgs) {
     try {
       const { tabId, ...args } = rawArgs || {};
@@ -675,7 +732,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
         } catch (e) {
           // RelayServer turns it into its usual isError result from .message.
           // A new Error: the thrown one's message may not be writable.
-          throw new Error(redact(e && e.message !== undefined ? e.message : e));
+          throw new Error(stripAnsi(redact(e && e.message !== undefined ? e.message : e)));
         }
       },
     };
@@ -816,7 +873,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     for (const tool of ownTools) relay.registerOwnTool(brokerOwnTool(tool, connId, relay));
     mcp.setRequestHandler(ListToolsRequestSchema, async () => {
       const list = await relay.handleToolsList();
-      return { ...list, tools: list.tools.map((t) => (takesTabId(t.name) ? withTabIdSchema(withNavTimeoutSchema(t)) : t)) };
+      return { ...list, tools: list.tools.map((t) => withoutRefsMapPromise(takesTabId(t.name) ? withTabIdSchema(withNavTimeoutSchema(t)) : t)) };
     });
     mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       policy.callStarted();
@@ -1117,9 +1174,13 @@ module.exports = {
   startWatchdog,
   prepareWorkDir,
   toCallToolResult,
+  brokerCallArgs,
   withNavTimeoutSchema,
+  withoutRefsMapPromise,
+  REFS_MAP_PROMISES,
   tabKeyOf,
   TAB_ID_SCHEMA,
+  SERVER_INSTRUCTIONS,
   NEEDS_RENDERING_RE,
   DEFAULT_EXIT_IDLE_MS,
   DEFAULT_BROWSER_IDLE_MS,
