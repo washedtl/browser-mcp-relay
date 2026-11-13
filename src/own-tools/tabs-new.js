@@ -27,7 +27,7 @@ module.exports = {
     "Open a new tab, optionally navigating to a URL, and return its tabId. Pass the tabId on later calls " +
     "to act on that tab (a tool that can't take it says so); without it, calls act on your main tab. " +
     "Parallel subagents share one connection: each should open its own tab, pass its tabId, and call tabs_close when done " +
-    "(the broker can't see a subagent finish, so its window otherwise stays until the session ends).",
+    "(the broker can't see a subagent finish, so its window otherwise stays until the session ends; broker mode also closes a tab after 20 min without a call, by default).",
   inputSchema: {
     type: "object",
     properties: {

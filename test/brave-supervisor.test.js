@@ -19,6 +19,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
+const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -31,6 +32,7 @@ const {
   BraveSupervisor,
   buildBraveArgs,
   disableMemorySaver,
+  forgetLastSession,
   resolveProxy,
   isLoopbackHost,
   braveEnv,
@@ -263,6 +265,50 @@ test("disableMemorySaver: does NOT write Default/Preferences (measured: Brave 14
   const dir = tmpProfile("ms-prefs");
   disableMemorySaver(dir);
   assert.ok(!fs.existsSync(path.join(dir, "Default")));
+});
+
+test("forgetLastSession: the saved session goes; the rest of the profile (cookies, prefs, Local State) stays", () => {
+  const dir = tmpProfile("forget-session");
+  const keep = { "Local State": "{}", "Default/Preferences": "{}", "Default/Network/Cookies": "db", "Default/History": "db" };
+  for (const [rel, body] of Object.entries({ ...keep, "Default/Sessions/Session_1": "s", "Default/Sessions/Tabs_1": "t" })) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), body);
+  }
+  const log = collectLog();
+  forgetLastSession(dir, log);
+  assert.ok(!fs.existsSync(path.join(dir, "Default", "Sessions")));
+  for (const [rel, body] of Object.entries(keep)) assert.strictEqual(fs.readFileSync(path.join(dir, rel), "utf8"), body, rel);
+  assert.deepStrictEqual(log.lines, []);
+});
+
+test("forgetLastSession: nothing saved yet → nothing to do, no warning", () => {
+  const dir = tmpProfile("forget-none");
+  const log = collectLog();
+  forgetLastSession(dir, log);
+  assert.deepStrictEqual(log.lines, []);
+});
+
+test("forgetLastSession: a folder that cannot be removed warns and never throws (the launch goes on)", () => {
+  const dir = tmpProfile("forget-busy");
+  const rmSync = fs.rmSync;
+  fs.rmSync = () => { throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" }); };
+  const log = collectLog();
+  try {
+    assert.doesNotThrow(() => forgetLastSession(dir, log));
+  } finally {
+    fs.rmSync = rmSync;
+  }
+  assert.ok(log.lines.some((l) => /Sessions/.test(l) && /EBUSY/.test(l) && /last run's windows/.test(l)), log.lines.join("\n"));
+});
+
+test("ensure(): the saved session is gone before Brave is spawned", async () => {
+  const dir = tmpProfile("fake-forget");
+  fs.mkdirSync(path.join(dir, "Default", "Sessions"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "Default", "Sessions", "Session_1"), "s");
+  const seen = [];
+  const { sup } = fakeSupervisor(dir, { onSpawn: () => seen.push(fs.existsSync(path.join(dir, "Default", "Sessions"))) });
+  await sup.ensure();
+  assert.deepStrictEqual(seen, [false]);
 });
 
 test("isLoopbackHost: 127.0.0.0/8, localhost (+ subdomains, trailing dot), ::1 — nothing else (W1E policy)", () => {
@@ -1147,6 +1193,33 @@ test("real Brave: graceful close keeps a cookie set 2 s before close (spike E7a)
   const { cookies } = await cdp2.send("Storage.getCookies");
   await cdp2.close();
   assert.ok(cookies.some((c) => c.name === "w2c_e7a" && c.value === "graceful-2s"), `cookie lost; have: ${cookies.map((c) => c.name)}`);
+});
+
+test("real Brave: a relaunch does not bring back the last run's windows", REAL, async () => {
+  // Under --no-startup-window, Brave restored them as soon as the first window opened: windows no session tracks
+  const server = http.createServer((req, res) => { res.setHeader("Content-Type", "text/html"); res.end(`<title>left ${req.url}</title>left`); });
+  const port = await listen(server);
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    const dir = tmpProfile("real-no-restore");
+    const { sup, proxy } = await realSupervisor(dir);
+    await sup.ensure();
+    const cdp = await openCdp(proxy.wsUrl);
+    await cdp.send("Target.createTarget", { url: `${base}/one`, newWindow: true, background: true });
+    await cdp.send("Target.createTarget", { url: `${base}/two`, newWindow: true, background: true });
+    await sleep(2000); // both pages loaded, so the session Brave saves at close holds their URLs
+    await cdp.close();
+    assert.strictEqual((await sup.closeGracefully()).graceful, true);
+    await sup.ensure();
+    const cdp2 = await openCdp(proxy.wsUrl);
+    await cdp2.send("Target.createTarget", { url: "about:blank", newWindow: true, background: true }); // as a session's first tab does
+    await sleep(3000); // a restore lands within about a second of that window
+    const { targetInfos } = await cdp2.send("Target.getTargets");
+    await cdp2.close();
+    assert.deepStrictEqual(targetInfos.filter((t) => t.type === "page").map((t) => t.url), ["about:blank"]);
+  } finally {
+    server.close();
+  }
 });
 
 test("real Brave: after a root-only hard kill, the immediate relaunch still reads the persisted cookies", REAL, async () => {

@@ -480,11 +480,11 @@ All paths the relay needs are auto-detected by default. Override them with these
 | Env var | Default | Purpose |
 |---|---|---|
 | `BROWSER_RELAY_MODE` | `broker` on Windows, `legacy` elsewhere | `broker`: `src/index.js` is the shim and joins the shared broker. `legacy`: one relay + Brave + upstream per session (the pre-v0.4 model). On macOS and Linux the broker's unix-socket code is untested (never run), so legacy stays the default there. |
-| `BROWSER_RELAY_BROKER_PROFILE_DIR` | `<broker home>/profile` | The broker's one persistent Brave profile. The pipe name is derived from it, so two profile dirs mean two brokers. |
+| `BROWSER_RELAY_BROKER_PROFILE_DIR` | `<broker home>/profile` | The broker's one persistent Brave profile. The pipe name is derived from it, so two profile dirs mean two brokers. The broker removes its saved session (`Default/Sessions`) before each launch, so don't point it at a profile whose open tabs you want back. |
 | `BROWSER_RELAY_BROKER_PIPE` | `\\.\pipe\browser-mcp-relay-<user>-<hash of user + profile>` | Override the pipe (tests use a unique one). On unix (untested): `<tmpdir>/browser-mcp-relay-<uid>/<hash>.sock` in a private 0700 dir. |
 | `BROWSER_RELAY_BROKER_WINDOWS` | `cascade` | `cascade`: visible, stepped windows, one per session tab. `offscreen`: windows left of every display; they still render at full speed, and `browser_show` brings one into view. |
 | `BROWSER_RELAY_BROKER_IDLE_EXIT_MS` | `600000` (10 min) | The broker exits this long after its last session disconnected, closing Brave gracefully first. |
-| `BROWSER_RELAY_BROKER_BROWSER_IDLE_MS` | `1200000` (20 min) | Brave closes gracefully after this long without any tool call, even with sessions connected. The next call relaunches it (~1-2 s), and its tabs answer with a reset notice. |
+| `BROWSER_RELAY_BROKER_BROWSER_IDLE_MS` | `1200000` (20 min) | Brave closes gracefully after this long without any tool call, even with sessions connected. The next call relaunches it (~1-2 s), and its tabs answer with a reset notice. A tab with no call for this long closes on its own too (checked once a minute). |
 | `BROWSER_RELAY_BROKER_DEELEVATE` | on | `off` keeps a broker started from an elevated session elevated, and its Brave with it. Read by the launcher from the **process env only** (the MCP server's `env` block), not from `local-config.json`. |
 | `BROWSER_RELAY_BROKER_WATCHDOG_MS` | `60000` | A watchdog thread stops the code blocking the broker's event loop after a third of this (e.g. a runaway `execute`; every other session keeps its tabs) and kills the broker if it is still blocked at this limit; the next tool call then starts a fresh one. Minimum 30 s; `0` turns it off. It is also off while Node's own debugger is attached. |
 | `BROWSER_RELAY_BROKER_RECYCLE_RSS_MB` | `1024` | A broker whose memory (RSS) is above this restarts itself once no tool call has run for a minute and either no session is connected or Brave has idled out (no session loses an open tab). `0` turns it off. |
@@ -529,12 +529,14 @@ Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to cla
 
 - One MCP connection is one Claude session, and its subagents share it. The session's `main` tab is opened on its first page tool. `tabs_new` opens more, each in its own window, and returns a `tabId` that every page tool accepts. Only `tabs_new` creates tabs: an unknown `tabId` is an error.
 - `tabs_list`, `tabs_select` and `tabs_close` see only the calling session's tabs. Cookies (`cookies_*`) are shared by design: there is one profile.
-- A session's tabs close when it disconnects.
+- A session's tabs close when it disconnects, and a tab with no tool call for 20 min closes on its own, even while its session stays open (see the table below).
+- Brave does not reopen the windows of its last run: the broker removes the saved session (`Default/Sessions`) before each launch. Before, Brave brought them back as soon as a session's first window opened, and no session owned them, so nothing closed them.
 
 ### Idle, crashes, restarts
 
 | Event | What happens |
 |---|---|
+| No tool call on a tab for 20 min | Its window closes, even while other tabs or sessions keep the browser busy. A tab with a call in flight is never closed. Its next call reopens it, and the result starts with the reset notice below. |
 | No tool call for 20 min | Brave closes gracefully (cookies flushed). The next call relaunches it, and each tab's next result starts with a one-line *"This tab was reset because …"* notice. |
 | No session for 10 min | The broker closes Brave gracefully and exits. The next session starts a new one. |
 | Brave crashes or is killed | The broker sees the PID gone, drops every tab, and the next call relaunches Brave (measured ≈ 1.5 s) and answers with the reset notice. A hard kill can lose the last ~30 s of cookie changes; a graceful close loses nothing. |
@@ -887,7 +889,7 @@ For code that imports `src/inspector-server.js` (or `scripts/inspector.js`) dire
 - **Restart it** (new settings, a wedged Brave): run `npm run broker:stop`. The next tool call in any session starts a fresh broker.
 - **"the broker key file … is missing while a broker runs"**: `broker.key` was deleted while a broker runs. The broker writes it back within ~30 s: retry the call then. The session never makes a key of its own while a broker answers. If it persists, run `npm run broker:stop` (close sessions first) and retry.
 - **"browser broker restarted; please retry the call"**: the broker died while that call was in flight. Retry it: the retry reconnects, starting a new broker if needed.
-- **"This tab was reset because …"**: Brave was relaunched (crash, idle close, broker restart). The tab's URL, console and network buffers, element refs, stubs and emulation are gone. Navigate again.
+- **"This tab was reset because …"**: Brave was relaunched (crash, idle close, broker restart), or the tab had no tool call for 20 min and was closed. The tab's URL, console and network buffers, element refs, stubs and emulation are gone. Navigate again.
 - **"the pipe's owner failed authentication … the broker key changed or is missing"**: something other than your broker holds the pipe name: close it, or set `BROWSER_RELAY_BROKER_PIPE`. (Rarely, `broker.key` was replaced by hand while a broker runs: the broker restores only a *missing* key, so end that broker process and retry.)
 - **"… is still locked by another browser … not launching on it"**: a browser the broker could not end holds its profile (an elevated one under a de-elevated broker, or one whose executable isn't the configured Brave). Close it, then retry the call. A Brave left by an earlier broker is ended automatically.
 - **"the browser broker runs elevated"** warning: de-elevation failed (no desktop shell, or UAC off), so the broker and its Brave run as administrator. A process at medium integrity can then reach an elevated Brave through the pipe.

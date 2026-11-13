@@ -20,6 +20,9 @@
 //     about:blank would be misread as "my page is blank".
 //   - A context that finishes creating after a reset (or after its
 //     connection closed) is closed and never handed out.
+//   - A tab with no call for a while is closed (closeIdle), as a reset: a
+//     session that stays open no longer keeps the windows of work it has
+//     finished. A tab with a call in flight (hold) is never closed.
 
 "use strict";
 
@@ -79,6 +82,7 @@ class SessionRegistry {
     this._conns = new Map(); // connId → Map<tabKey, entry {promise, ctx}>
     this._notices = new Map(); // connId → Map<tabKey, reason>
     this._closedConns = new Set(); // connIds that left: a late call must not open a tab for them
+    this._use = new Map(); // connId → Map<tabKey, {busy: calls in flight, last: when one last started or ended}>
     this._epoch = 0; // bumped by invalidateAll; a creation from an older epoch is stale
     this._lock = Promise.resolve(); // context-creation mutex
     if (typeof supervisor.on === "function") {
@@ -111,7 +115,7 @@ class SessionRegistry {
       tabs.delete(tabKey);
       this._setNotice(connId, tabKey, "the browser disconnected");
     }
-    const fresh = { ctx: null, promise: null };
+    const fresh = { ctx: null, promise: null, openedAt: Date.now() };
     tabs.set(tabKey, fresh);
     fresh.promise = this._create(connId, tabKey, fresh);
     // never cache a rejected creation
@@ -197,8 +201,8 @@ class SessionRegistry {
 
   /**
    * This connection's tabs, main first: state "open" (page ready), "opening"
-   * (being created) or "reset" (dropped by a browser restart; reopens on the
-   * next call with this tabKey).
+   * (being created) or "reset" (dropped by a browser restart, or closed by
+   * closeIdle; reopens on the next call with this tabKey).
    * @returns {Array<{tabKey: string, state: "open"|"opening"|"reset", page: object|null}>}
    */
   listTabs(connId) {
@@ -225,6 +229,8 @@ class SessionRegistry {
     const entry = tabs && tabs.get(tabKey);
     const notices = this._notices.get(connId);
     const hadNotice = Boolean(notices && notices.delete(tabKey));
+    const uses = this._use.get(connId);
+    if (uses && !(uses.get(tabKey)?.busy > 0)) uses.delete(tabKey); // a call still holding it keeps a reopened tab from closing under it
     if (!entry) return hadNotice;
     tabs.delete(tabKey);
     if (entry.ctx) await closeQuietly(entry.ctx, this._log);
@@ -238,8 +244,56 @@ class SessionRegistry {
     const tabs = this._conns.get(connId);
     this._conns.delete(connId);
     this._notices.delete(connId);
+    this._use.delete(connId);
     if (!tabs) return;
     await Promise.all([...tabs.values()].filter((e) => e.ctx).map((e) => closeQuietly(e.ctx, this._log)));
+  }
+
+  /**
+   * A call on this tab has started: until the returned release() runs, the
+   * tab is in use and closeIdle leaves it open. Its idle time counts from
+   * the later of the call's start and end.
+   * @returns {() => void}
+   */
+  hold(connId, tabKey) {
+    if (this._closedConns.has(connId)) return () => {}; // nothing left to keep open
+    let uses = this._use.get(connId);
+    if (!uses) this._use.set(connId, (uses = new Map()));
+    const use = uses.get(tabKey) || { busy: 0, last: 0 };
+    uses.set(tabKey, use);
+    use.busy++;
+    use.last = Date.now();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      use.busy--;
+      use.last = Date.now();
+    };
+  }
+
+  /**
+   * Close every open tab with no call in flight and none started or ended
+   * for idleMs (counted from its opening when it had none). Its next call
+   * opens a fresh page with a reset notice giving `reason`, as after a
+   * browser restart. Resolves how many tabs were closed.
+   */
+  async closeIdle(idleMs, reason) {
+    const now = Date.now();
+    const closing = [];
+    for (const [connId, tabs] of this._conns) {
+      for (const [tabKey, entry] of tabs) {
+        if (!entry.ctx) continue; // still opening
+        const use = this._use.get(connId)?.get(tabKey);
+        if (use && use.busy > 0) continue;
+        if (now - Math.max(entry.openedAt, use ? use.last : 0) < idleMs) continue;
+        tabs.delete(tabKey);
+        this._setNotice(connId, tabKey, reason);
+        closing.push(closeQuietly(entry.ctx, this._log));
+      }
+    }
+    await Promise.all(closing);
+    return closing.length;
   }
 
   /**

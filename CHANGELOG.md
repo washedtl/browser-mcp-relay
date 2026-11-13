@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Windows close when the work is done
+
+- **Brave no longer reopens the last run's windows.** Brave was started with `--no-startup-window`, and still brought back every window of its last run as soon as a session's first window opened, whatever the startup setting said. No session owned those windows, so nothing ever closed them, and each run saved them again (measured: after two days the broker's Brave had 11 windows and tracked 3, using 2.6 GB). The broker now removes the saved session (`Default/Sessions`) before each launch; cookies, logins and history are kept.
+- **A tab with no tool call for 20 min closes on its own**, even while its session stays open. Until now a tab closed only when the agent called `tabs_close`, its session ended, or no session at all made a call for 20 min, so a finished task's window stayed open while other sessions worked. A tab with a call in flight is never closed. Its next call reopens it with the usual reset notice. The time is `BROWSER_RELAY_BROKER_BROWSER_IDLE_MS`, the one Brave's own idle close uses.
+
 ### Faster navigation, results that fit
 
 Found by measuring what an agent gets back from real sites. Broker mode.

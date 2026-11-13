@@ -98,11 +98,12 @@ function fakeCtx(sessionKey) {
  * "leak-huge://" (in the first and the last line of a result too long to
  * return whole). "huge://" returns a snapshot of a 2,000-row page (the tree text in `output`
  * plus the `refs` map upstream adds beside it); "ansi://" throws with the
- * colour codes Playwright puts in its errors. `state.nestedArgs` is the
+ * colour codes Playwright puts in its errors; "wait://<name>" stays in flight
+ * until the test calls `state.waits[name]()`. `state.nestedArgs` is the
  * function the broker passed to loadUpstream.
  */
 function fakeUpstreamModule() {
-  const state = { loads: [], contexts: [], executed: [], order: [], cdpUrl: null };
+  const state = { loads: [], contexts: [], executed: [], order: [], cdpUrl: null, waits: {} };
   const tabId = z.string().optional();
   const tool = (name, run) => ({ name: () => name, run });
   const tools = [
@@ -134,6 +135,7 @@ function fakeUpstreamModule() {
           return { url: args.url, output: rows.join("\n"), refs: Object.fromEntries(rows.map((_, i) => [`e${i}`, { role: "row", name: `item ${i}` }])) };
         }
         if (args.url === "ansi://") throw new Error("locator.click: \u001b[2mTimeout 800ms exceeded.\u001b[22m");
+        if (args.url.startsWith("wait://")) await new Promise((r) => { state.waits[args.url.slice(7)] = r; }); // in flight until the test calls state.waits[name]()
         return { navigated: args.url, session: ctx.sessionKey };
       }),
     },
@@ -288,7 +290,9 @@ const probeOwnTool = {
   name: "own_probe",
   description: "Reports its broker context",
   inputSchema: { type: "object", properties: { v: { type: "string" }, tabId: TAB_ID } },
+  waits: {}, // v "wait:<name>" stays in flight until the test calls waits[name]()
   async handler(args, ctx) {
+    if (typeof args.v === "string" && args.v.startsWith("wait:")) await new Promise((r) => { probeOwnTool.waits[args.v.slice(5)] = r; });
     return text({
       args,
       sessionKey: ctx.sessionKey,

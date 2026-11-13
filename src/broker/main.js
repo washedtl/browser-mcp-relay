@@ -170,6 +170,7 @@ const DEFAULT_DEPS = {
     });
   },
   poolConfig: () => require("../pool-shared.js").CONFIG,
+  startWatchdog,
   upstreamModule: () => require("./upstream-inproc.js"),
   windowPages: () => require("./window-pages.js"),
   ownTools: () => require("../own-tools/index.js").tools,
@@ -430,7 +431,7 @@ const fmtMinutes = (ms) => (ms >= MINUTE ? `${Math.round(ms / MINUTE)} min` : `$
  * @param {((opts: {profileDir: string, log: Function}) => Promise<unknown>)|null} [opts.seedProfile] — the
  *   profile's one-time seed (profile-seed.js), done before Brave first opens the profile
  * @param {{port: number}|null} [opts.relayInspector] — host the relay Inspector web UI on this port
- * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, toolContext, loadCatalog, rss
+ * @param {object} [opts.deps] — test seams: createSupervisor, upstreamModule, windowPages, ownTools, toolContext, loadCatalog, rss, startWatchdog
  */
 async function startBroker({ pipe, profileDir, env = process.env, log: rawLog = () => {}, idle = {}, onExit = () => {}, deps = {}, keyFile, watchdog = null, recycle = null, seedProfile = null, relayInspector = null }) {
   const { CdpProxy, redact } = require("./cdp-proxy.js");
@@ -571,6 +572,9 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
   // page tools get it here, since W1B's catalog has none
   const ownNames = new Set(ownTools.map((t) => t.name));
   const takesTabId = (name) => !ownNames.has(name) && !sessionless.has(name);
+  // tools that act on the tab their tabId names (main without one): upstream page tools and routed own tools
+  const routedOwnNames = new Set(ownTools.filter((t) => t.needsBrave !== false && t.needsPage !== false).map((t) => t.name));
+  const usesTab = (name) => takesTabId(name) || routedOwnNames.has(name);
 
   let warnedProxyCredentials = false;
   function checkProxyCredentials() {
@@ -879,11 +883,21 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       policy.callStarted();
       const call = trackCall();
+      // the tab the call acts on is not closed as idle until the call is answered
+      // (released here, not inside the call: code the watchdog stopped never finishes)
+      let release = () => {};
+      if (usesTab(req.params.name)) {
+        try {
+          const tabKey = tabKeyOf(req.params.arguments && req.params.arguments.tabId);
+          if (knownTab(connId, tabKey)) release = registry.hold(connId, tabKey);
+        } catch { /* the call itself reports a bad tabId */ }
+      }
       try {
         return await Promise.race([relay.handleToolsCall(req.params), call.orphaned]);
       } finally {
         call.done();
         policy.callEnded();
+        release(); // after callEnded: a tab is never idle longer than the broker, so the idle-tab check can't beat Brave's own idle close
       }
     });
     mcp.onerror = (e) => log(`conn ${connId}: ${e.message}`);
@@ -918,6 +932,7 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
       stopWatchdog();
       clearInterval(rssTimer);
       clearInterval(keyTimer);
+      clearInterval(tabTimer);
       for (const s of sockets) s.destroy();
       for (const s of bridgeSockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
@@ -953,8 +968,22 @@ function serve({ server, cdpProxy, key, keyFile, pipe, profileDir, env, log, idl
     },
   });
 
+  // A session can stay open for days after its work is done, and while any
+  // other session makes calls Brave never idles out: close each tab with no
+  // call for browserMs on its own (its next call reopens it with a notice).
+  // With no call anywhere for as long, Brave's own idle close is due and
+  // takes every tab at once, with its own notice: leave it to that.
+  const idleTabReason = `it had no tool call for ${fmtMinutes(browserMs)}`;
+  const tabTimer = setInterval(() => {
+    if (closing || (policy.calls === 0 && Date.now() - policy.lastActivity >= browserMs)) return;
+    registry.closeIdle(browserMs, idleTabReason).then((n) => {
+      if (n) log(`closed ${n} tab(s) with no tool call for ${fmtMinutes(browserMs)}`);
+    }).catch((e) => log(`closing idle tabs failed: ${e.message}`));
+  }, Math.min(MINUTE, browserMs));
+  tabTimer.unref();
+
   const onStopped = () => { for (const call of inFlightCalls) call.arm(); };
-  const stopWatchdog = watchdog && watchdog.timeoutMs ? startWatchdog({ ...watchdog, onStopped }, log) : () => {};
+  const stopWatchdog = watchdog && watchdog.timeoutMs ? d.startWatchdog({ ...watchdog, onStopped }, log) : () => {};
   // if our key file vanishes while we run, put it back, so new sessions still match us
   const keyTimer = setInterval(() => {
     try {
