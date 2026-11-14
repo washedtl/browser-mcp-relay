@@ -365,7 +365,7 @@ function upgrade(url) {
   });
 }
 
-async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}, loadCatalog, supervisor, recycle = null, rss, pipe: fixedPipe } = {}) {
+async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}, loadCatalog, supervisor, recycle = null, rss, pipe: fixedPipe, watchdog = null, startWatchdog } = {}) {
   const pipe = fixedPipe || testPipe("broker");
   const made = [];
   const upstreamModule = fakeUpstreamModule();
@@ -378,11 +378,13 @@ async function startTestBroker(t, { idle, ownTools = DEFAULT_OWN_TOOLS, env = {}
     env,
     keyFile: KEY_FILE,
     recycle,
+    watchdog,
     log: (m) => logs.push(m),
     idle: idle || { exitMs: 60_000, browserMs: 60_000 },
     onExit: (why) => exits.push(why),
     deps: {
       ...(rss ? { rss } : {}),
+      ...(startWatchdog ? { startWatchdog } : {}),
       createSupervisor: (opts) => { const s = supervisor ? supervisor(opts) : fakeSupervisor(opts); made.push(s); return s; },
       upstreamModule: () => upstreamModule,
       windowPages: () => windowPages,
@@ -1263,12 +1265,68 @@ test("idle exit is called off when a session connects while Brave is closing", a
   assert.ok((await c.listTools()).tools.length > 0, "still serving");
 });
 
+test("tab idle: a tab with no call for browserMs closes while a call keeps another tab (and Brave) busy; its next call reopens it with a notice", async (t) => {
+  // from the call on main to the end a call is always in flight, so Brave's own idle close (also browserMs) never fires
+  const b = await startTestBroker(t, { idle: { exitMs: 60_000, browserMs: 300 } });
+  const c = await connectClient(t, b.pipe);
+  await openTab(c, "sub1"); // opened, never used since
+  const tabCtx = (key) => b.up.contexts.filter((x) => x.sessionKey.endsWith(`:${key}`));
+  const onMain = c.callTool({ name: "navigation_go-to", arguments: { url: "wait://main" } });
+  await until(() => tabCtx("sub1")[0].closed === 1, 3000, "the unused tab to close");
+  await sleep(700); // main's call has now run past browserMs twice
+  assert.strictEqual(tabCtx("main")[0].closed, 0, "a tab with a call in flight stays open");
+  assert.strictEqual(b.sup.closes, 0, "Brave stays up while a call runs");
+  assert.ok(b.logs.some((l) => l === "closed 1 tab(s) with no tool call for 300 ms"), b.logs.join("\n"));
+  const onSub = c.callTool({ name: "own_probe", arguments: { v: "wait:idle-sub1", tabId: "sub1" } }); // an own tool holds its tab too
+  await until(() => probeOwnTool.waits["idle-sub1"], 3000, "the call on sub1 to start");
+  assert.strictEqual(tabCtx("sub1").length, 2, "the next call on the closed tab opened a fresh one");
+  b.up.waits.main();
+  assert.ok(!(await onMain).isError);
+  // main's idle time starts when its call ended, and calls that act on no tab (tabs_list) do not count as using it
+  const deadline = Date.now() + 3000;
+  while (tabCtx("main")[0].closed !== 1) {
+    assert.ok(Date.now() < deadline, "main to close while tabs_list calls go on");
+    await c.callTool({ name: "tabs_list", arguments: {} });
+    await sleep(50);
+  }
+  probeOwnTool.waits["idle-sub1"]();
+  const r = await onSub;
+  assert.match(r.content[0].text, /^\[browser-mcp-relay\] This tab was reset because it had no tool call for 300 ms: /);
+  assert.strictEqual(tabCtx("sub1")[1].closed, 0);
+  assert.deepStrictEqual(b.exits, [], "the broker stays up");
+});
+
+test("tab idle: a call whose code the watchdog stopped still lets its tab close once the call is answered", async (t) => {
+  let onStopped = null;
+  const b = await startTestBroker(t, {
+    idle: { exitMs: 60_000, browserMs: 300 },
+    watchdog: { timeoutMs: 50 }, // a stopped call is answered 2 × 50 ms later
+    startWatchdog: (opts) => { onStopped = opts.onStopped; return () => {}; },
+  });
+  const c = await connectClient(t, b.pipe);
+  await openTab(c, "sub1");
+  const tabCtx = (key) => b.up.contexts.filter((x) => x.sessionKey.endsWith(`:${key}`));
+  const frozen = c.callTool({ name: "own_probe", arguments: { v: "wait:wd-sub1", tabId: "sub1" } }); // its code never finishes
+  t.after(() => probeOwnTool.waits["wd-sub1"]?.());
+  await until(() => probeOwnTool.waits["wd-sub1"], 3000, "the call on sub1 to start");
+  onStopped(); // what the watchdog does after stopping frozen code
+  const onMain = c.callTool({ name: "navigation_go-to", arguments: { url: "wait://wd-main" } }); // keeps Brave from idling out
+  assert.match((await frozen).content[0].text, /never answered after the broker's watchdog stopped code/);
+  await until(() => tabCtx("sub1")[0].closed === 1, 3000, "sub1 to close although its call's code never finished");
+  await until(() => b.up.waits["wd-main"], 3000, "the call on main to start");
+  b.up.waits["wd-main"]();
+  assert.ok(!(await onMain).isError);
+});
+
 test("browser idle: no tool call for browserMs closes Brave; the tab's next call relaunches it with a notice", async (t) => {
   const b = await startTestBroker(t, { idle: { exitMs: 60_000, browserMs: 80 } });
   const c = await connectClient(t, b.pipe);
   await c.callTool({ name: "content_get-as-text", arguments: {} });
   await until(() => b.sup.closes === 1, 3000, "Brave to close");
   assert.strictEqual(b.sup.up, false);
+  await sleep(200); // over two of the idle-tab checks (every browserMs here)
+  assert.ok(!b.logs.some((l) => /^closed \d+ tab\(s\)/.test(l)), "with no call anywhere, the idle-tab check leaves the tabs to Brave's own close");
+  assert.strictEqual(b.up.contexts[0].closed, 0, "dropped with the browser, not closed one by one");
   const r = await c.callTool({ name: "content_get-as-text", arguments: {} });
   assert.match(r.content[0].text, /reset because the browser was closed after/);
   assert.strictEqual(b.sup.launches, 2);

@@ -267,6 +267,7 @@ class BraveSupervisor extends EventEmitter {
     fs.mkdirSync(this.profileDir, { recursive: true });
     await this._reapStrays(exe);
     disableMemorySaver(this.profileDir, this._log);
+    forgetLastSession(this.profileDir, this._log);
     const proxy = await resolveProxy(this._proxyUrl, { log: this._log, timeoutMs: this._t.proxyProbeTimeoutMs });
     const proxyServer = proxy ? proxy.server : null;
     const args = buildBraveArgs({ profileDir: this.profileDir, extensionPath: this._extensionPath, proxyServer, headless: this._headless });
@@ -694,6 +695,33 @@ function disableMemorySaver(profileDir, log = () => {}) {
   return true;
 }
 
+/**
+ * Remove the saved session (`Default/Sessions`) before launch.
+ *
+ * Under --no-startup-window, Brave brings back every window of its last run
+ * as soon as the first window is created (the broker's first tab), whatever
+ * the startup setting says (measured: two pages open at a clean close came
+ * back next to the new window, also with session.restore_on_startup = 5 and
+ * with --disable-restore-session-state; with this folder gone, only the new
+ * window). Those windows belong to no session, so nothing closed them, and
+ * each run saved them again: after two days the broker's Brave had 11
+ * windows and tracked 3. Cookies and history are kept elsewhere; the
+ * recently-closed list (Tabs_*) goes too, and the broker uses neither.
+ *
+ * Must run while Brave is not running on the profile.
+ *
+ * @param {string} profileDir
+ * @param {(msg: string) => void} [log]
+ */
+function forgetLastSession(profileDir, log = () => {}) {
+  const dir = path.join(profileDir, "Default", "Sessions");
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    log(`warning: could not remove ${dir} (${e.message}); Brave may reopen the last run's windows`);
+  }
+}
+
 function isObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
@@ -816,6 +844,7 @@ module.exports = {
   BraveSupervisor,
   buildBraveArgs,
   disableMemorySaver,
+  forgetLastSession,
   resolveProxy,
   isLoopbackHost,
   braveEnv,

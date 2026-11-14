@@ -327,6 +327,100 @@ test("closeConn drops pending reset notices", async () => {
   assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null);
 });
 
+/** Date.now() under the test's control (the registry stamps use with it). */
+function fakeClock(t, start) {
+  const real = Date.now;
+  const clock = { now: start };
+  Date.now = () => clock.now;
+  t.after(() => { Date.now = real; });
+  return clock;
+}
+const IDLE = "it had no tool call for 4 s";
+
+test("closeIdle: a tab with no call for the idle time is closed and reopens with a notice; one used since stays", async (t) => {
+  const clock = fakeClock(t, 1000);
+  const { registry } = setup();
+  const sub = await registry.getCtx("c1", "sub1");
+  const main = await registry.getCtx("c1");
+  clock.now = 5000;
+  registry.hold("c1", MAIN_TAB)(); // a call on main started and ended just now
+  assert.strictEqual(await registry.closeIdle(4000, IDLE), 1);
+  assert.deepStrictEqual([sub.closed, main.closed], [1, 0]);
+  assert.deepStrictEqual(registry.listTabs("c1").map((x) => [x.tabKey, x.state]), [["main", "open"], ["sub1", "reset"]]);
+  assert.strictEqual(registry.takeResetNotice("c1", MAIN_TAB), null);
+  assert.match(registry.takeResetNotice("c1", "sub1"), /This tab was reset because it had no tool call for 4 s: its page/);
+  assert.notStrictEqual(await registry.getCtx("c1", "sub1"), sub, "its next call opens a fresh one");
+});
+
+test("closeIdle: a tab with a call in flight is never closed, however long the call runs; its idle time starts when the call ends", async (t) => {
+  const clock = fakeClock(t, 1000);
+  const { registry } = setup();
+  const main = await registry.getCtx("c1");
+  const release = registry.hold("c1", MAIN_TAB);
+  clock.now = 1_000_000;
+  assert.strictEqual(await registry.closeIdle(1000, IDLE), 0);
+  release();
+  release(); // a second release changes nothing
+  clock.now += 999;
+  assert.strictEqual(await registry.closeIdle(1000, IDLE), 0);
+  assert.strictEqual(main.closed, 0);
+  clock.now += 1;
+  assert.strictEqual(await registry.closeIdle(1000, IDLE), 1);
+  assert.strictEqual(main.closed, 1);
+});
+
+test("closeIdle: idle time counts from the opening of a tab no call has named; a tab still opening is left alone", async (t) => {
+  const clock = fakeClock(t, 1000);
+  const { upstream, registry } = setup();
+  const opened = await registry.getCtx("c1"); // e.g. a tab tabs_new opened that no call has used since
+  const gate = deferred();
+  upstream.next = async (key) => { await gate.promise; return fakeCtx(key); };
+  const pending = registry.getCtx("c2");
+  await tick();
+  clock.now = 1499;
+  assert.strictEqual(await registry.closeIdle(500, IDLE), 0);
+  clock.now = 1500;
+  assert.strictEqual(await registry.closeIdle(500, IDLE), 1, "c1's tab only: c2's is still opening");
+  assert.strictEqual(opened.closed, 1);
+  gate.resolve();
+  const late = await pending;
+  assert.strictEqual(late.closed, 0);
+  assert.deepStrictEqual(registry.listTabs("c2").map((x) => x.state), ["open"]);
+});
+
+test("closeIdle: a tab closed and reopened while a call still holds it is not closed under that call", async (t) => {
+  const clock = fakeClock(t, 1000);
+  const { registry } = setup();
+  await registry.getCtx("c1");
+  const release = registry.hold("c1", MAIN_TAB);
+  await registry.closeTab("c1", MAIN_TAB); // tabs_close main from elsewhere, mid-call
+  const reopened = await registry.getCtx("c1");
+  clock.now = 1_000_000;
+  assert.strictEqual(await registry.closeIdle(1000, IDLE), 0);
+  release();
+  clock.now += 1000;
+  assert.strictEqual(await registry.closeIdle(1000, IDLE), 1);
+  assert.strictEqual(reopened.closed, 1);
+});
+
+test("hold: a call that arrives after its connection closed leaves no usage record behind", async () => {
+  const { registry } = setup();
+  await registry.closeConn("c1");
+  registry.hold("c1", MAIN_TAB)();
+  assert.strictEqual(registry._use.has("c1"), false);
+});
+
+test("closeIdle: a busy tab of one connection keeps only that tab; the same tab key of another connection still closes", async (t) => {
+  const clock = fakeClock(t, 1000);
+  const { registry } = setup();
+  const a = await registry.getCtx("c1");
+  const b = await registry.getCtx("c2");
+  registry.hold("c1", MAIN_TAB);
+  clock.now = 9000;
+  assert.strictEqual(await registry.closeIdle(1000, IDLE), 1);
+  assert.deepStrictEqual([a.closed, b.closed], [0, 1]);
+});
+
 test("a getCtx for a connection that already closed creates nothing (session left mid-call)", async () => {
   // e.g. the socket closed while the call awaited the first upstream import
   const { supervisor, upstream, registry } = setup();
