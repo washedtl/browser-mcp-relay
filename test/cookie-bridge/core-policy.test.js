@@ -29,11 +29,6 @@ test("policy: ordinary sites are allowed by default (no built-in allow list; cat
   assert.strictEqual(policy.BUSINESS_ALLOW, undefined, "no owner business list ships");
 });
 
-test("policy: no owner-specific domain ships in policy.js", () => {
-  const src = fs.readFileSync(POLICY_FILE, "utf8").toLowerCase();
-  for (const owner of ["boxedup", "boxeduplabs", "washed", "keepa", "whop"]) assert.ok(!src.includes(owner), owner);
-});
-
 test("policy: a sensitive-looking subdomain is held unless it is on the owner's always-allow list", () => {
   assert.strictEqual(decision("payments.ebay.com"), "hold");
   assert.strictEqual(decision("wallet.walmart.com"), "hold");

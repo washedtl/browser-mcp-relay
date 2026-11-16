@@ -213,8 +213,8 @@ test("W0-7: launchBrave with proxyUrl=null still strips BROWSER_RELAY_* from env
   // process.env.HTTP_PROXY leaks through the relay's
   // `for (k of Object.entries(process.env))` env copy and the assertion
   // `env.HTTP_PROXY === undefined` fires on a perfectly working relay.
-  // CI runners don't have this env var → test passes there. CLAUDE.md
-  // anti-pattern: "tests that pass on my env state."
+  // CI runners don't have this env var → test passes there, which is how
+  // a test ends up passing on one machine only.
   const stashed = {
     BROWSER_RELAY_INSPECTOR_PORT: process.env.BROWSER_RELAY_INSPECTOR_PORT,
     HTTP_PROXY: process.env.HTTP_PROXY,

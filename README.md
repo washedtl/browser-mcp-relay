@@ -41,6 +41,8 @@ For the full 72-tool catalog, see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ## Quick start
 
+You need **Node.js 20 or newer** and **Brave** installed: the relay drives your Brave and never downloads a browser of its own. Windows is the tested platform (see [Platform support](#platform-support)).
+
 ```bash
 git clone https://github.com/washedtl/browser-mcp-relay.git
 cd browser-mcp-relay
@@ -48,7 +50,9 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install   # PowerShell: $env:PLAYWRIGHT_S
 npm run setup
 ```
 
-The relay drives your installed Brave. `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` stops a dependency from downloading ~1.2 GB of Playwright browsers (Chromium, Firefox, WebKit) that the relay never uses. Without it, `npm install` takes much longer, and fails where that download is blocked.
+`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` stops a dependency from downloading ~1.2 GB of Playwright browsers (Chromium, Firefox, WebKit) that the relay never uses. Without it, `npm install` takes much longer, and fails where that download is blocked.
+
+`npm install` ends with a count of known advisories in dependencies (none critical). Most come from the versions the relay pins (Lighthouse 11, `browser-devtools-mcp` 0.6.12), which have no compatible fix yet; [Limitations](docs/REFERENCE.md#limitations) says why those aren't reached here. Don't run `npm audit fix --force`: it downgrades `browser-devtools-mcp` to 0.1.1 and breaks the relay.
 
 The setup wizard:
 
@@ -58,7 +62,7 @@ The setup wizard:
 4. Runs a smoke test (spawns the relay with every toolset on, expects ≥60 tools; on Windows in broker mode, on a private pipe, and in legacy mode)
 5. Prints a paste-ready snippet for your MCP client config
 
-Paste the printed snippet into your MCP client's config file (`~/.claude.json` for Claude Code; `mcp.json` for Cursor) and restart the client. **Under two minutes on a clean machine.**
+Close your MCP client (Claude Code writes to `~/.claude.json` while it runs), paste the printed snippet into its config file (`~/.claude.json` for Claude Code; `~/.cursor/mcp.json` for Cursor), then open the client again. **About five minutes on a clean machine, most of it `npm install`.**
 
 > 💡 The wizard never modifies your client's config directly — it only prints a snippet. You stay in control of where it lands.
 
@@ -67,9 +71,11 @@ To re-verify anytime:
 ```bash
 npm run smoke
 # → [smoke] Brave: C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe
-# → ✓ Relay healthy. 72 tools available (≥60). [broker, 3.5s]
-# → ✓ Relay healthy. 72 tools available (≥60). [legacy, 2.2s]
+# → ✓ Relay healthy. 72 tools available (≥60). [broker, 6.0s]
+# → ✓ Relay healthy. 72 tools available (≥60). [legacy, 2.6s]
 ```
+
+The first run after `npm install` is slower (about 30-40 s per mode on a fresh clone), and so is the first connection from your client.
 
 ## The Inspector
 

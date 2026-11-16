@@ -146,6 +146,25 @@ test("W2P setup mode: standalone and pool are legacy mode; an unknown answer fal
   assert.match(u.printed, /Unknown mode "brokr"; using broker/);
 });
 
+test("setup snippet: names both clients' config files, and node's full path for clients that can't find node", () => {
+  const { step8_printMcpSnippet } = require("../scripts/setup.js");
+  const realWrite = process.stdout.write;
+  let printed = "";
+  process.stdout.write = (s) => { printed += s; return true; };
+  try {
+    step8_printMcpSnippet();
+  } finally {
+    process.stdout.write = realWrite;
+  }
+  assert.match(printed, /Claude Code: ~\/\.claude\.json\n/);
+  assert.match(printed, /Cursor: {6}~\/\.cursor\/mcp\.json\n/);
+  assert.doesNotMatch(printed, /Cursor config \(e\.g\. ~\/\.claude\.json\)/, "~/.claude.json is Claude Code's, not Cursor's");
+  assert.ok(printed.includes(`"command": ${JSON.stringify(process.execPath)}`), "the full-path fallback names this node");
+  const start = printed.indexOf("\n{\n") + 1;
+  const snippet = JSON.parse(printed.slice(start, printed.indexOf("\n}\n", start) + 2));
+  assert.deepStrictEqual(snippet, { "browser-mcp-relay": { command: "node", args: [path.join(REPO_ROOT, "src", "index.js")] } });
+});
+
 // ─────────────────── W2P: smoke needs Brave ───────────────────
 
 function smokeRun(argv, config) {
