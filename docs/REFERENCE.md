@@ -507,7 +507,7 @@ One broker per user and profile serves every session: one Brave, one persistent 
 
 ### 🟢 Legacy standalone (legacy's default)
 
-One Brave per relay process. Profile stored at `<repo>/.browser-data` (or a per-user cache dir if the repo is read-only — see `BROWSER_RELAY_POOL_DIR` above for platform-specific paths). No cookie snapshot. Each `npm run setup` produces this configuration. **Recommended for first-time users.**
+One Brave per relay process. Profile stored at `<repo>/.browser-data` (or a per-user cache dir if the repo is read-only — see `BROWSER_RELAY_POOL_DIR` above for platform-specific paths). No cookie snapshot. `npm run setup` offers it, and picks it by default on macOS and Linux, where broker mode is untested.
 
 ### 🔵 Legacy pool (opt-in)
 

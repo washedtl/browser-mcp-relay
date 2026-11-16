@@ -2,7 +2,7 @@
 
 Open work, ranked by real-world leverage. Items are deferred not because they're unimportant but because they're either (a) not the highest-leverage thing to ship right now, (b) require an architectural pivot, or (c) need real-world signal we don't have yet.
 
-This file is the canonical source for "what's known but not yet shipped." Items that get shipped move from here to a release note + a `feedback_*.md` memory entry.
+This file is the canonical source for "what's known but not yet shipped." Items that get shipped move from here to the CHANGELOG.
 
 ## Contents
 

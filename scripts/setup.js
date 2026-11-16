@@ -285,13 +285,18 @@ function step8_printMcpSnippet() {
   process.stdout.write([
     "",
     "─────────────────────── MCP registration snippet ───────────────────────",
-    "Paste the following into the `mcpServers` section of your Claude Code or",
-    "Cursor config (e.g. ~/.claude.json):",
+    "Paste the following into the `mcpServers` section of your MCP client's config:",
+    "  Claude Code: ~/.claude.json",
+    "  Cursor:      ~/.cursor/mcp.json",
     "",
     json,
     "",
     "If you already have other MCP entries, merge this one in alongside them",
     "(don't replace the whole `mcpServers` object).",
+    "If the client can't start it because `node` isn't found (an app started from",
+    "the Start menu or Dock may not see your terminal's PATH), use node's full path",
+    "(and update it if a Node upgrade moves node):",
+    `  "command": ${JSON.stringify(process.execPath)}`,
     "────────────────────────────────────────────────────────────────────────",
     "",
   ].join("\n"));
@@ -338,8 +343,9 @@ async function main() {
   process.stdout.write([
     "",
     "Next steps:",
-    "  1. Paste the MCP snippet above into your Claude Code config (~/.claude.json).",
-    "  2. Restart Cursor / Claude Code.",
+    "  1. Close Claude Code / Cursor, then paste the MCP snippet above into its config",
+    "     (Claude Code: ~/.claude.json; Cursor: ~/.cursor/mcp.json). Claude Code writes that file while it runs.",
+    "  2. Open the client again.",
     "  3. The relay's tools should appear (browser-devtools-mcp tools + the relay's own tools).",
     "  4. Re-run `npm run smoke` anytime to verify the relay still launches cleanly.",
     "",
@@ -356,6 +362,7 @@ if (require.main === module) {
 module.exports = {
   // Exported for tests.
   step6_chooseMode,
+  step8_printMcpSnippet,
   step9_smokeTest,
   killTree: smoke.killTree,
 };
